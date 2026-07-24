@@ -41,7 +41,7 @@ on:
           - historical_semantic
           - live_head
       baseline_ref:
-        description: "Optional historical_sync A/B baseline (live_head is intentionally single-leg)"
+        description: "Optional A/B baseline (live_head comparisons remain observational)"
         required: false
         default: ""
       profile:
@@ -112,10 +112,6 @@ jobs:
             live_head) WORKLOAD=live_head; VERIFY_MODE=semantic ;;
             *) echo "unknown workload: $REQUESTED_WORKLOAD" >&2; exit 1 ;;
           esac
-          if [ "$WORKLOAD" = live_head ] && [ -n "$BASELINE_REF" ]; then
-            echo "live_head is observational and intentionally single-leg; leave baseline_ref blank" >&2
-            exit 1
-          fi
           resolve() { gh api "repos/${REPO}/commits/$1" --jq .sha; }
           PRIMARY_SHA=$(resolve "$REF")
           legs="[{\"leg\":\"primary\",\"ref\":\"${REF}\",\"sha\":\"${PRIMARY_SHA}\"}"
