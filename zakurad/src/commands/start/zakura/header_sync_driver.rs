@@ -251,7 +251,7 @@ fn header_root_authentication_failure_kind(
                     ..
                 } => HeaderRootAuthenticationFailureKind::Stale,
                 zakura_state::AuthenticateHeaderRootsError::CountMismatch { .. }
-                | zakura_state::AuthenticateHeaderRootsError::MissingSuccessorWitness { .. }
+                | zakura_state::AuthenticateHeaderRootsError::MissingHeaderWitness { .. }
                 | zakura_state::AuthenticateHeaderRootsError::NonContiguous { .. }
                 | zakura_state::AuthenticateHeaderRootsError::HeightOverflow
                 | zakura_state::AuthenticateHeaderRootsError::Frontier(_) => {

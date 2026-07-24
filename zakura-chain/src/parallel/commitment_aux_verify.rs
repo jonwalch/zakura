@@ -23,7 +23,42 @@ use crate::{
 pub struct VerifiedHeaderCommitmentRoots {
     confirmed_roots: Vec<BlockCommitmentRoots>,
     confirmed_hashes: Vec<block::Hash>,
+    header_witness: Option<HeaderWitness>,
     history_tree: HistoryTree,
+}
+
+/// The final header's authenticated metadata retained for the one-block-lag handoff.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderWitness {
+    height: Height,
+    hash: block::Hash,
+    auth_data_root: AuthDataRoot,
+}
+
+impl HeaderWitness {
+    /// Constructs retained header witness metadata.
+    pub fn from_parts(height: Height, hash: block::Hash, auth_data_root: AuthDataRoot) -> Self {
+        Self {
+            height,
+            hash,
+            auth_data_root,
+        }
+    }
+
+    /// Returns the witness header's height.
+    pub fn height(&self) -> Height {
+        self.height
+    }
+
+    /// Returns the witness header's hash.
+    pub fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// Returns the authorizing-data root authenticated by the witness header.
+    pub fn auth_data_root(&self) -> AuthDataRoot {
+        self.auth_data_root
+    }
 }
 
 impl VerifiedHeaderCommitmentRoots {
@@ -40,6 +75,13 @@ impl VerifiedHeaderCommitmentRoots {
     /// Returns the header hash at the confirmed tip, if any roots were confirmed.
     pub fn confirmed_hash(&self) -> Option<block::Hash> {
         self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the final header's authenticated witness metadata.
+    ///
+    /// The witness's note-commitment roots require a later successor and are not retained.
+    pub fn header_witness(&self) -> Option<HeaderWitness> {
+        self.header_witness
     }
 
     /// Returns the history tree after folding the confirmed roots.
@@ -153,6 +195,13 @@ where
     Ok(VerifiedHeaderCommitmentRoots {
         confirmed_roots,
         confirmed_hashes,
+        header_witness: items.last().map(|(header, roots)| {
+            HeaderWitness::from_parts(
+                roots.height,
+                block::Hash::from(*header),
+                roots.auth_data_root,
+            )
+        }),
         history_tree: tree,
     })
 }
@@ -838,6 +887,15 @@ mod tests {
         assert_eq!(
             verified.confirmed_hash(),
             Some(block::Hash::from(act_block.header.as_ref())),
+        );
+        assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness {
+                height: next_roots.height,
+                hash: block::Hash::from(next_block.header.as_ref()),
+                auth_data_root: next_roots.auth_data_root,
+            }),
+            "only the final header's authenticated witness metadata is retained"
         );
         assert_eq!(
             verified.history_tree().hash(),
