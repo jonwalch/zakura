@@ -254,7 +254,12 @@ CFG=/root/bench-config.toml
 } > "$CFG"
 
 if [[ "$WORKLOAD" == live_head ]]; then
-  SNAPSHOT_HEIGHT="$("$ZAKURAD_BIN" -c "$CFG" tip-height 2>/dev/null | tail -1)"
+  TIP_HEIGHT_LOG="$OUT_DIR/tip-height.log"
+  if ! SNAPSHOT_HEIGHT="$("$ZAKURAD_BIN" -c "$CFG" tip-height --network Mainnet \
+    2>"$TIP_HEIGHT_LOG" | tail -1)"; then
+    tail -20 "$TIP_HEIGHT_LOG" >&2 || true
+    die "could not open the baked tip snapshot"
+  fi
   [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ ]] \
     || die "could not read the baked tip snapshot height"
   START_HEIGHT="$SNAPSHOT_HEIGHT"
