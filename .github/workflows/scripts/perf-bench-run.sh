@@ -277,8 +277,7 @@ T0=$(date +%s)
 sleep 3
 kill -0 "$NODE_PID" 2>/dev/null || { tail -20 "$LOGF" >&2; die "zakurad died on startup"; }
 
-# Metrics recorder sidecar for the bottleneck verdict. Live-head mode starts it
-# only after catch-up so its series describes the profile window.
+# Metrics recorder sidecar for the historical-sync bottleneck verdict.
 REC_DIR="$OUT_DIR/recorded"
 start_recorder() {
   [[ -z "$REC_PID" ]] || return 0
@@ -504,7 +503,6 @@ else
             UNHEALTHY=0
             T_ESCAPE="$PROFILE_START_EPOCH"
             capture_metrics "$METRICS_BASELINE" || true
-            start_recorder
             start_profile
             log "live head locked at $START_HEIGHT ($START_HASH); recording ${PROFILE_SECONDS}s"
             break
