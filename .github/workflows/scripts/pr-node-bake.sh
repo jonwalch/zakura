@@ -47,8 +47,8 @@ ln -sf /root/.cargo/bin/cargo /root/.cargo/bin/rustc /root/.cargo/bin/rustup /us
 # (best-effort; the run script falls back gracefully without either)
 cargo install inferno --locked >/dev/null 2>&1 || true
 cargo install rustfilt --locked >/dev/null 2>&1 || true
-ln -sf /root/.cargo/bin/inferno-flamegraph /root/.cargo/bin/inferno-diff-folded \
-  /root/.cargo/bin/rustfilt /usr/local/bin/ 2>/dev/null || true
+ln -sf /root/.cargo/bin/inferno-flamegraph /root/.cargo/bin/rustfilt \
+  /usr/local/bin/ 2>/dev/null || true
 
 git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /root/zakura
 # Strip the token from the baked image; run droplets fetch with a fresh

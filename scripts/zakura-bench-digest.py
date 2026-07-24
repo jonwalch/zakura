@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Digest CPU profiles and block-processing latency for checkpoint-sync bench runs.
+"""Digest CPU profiles and block-processing latency for Zakura benchmark runs.
 
-Stdlib-only helper used by scripts/checkpoint-sync-bench.sh (see the profiling
-section of that script's header and docs/cpu-profiling.md). Every subcommand is
-best-effort: missing or partial inputs produce a markdown note instead of an
-error, so a digest failure can never fail a bench run.
+Stdlib-only helper used by the ephemeral droplet performance benchmark. Every
+subcommand is best-effort: missing or partial inputs produce a markdown note
+instead of an error, so a digest failure can never fail a bench run.
 
 Subcommands:
   collapse   Fold `perf script` output (stdin) into flamegraph "folded stacks"

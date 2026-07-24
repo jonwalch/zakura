@@ -13,7 +13,7 @@
 #
 # Config via /root/run.env (sourced by the caller before exec):
 #   GH_REPO / GH_CLONE_TOKEN  repo slug + per-run token for the ref fetch
-#   SHA / REFSPEC             commit to bench + refspec that reaches it
+#   SHA                       commit to bench
 #   LEG                       primary | baseline (labels outputs)
 #   VERIFY_MODE               checkpoint | semantic
 #   PROFILE                   cpu | off
@@ -35,9 +35,7 @@ OUT_DIR=/root/out
 DIGEST_PY=/root/zakura-bench-digest.py
 DASHBOARD_PY=/root/zakura-metrics-dashboard.py
 PROFILE_SECONDS="${PROFILE_SECONDS:-300}"
-# 49Hz (not 99) keeps `perf script` DWARF unwinding tractable: the A/A
-# validation run measured ~55 minutes of unwinding for a 99Hz x 300s window on
-# a c-16 droplet; halving the samples plus --no-inline brings it to minutes.
+# 49Hz keeps DWARF unwinding fast while retaining enough samples for comparison.
 PROFILE_FREQ="${PROFILE_FREQ:-49}"
 PROFILE_DWARF_STACK="${PROFILE_DWARF_STACK:-8192}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
@@ -93,7 +91,7 @@ df -h /mnt/snapshots >&2
 cd /root/zakura
 GIT_AUTH=$(printf 'x-access-token:%s' "${GH_CLONE_TOKEN}" | base64 -w0)
 git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
-  fetch --no-tags origin "${REFSPEC}"
+  fetch --no-tags origin "${SHA}"
 git checkout --detach "${SHA}"
 rm -f /root/run.env
 unset GH_CLONE_TOKEN GIT_AUTH
@@ -152,7 +150,7 @@ if [[ "$PROFILE" == "cpu" ]]; then
   command -v rustfilt >/dev/null 2>&1 && DEMANGLE=(rustfilt)
   found=0
   if command -v perf >/dev/null 2>&1; then
-    # DO droplets expose no PMU, so hardware cycles falls back to cpu-clock
+    # Prefer hardware cycles when available, then fall back to cpu-clock.
     for event in "cycles:u" "cpu-clock:u"; do
       if perf record -o /root/.perf-probe -e "$event" -F 9 -- true >/dev/null 2>&1; then
         PERF_EVENT="$event"; found=1; break
@@ -276,7 +274,7 @@ start_profile() {
 
 CSV="$OUT_DIR/samples.csv"
 echo "epoch,elapsed,height" > "$CSV"
-T_ESCAPE=""; END_HEIGHT="$START_HEIGHT"; CLEAN_STOP=0; LAST_BEAT=0
+T_ESCAPE=""; END_HEIGHT="$START_HEIGHT"; CLEAN_STOP=0; NODE_EXIT_STATUS=0; LAST_BEAT=0
 while :; do
   NOW=$(date +%s); ELAPSED=$((NOW - T0))
   H="$(scrape_height)" || true
@@ -294,8 +292,12 @@ while :; do
     fi
   fi
   if ! kill -0 "$NODE_PID" 2>/dev/null; then
-    wait "$NODE_PID" 2>/dev/null || true
-    CLEAN_STOP=1
+    if wait "$NODE_PID" 2>/dev/null; then
+      CLEAN_STOP=1
+    else
+      NODE_EXIT_STATUS=$?
+      log "zakurad exited with status ${NODE_EXIT_STATUS} before reaching stop height"
+    fi
     break
   fi
   if (( ELAPSED >= WALL_CAP )); then
@@ -368,7 +370,14 @@ if [[ -d "$REC_DIR" && -f "$REC_DIR/samples.jsonl" ]]; then
   fi
 fi
 
-if (( CLEAN_STOP )); then END_HEIGHT="$STOP_HEIGHT"; fi
+if (( CLEAN_STOP )); then
+  END_HEIGHT="$STOP_HEIGHT"
+  STOP_RESULT="yes"
+elif (( NODE_EXIT_STATUS != 0 )); then
+  STOP_RESULT="no (exit ${NODE_EXIT_STATUS})"
+else
+  STOP_RESULT="no (wall cap)"
+fi
 BLOCKS=$((END_HEIGHT - START_HEIGHT))
 TOTAL=$((T_END - T0)); (( TOTAL > 0 )) || TOTAL=1
 POST=$TOTAL
@@ -385,7 +394,7 @@ ERRS="$(grep -iE 'panic|ERROR committing|resetting state queue' "$LOGF" 2>/dev/n
   echo "|---|---:|---:|---:|---:|---:|---|---|"
   printf '| %s | %s | %s | %ss | %s | %s | %s | %s |\n' \
     "$LEG" "$END_HEIGHT" "$BLOCKS" "$TOTAL" "$BPS" "$PBPS" \
-    "$( (( CLEAN_STOP )) && echo yes || echo "wall-capped" )" "${VERDICT:-n/a}"
+    "$STOP_RESULT" "${VERDICT:-n/a}"
   echo ""
   echo "build: ${BUILD_SECS}s (warm baked cache); profile: $( [[ -s "$OUT_DIR/profile.folded" ]] && echo "captured ($PERF_EVENT)" || echo "n/a" )"
   if [[ -n "$ERRS" ]]; then
@@ -419,8 +428,12 @@ json.dump({
     "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,
     "blocks": $BLOCKS, "seconds": $TOTAL, "bps": $BPS, "post_bps": $PBPS,
     "clean_stop": bool($CLEAN_STOP), "build_secs": $BUILD_SECS,
+    "node_exit_status": $NODE_EXIT_STATUS,
     "verdict": "${VERDICT}", "profiled": bool($PROFILED),
 }, open(sys.argv[1], "w"), indent=2)
 PY
 
+if (( NODE_EXIT_STATUS != 0 )); then
+  die "zakurad exited with status ${NODE_EXIT_STATUS} before reaching stop height"
+fi
 log "leg $LEG done: $BLOCKS blocks in ${TOTAL}s ($BPS blk/s), verdict=${VERDICT:-n/a}"

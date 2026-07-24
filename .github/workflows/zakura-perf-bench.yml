@@ -185,7 +185,7 @@ jobs:
           VOL_SNAP_ID: ${{ steps.baked.outputs.vol_snap_id }}
         run: |
           set -euo pipefail
-          VOLUME_NAME="zakura-perf-vol-${GITHUB_RUN_ID}-${LEG}"
+          VOLUME_NAME="zakura-pr-perf-vol-${GITHUB_RUN_ID}-${LEG}"
           SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
           VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
             --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
@@ -242,7 +242,6 @@ jobs:
             printf 'GH_REPO=%q\n'          "${GITHUB_REPOSITORY}"
             printf 'GH_CLONE_TOKEN=%q\n'   "${GH_CLONE_TOKEN}"
             printf 'SHA=%q\n'              "${SHA}"
-            printf 'REFSPEC=%q\n'          "${SHA}"
             printf 'LEG=%q\n'              "${LEG}"
             printf 'VERIFY_MODE=%q\n'      "${VERIFY_MODE}"
             printf 'PROFILE=%q\n'          "${PROFILE}"
@@ -337,6 +336,16 @@ jobs:
           B="legs/zakura-perf-bench-${GITHUB_RUN_ID}-baseline"
           [ -f "$P/meta.json" ] && [ -f "$B/meta.json" ] \
             || { echo "one or both legs produced no meta.json; nothing to compare" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          FAILED_LEGS=$(python3 - "$P/meta.json" "$B/meta.json" <<'PY'
+          import json, sys
+          legs = (json.load(open(path)) for path in sys.argv[1:3])
+          print(", ".join(leg["leg"] for leg in legs if leg.get("node_exit_status", 0)))
+          PY
+          )
+          if [ -n "$FAILED_LEGS" ]; then
+            echo "No comparison: zakurad failed in ${FAILED_LEGS}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           python3 - "$P/meta.json" "$B/meta.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
           p, b = (json.load(open(a)) for a in sys.argv[1:3])
