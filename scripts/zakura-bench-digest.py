@@ -21,6 +21,7 @@ Subcommands:
 """
 
 import argparse
+import csv
 import json
 import math
 import re
@@ -227,6 +228,55 @@ def cmd_diff(args):
 
 
 # ---------------------------------------------------------------------------
+# perf stat
+# ---------------------------------------------------------------------------
+
+
+def parse_perf_stat(text):
+    """Parse `perf stat -x,` output into `(event, value, unit)` rows."""
+    rows = []
+    for fields in csv.reader(text.splitlines()):
+        if len(fields) < 3:
+            continue
+        value_raw, unit, event = (field.strip() for field in fields[:3])
+        try:
+            value = float(value_raw)
+        except ValueError:
+            continue
+        rows.append((event, value, unit))
+    return rows
+
+
+def cmd_stat(args):
+    """Render absolute CPU counters from one `perf stat -x,` file."""
+    out = sys.stdout
+    out.write(f"### Absolute CPU counters — {args.title}\n\n")
+    try:
+        rows = parse_perf_stat(Path(args.csv).read_text())
+    except OSError as error:
+        out.write(f"_(no CPU counters: {error})_\n")
+        return 0
+    if not rows:
+        out.write("_(no CPU counters: perf stat output has no counted events)_\n")
+        return 0
+
+    out.write("| counter | value |\n|---|---:|\n")
+    values = {}
+    for event, value, unit in rows:
+        values[event.removesuffix(":u")] = value
+        if event == "task-clock":
+            shown = f"{value / 1000.0:,.1f} CPU-s"
+        else:
+            shown = f"{value:,.0f}" + (f" {unit}" if unit else "")
+        out.write(f"| `{event}` | {shown} |\n")
+    cycles = values.get("cycles")
+    instructions = values.get("instructions")
+    if cycles and instructions:
+        out.write(f"\nInstructions per cycle: **{instructions / cycles:.2f}**\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # latency
 # ---------------------------------------------------------------------------
 
@@ -315,7 +365,7 @@ def nearest_rank(sorted_values, quantile):
     return sorted_values[rank - 1]
 
 
-def parse_commit_trace(trace_path):
+def parse_commit_trace(trace_path, min_height=None):
     """Parse commit_state.jsonl into block, header-range, and stall records.
 
     The trace table is shared by two drivers: the block-sync driver (per-block
@@ -338,12 +388,18 @@ def parse_commit_trace(trace_path):
                 continue
             event = row.get("event")
             if row.get("source") == "header_sync_driver":
+                range_start = row.get("range_start")
+                if min_height is not None and isinstance(range_start, int):
+                    if range_start < min_height:
+                        continue
                 if event == "commit_finish" and row.get("result") == "committed":
                     elapsed = row.get("elapsed_ms")
                     if isinstance(elapsed, (int, float)):
                         headers.append((float(elapsed), int(row.get("range_count") or 0)))
                 continue
             height = row.get("height")
+            if min_height is not None and isinstance(height, int) and height < min_height:
+                continue
             if event == "block_submit_queued" and height is not None:
                 queued_ts.setdefault(height, row.get("ts"))
             elif event == "commit_start" and height is not None:
@@ -403,7 +459,7 @@ def cmd_latency(args):
     trace_path = Path(args.traces, "commit_state.jsonl") if args.traces else None
     if trace_path and trace_path.is_file():
         queued_ts, start_ts, finishes, headers, stalls, non_committed = (
-            parse_commit_trace(trace_path)
+            parse_commit_trace(trace_path, getattr(args, "min_height", None))
         )
         by_class = defaultdict(list)  # class -> [(height, ts, elapsed_ms)]
         for height, (ts, elapsed, apply_class) in finishes.items():
@@ -576,11 +632,22 @@ def cmd_latency(args):
         )
 
     if args.metrics and Path(args.metrics).is_file():
-        rows = stage_rows(parse_prometheus(Path(args.metrics).read_text()))
+        metrics = parse_prometheus(Path(args.metrics).read_text())
+        baseline_path = getattr(args, "metrics_baseline", "")
+        if baseline_path and Path(baseline_path).is_file():
+            baseline = parse_prometheus(Path(baseline_path).read_text())
+            metrics = {
+                key: max(0.0, value - baseline.get(key, 0.0))
+                for key, value in metrics.items()
+            }
+        rows = stage_rows(metrics)
         report["stages"] = rows
         if rows:
             out.write(
-                "\n**Pipeline stage timings** (cumulative Prometheus histograms"
+                "\n**Pipeline stage timings** (Prometheus histogram deltas for"
+                " the measurement window; per recorded operation, not per block)\n\n"
+                if baseline_path
+                else "\n**Pipeline stage timings** (cumulative Prometheus histograms"
                 " at run end; per recorded operation, not per block)\n\n"
             )
             out.write("| stage | ops | mean ms |\n|---|---:|---:|\n")
@@ -626,9 +693,15 @@ def main():
     diff.add_argument("--title", default="primary vs baseline")
     diff.add_argument("--limit", type=int, default=15)
 
+    stat = sub.add_parser("stat", help="markdown digest of perf stat CSV")
+    stat.add_argument("--csv", required=True)
+    stat.add_argument("--title", default="CPU")
+
     latency = sub.add_parser("latency", help="markdown block-latency digest")
     latency.add_argument("--traces", default="", help="dir with commit_state.jsonl")
     latency.add_argument("--metrics", default="", help="final /metrics text snapshot")
+    latency.add_argument("--metrics-baseline", default="", help="optional starting /metrics snapshot")
+    latency.add_argument("--min-height", type=int, help="ignore trace rows below this height")
     latency.add_argument("--json-out", default="")
     latency.add_argument("--title", default="run")
 
@@ -637,6 +710,7 @@ def main():
         "collapse": cmd_collapse,
         "top": cmd_top,
         "diff": cmd_diff,
+        "stat": cmd_stat,
         "latency": cmd_latency,
     }[args.command]
     return handler(args)

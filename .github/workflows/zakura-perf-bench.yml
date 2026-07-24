@@ -1,15 +1,12 @@
 name: Perf bench (ephemeral droplets)
 
-# CPU-profiled mainnet sync bench on throwaway DigitalOcean droplets.
+# CPU-profiled mainnet workloads on throwaway DigitalOcean droplets.
 #
-# Each leg boots a droplet from the weekly-baked PR-node golden image, attaches
-# a clone of the baked mainnet `sandblast` state volume (tip 1,707,210 — the
-# same window as the checkpoint-sync bench), builds the requested ref against
-# the baked cargo cache, and syncs forward to a stop height while collecting a
-# sampled CPU flamegraph, the Zakura JSONL traces, a recorded metrics series
-# with a bottleneck verdict, and block-latency + top-functions digests
-# (.github/workflows/scripts/perf-bench-run.sh). `verify_mode: semantic` reruns
-# the same blocks under full script+proof verification.
+# Historical sync restores the baked `sandblast` state and syncs to a fixed
+# height. Live-head profiling restores the baked pruned `tip` state, catches up
+# without profiling, waits until the verified body tip matches the peer header
+# tip, then records one fixed window of real head traffic. Both workloads emit
+# a sampled CPU flamegraph, Zakura JSONL traces, metrics, and digests.
 #
 # Setting `baseline_ref` runs BOTH legs in parallel on identical fresh droplets
 # and adds a compare job: blocks/s speedup, per-function CPU self-share diff,
@@ -33,20 +30,21 @@ on:
         description: "Branch/tag/SHA to bench"
         required: false
         default: "main"
-      baseline_ref:
-        description: "Optional second ref benched in parallel on an identical droplet, with an A/B compare (e.g. main)"
-        required: false
-        default: ""
-      verify_mode:
-        description: "checkpoint = checkpoint-zone sync; semantic = full script+proof verification (consensus.checkpoint_sync=false)"
+      workload:
+        description: "Mainnet workload to profile"
         type: choice
         required: false
-        default: "checkpoint"
+        default: "historical_checkpoint"
         options:
-          - checkpoint
-          - semantic
+          - historical_checkpoint
+          - historical_semantic
+          - live_head
+      baseline_ref:
+        description: "Optional historical_sync A/B baseline (live_head is intentionally single-leg)"
+        required: false
+        default: ""
       profile:
-        description: "CPU profiling: cpu = sampled flamegraph + digests (default); off = bench only"
+        description: "CPU profiling: cpu = flamegraph + CPU counters; off = workload only"
         type: choice
         required: false
         default: "cpu"
@@ -54,25 +52,25 @@ on:
           - cpu
           - "off"
       stop_height:
-        description: "Sync stops after committing this height (sandblast volume tip is 1,707,210)"
+        description: "historical_sync only: stop after committing this height (sandblast tip is 1,707,210)"
         required: false
         default: "1730000"
       wall_cap_seconds:
-        description: "Hard wall-clock cap for the sync phase, seconds"
+        description: "Hard cap for historical sync or live-head catch-up, seconds"
         required: false
         default: "2000"
+      head_profile_minutes:
+        description: "live_head only: profile duration after the head gate"
+        required: false
+        default: "60"
       droplet_size:
         description: "Droplet size per leg (disk must be >= the baked image's disk)"
         required: false
         default: "c-16"
       peerset_size:
-        description: "Target peer count (blank feed_peer = public DNS-seeder peers)"
+        description: "Target peer count"
         required: false
         default: "75"
-      feed_peer:
-        description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
-        required: false
-        default: ""
       teardown_after_run:
         description: "Delete the droplets + volumes when the run ends (else the reaper removes them within 24h)"
         type: boolean
@@ -93,6 +91,7 @@ jobs:
       legs: ${{ steps.legs.outputs.legs }}
       has_baseline: ${{ steps.legs.outputs.has_baseline }}
       verify_mode: ${{ steps.legs.outputs.verify_mode }}
+      workload: ${{ steps.legs.outputs.workload }}
     steps:
       - name: Resolve legs and modes
         id: legs
@@ -103,9 +102,19 @@ jobs:
           # 06:47 cron is the semantic baseline
           REF: ${{ inputs.ref || 'main' }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
-          VERIFY_MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'semantic' || 'checkpoint') || inputs.verify_mode || 'checkpoint' }}
+          REQUESTED_WORKLOAD: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'historical_semantic' || 'historical_checkpoint') || inputs.workload || 'historical_checkpoint' }}
         run: |
           set -euo pipefail
+          case "$REQUESTED_WORKLOAD" in
+            historical_checkpoint) WORKLOAD=historical_sync; VERIFY_MODE=checkpoint ;;
+            historical_semantic) WORKLOAD=historical_sync; VERIFY_MODE=semantic ;;
+            live_head) WORKLOAD=live_head; VERIFY_MODE=semantic ;;
+            *) echo "unknown workload: $REQUESTED_WORKLOAD" >&2; exit 1 ;;
+          esac
+          if [ "$WORKLOAD" = live_head ] && [ -n "$BASELINE_REF" ]; then
+            echo "live_head is observational and intentionally single-leg; leave baseline_ref blank" >&2
+            exit 1
+          fi
           resolve() { gh api "repos/${REPO}/commits/$1" --jq .sha; }
           PRIMARY_SHA=$(resolve "$REF")
           legs="[{\"leg\":\"primary\",\"ref\":\"${REF}\",\"sha\":\"${PRIMARY_SHA}\"}"
@@ -120,14 +129,15 @@ jobs:
             echo "legs=${legs}"
             echo "has_baseline=${has_baseline}"
             echo "verify_mode=${VERIFY_MODE}"
+            echo "workload=${WORKLOAD}"
           } >> "$GITHUB_OUTPUT"
-          echo "plan: ${legs} (verify_mode=${VERIFY_MODE})"
+          echo "plan: ${legs} (workload=${WORKLOAD}, verify_mode=${VERIFY_MODE})"
 
   bench:
-    name: "bench ${{ matrix.leg.leg }}: ${{ matrix.leg.ref }} (${{ needs.plan.outputs.verify_mode }})"
+    name: "bench ${{ matrix.leg.leg }}: ${{ matrix.leg.ref }} (${{ needs.plan.outputs.workload }})"
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -155,7 +165,7 @@ jobs:
           install -m 600 /dev/null /tmp/do_ssh
           printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
 
-      - name: Pick baked image and sandblast state snapshot
+      - name: Pick baked image and state snapshot
         id: baked
         run: |
           set -euo pipefail
@@ -226,13 +236,14 @@ jobs:
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LEG: ${{ matrix.leg.leg }}
           SHA: ${{ matrix.leg.sha }}
+          WORKLOAD: ${{ needs.plan.outputs.workload }}
           VERIFY_MODE: ${{ needs.plan.outputs.verify_mode }}
           PROFILE: ${{ inputs.profile || 'cpu' }}
           STOP_HEIGHT: ${{ inputs.stop_height || '1730000' }}
           WALL_CAP: ${{ inputs.wall_cap_seconds || '2000' }}
+          HEAD_PROFILE_MINUTES: ${{ inputs.head_profile_minutes || '60' }}
           START_HEIGHT: ${{ vars.PERF_BENCH_START_HEIGHT || '1707210' }}
           PEERSET_SIZE: ${{ inputs.peerset_size || '75' }}
-          FEED_PEER: ${{ inputs.feed_peer }}
           VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -243,13 +254,14 @@ jobs:
             printf 'GH_CLONE_TOKEN=%q\n'   "${GH_CLONE_TOKEN}"
             printf 'SHA=%q\n'              "${SHA}"
             printf 'LEG=%q\n'              "${LEG}"
+            printf 'WORKLOAD=%q\n'         "${WORKLOAD}"
             printf 'VERIFY_MODE=%q\n'      "${VERIFY_MODE}"
             printf 'PROFILE=%q\n'          "${PROFILE}"
             printf 'STOP_HEIGHT=%q\n'      "${STOP_HEIGHT}"
             printf 'WALL_CAP=%q\n'         "${WALL_CAP}"
+            printf 'HEAD_PROFILE_MINUTES=%q\n' "${HEAD_PROFILE_MINUTES}"
             printf 'START_HEIGHT=%q\n'     "${START_HEIGHT}"
             printf 'PEERSET_SIZE=%q\n'     "${PEERSET_SIZE}"
-            printf 'FEED_PEER=%q\n'        "${FEED_PEER}"
             printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
             printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
             printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"

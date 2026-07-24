@@ -146,6 +146,23 @@ class DiffTests(unittest.TestCase):
         self.assertIn("| -40.00pp | 80.0% | 40.0% | `fast_fn` |", output)
 
 
+class PerfStatTests(unittest.TestCase):
+    def test_renders_absolute_cpu_counters_and_ipc(self):
+        data = (
+            "120000.000,msec,task-clock,100.00,1.000,CPUs utilized\n"
+            "240000000000,,cycles:u,100.00,1.000,,\n"
+            "360000000000,,instructions:u,100.00,1.000,1.50,insn per cycle\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "perf-stat.csv"
+            path.write_text(data)
+            args = SimpleNamespace(csv=str(path), title="t")
+            output = run_command(digest.cmd_stat, args)
+        self.assertIn("| `task-clock` | 120.0 CPU-s |", output)
+        self.assertIn("| `cycles:u` | 240,000,000,000 |", output)
+        self.assertIn("Instructions per cycle: **1.50**", output)
+
+
 METRICS_SNAPSHOT = """\
 # TYPE zakura_state_write_update_trees_duration_seconds summary
 zakura_state_write_update_trees_duration_seconds{quantile="0.5"} 0.002
@@ -201,9 +218,16 @@ def header_range_row(elapsed_ms, range_count):
 
 
 class LatencyTests(unittest.TestCase):
-    def run_latency(self, traces="", metrics="", json_out=""):
+    def run_latency(
+        self, traces="", metrics="", metrics_baseline="", min_height=None, json_out=""
+    ):
         args = SimpleNamespace(
-            traces=traces, metrics=metrics, json_out=json_out, title="t"
+            traces=traces,
+            metrics=metrics,
+            metrics_baseline=metrics_baseline,
+            min_height=min_height,
+            json_out=json_out,
+            title="t",
         )
         return run_command(digest.cmd_latency, args)
 
@@ -301,6 +325,17 @@ class LatencyTests(unittest.TestCase):
         self.assertNotIn("not applicable", output)
         self.assertEqual(report["full_per_block"]["stats"]["count"], 3)
 
+    def test_min_height_excludes_catchup_rows(self):
+        rows = [
+            commit_row(height=1707211, apply_class="full", elapsed_ms=500),
+            commit_row(height=1707212, apply_class="full", elapsed_ms=20),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            output = self.run_latency(traces=tmp, min_height=1707212)
+        self.assertIn("| 1 | 20.0 | 20.0 | 20.0 | 20.0 | 20.0 |", output)
+        self.assertNotIn("500", output)
+
     def test_unclassified_block_rows_are_surfaced(self):
         rows = [commit_row(height=1707211, apply_class=None, elapsed_ms=5)]
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,6 +357,22 @@ class LatencyTests(unittest.TestCase):
         )
         self.assertIn("| commit: rocksdb batch write | 5,000 | 5.0 |", output)
         self.assertNotIn("| p50 |", output.split("Pipeline stage timings")[1])
+
+    def test_stage_timings_can_be_scoped_to_measurement_window(self):
+        baseline = METRICS_SNAPSHOT.replace("12.5", "10.0").replace(
+            "5000", "4000"
+        ).replace("90.0", "60.0").replace("3000", "2000")
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = Path(tmp) / "metrics.prom"
+            metrics_start = Path(tmp) / "metrics-start.prom"
+            metrics.write_text(METRICS_SNAPSHOT)
+            metrics_start.write_text(baseline)
+            output = self.run_latency(
+                metrics=str(metrics), metrics_baseline=str(metrics_start)
+            )
+        self.assertIn("histogram deltas for the measurement window", output)
+        self.assertIn("| commit: update note trees | 1,000 | 2.5 |", output)
+        self.assertIn("| verify: batch (result=ok,verifier=halo2) | 1,000 | 30.0 |", output)
 
     def test_missing_inputs_degrade_to_notes(self):
         output = self.run_latency()

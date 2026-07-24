@@ -1,6 +1,6 @@
 # CPU profiling and block-processing latency
 
-How to get a CPU flamegraph and a per-stage latency breakdown of `zakurad` processing real mainnet blocks, with zero local setup. The [Perf bench workflow](../.github/workflows/zakura-perf-bench.yml) runs each measurement on a **throwaway DigitalOcean droplet** booted from the weekly-baked PR-node golden image, with a clone of the baked mainnet `sandblast` state volume (tip 1,707,210) attached — so there is no shared bench host to queue behind, no snapshot download, droplet size is an input, and an A/B comparison runs both refs **in parallel on identical fresh machines**. Profiling is a sidecar (`perf record` attached to the node), so the node binary and the bench numbers are unchanged.
+The [Perf bench workflow](../.github/workflows/zakura-perf-bench.yml) captures CPU flamegraphs and block latency on throwaway DigitalOcean droplets. `historical_sync` restores the baked `sandblast` state for fixed-height throughput and optional parallel A/B. `live_head` restores the baked pruned tip, catches up without profiling, then records real network-head traffic for a fixed window. Profiling runs as a sidecar, so the measured binary is unchanged.
 
 ## Trigger a run
 
@@ -12,8 +12,9 @@ gh workflow run zakura-perf-bench.yml -f ref=my-branch
 
 Useful input combinations:
 
+- `-f workload=live_head` — single-leg 60-minute observational profile at real mainnet head. The gate requires the verified body tip to match the peer header frontier for consecutive samples, at least three healthy peers, and a fresh estimated tip. `baseline_ref` is rejected in this mode; use `head_profile_minutes` for a shorter smoke run.
 - `-f baseline_ref=main` — A/B: both refs bench simultaneously on identical droplets, and a compare job adds the blocks/s speedup, a per-function CPU self-share diff table, and a differential flamegraph (`flamegraph-diff.svg`).
-- `-f verify_mode=semantic` — same state range, but with `consensus.checkpoint_sync = false`, so every block gets full script + proof verification (the mandatory checkpoints end below the volume tip, so the whole range is semantically verified). This is the "block execution" workload; `checkpoint` (default) is the bulk-sync workload.
+- `-f workload=historical_semantic` — the fixed state range with full script and proof verification. `historical_checkpoint` is the default bulk-sync workload.
 - `-f droplet_size=c-32` — more cores per leg; `-f profile=off` — plain bench, no profiling sidecar.
 - `-f teardown_after_run=false` — keep the droplets up for SSH inspection (the hourly reaper removes them within 24h; they are tagged `zakura-pr-node`).
 
@@ -21,14 +22,15 @@ Every Monday two scheduled runs profile `main` as standing baselines: 05:17 UTC 
 
 ## Read the results
 
-Each leg appends to the run's **step summary**: a throughput row (blocks/s, post-commit blocks/s, reached-stop), then the **CPU digest** (share per thread pool: `rayon`, `commit-compute`, `tokio-runtime-w`, the committer thread; then the hottest functions by self time), the **block-latency digest** (a plain-English takeaway line, pipeline residence in checkpoint mode or true per-block verify+commit percentiles in semantic mode, header-range commit health), and the bottleneck verdict (commit / download / verify) as the closer. A/B runs add the compare section. To view a flamegraph: open the run page, scroll to **Artifacts** at the bottom, download `zakura-perf-bench-<run>-<leg>`, unzip, and open `flamegraph.svg` in any browser (click a frame to zoom, ctrl-F to search) — or from the CLI: `gh run download <run-id> -n zakura-perf-bench-<run-id>-primary -D out && open out/flamegraph.svg`. The per-leg **artifacts** contain:
+Each leg appends its result, CPU digest, absolute CPU counters, and block-latency digest to the run summary. Historical A/B runs also add the comparison and bottleneck verdict. Live-head summaries record the baked tip, catch-up time, exact start/end tips and hashes, profile duration, and committed blocks without claiming a speedup. Download `zakura-perf-bench-<run>-primary` and open `flamegraph.svg` in a browser, or run `gh run download <run-id> -n zakura-perf-bench-<run-id>-primary -D out`.
 
 | file | what it is |
 | --- | --- |
 | `flamegraph.svg` | sampled CPU flamegraph; open it in a browser, click to zoom |
 | `profile.folded` | folded stacks; re-render or diff locally with [inferno](https://github.com/jonhoo/inferno) |
+| `perf-stat.csv` / `.md` | absolute task clock, cycles, instructions, and instructions per cycle |
 | `latency.md` / `.json` | per-block commit latency (p50/p90/p99/max, slowest heights, stalls) + per-stage pipeline timings |
-| `metrics-final.prom` | last full `/metrics` page of the run (cumulative histograms) |
+| `metrics-start.prom` / `metrics-final.prom` | live-head measurement boundary snapshots; stage timings use their delta |
 | `samples.csv` / `samples.jsonl` | height-over-time and the recorded metrics series |
 | `zakura-traces.tar.zst` | the raw Zakura JSONL traces (`commit_state.jsonl`, `block_sync.jsonl`, ...) |
 | `meta.json`, `verdict.json` | machine-readable leg result + bottleneck verdict |
@@ -36,13 +38,13 @@ Each leg appends to the run's **step summary**: a throughput row (blocks/s, post
 Interpretation notes:
 
 - Per-block latency comes from the `commit_state.jsonl` trace (`commit_start` → `commit_finish` around the verifier commit). In `checkpoint` mode a block's latency includes waiting for its checkpoint range to fill, so high p99 there is batching, not slow verification; `semantic` mode is true per-block verify+commit latency.
-- Stage timings are cumulative Prometheus histograms at run end (ops + mean only; the exporter's summary quantiles are rolling-window values and are deliberately not shown): the `commit-metrics` phases (`update_trees`, `commitment_check`, `checkpoint_compute`), the always-on RocksDB batch-commit histogram, batch-verifier durations (`halo2`, `redpallas`, `groth16`, ...), and the sequencer submit queue wait. In `checkpoint` mode with VCT fast sync (the default) the tree/commitment phases never run, so those rows are absent; `semantic` mode populates them.
-- The profile window starts when the sync escapes cold start and lasts `PROFILE_SECONDS` (default 300s at 49 Hz, DWARF unwinding — 49 Hz keeps the `perf script` fold to seconds). Sampling uses hardware `cycles` when the droplet exposes a PMU (current DO images do), else the software `cpu-clock` event. Rust symbols are demangled via `rustfilt` and glibc internals resolved via `libc6-dbg`/debuginfod; residual `[unknown]` frames are DWARF-unwind gaps. Release binaries already carry `debug = "line-tables-only"` and full `.eh_frame` (`panic = "unwind"`), which is why no special build is needed.
+- Stage timings use cumulative Prometheus histograms for historical sync and start/end deltas for live head. The exporter's rolling-window quantiles are deliberately omitted.
+- Historical profiling starts after the first committed block and defaults to 300 seconds. Live-head profiling starts only after the head gate and defaults to 60 minutes. Sampling uses hardware `cycles` when available, else `cpu-clock`, at 49 Hz with DWARF unwinding.
 - Both legs of an A/B fetch from the public P2P network concurrently, so residual noise is peer-delivery variance; identical droplet specs remove the hardware variance a shared host cannot.
 
 ## Knobs
 
-Workflow inputs cover the common cases; the droplet-side script (`.github/workflows/scripts/perf-bench-run.sh`) documents the finer-grained environment knobs (`PROFILE_SECONDS`, `PROFILE_FREQ`, `PROFILE_DWARF_STACK`, `CKPT_LIMIT`, `DL_LIMIT`, `P2P_STACK`).
+Workflow inputs cover the common cases; the droplet-side script (`.github/workflows/scripts/perf-bench-run.sh`) documents the finer-grained profiling and live-head gate knobs.
 
 ## Local profiling recipes
 
