@@ -1193,7 +1193,13 @@ impl FinalizedState {
             .commitment_roots_by_height_range(successor_height..=successor_height)
             .into_iter()
             .next()
-            .filter(|roots| roots.height == successor_height)?;
+            .filter(|roots| roots.height == successor_height)
+            .or_else(|| {
+                self.db.header_root_successor_witness(
+                    successor_height,
+                    block::Hash::from(header.as_ref()),
+                )
+            })?;
 
         Some(NextVctBlock::from_header(
             header,

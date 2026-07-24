@@ -23,6 +23,7 @@ use crate::{
 pub struct VerifiedHeaderCommitmentRoots {
     confirmed_roots: Vec<BlockCommitmentRoots>,
     confirmed_hashes: Vec<block::Hash>,
+    successor_witness: Option<(BlockCommitmentRoots, block::Hash)>,
     history_tree: HistoryTree,
 }
 
@@ -40,6 +41,16 @@ impl VerifiedHeaderCommitmentRoots {
     /// Returns the header hash at the confirmed tip, if any roots were confirmed.
     pub fn confirmed_hash(&self) -> Option<block::Hash> {
         self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the final, unconfirmed root record and its canonical header hash.
+    ///
+    /// The witness's own header authenticates its authorizing-data root, but its
+    /// note-commitment roots require a later successor and are not confirmed.
+    pub fn successor_witness(&self) -> Option<(&BlockCommitmentRoots, block::Hash)> {
+        self.successor_witness
+            .as_ref()
+            .map(|(roots, hash)| (roots, *hash))
     }
 
     /// Returns the history tree after folding the confirmed roots.
@@ -153,6 +164,9 @@ where
     Ok(VerifiedHeaderCommitmentRoots {
         confirmed_roots,
         confirmed_hashes,
+        successor_witness: items
+            .last()
+            .map(|(header, roots)| ((*roots).clone(), block::Hash::from(*header))),
         history_tree: tree,
     })
 }
