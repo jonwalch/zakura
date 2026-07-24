@@ -1188,14 +1188,15 @@ impl FinalizedState {
             return None;
         }
 
-        let roots = self
+        let auth_data_root = self
             .db
             .commitment_roots_by_height_range(successor_height..=successor_height)
             .into_iter()
             .next()
             .filter(|roots| roots.height == successor_height)
+            .map(|roots| roots.auth_data_root)
             .or_else(|| {
-                self.db.header_root_successor_witness(
+                self.db.header_witness_auth_data_root(
                     successor_height,
                     block::Hash::from(header.as_ref()),
                 )
@@ -1204,7 +1205,7 @@ impl FinalizedState {
         Some(NextVctBlock::from_header(
             header,
             successor_height,
-            roots.auth_data_root,
+            auth_data_root,
         ))
     }
 

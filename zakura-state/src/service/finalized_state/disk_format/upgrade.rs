@@ -35,6 +35,7 @@ pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod header_root_auth_frontier;
+pub(crate) mod header_witness;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
 pub(crate) mod repair_vct_sprout_history;
@@ -128,10 +129,7 @@ fn format_upgrades(
         Box::new(add_ironwood_tree::Upgrade),
         Box::new(repair_vct_sprout_history::Upgrade::new(prepared_vct_repair)),
         Box::new(header_root_auth_frontier::Upgrade),
-        Box::new(no_migration::NoMigration::new(
-            "retain the header-root successor witness",
-            Version::new(28, 0, 3),
-        )),
+        Box::new(header_witness::Upgrade),
     ] as [Box<dyn DiskFormatUpgrade>; 12])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
@@ -1094,6 +1092,10 @@ fn vct_format_changes_include_root_auth_metadata_migrations() {
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 0, 3));
+    assert!(
+        upgrades[3].needs_migration(),
+        "28.0.3 must repair databases that already discarded their terminal header witness"
+    );
     assert_eq!(
         upgrades.last().expect("repair is registered").version(),
         state_database_format_version_in_code()
