@@ -406,6 +406,12 @@ class LatencyTests(unittest.TestCase):
         self.assertIn("no per-block trace", output)
         self.assertIn("no final /metrics snapshot", output)
 
+    def test_live_head_without_zakura_trace_reports_observed_blocks(self):
+        output = self.run_latency(observed_blocks=27)
+        self.assertIn("Observed 27 live tip advances", output)
+        self.assertIn("does not emit Zakura JSONL commit events", output)
+        self.assertNotIn("blocks/s", output)
+
 
 if __name__ == "__main__":
     unittest.main()

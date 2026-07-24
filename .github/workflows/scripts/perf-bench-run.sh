@@ -25,6 +25,8 @@
 # Optional knobs (defaults below): PROFILE_SECONDS, PROFILE_FREQ,
 #   PROFILE_DWARF_STACK, CKPT_LIMIT, DL_LIMIT, P2P_STACK, FEED_PEER,
 #   HEAD_STABLE_SAMPLES, HEAD_MAX_ESTIMATED_DISTANCE, HEAD_MIN_HEALTHY_PEERS.
+#   P2P_STACK defaults to the production network default for live head and to
+#   Zakura for historical sync.
 #
 # Helper scripts scp'd next to this one by the workflow (from the workflow's
 # own checkout, so the benched ref does not need to contain them):
@@ -41,7 +43,7 @@ PROFILE_FREQ="${PROFILE_FREQ:-49}"
 PROFILE_DWARF_STACK="${PROFILE_DWARF_STACK:-8192}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
-P2P_STACK="${P2P_STACK:-zakura}"
+P2P_STACK="${P2P_STACK:-}"
 METRICS_PORT=9999
 SAMPLE_INTERVAL=5
 HEAD_STABLE_SAMPLES="${HEAD_STABLE_SAMPLES:-6}"
@@ -92,6 +94,18 @@ case "$WORKLOAD" in
     PROFILE_SECONDS=$(( HEAD_PROFILE_MINUTES * 60 ))
     ;;
   *) die "unknown workload: $WORKLOAD" ;;
+esac
+
+if [[ -z "$P2P_STACK" ]]; then
+  if [[ "$WORKLOAD" == live_head ]]; then
+    P2P_STACK=default
+  else
+    P2P_STACK=zakura
+  fi
+fi
+case "$P2P_STACK" in
+  default|legacy|zakura|dual) ;;
+  *) die "unknown P2P_STACK: $P2P_STACK" ;;
 esac
 
 # ---------------------------------------------------------------------------- #
@@ -213,7 +227,7 @@ CFG=/root/bench-config.toml
   echo "peerset_initial_target_size = ${PEERSET_SIZE}"
   echo "p2p_stack = \"$P2P_STACK\""
   echo ''
-  if [[ "$P2P_STACK" != "legacy" ]]; then
+  if [[ "$P2P_STACK" == "zakura" || "$P2P_STACK" == "dual" ]]; then
     echo '[network.zakura]'
     echo "trace_dir = \"$TRACE_DIR\""
     echo 'bootstrap_peers = ['
@@ -301,7 +315,7 @@ scrape_height() {
 }
 
 scrape_head_state() {
-  local page height header peers estimated_distance
+  local page height header peers estimated_distance rpc_info rpc_height rpc_estimated rpc_peers
   page="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)"
   [[ -n "$page" ]] || return 0
   printf '%s\n' "$page" > "$METRICS_SNAP.tmp" 2>/dev/null || true
@@ -313,6 +327,26 @@ scrape_head_state() {
   peers="$(metric zakura_p2p_healthy_peers)"
   [[ -n "$peers" ]] || peers="$(metric zakura_p2p_connected_peers)"
   estimated_distance="$(metric sync_estimated_distance_to_tip)"
+  if [[ ! "$height" =~ ^[1-9][0-9]*$ || ! "$estimated_distance" =~ ^[0-9]+$ ]]; then
+    rpc_info="$(rpc_chain_info)"
+    if [[ -n "$rpc_info" ]]; then
+      IFS=$'\t' read -r rpc_height _ rpc_estimated <<<"$rpc_info"
+      [[ "$height" =~ ^[1-9][0-9]*$ ]] || height="$rpc_height"
+      if [[ ! "$estimated_distance" =~ ^[0-9]+$ ]]; then
+        estimated_distance=$((rpc_estimated - height))
+        (( estimated_distance >= 0 )) || estimated_distance=0
+      fi
+    fi
+  fi
+  if [[ "$P2P_STACK" == "default" || "$P2P_STACK" == "legacy" \
+    || ! "$header" =~ ^[1-9][0-9]*$ ]]; then
+    header="$height"
+  fi
+  rpc_peers="$(rpc_connection_count)"
+  if [[ "$rpc_peers" =~ ^[0-9]+$ \
+    && ( ! "$peers" =~ ^[0-9]+$ || "$rpc_peers" -gt "$peers" ) ]]; then
+    peers="$rpc_peers"
+  fi
   [[ "$height" =~ ^[0-9]+$ && "$header" =~ ^[0-9]+$ \
     && "$peers" =~ ^[0-9]+$ && "$estimated_distance" =~ ^[0-9]+$ ]] || return 0
   printf '%s\t%s\t%s\t%s\n' "$height" "$header" "$peers" "$estimated_distance"
@@ -324,6 +358,20 @@ rpc_chain_info() {
     http://127.0.0.1:8232 2>/dev/null \
     | jq -er '.result | [.blocks, .bestblockhash, (.estimatedheight // .blocks)] | @tsv' \
       2>/dev/null || true
+}
+
+rpc_connection_count() {
+  curl -fsS --max-time 10 -H 'content-type: application/json' \
+    --data-binary '{"jsonrpc":"1.0","id":"perf-bench","method":"getnetworkinfo","params":[]}' \
+    http://127.0.0.1:8232 2>/dev/null \
+    | jq -er '.result.connections' 2>/dev/null || true
+}
+
+head_sample_is_healthy() {
+  local height="$1" header="$2" peers="$3" estimated_distance="$4"
+  (( height >= header \
+    && peers >= HEAD_MIN_HEALTHY_PEERS \
+    && estimated_distance <= HEAD_MAX_ESTIMATED_DISTANCE ))
 }
 
 start_profile() {
@@ -343,6 +391,7 @@ CSV="$OUT_DIR/samples.csv"
 T_ESCAPE=""; END_HEIGHT="$START_HEIGHT"; CLEAN_STOP=0; NODE_EXIT_STATUS=0; LAST_BEAT=0
 START_HASH=""; END_HASH=""; ESTIMATED_START=""; ESTIMATED_END=""
 HEADER_START=""; HEADER_END=""; CATCHUP_SECONDS=0; WINDOW_COMPLETE=0
+MAX_ESTIMATED_DISTANCE=0; MAX_HEADER_LAG=0; MAX_UNHEALTHY_SAMPLES=0
 FAILURE_REASON=""
 
 stop_node() {
@@ -392,7 +441,7 @@ if [[ "$WORKLOAD" == historical_sync ]]; then
     sleep "$SAMPLE_INTERVAL"
   done
 else
-  echo "epoch,elapsed,height,header_height,healthy_peers,estimated_distance,phase" > "$CSV"
+  echo "epoch,elapsed,height,header_height,peer_count,estimated_distance,phase" > "$CSV"
   STABLE=0
   PROFILE_START_EPOCH=0
   PROFILE_END_EPOCH=0
@@ -409,9 +458,8 @@ else
         START_HEIGHT="$H"
         log "initial observed tip: $SNAPSHOT_HEIGHT"
       fi
-      if (( H >= HEADER && HEADER >= SNAPSHOT_HEIGHT \
-        && PEERS >= HEAD_MIN_HEALTHY_PEERS \
-        && EST_DISTANCE <= HEAD_MAX_ESTIMATED_DISTANCE )); then
+      if (( HEADER >= SNAPSHOT_HEIGHT )) \
+        && head_sample_is_healthy "$H" "$HEADER" "$PEERS" "$EST_DISTANCE"; then
         STABLE=$((STABLE + 1))
       else
         STABLE=0
@@ -430,6 +478,8 @@ else
             CATCHUP_SECONDS="$ELAPSED"
             PROFILE_START_EPOCH="$NOW"
             PROFILE_END_EPOCH=$((PROFILE_START_EPOCH + PROFILE_SECONDS))
+            LAST_HEALTHY_EPOCH="$NOW"
+            UNHEALTHY=0
             T_ESCAPE="$PROFILE_START_EPOCH"
             cp "$METRICS_SNAP.tmp" "$METRICS_BASELINE" 2>/dev/null || true
             start_recorder
@@ -464,10 +514,29 @@ else
       IFS=$'\t' read -r H HEADER PEERS EST_DISTANCE <<<"$HEAD_STATE"
       echo "$NOW,$ELAPSED,$H,$HEADER,$PEERS,$EST_DISTANCE,profile" >> "$CSV"
       END_HEIGHT="$H"; HEADER_END="$HEADER"; ESTIMATED_END=$((H + EST_DISTANCE))
+      (( EST_DISTANCE > MAX_ESTIMATED_DISTANCE )) && MAX_ESTIMATED_DISTANCE="$EST_DISTANCE"
+      HEADER_LAG=$((HEADER - H)); (( HEADER_LAG >= 0 )) || HEADER_LAG=0
+      (( HEADER_LAG > MAX_HEADER_LAG )) && MAX_HEADER_LAG="$HEADER_LAG"
+      if head_sample_is_healthy "$H" "$HEADER" "$PEERS" "$EST_DISTANCE"; then
+        UNHEALTHY=0
+        LAST_HEALTHY_EPOCH="$NOW"
+      else
+        UNHEALTHY=$((UNHEALTHY + 1))
+      fi
       if (( NOW - LAST_BEAT >= 120 )); then
         LAST_BEAT=$NOW
-        log "live profile: body=$H header=$HEADER peers=$PEERS (+${ELAPSED}/${PROFILE_SECONDS}s)"
+        log "live profile: body=$H header=$HEADER peers=$PEERS estimated_distance=$EST_DISTANCE unhealthy=$UNHEALTHY/$HEAD_STABLE_SAMPLES (+${ELAPSED}/${PROFILE_SECONDS}s)"
       fi
+    else
+      UNHEALTHY=$((UNHEALTHY + 1))
+    fi
+    (( UNHEALTHY > MAX_UNHEALTHY_SAMPLES )) && MAX_UNHEALTHY_SAMPLES="$UNHEALTHY"
+    if (( UNHEALTHY >= HEAD_STABLE_SAMPLES )); then
+      NODE_EXIT_STATUS=125
+      FAILURE_REASON="live head was lost for ${UNHEALTHY} consecutive samples (body=${H:-n/a} header=${HEADER:-n/a} peers=${PEERS:-n/a} estimated_distance=${EST_DISTANCE:-n/a})"
+      log "$FAILURE_REASON"
+      stop_node
+      break
     fi
     if ! kill -0 "$NODE_PID" 2>/dev/null; then
       if wait "$NODE_PID" 2>/dev/null; then NODE_EXIT_STATUS=1; else NODE_EXIT_STATUS=$?; fi
@@ -476,7 +545,14 @@ else
       break
     fi
     if (( NOW >= PROFILE_END_EPOCH )); then
-      WINDOW_COMPLETE=1
+      if (( NOW - LAST_HEALTHY_EPOCH < HEAD_STABLE_SAMPLES * SAMPLE_INTERVAL )); then
+        WINDOW_COMPLETE=1
+      else
+        NODE_EXIT_STATUS=125
+        FAILURE_REASON="live head was not healthy at the end of the profile window"
+        log "$FAILURE_REASON"
+        stop_node
+      fi
       break
     fi
     sleep "$SAMPLE_INTERVAL"
@@ -505,7 +581,7 @@ if [[ -n "$REC_PID" ]]; then kill "$REC_PID" 2>/dev/null || true; wait "$REC_PID
 # Profile digest: folded stacks, flamegraph SVG, top-functions markdown
 # ---------------------------------------------------------------------------- #
 
-PROFILE_NOTE="workload=$WORKLOAD verify_mode=$VERIFY_MODE $PERF_EVENT @ ${PROFILE_FREQ}Hz, ${PROFILE_SECONDS}s window"
+PROFILE_NOTE="workload=$WORKLOAD verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK $PERF_EVENT @ ${PROFILE_FREQ}Hz, ${PROFILE_SECONDS}s window"
 if [[ -n "$PERF_PID" ]]; then
   if [[ "$WORKLOAD" != live_head || "$WINDOW_COMPLETE" -ne 1 ]]; then
     kill "$PERF_PID" 2>/dev/null || true
@@ -614,7 +690,7 @@ ERRS="$(grep -iE 'panic|ERROR committing|resetting state queue' "$LOGF" 2>/dev/n
   if [[ "$WORKLOAD" == live_head ]]; then
     echo "### Live-head profile: $LEG — \`$SHA\`"
     echo ""
-    echo "Observational profile of real mainnet head traffic; no baseline or speedup is implied."
+    echo "Observational profile of real mainnet head traffic with p2p_stack=$P2P_STACK; no baseline or speedup is implied."
     echo ""
     echo "| initial observed tip | catch-up | profile window | start tip | end tip | committed blocks | complete |"
     echo "|---:|---:|---:|---:|---:|---:|---|"
@@ -663,12 +739,17 @@ python3 - "$OUT_DIR/meta.json" <<PY || log "WARNING: meta.json write failed"
 import json, sys
 json.dump({
     "leg": "$LEG", "sha": "$SHA", "workload": "$WORKLOAD",
-    "verify_mode": "$VERIFY_MODE",
+    "verify_mode": "$VERIFY_MODE", "p2p_stack": "$P2P_STACK",
     "snapshot_height": ${SNAPSHOT_HEIGHT:-$START_HEIGHT},
     "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,
     "start_hash": "${START_HASH}", "end_hash": "${END_HASH}",
     "blocks": $BLOCKS, "seconds": $TOTAL, "bps": $BPS, "post_bps": $PBPS,
     "catchup_seconds": $CATCHUP_SECONDS,
+    "estimated_start_height": ${ESTIMATED_START:-0},
+    "estimated_end_height": ${ESTIMATED_END:-0},
+    "max_estimated_distance": $MAX_ESTIMATED_DISTANCE,
+    "max_header_lag": $MAX_HEADER_LAG,
+    "max_unhealthy_samples": $MAX_UNHEALTHY_SAMPLES,
     "clean_stop": bool($CLEAN_STOP or $WINDOW_COMPLETE), "build_secs": $BUILD_SECS,
     "node_exit_status": $NODE_EXIT_STATUS,
     "verdict": "${VERDICT}", "profiled": bool($PROFILED),

@@ -1,6 +1,6 @@
 # CPU profiling and block-processing latency
 
-The [Perf bench workflow](../.github/workflows/zakura-perf-bench.yml) captures CPU flamegraphs and block latency on throwaway DigitalOcean droplets. `historical_sync` restores the baked `sandblast` state for fixed-height throughput and optional parallel A/B. `live_head` restores the baked pruned tip, catches up without profiling, then records real network-head traffic for a fixed window. Profiling runs as a sidecar, so the measured binary is unchanged.
+The [Perf bench workflow](../.github/workflows/zakura-perf-bench.yml) captures CPU flamegraphs and block latency on throwaway DigitalOcean droplets. `historical_sync` restores the baked `sandblast` state for fixed-height throughput and optional parallel A/B. `live_head` restores the baked pruned tip, catches up without profiling, then records real network-head traffic for a fixed window using the production default P2P stack. Profiling runs as a sidecar, so the measured binary is unchanged.
 
 ## Trigger a run
 
@@ -12,7 +12,7 @@ gh workflow run zakura-perf-bench.yml -f ref=my-branch
 
 Useful input combinations:
 
-- `-f workload=live_head` — single-leg 60-minute observational profile at real mainnet head. The gate requires the verified body tip to match the peer header frontier for consecutive samples, at least three healthy peers, and a fresh estimated tip. `baseline_ref` is rejected in this mode; use `head_profile_minutes` for a shorter smoke run.
+- `-f workload=live_head` — single-leg 60-minute observational profile at real mainnet head. Mainnet's production default currently resolves to the legacy P2P stack. The gate requires the verified body tip to match the available header frontier for consecutive samples, at least three live peers, and a fresh estimated tip; the run fails if those conditions are lost for 30 seconds during capture. `baseline_ref` is rejected in this mode; use `head_profile_minutes` for a shorter smoke run.
 - `-f baseline_ref=main` — A/B: both refs bench simultaneously on identical droplets, and a compare job adds the blocks/s speedup, a per-function CPU self-share diff table, and a differential flamegraph (`flamegraph-diff.svg`).
 - `-f workload=historical_semantic` — the fixed state range with full script and proof verification. `historical_checkpoint` is the default bulk-sync workload.
 - `-f droplet_size=c-32` — more cores per leg; `-f profile=off` — plain bench, no profiling sidecar.
@@ -32,7 +32,7 @@ Each leg appends its result, CPU digest, absolute CPU counters, and block-latenc
 | `latency.md` / `.json` | per-block commit latency (p50/p90/p99/max, slowest heights, stalls) + per-stage pipeline timings |
 | `metrics-start.prom` / `metrics-final.prom` | live-head measurement boundary snapshots; stage timings use their delta |
 | `samples.csv` / `samples.jsonl` | height-over-time and the recorded metrics series |
-| `zakura-traces.tar.zst` | the raw Zakura JSONL traces (`commit_state.jsonl`, `block_sync.jsonl`, ...) |
+| `zakura-traces.tar.zst` | raw Zakura JSONL traces when the selected stack emits them (`commit_state.jsonl`, `block_sync.jsonl`, ...) |
 | `meta.json`, `verdict.json` | machine-readable leg result + bottleneck verdict |
 
 Interpretation notes:

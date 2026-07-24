@@ -641,10 +641,17 @@ def cmd_latency(args):
         if non_committed.get("duplicate"):
             out.write(f"\nduplicate commits: {non_committed['duplicate']}\n")
     else:
-        out.write(
-            "_(no per-block trace: commit_state.jsonl absent — legacy-stack leg"
-            " or tracing disabled)_\n"
-        )
+        if observed_blocks is not None:
+            out.write(
+                f"Observed {observed_blocks:,} live tip advances. Detailed per-block"
+                " traces are unavailable because this stack does not emit Zakura"
+                " JSONL commit events.\n"
+            )
+        else:
+            out.write(
+                "_(no per-block trace: commit_state.jsonl absent — legacy-stack leg"
+                " or tracing disabled)_\n"
+            )
 
     if args.metrics and Path(args.metrics).is_file():
         metrics = parse_prometheus(Path(args.metrics).read_text())

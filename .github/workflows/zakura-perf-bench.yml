@@ -4,9 +4,10 @@ name: Perf bench (ephemeral droplets)
 #
 # Historical sync restores the baked `sandblast` state and syncs to a fixed
 # height. Live-head profiling restores the baked pruned `tip` state, catches up
-# without profiling, waits until the verified body tip matches the peer header
-# tip, then records one fixed window of real head traffic. Both workloads emit
-# a sampled CPU flamegraph, Zakura JSONL traces, metrics, and digests.
+# without profiling on the production default P2P stack, waits until the
+# verified body tip matches the peer header tip, then records one fixed window
+# of real head traffic. Both workloads emit a sampled CPU flamegraph, metrics,
+# available traces, and digests.
 #
 # Setting `baseline_ref` runs BOTH legs in parallel on identical fresh droplets
 # and adds a compare job: blocks/s speedup, per-function CPU self-share diff,
