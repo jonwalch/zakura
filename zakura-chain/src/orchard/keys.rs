@@ -159,18 +159,20 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
     }
 }
 
-/// An ephemeral public key for Orchard key agreement.
+/// An ephemeral public key for Orchard and Ironwood key agreement.
 ///
 /// Stored as the raw 32-byte encoding: deserialization defers the canonical,
 /// non-identity Pallas point check (a modular square root, the dominant CPU
-/// cost of parsing Orchard actions) to [`EphemeralPublicKey::decompress`]. The
+/// cost of parsing these actions) to [`EphemeralPublicKey::decompress`]. The
 /// semantic verifier enforces the deferred check on untrusted transactions
-/// (see [`Transaction::orchard_point_encodings_are_valid`]); the checkpoint
-/// verifier trusts block hashes and skips it.
+/// with [`Transaction::orchard_point_encodings_are_valid`] or
+/// [`Transaction::ironwood_point_encodings_are_valid`]; the checkpoint verifier
+/// trusts block hashes and skips it.
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concreteorchardkeyagreement>
 /// <https://zips.z.cash/protocol/nu5.pdf#saplingandorchardencrypt>
 ///
+/// [`Transaction::ironwood_point_encodings_are_valid`]: crate::transaction::Transaction::ironwood_point_encodings_are_valid
 /// [`Transaction::orchard_point_encodings_are_valid`]: crate::transaction::Transaction::orchard_point_encodings_are_valid
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
@@ -305,9 +307,19 @@ mod tests {
         // rejected for epk ("epk cannot be 𝒪_P")
         let identity = pallas::Affine::identity().to_bytes();
 
+        let orchard_accepts = |bytes: [u8; 32]| {
+            Option::<pallas::Point>::from(pallas::Point::from_bytes(&bytes))
+                .is_some_and(|point| !bool::from(point.is_identity()))
+        };
+
         for bytes in [off_curve, identity] {
             // the validating constructor still rejects, like the pre-lazy parser
             assert!(EphemeralPublicKey::try_from(bytes).is_err());
+            assert_eq!(
+                EphemeralPublicKey::try_from(bytes).is_ok(),
+                orchard_accepts(bytes),
+                "local and Orchard ephemeral-key decoders must agree",
+            );
 
             // wire deserialization accepts the raw bytes and round-trips them
             // unchanged, so txids and merkle roots are unaffected
@@ -328,5 +340,10 @@ mod tests {
         let epk = EphemeralPublicKey::zcash_deserialize(&g.to_bytes()[..])
             .expect("lazy deserialization accepts any 32 bytes");
         assert_eq!(epk.decompress().expect("generator is valid"), g);
+        assert_eq!(
+            EphemeralPublicKey::try_from(g.to_bytes()).is_ok(),
+            orchard_accepts(g.to_bytes()),
+            "local and Orchard ephemeral-key decoders must agree",
+        );
     }
 }

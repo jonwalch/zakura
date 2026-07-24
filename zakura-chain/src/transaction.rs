@@ -1300,6 +1300,15 @@ impl Transaction {
 
     // ironwood
 
+    /// Returns true if every Ironwood value commitment in this transaction is a
+    /// canonical Pallas point encoding and every Ironwood ephemeral public key
+    /// is a canonical encoding of a non-identity Pallas point (or the
+    /// transaction has no Ironwood data).
+    pub fn ironwood_point_encodings_are_valid(&self) -> bool {
+        self.ironwood_shielded_data()
+            .is_none_or(|shielded_data| shielded_data.point_encodings_are_valid())
+    }
+
     /// Access the [`ironwood::ShieldedData`] in this transaction,
     /// regardless of version.
     pub fn ironwood_shielded_data(&self) -> Option<&ironwood::ShieldedData> {

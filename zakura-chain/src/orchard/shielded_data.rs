@@ -131,10 +131,12 @@ impl ShieldedData {
     /// Returns `None` when any action's `cv` bytes are not a canonical Pallas
     /// point: deserialization defers that check (see [`ValueCommitment`]), so
     /// the sum of commitment points only exists for valid encodings. The
-    /// semantic verifier rejects such transactions via
-    /// [`Transaction::orchard_point_encodings_are_valid`] before verifying the
+    /// semantic verifier rejects such transactions with
+    /// [`Transaction::orchard_point_encodings_are_valid`] or
+    /// [`Transaction::ironwood_point_encodings_are_valid`] before verifying the
     /// binding signature.
     ///
+    /// [`Transaction::ironwood_point_encodings_are_valid`]: crate::transaction::Transaction::ironwood_point_encodings_are_valid
     /// [`Transaction::orchard_point_encodings_are_valid`]: crate::transaction::Transaction::orchard_point_encodings_are_valid
     pub fn binding_verification_key(&self) -> Option<reddsa::VerificationKeyBytes<Binding>> {
         let mut cv: pallas::Point = pallas::Point::identity();

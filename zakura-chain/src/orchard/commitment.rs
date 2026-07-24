@@ -99,17 +99,19 @@ impl NoteCommitment {
 }
 
 /// A homomorphic Pedersen commitment to the net value of a _note_, used in
-/// Action descriptions.
+/// Orchard and Ironwood Action descriptions.
 ///
 /// Stored as the raw 32-byte encoding: deserialization defers the canonical
 /// Pallas point check (a modular square root, the dominant CPU cost of parsing
-/// Orchard actions) to [`ValueCommitment::commitment`]. The semantic verifier
-/// enforces the deferred check on untrusted transactions (see
-/// [`Transaction::orchard_point_encodings_are_valid`]); the checkpoint verifier
+/// these actions) to [`ValueCommitment::commitment`]. The semantic verifier
+/// enforces the deferred check on untrusted transactions with
+/// [`Transaction::orchard_point_encodings_are_valid`] or
+/// [`Transaction::ironwood_point_encodings_are_valid`]; the checkpoint verifier
 /// trusts block hashes and skips it.
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concretehomomorphiccommit>
 ///
+/// [`Transaction::ironwood_point_encodings_are_valid`]: crate::transaction::Transaction::ironwood_point_encodings_are_valid
 /// [`Transaction::orchard_point_encodings_are_valid`]: crate::transaction::Transaction::orchard_point_encodings_are_valid
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValueCommitment(pub(crate) [u8; 32]);
@@ -287,6 +289,26 @@ mod tests {
 
         // the deferred check catches the invalid encoding
         assert!(cv.commitment().is_none());
+    }
+
+    #[test]
+    fn validating_constructor_matches_orchard() {
+        let _init_guard = zakura_test::init();
+
+        let encodings = [
+            pallas::Affine::identity().to_bytes(),
+            pallas::Affine::generator().to_bytes(),
+            off_curve_bytes(),
+            [0xff; 32],
+        ];
+
+        for bytes in encodings {
+            assert_eq!(
+                ValueCommitment::try_from(bytes).is_ok(),
+                bool::from(::orchard::value::ValueCommitment::from_bytes(&bytes).is_some()),
+                "local and Orchard value-commitment decoders must agree for {bytes:?}",
+            );
+        }
     }
 
     #[test]

@@ -236,6 +236,15 @@ pub fn orchard_point_encodings_are_valid(tx: &Transaction) -> Result<(), Transac
     Ok(())
 }
 
+/// Checks the point encodings deferred by Ironwood Action deserialization.
+pub fn ironwood_point_encodings_are_valid(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.ironwood_point_encodings_are_valid() {
+        return Err(TransactionError::SmallOrder);
+    }
+
+    Ok(())
+}
+
 /// Checks that shielded proof sizes are canonical when the proof-size rule is active.
 pub fn shielded_proof_size_is_canonical(
     tx: &Transaction,
