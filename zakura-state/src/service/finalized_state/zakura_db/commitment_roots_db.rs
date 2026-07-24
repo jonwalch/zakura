@@ -501,9 +501,10 @@ fn decode_frontier(
             height: confirmed_height,
         });
     }
-    if let Some(witness) = header_witness {
-        validate_header_witness(db, confirmed_height, witness)?;
-    }
+    // A header-only reorg can stale the optional successor witness without changing
+    // the confirmed frontier. Treat it as missing so header sync can authenticate it again.
+    let header_witness = header_witness
+        .filter(|witness| validate_header_witness(db, confirmed_height, *witness).is_ok());
 
     Ok(HeaderRootAuthFrontier {
         confirmed_height,
@@ -1622,6 +1623,85 @@ mod tests {
     }
 
     #[test]
+    fn verified_promotion_rejects_noncanonical_header_witness() {
+        let db = ephemeral_mainnet_db();
+        let (verified, roots, hash, (successor_height, _successor_hash)) =
+            verified_activation_root();
+        let base = roots
+            .height
+            .previous()
+            .expect("activation has a predecessor");
+        seed_frontier_and_headers(
+            &db,
+            base,
+            &[
+                (roots.height, hash),
+                (successor_height, block::Hash([0x99; 32])),
+            ],
+        );
+
+        assert!(matches!(
+            db.write_verified_header_commitment_roots(verified),
+            Err(HeaderRootAuthFrontierError::HeaderWitnessHashMismatch { height })
+                if height == successor_height
+        ));
+    }
+
+    #[test]
+    fn stale_header_witness_degrades_to_missing_on_frontier_load() {
+        let db = ephemeral_mainnet_db();
+        let (verified, roots, hash, (successor_height, successor_hash)) =
+            verified_activation_root();
+        let base = roots
+            .height
+            .previous()
+            .expect("activation has a predecessor");
+        seed_frontier_and_headers(
+            &db,
+            base,
+            &[(roots.height, hash), (successor_height, successor_hash)],
+        );
+        db.write_verified_header_commitment_roots(verified)
+            .expect("canonical verified prefix promotes");
+
+        let successor = mainnet_block_at(successor_height.0);
+        let mut replacement_header = *successor.header;
+        replacement_header.nonce.0[0] ^= 1;
+        let replacement_header = Arc::new(replacement_header);
+        let replacement_hash = block::Hash::from(replacement_header.as_ref());
+        let header_hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
+        let header_height_by_hash = db.db.cf_handle("zakura_header_height_by_hash").unwrap();
+        let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_delete(&header_height_by_hash, successor_hash);
+        batch.zs_insert(&header_hash_by_height, successor_height, replacement_hash);
+        batch.zs_insert(&header_height_by_hash, replacement_hash, successor_height);
+        batch.zs_insert(&header_by_height, successor_height, &replacement_header);
+        db.write_batch(batch)
+            .expect("canonical successor replacement writes");
+
+        let frontier = db
+            .validate_header_root_auth_state()
+            .expect("a stale optional witness does not invalidate the confirmed frontier")
+            .expect("the confirmed frontier remains available");
+        assert_eq!(frontier.confirmed_height(), roots.height);
+        assert_eq!(frontier.confirmed_hash(), hash);
+        assert_eq!(frontier.header_witness, None);
+        assert_eq!(
+            db.commitment_roots(roots.height),
+            Some(normalize_unauthenticated_commitment_fields(
+                &db.network(),
+                roots
+            ))
+        );
+        assert_eq!(
+            db.header_witness_auth_data_root(successor_height, replacement_hash),
+            None,
+            "a stale witness is never used for the replacement header"
+        );
+    }
+
+    #[test]
     fn verified_insert_preserves_body_derived_row() {
         let db = ephemeral_mainnet_db();
         let (_verified, mut peer_roots, hash, _successor_header) = verified_activation_root();
@@ -1890,20 +1970,21 @@ mod tests {
         let mut wrong_height = encoded.clone();
         wrong_height[witness_offset..witness_offset + 4]
             .copy_from_slice(&Height(3).0.to_le_bytes());
-        assert!(matches!(
-            decode_frontier(&db, &RawBytes::new_raw_bytes(wrong_height)),
-            Err(HeaderRootAuthFrontierError::HeaderWitnessHeightMismatch {
-                expected: Height(2),
-                actual: Height(3),
-            })
-        ));
+        assert_eq!(
+            decode_frontier(&db, &RawBytes::new_raw_bytes(wrong_height))
+                .expect("an invalid optional witness does not poison the frontier")
+                .header_witness,
+            None
+        );
 
         let mut wrong_hash = encoded;
         wrong_hash[witness_offset + 4] ^= 1;
-        assert!(matches!(
-            decode_frontier(&db, &RawBytes::new_raw_bytes(wrong_hash)),
-            Err(HeaderRootAuthFrontierError::HeaderWitnessHashMismatch { height: Height(2) })
-        ));
+        assert_eq!(
+            decode_frontier(&db, &RawBytes::new_raw_bytes(wrong_hash))
+                .expect("a stale optional witness does not poison the frontier")
+                .header_witness,
+            None
+        );
     }
 
     #[test]
