@@ -316,11 +316,12 @@ pub enum HeaderSyncEvent {
         tip_height: block::Height,
         /// Durable best header tip hash.
         tip_hash: block::Hash,
-        /// Replace the cached frontier even if durable state is behind it.
+        /// Frontier generation captured by a retreat-capable query.
         ///
-        /// This is set only when recovering from a locally stale/unknown
-        /// anchor or a verified-chain reset.
-        reanchor: bool,
+        /// `None` only advances the cached frontier. `Some(generation)` can
+        /// replace it with a lower durable tip while that generation is still
+        /// current.
+        reanchor_from: Option<u64>,
     },
     /// State successfully committed a header range.
     HeaderRangeOperationCompleted {
@@ -459,9 +460,9 @@ pub enum HeaderSyncAction {
     },
     /// Ask state for the durable best header tip.
     QueryBestHeaderTip {
-        /// Replace the cached frontier with the returned durable tip, including
-        /// a retreat, when recovering from a stale local anchor.
-        reanchor: bool,
+        /// Frontier generation that permits a returned durable tip to retreat
+        /// the cached frontier while the generation is still current.
+        reanchor_from: Option<u64>,
     },
     /// Ask state for a bounded contiguous range of headers.
     QueryHeadersByHeightRange {

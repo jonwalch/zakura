@@ -164,7 +164,9 @@ impl HeaderSyncReactor {
         let mut frontier_updates_open = frontier_updates.is_some();
         self.publish_connectivity_metrics();
         if self.startup.range_state_actions_enabled {
-            let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip { reanchor: false });
+            let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: None,
+            });
             let _ = self.dispatch_action(HeaderSyncAction::QueryMissingBlockBodies {
                 from: next_height(self.state.verified_block_tip)
                     .unwrap_or(self.state.verified_block_tip),
@@ -469,9 +471,9 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::BestHeaderTipLoaded {
                 tip_height,
                 tip_hash,
-                reanchor,
+                reanchor_from,
             } => {
-                self.handle_best_header_tip_loaded(tip_height, tip_hash, reanchor)
+                self.handle_best_header_tip_loaded(tip_height, tip_hash, reanchor_from)
                     .await;
             }
             HeaderSyncEvent::HeaderRangeOperationCompleted {
@@ -593,8 +595,7 @@ impl HeaderSyncReactor {
                 })
                 .await;
                 if reanchor {
-                    let _ = self
-                        .dispatch_action(HeaderSyncAction::QueryBestHeaderTip { reanchor: true });
+                    self.query_best_header_tip_for_reanchor();
                 }
             }
             FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {}
@@ -1099,9 +1100,13 @@ impl HeaderSyncReactor {
         &mut self,
         tip_height: block::Height,
         tip_hash: block::Hash,
-        reanchor: bool,
+        reanchor_from: Option<u64>,
     ) {
-        if reanchor {
+        if let Some(generation) = reanchor_from {
+            if generation != self.state.frontier_generation {
+                metrics::counter!("sync.header.stale_anchor.stale_reanchor_response").increment(1);
+                return;
+            }
             self.reanchor_to_durable_header_tip(tip_height, tip_hash)
                 .await;
         } else if tip_height > self.state.best_header_tip {
@@ -1205,7 +1210,7 @@ impl HeaderSyncReactor {
                 .await;
         }
         if kind == HeaderSyncCommitFailureKind::UnknownAnchor {
-            let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip { reanchor: true });
+            self.query_best_header_tip_for_reanchor();
         }
         if range.priority == RangePriority::Forward
             && range.start_height() <= self.state.best_header_tip
@@ -2685,8 +2690,14 @@ impl HeaderSyncReactor {
 
         self.state.schedule.clear_assignment(range);
         self.state.schedule.retry_delayed(range);
-        let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip { reanchor: true });
+        self.query_best_header_tip_for_reanchor();
         true
+    }
+
+    fn query_best_header_tip_for_reanchor(&self) {
+        let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip {
+            reanchor_from: Some(self.state.frontier_generation),
+        });
     }
 
     async fn reanchor_to_durable_header_tip(&mut self, height: block::Height, hash: block::Hash) {
@@ -3260,6 +3271,7 @@ impl HeaderSyncReactor {
         hash: block::Hash,
         publication: BestTipPublication,
     ) {
+        self.state.frontier_generation = self.state.frontier_generation.wrapping_add(1);
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         self.state.last_header_progress_at = Instant::now();

@@ -875,7 +875,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                         .send(HeaderSyncEvent::BestHeaderTipLoaded {
                                             tip_height,
                                             tip_hash,
-                                            reanchor: false,
+                                            reanchor_from: None,
                                         })
                                         .await
                                         .is_err()
@@ -1491,7 +1491,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                 });
             }
-            HeaderSyncAction::QueryBestHeaderTip { reanchor } => {
+            HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
                 emit_commit_state(
                     &trace,
                     cs_trace::STATE_READ_START,
@@ -1517,7 +1517,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .send(HeaderSyncEvent::BestHeaderTipLoaded {
                                 tip_height,
                                 tip_hash,
-                                reanchor,
+                                reanchor_from,
                             })
                             .await;
                     }
@@ -2108,7 +2108,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                             .send(HeaderSyncEvent::BestHeaderTipLoaded {
                                 tip_height,
                                 tip_hash,
-                                reanchor: false,
+                                reanchor_from: None,
                             })
                             .await
                             .is_err()

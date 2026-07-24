@@ -1119,7 +1119,7 @@ mod tests {
                         )))
                         .await;
                 }
-                HeaderSyncAction::QueryBestHeaderTip { reanchor } => {
+                HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
                     let (tip_height, tip_hash) = local
                         .store
                         .lock()
@@ -1130,7 +1130,7 @@ mod tests {
                         .send(HeaderSyncEvent::BestHeaderTipLoaded {
                             tip_height,
                             tip_hash,
-                            reanchor,
+                            reanchor_from,
                         })
                         .await;
                 }

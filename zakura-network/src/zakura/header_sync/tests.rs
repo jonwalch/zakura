@@ -5392,7 +5392,7 @@ async fn durable_tip_coverage_does_not_commit_late_response() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: tip,
             tip_hash: block::Hash([2; 32]),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -6354,7 +6354,7 @@ async fn material_tip_advance_sends_rate_limited_unsolicited_status() {
                 tip_hash: block::Hash(
                     [u8::try_from(height.0).expect("test heights fit in u8"); 32],
                 ),
-                reanchor: false,
+                reanchor_from: None,
             })
             .await
             .unwrap();
@@ -8783,7 +8783,9 @@ async fn unknown_anchor_reloads_durable_tip_and_retries_with_backoff_without_sco
 
     loop {
         match next_action(&mut fixture.actions).await {
-            HeaderSyncAction::QueryBestHeaderTip { reanchor: true } => break,
+            HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: Some(_),
+            } => break,
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 panic!("a local unknown anchor must not score {peer:?}: {reason:?}")
             }
@@ -8803,6 +8805,115 @@ async fn unknown_anchor_reloads_durable_tip_and_retries_with_backoff_without_sco
         next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(retry_peer, peer_id);
     assert_eq!((retry_start, retry_count), (block::Height(4), 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_reanchor_response_cannot_retreat_a_newer_durable_frontier() {
+    let header1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let anchor = (block::Height(0), Network::Mainnet.genesis_hash());
+    let durable = (block::Height(1), block::Hash::from(header1.as_ref()));
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_id = peer(239);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, block::Height(3), 1, 2).await;
+    let mut requests = HashMap::new();
+    while requests.len() < 2 {
+        let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(count, 1);
+        requests.insert(start, request_id);
+    }
+    assert!(requests.contains_key(&block::Height(1)));
+    assert!(requests.contains_key(&block::Height(2)));
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(1)],
+        finalized_headers_message(vec![header1]),
+    )
+    .await;
+    let operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationFailed {
+            operation,
+            kind: HeaderSyncCommitFailureKind::UnknownAnchor,
+        })
+        .await
+        .unwrap();
+
+    let stale_generation = loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: Some(generation),
+            } => break generation,
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("a local unknown anchor must not score {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    };
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: durable.0,
+            tip_hash: durable.1,
+            reanchor_from: None,
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), durable);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: anchor.0,
+            tip_hash: anchor.1,
+            reanchor_from: Some(stale_generation),
+        })
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(fixture.handle.best_header_tip(), durable);
+
+    while let Ok(action) = fixture.actions.try_recv() {
+        assert!(
+            !matches!(action, HeaderSyncAction::HeaderReanchored { .. }),
+            "a stale reanchor response must not publish a retreat"
+        );
+    }
+
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(2)],
+        finalized_headers_message(vec![header2]),
+    )
+    .await;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange { payload, .. } => {
+                assert_eq!(payload.range().start(), block::Height(2));
+                break;
+            }
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                panic!("stale reanchor reset forward work: {old:?} -> {new:?}");
+            }
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -8832,7 +8943,7 @@ async fn partial_durable_header_coverage_retires_old_request_and_requests_suffix
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(1),
             tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -8880,7 +8991,7 @@ async fn partial_coverage_recreates_an_interior_hole_before_a_later_batch() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(1),
             tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -8933,7 +9044,7 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(3),
             tip_hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -9005,7 +9116,7 @@ async fn loaded_best_tip_reconciles_outstanding_and_buffered_work() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(3),
             tip_hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -9084,7 +9195,7 @@ async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(1),
             tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -9142,7 +9253,7 @@ async fn buffered_successor_drains_after_durable_tip_covers_its_predecessor() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(1),
             tip_hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -9582,7 +9693,7 @@ async fn loaded_best_tip_updates_tip_watch_and_does_not_advance_finality() {
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: block::Height(1),
             tip_hash,
-            reanchor: false,
+            reanchor_from: None,
         })
         .await
         .unwrap();
@@ -9641,21 +9752,23 @@ async fn forward_link_wedge_reloads_the_durable_tip_without_banning() {
         .await;
     }
 
-    loop {
+    let reanchor_from = loop {
         match next_action(&mut fixture.actions).await {
-            HeaderSyncAction::QueryBestHeaderTip { reanchor: true } => break,
+            HeaderSyncAction::QueryBestHeaderTip {
+                reanchor_from: Some(generation),
+            } => break generation,
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 panic!("unexpected misbehavior from {peer:?}: {reason:?}");
             }
             _ => {}
         }
-    }
+    };
     fixture
         .handle
         .send(HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height: verified.0,
             tip_hash: verified.1,
-            reanchor: true,
+            reanchor_from: Some(reanchor_from),
         })
         .await
         .unwrap();
@@ -9692,6 +9805,75 @@ async fn forward_link_wedge_reloads_the_durable_tip_without_banning() {
         }
     }
     panic!("after re-anchor, header sync did not emit the reanchor action and request forward from the verified tip");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_reanchor_requeues_previously_covered_headers() {
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let anchor = (block::Height(0), Network::Mainnet.genesis_hash());
+    let durable = (block::Height(1), block::Hash::from(headers[0].as_ref()));
+    let committed = (block::Height(3), block::Hash::from(headers[2].as_ref()));
+    let (network, _) = checkpoint_testnet_with_hash(committed.0, committed.1);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_id = peer(238);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), anchor.0, committed.0, 3, 1).await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 3));
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        finalized_headers_message(headers.to_vec()),
+    )
+    .await;
+    let operation = loop {
+        if let HeaderSyncAction::CommitHeaderRange { operation, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            break operation;
+        }
+    };
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation,
+            tip_hash: committed.1,
+        })
+        .await
+        .unwrap();
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), committed);
+
+    // The first committed frontier publication advances the initial generation
+    // from zero to one.
+    let committed_generation = 1;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: durable.0,
+            tip_hash: durable.1,
+            reanchor_from: Some(committed_generation),
+        })
+        .await
+        .unwrap();
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), durable);
+
+    let (_, _, retry_start, retry_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(
+        (retry_start, retry_count),
+        (block::Height(2), 2),
+        "reanchoring below committed coverage must request the now-missing headers again"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
