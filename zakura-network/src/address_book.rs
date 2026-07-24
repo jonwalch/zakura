@@ -817,30 +817,31 @@ impl AddressBook {
     /// in production code, to avoid deadlocks.
     /// (Using the watch channel receiver does not lock the address book mutex.)
     fn address_metrics_internal(&self, now: chrono::DateTime<Utc>) -> AddressMetrics {
-        let responded = self.state_peers(PeerAddrState::Responded).count();
-        let never_attempted_gossiped = self
-            .state_peers(PeerAddrState::NeverAttemptedGossiped)
-            .count();
-        let failed = self.state_peers(PeerAddrState::Failed).count();
-        let attempt_pending = self.state_peers(PeerAddrState::AttemptPending).count();
-
-        let recently_live = self.recently_live_peers(now).len();
-        let recently_stopped_responding = responded
-            .checked_sub(recently_live)
-            .expect("all recently live peers must have responded");
-
-        let num_addresses = self.len();
-
-        AddressMetrics {
-            responded,
-            never_attempted_gossiped,
-            failed,
-            attempt_pending,
-            recently_live,
-            recently_stopped_responding,
-            num_addresses,
+        let mut metrics = AddressMetrics {
             address_limit: self.addr_limit,
+            ..AddressMetrics::default()
+        };
+
+        for peer in self.by_addr.descending_values() {
+            match peer.last_connection_state {
+                PeerAddrState::Responded => {
+                    metrics.responded += 1;
+                    metrics.recently_live += usize::from(peer.was_recently_live(now));
+                }
+                PeerAddrState::NeverAttemptedGossiped => {
+                    metrics.never_attempted_gossiped += 1;
+                }
+                PeerAddrState::Failed => metrics.failed += 1,
+                PeerAddrState::AttemptPending => metrics.attempt_pending += 1,
+            }
         }
+
+        metrics.recently_stopped_responding = metrics
+            .responded
+            .checked_sub(metrics.recently_live)
+            .expect("all recently live peers must have responded");
+        metrics.num_addresses = self.len();
+        metrics
     }
 
     /// Update the metrics for this address book.

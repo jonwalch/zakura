@@ -4,9 +4,17 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use crate::constants::MAX_BANNED_IPS;
+use chrono::Utc;
+use tracing::Span;
+use zakura_chain::{parameters::Network::Mainnet, serialization::DateTime32};
 
-use super::{BanList, BannedIps};
+use crate::{
+    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_BANNED_IPS},
+    meta_addr::{MetaAddr, PeerSocketAddr},
+    protocol::external::types::PeerServices,
+};
+
+use super::{AddressBook, AddressMetrics, BanList, BannedIps};
 
 mod prop;
 mod vectors;
@@ -36,4 +44,48 @@ fn banned_ips_match_ipv4_and_ipv4_mapped_ipv6() {
 
     assert!(BannedIps::with_banned_ip(ipv4).contains(ipv4_mapped));
     assert!(BannedIps::with_banned_ip(ipv4_mapped).contains(ipv4));
+}
+
+#[test]
+fn address_metrics_count_each_peer_state() {
+    let addrs: [PeerSocketAddr; 4] = [
+        "11.1.1.1:8233".parse().unwrap(),
+        "11.1.1.2:8233".parse().unwrap(),
+        "11.1.1.3:8233".parse().unwrap(),
+        "11.1.1.4:8233".parse().unwrap(),
+    ];
+    let initial_addrs = addrs.map(|addr| {
+        MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, DateTime32::MIN)
+    });
+    let mut address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::none(),
+        initial_addrs,
+    );
+
+    address_book.update(MetaAddr::new_reconnect(addrs[0]));
+    address_book.update(MetaAddr::new_responded(addrs[0], None));
+    address_book.update(MetaAddr::new_reconnect(addrs[1]));
+    address_book.update(MetaAddr::new_errored(
+        addrs[1],
+        Option::<PeerServices>::None,
+    ));
+    address_book.update(MetaAddr::new_reconnect(addrs[2]));
+
+    assert_eq!(
+        address_book.address_metrics(Utc::now()),
+        AddressMetrics {
+            responded: 1,
+            never_attempted_gossiped: 1,
+            failed: 1,
+            attempt_pending: 1,
+            recently_live: 1,
+            recently_stopped_responding: 0,
+            num_addresses: 4,
+            address_limit: MAX_ADDRS_IN_ADDRESS_BOOK,
+        }
+    );
 }
