@@ -1994,10 +1994,6 @@ impl Service<ReadRequest> for ReadStateService {
                 headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
             )),
 
-            ReadRequest::DurableHeadersByHeightRange { start, count } => Ok(
-                ReadResponse::DurableHeaders(state.db.headers_by_height_range(start, count)),
-            ),
-
             ReadRequest::BlockRoots {
                 start_height,
                 count,

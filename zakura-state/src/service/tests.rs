@@ -1044,7 +1044,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<()> {
+async fn best_durable_header_tip_excludes_non_finalized_chain() -> Result<()> {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let cache_dir = tempfile::tempdir().expect("test cache directory is created");
@@ -1108,15 +1108,6 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
             (start.next().unwrap(), block2_hash, block2.header.clone()),
         ]),
         "the composite serving view includes restored non-finalized bodies",
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::DurableHeadersByHeightRange { start, count: 2 })
-            .await
-            .expect("durable header read succeeds"),
-        ReadResponse::DurableHeaders(Vec::new()),
-        "the anchor view must exclude restored non-finalized bodies",
     );
     assert_eq!(
         read_state

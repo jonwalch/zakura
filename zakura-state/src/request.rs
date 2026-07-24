@@ -1487,18 +1487,6 @@ pub enum ReadRequest {
         count: u32,
     },
 
-    /// Returns contiguous headers from the durable full-block/header database,
-    /// excluding the in-memory non-finalized chain.
-    ///
-    /// The response stops before the first missing height and is capped by
-    /// [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
-    DurableHeadersByHeightRange {
-        /// First height to read.
-        start: block::Height,
-        /// Maximum number of headers to return.
-        count: u32,
-    },
-
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
     /// with the per-block commitment roots for the requested heights, in ascending height
     /// order. May return fewer than `count` roots if the node does not hold the whole range.
@@ -1749,7 +1737,6 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
-            ReadRequest::DurableHeadersByHeightRange { .. } => "durable_headers_by_height_range",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestDurableHeaderTip => "best_durable_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
