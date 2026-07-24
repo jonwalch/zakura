@@ -301,6 +301,13 @@ start_recorder() {
 HEIGHT_METRICS="state_finalized_block_height state_checkpoint_finalized_block_height checkpoint_finalized_block_height checkpoint_verified_height"
 METRICS_SNAP="$OUT_DIR/metrics-final.prom"
 METRICS_BASELINE="$OUT_DIR/metrics-start.prom"
+capture_metrics() {
+  local output="$1" page
+  page="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)"
+  [[ -n "$page" ]] || return 1
+  printf '%s\n' "$page" > "$output"
+}
+
 scrape_height() {
   local page m v c
   page="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)"
@@ -316,6 +323,19 @@ scrape_height() {
 
 scrape_head_state() {
   local page height header peers estimated_distance rpc_info rpc_height rpc_estimated rpc_peers
+  if [[ "$P2P_STACK" == "default" || "$P2P_STACK" == "legacy" ]]; then
+    rpc_info="$(rpc_chain_info)"
+    rpc_peers="$(rpc_connection_count)"
+    [[ -n "$rpc_info" && "$rpc_peers" =~ ^[0-9]+$ ]] || return 0
+    IFS=$'\t' read -r rpc_height _ rpc_estimated <<<"$rpc_info"
+    [[ "$rpc_height" =~ ^[1-9][0-9]*$ && "$rpc_estimated" =~ ^[0-9]+$ ]] || return 0
+    estimated_distance=$((rpc_estimated - rpc_height))
+    (( estimated_distance >= 0 )) || estimated_distance=0
+    printf '%s\t%s\t%s\t%s\n' \
+      "$rpc_height" "$rpc_height" "$rpc_peers" "$estimated_distance"
+    return
+  fi
+
   page="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)"
   [[ -n "$page" ]] || return 0
   printf '%s\n' "$page" > "$METRICS_SNAP.tmp" 2>/dev/null || true
@@ -338,8 +358,7 @@ scrape_head_state() {
       fi
     fi
   fi
-  if [[ "$P2P_STACK" == "default" || "$P2P_STACK" == "legacy" \
-    || ! "$header" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ ! "$header" =~ ^[1-9][0-9]*$ ]]; then
     header="$height"
   fi
   rpc_peers="$(rpc_connection_count)"
@@ -396,6 +415,9 @@ FAILURE_REASON=""
 
 stop_node() {
   [[ -n "$NODE_PID" ]] || return 0
+  if [[ "$WORKLOAD" == live_head ]]; then
+    capture_metrics "$METRICS_SNAP" || true
+  fi
   kill "$NODE_PID" 2>/dev/null || true
   for _ in $(seq 1 12); do
     kill -0 "$NODE_PID" 2>/dev/null || break
@@ -481,7 +503,7 @@ else
             LAST_HEALTHY_EPOCH="$NOW"
             UNHEALTHY=0
             T_ESCAPE="$PROFILE_START_EPOCH"
-            cp "$METRICS_SNAP.tmp" "$METRICS_BASELINE" 2>/dev/null || true
+            capture_metrics "$METRICS_BASELINE" || true
             start_recorder
             start_profile
             log "live head locked at $START_HEIGHT ($START_HASH); recording ${PROFILE_SECONDS}s"
@@ -575,7 +597,11 @@ fi
 
 T_END=$(date +%s)
 if [[ -n "$REC_PID" ]]; then kill "$REC_PID" 2>/dev/null || true; wait "$REC_PID" 2>/dev/null || true; REC_PID=""; fi
-{ [[ -f "$METRICS_SNAP.tmp" ]] && mv -f "$METRICS_SNAP.tmp" "$METRICS_SNAP"; } 2>/dev/null || true
+if [[ "$WORKLOAD" == historical_sync ]]; then
+  { [[ -f "$METRICS_SNAP.tmp" ]] && mv -f "$METRICS_SNAP.tmp" "$METRICS_SNAP"; } 2>/dev/null || true
+elif [[ ! -s "$METRICS_SNAP" ]]; then
+  { [[ -f "$METRICS_SNAP.tmp" ]] && mv -f "$METRICS_SNAP.tmp" "$METRICS_SNAP"; } 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------- #
 # Profile digest: folded stacks, flamegraph SVG, top-functions markdown
