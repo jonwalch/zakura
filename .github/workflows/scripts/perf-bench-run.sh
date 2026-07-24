@@ -253,17 +253,7 @@ CFG=/root/bench-config.toml
   echo 'filter = "info"'
 } > "$CFG"
 
-if [[ "$WORKLOAD" == live_head ]]; then
-  TIP_HEIGHT_LOG="$OUT_DIR/tip-height.log"
-  if ! SNAPSHOT_HEIGHT="$("$ZAKURAD_BIN" -c "$CFG" tip-height --network Mainnet \
-    2>"$TIP_HEIGHT_LOG" | tail -1)"; then
-    tail -20 "$TIP_HEIGHT_LOG" >&2 || true
-    die "could not open the baked tip snapshot"
-  fi
-  [[ "$SNAPSHOT_HEIGHT" =~ ^[0-9]+$ ]] \
-    || die "could not read the baked tip snapshot height"
-  START_HEIGHT="$SNAPSHOT_HEIGHT"
-fi
+[[ "$WORKLOAD" == live_head ]] && SNAPSHOT_HEIGHT=""
 
 LOGF="$OUT_DIR/node.log"
 log "starting zakurad ($SHA), workload=$WORKLOAD leg=$LEG verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK cap=${WALL_CAP}s peers=${FEED_PEER:-DNS-seeders}/${PEERSET_SIZE}"
@@ -406,7 +396,7 @@ else
   STABLE=0
   PROFILE_START_EPOCH=0
   PROFILE_END_EPOCH=0
-  log "catching up from baked tip $SNAPSHOT_HEIGHT; profiling starts after ${HEAD_STABLE_SAMPLES} stable head samples"
+  log "catching up from the baked tip; profiling starts after ${HEAD_STABLE_SAMPLES} stable head samples"
   while :; do
     NOW=$(date +%s); ELAPSED=$((NOW - T0))
     HEAD_STATE="$(scrape_head_state)" || true
@@ -414,6 +404,11 @@ else
       IFS=$'\t' read -r H HEADER PEERS EST_DISTANCE <<<"$HEAD_STATE"
       echo "$NOW,$ELAPSED,$H,$HEADER,$PEERS,$EST_DISTANCE,catchup" >> "$CSV"
       END_HEIGHT="$H"
+      if [[ -z "$SNAPSHOT_HEIGHT" ]]; then
+        SNAPSHOT_HEIGHT="$H"
+        START_HEIGHT="$H"
+        log "initial observed tip: $SNAPSHOT_HEIGHT"
+      fi
       if (( H >= HEADER && HEADER >= SNAPSHOT_HEIGHT \
         && PEERS >= HEAD_MIN_HEALTHY_PEERS \
         && EST_DISTANCE <= HEAD_MAX_ESTIMATED_DISTANCE )); then
@@ -621,7 +616,7 @@ ERRS="$(grep -iE 'panic|ERROR committing|resetting state queue' "$LOGF" 2>/dev/n
     echo ""
     echo "Observational profile of real mainnet head traffic; no baseline or speedup is implied."
     echo ""
-    echo "| baked tip | catch-up | profile window | start tip | end tip | committed blocks | complete |"
+    echo "| initial observed tip | catch-up | profile window | start tip | end tip | committed blocks | complete |"
     echo "|---:|---:|---:|---:|---:|---:|---|"
     printf '| %s | %ss | %ss | %s | %s | %s | %s |\n' \
       "$SNAPSHOT_HEIGHT" "$CATCHUP_SECONDS" "$PROFILE_SECONDS" "$START_HEIGHT" \
