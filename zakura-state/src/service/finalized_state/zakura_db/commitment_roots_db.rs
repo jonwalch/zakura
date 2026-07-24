@@ -464,7 +464,7 @@ fn decode_frontier(
         LEGACY_FRONTIER_FORMAT_VERSION => (None, FRONTIER_PREFIX_BYTES),
         FRONTIER_FORMAT_VERSION => match bytes.get(FRONTIER_PREFIX_BYTES) {
             Some(0) => (None, FRONTIER_PREFIX_BYTES + 1),
-            Some(1) if bytes.len() >= FRONTIER_PREFIX_BYTES + 1 + WITNESS_FIXED_BYTES + 1 => {
+            Some(1) if bytes.len() > FRONTIER_PREFIX_BYTES + 1 + WITNESS_FIXED_BYTES => {
                 let witness_offset = FRONTIER_PREFIX_BYTES + 1;
                 let roots_height = Height(u32::from_le_bytes(
                     bytes[witness_offset..witness_offset + 4]
