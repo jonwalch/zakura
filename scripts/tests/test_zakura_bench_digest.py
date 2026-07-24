@@ -219,13 +219,20 @@ def header_range_row(elapsed_ms, range_count):
 
 class LatencyTests(unittest.TestCase):
     def run_latency(
-        self, traces="", metrics="", metrics_baseline="", min_height=None, json_out=""
+        self,
+        traces="",
+        metrics="",
+        metrics_baseline="",
+        min_height=None,
+        observed_blocks=None,
+        json_out="",
     ):
         args = SimpleNamespace(
             traces=traces,
             metrics=metrics,
             metrics_baseline=metrics_baseline,
             min_height=min_height,
+            observed_blocks=observed_blocks,
             json_out=json_out,
             title="t",
         )
@@ -324,6 +331,26 @@ class LatencyTests(unittest.TestCase):
         self.assertIn("slowest: 1707213 (500 ms)", output)
         self.assertNotIn("not applicable", output)
         self.assertEqual(report["full_per_block"]["stats"]["count"], 3)
+
+    def test_live_head_reports_trace_coverage_without_throughput_claim(self):
+        rows = []
+        for i, elapsed in enumerate([41, 42]):
+            rows += block_lifecycle(
+                1707211 + i,
+                queued_ts=1_000_000 * i,
+                start_ts=1_000_000 * i + 100,
+                finish_ts=180_000_000 * (i + 1),
+                elapsed_ms=elapsed,
+                apply_class="full",
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            output = self.run_latency(traces=tmp, observed_blocks=5)
+        self.assertIn("observed 5 live tip advances", output)
+        self.assertIn("detailed commit trace covers 2", output)
+        self.assertIn("not a throughput or processing-cost measurement", output)
+        self.assertNotIn("blocks/s", output)
+        self.assertNotIn("marginal cost", output)
 
     def test_min_height_excludes_catchup_rows(self):
         rows = [

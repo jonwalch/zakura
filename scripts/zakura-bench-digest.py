@@ -455,6 +455,9 @@ def cmd_latency(args):
     out = sys.stdout
     out.write(f"### Block-processing latency — {args.title}\n\n")
     report = {}
+    observed_blocks = getattr(args, "observed_blocks", None)
+    if observed_blocks is not None:
+        report["observed_blocks"] = observed_blocks
 
     trace_path = Path(args.traces, "commit_state.jsonl") if args.traces else None
     if trace_path and trace_path.is_file():
@@ -548,7 +551,14 @@ def cmd_latency(args):
             stats = latency_stats(values)
             bps = steady_bps([ts for _, ts, _ in full_rows if ts is not None])
             out.write("\n**Per-block verify+commit latency** (full class)\n\n")
-            if bps:
+            if observed_blocks is not None:
+                out.write(
+                    f"**Takeaway:** observed {observed_blocks:,} live tip advances;"
+                    f" the detailed commit trace covers {stats['count']:,}. Block"
+                    " spacing is controlled by network arrival and is not a"
+                    " throughput or processing-cost measurement.\n\n"
+                )
+            elif bps:
                 out.write(
                     f"**Takeaway:** verified+committed {stats['count']:,} blocks at"
                     f" **{bps:.0f} blocks/s** (**{1000.0 / bps:.1f} ms/block** marginal"
@@ -582,6 +592,11 @@ def cmd_latency(args):
                 "\n**Per-block verify+commit latency** — _not applicable:"
                 " checkpoint mode skips per-block verification; run with"
                 " `verify_mode: semantic` for true per-block cost percentiles._\n"
+            )
+        elif observed_blocks:
+            out.write(
+                f"\n_(observed {observed_blocks:,} live tip advances, but the"
+                " detailed commit trace contains no full-path commit rows)_\n"
             )
 
         other = {
@@ -702,6 +717,11 @@ def main():
     latency.add_argument("--metrics", default="", help="final /metrics text snapshot")
     latency.add_argument("--metrics-baseline", default="", help="optional starting /metrics snapshot")
     latency.add_argument("--min-height", type=int, help="ignore trace rows below this height")
+    latency.add_argument(
+        "--observed-blocks",
+        type=int,
+        help="live tip advances observed by RPC; suppresses throughput claims",
+    )
     latency.add_argument("--json-out", default="")
     latency.add_argument("--title", default="run")
 

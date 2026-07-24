@@ -561,7 +561,9 @@ fi
 LATENCY_ARGS=(latency --traces "$TRACE_DIR" --metrics "$METRICS_SNAP"
   --json-out "$OUT_DIR/latency.json" --title "$LEG $SHA ($WORKLOAD/$VERIFY_MODE)")
 if [[ "$WORKLOAD" == live_head ]]; then
-  LATENCY_ARGS+=(--min-height "$(( START_HEIGHT + 1 ))")
+  BLOCKS=$((END_HEIGHT - START_HEIGHT))
+  (( BLOCKS >= 0 )) || BLOCKS=0
+  LATENCY_ARGS+=(--min-height "$(( START_HEIGHT + 1 ))" --observed-blocks "$BLOCKS")
   [[ -s "$METRICS_BASELINE" ]] && LATENCY_ARGS+=(--metrics-baseline "$METRICS_BASELINE")
 fi
 python3 "$DIGEST_PY" "${LATENCY_ARGS[@]}" \
@@ -579,8 +581,6 @@ if [[ -d "$REC_DIR" && -f "$REC_DIR/samples.jsonl" ]]; then
 fi
 
 if [[ "$WORKLOAD" == live_head ]]; then
-  BLOCKS=$((END_HEIGHT - START_HEIGHT))
-  (( BLOCKS >= 0 )) || BLOCKS=0
   if (( WINDOW_COMPLETE )); then
     TOTAL="$PROFILE_SECONDS"
   elif (( PROFILE_START_EPOCH > 0 )); then
