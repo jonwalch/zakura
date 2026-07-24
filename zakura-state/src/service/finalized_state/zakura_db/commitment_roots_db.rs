@@ -1334,6 +1334,7 @@ mod tests {
         VerifiedHeaderCommitmentRoots,
         BlockCommitmentRoots,
         block::Hash,
+        (Height, block::Hash),
     ) {
         let activation = NetworkUpgrade::Heartwood
             .activation_height(&Network::Mainnet)
@@ -1352,7 +1353,11 @@ mod tests {
         )
         .expect("real activation roots verify");
         let hash = block::Hash::from(block.header.as_ref());
-        (verified, roots, hash)
+        let successor_header = (
+            successor_roots.height,
+            block::Hash::from(successor.header.as_ref()),
+        );
+        (verified, roots, hash, successor_header)
     }
 
     fn two_block_checkpoint_fixture_with_config(
@@ -1511,12 +1516,12 @@ mod tests {
     #[test]
     fn verified_promotion_appends_exact_canonical_prefix() {
         let db = ephemeral_mainnet_db();
-        let (verified, roots, hash) = verified_activation_root();
+        let (verified, roots, hash, successor_header) = verified_activation_root();
         let base = roots
             .height
             .previous()
             .expect("activation has a predecessor");
-        seed_frontier_and_headers(&db, base, &[(roots.height, hash)]);
+        seed_frontier_and_headers(&db, base, &[(roots.height, hash), successor_header]);
 
         db.write_verified_header_commitment_roots(verified)
             .expect("canonical verified prefix promotes");
@@ -1550,12 +1555,12 @@ mod tests {
     #[test]
     fn verified_promotion_rejects_stale_prefix() {
         let db = ephemeral_mainnet_db();
-        let (verified, roots, hash) = verified_activation_root();
+        let (verified, roots, hash, successor_header) = verified_activation_root();
         let base = roots
             .height
             .previous()
             .expect("activation has a predecessor");
-        seed_frontier_and_headers(&db, base, &[(roots.height, hash)]);
+        seed_frontier_and_headers(&db, base, &[(roots.height, hash), successor_header]);
         db.write_verified_header_commitment_roots(verified.clone())
             .expect("first promotion succeeds");
 
@@ -1568,9 +1573,9 @@ mod tests {
     #[test]
     fn verified_promotion_rejects_gap() {
         let db = ephemeral_mainnet_db();
-        let (verified, roots, hash) = verified_activation_root();
+        let (verified, roots, hash, successor_header) = verified_activation_root();
         let base = Height(roots.height.0 - 2);
-        seed_frontier_and_headers(&db, base, &[(roots.height, hash)]);
+        seed_frontier_and_headers(&db, base, &[(roots.height, hash), successor_header]);
 
         assert!(matches!(
             db.write_verified_header_commitment_roots(verified),
@@ -1581,12 +1586,16 @@ mod tests {
     #[test]
     fn verified_promotion_rejects_noncanonical_hash() {
         let db = ephemeral_mainnet_db();
-        let (verified, roots, _hash) = verified_activation_root();
+        let (verified, roots, _hash, successor_header) = verified_activation_root();
         let base = roots
             .height
             .previous()
             .expect("activation has a predecessor");
-        seed_frontier_and_headers(&db, base, &[(roots.height, block::Hash([0x99; 32]))]);
+        seed_frontier_and_headers(
+            &db,
+            base,
+            &[(roots.height, block::Hash([0x99; 32])), successor_header],
+        );
 
         assert!(matches!(
             db.write_verified_header_commitment_roots(verified),
@@ -1598,7 +1607,7 @@ mod tests {
     #[test]
     fn verified_insert_preserves_body_derived_row() {
         let db = ephemeral_mainnet_db();
-        let (_verified, mut peer_roots, hash) = verified_activation_root();
+        let (_verified, mut peer_roots, hash, _successor_header) = verified_activation_root();
         let body_roots = peer_roots.clone();
         peer_roots.sapling_tx = peer_roots.sapling_tx.saturating_add(1);
         let hash_by_height = db.db.cf_handle("hash_by_height").unwrap();
@@ -1677,12 +1686,12 @@ mod tests {
     #[test]
     fn steady_state_frontier_load_does_not_audit_authenticated_root_prefix() {
         let db = ephemeral_mainnet_db();
-        let (verified, roots, hash) = verified_activation_root();
+        let (verified, roots, hash, successor_header) = verified_activation_root();
         let base = roots
             .height
             .previous()
             .expect("activation has a predecessor");
-        seed_frontier_and_headers(&db, base, &[(roots.height, hash)]);
+        seed_frontier_and_headers(&db, base, &[(roots.height, hash), successor_header]);
         let expected_frontier = db
             .write_verified_header_commitment_roots(verified)
             .expect("canonical verified prefix promotes");

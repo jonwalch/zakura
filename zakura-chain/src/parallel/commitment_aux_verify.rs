@@ -43,10 +43,11 @@ impl VerifiedHeaderCommitmentRoots {
         self.confirmed_hashes.last().copied()
     }
 
-    /// Returns the final, unconfirmed root record and its canonical header hash.
+    /// Returns the final, unconfirmed root record and its header hash.
     ///
-    /// The witness's own header authenticates its authorizing-data root, but its
-    /// note-commitment roots require a later successor and are not confirmed.
+    /// At NU5 and later, the witness's own header authenticates its authorizing-data
+    /// root, but its note-commitment roots require a later successor and are not
+    /// confirmed.
     pub fn successor_witness(&self) -> Option<(&BlockCommitmentRoots, block::Hash)> {
         self.successor_witness
             .as_ref()
@@ -852,6 +853,11 @@ mod tests {
         assert_eq!(
             verified.confirmed_hash(),
             Some(block::Hash::from(act_block.header.as_ref())),
+        );
+        assert_eq!(
+            verified.successor_witness(),
+            Some((&next_roots, block::Hash::from(next_block.header.as_ref()))),
+            "the final root record is retained separately as the successor witness"
         );
         assert_eq!(
             verified.history_tree().hash(),
