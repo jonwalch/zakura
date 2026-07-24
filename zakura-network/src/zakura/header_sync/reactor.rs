@@ -3271,6 +3271,7 @@ impl HeaderSyncReactor {
         hash: block::Hash,
         publication: BestTipPublication,
     ) {
+        let old_body_sync_target = self.state.body_sync_target;
         self.state.frontier_generation = self.state.frontier_generation.wrapping_add(1);
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
@@ -3282,12 +3283,12 @@ impl HeaderSyncReactor {
         }
         let _ = self.tip.send((height, hash));
         if matches!(publication, BestTipPublication::Reanchored)
-            && self.state.body_sync_target.0 > height
+            && (old_body_sync_target.0 > height
+                || (old_body_sync_target.0 == height && old_body_sync_target.1 != hash))
         {
-            let old = self.state.body_sync_target;
             self.state.body_sync_target = (height, hash);
             let _ = self.dispatch_action(HeaderSyncAction::HeaderReanchored {
-                old,
+                old: old_body_sync_target,
                 new: (height, hash),
             });
         } else if height <= self.state.verified_block_tip {

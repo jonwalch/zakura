@@ -9704,6 +9704,46 @@ async fn loaded_best_tip_updates_tip_watch_and_does_not_advance_finality() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn same_height_durable_reanchor_replaces_the_body_sync_target() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let old = (block::Height(1), block::Hash([11; 32]));
+    let new = (old.0, block::Hash([12; 32]));
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(old)));
+    let mut tip = fixture.handle.subscribe_tip();
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderTipLoaded {
+            tip_height: new.0,
+            tip_hash: new.1,
+            reanchor_from: Some(0),
+        })
+        .await
+        .unwrap();
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), new);
+
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored {
+                old: actual_old,
+                new: actual_new,
+            } => {
+                assert_eq!(actual_old, old);
+                assert_eq!(actual_new, new);
+                break;
+            }
+            HeaderSyncAction::HeaderAdvanced { height, hash } => {
+                panic!("same-height hash replacement advanced instead of reanchoring: {height:?} {hash:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn forward_link_wedge_reloads_the_durable_tip_without_banning() {
     let network = regtest_network();
     let verified = (block::Height(0), network.genesis_hash());
