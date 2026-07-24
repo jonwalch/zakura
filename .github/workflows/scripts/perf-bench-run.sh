@@ -87,7 +87,6 @@ case "$WORKLOAD" in
   live_head)
     SNAPSHOT_MODE=tip
     STORAGE_MODE=pruned
-    [[ "$LEG" == primary ]] || die "live_head only supports the primary leg"
     HEAD_PROFILE_MINUTES="${HEAD_PROFILE_MINUTES:-60}"
     [[ "$HEAD_PROFILE_MINUTES" =~ ^[1-9][0-9]*$ ]] \
       || die "HEAD_PROFILE_MINUTES must be a positive integer"
