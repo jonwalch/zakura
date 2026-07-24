@@ -439,14 +439,6 @@ impl HeaderWorkQueue {
         )
     }
 
-    pub(super) fn mark_height_covered(&mut self, height: block::Height) {
-        self.mark_covered_interval(CoveredRange {
-            start: height,
-            end: height,
-        });
-        self.prune_covered();
-    }
-
     pub(super) fn mark_range_covered(&mut self, start: block::Height, end: block::Height) {
         self.mark_covered_interval(CoveredRange { start, end });
         self.prune_covered();
@@ -1009,7 +1001,7 @@ mod tests {
         queue.mark_committing(operation.clone(), committing);
 
         queue.mark_range_covered(block::Height(1), block::Height(2));
-        queue.mark_height_covered(block::Height(3));
+        queue.mark_range_covered(block::Height(3), block::Height(3));
 
         assert_eq!(
             queue.covered,

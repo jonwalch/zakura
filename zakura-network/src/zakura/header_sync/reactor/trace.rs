@@ -572,10 +572,12 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
         HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height,
             tip_hash,
+            reanchor,
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("best_header_tip_loaded"));
             insert_height(row, hs_trace::HEIGHT, *tip_height);
             insert_hash(row, hs_trace::HASH, *tip_hash);
+            insert_bool(row, "reanchor", *reanchor);
         }
         HeaderSyncEvent::HeaderRangeOperationCompleted {
             operation,
@@ -780,8 +782,9 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
                 u64::from(payload.range().count()),
             );
         }
-        HeaderSyncAction::QueryBestHeaderTip => {
+        HeaderSyncAction::QueryBestHeaderTip { reanchor } => {
             insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
+            insert_bool(row, "reanchor", *reanchor);
         }
         HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
             insert_optional_str(row, hs_trace::KIND, Some("query_missing_block_bodies"));
@@ -1026,6 +1029,7 @@ fn misbehavior_reason_label(reason: HeaderSyncMisbehavior) -> &'static str {
 pub(super) fn commit_failure_reason_label(kind: HeaderSyncCommitFailureKind) -> &'static str {
     match kind {
         HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
+        HeaderSyncCommitFailureKind::UnknownAnchor => "unknown_anchor",
         HeaderSyncCommitFailureKind::Local => "local",
     }
 }
@@ -1245,6 +1249,7 @@ mod tests {
             HeaderSyncEvent::BestHeaderTipLoaded {
                 tip_height: block::Height(7),
                 tip_hash: block::Hash([7; 32]),
+                reanchor: false,
             },
             HeaderSyncEvent::HeaderRangeOperationCompleted {
                 operation: operation(peer.clone()),
@@ -1329,7 +1334,7 @@ mod tests {
                 "commit_header_range",
             ),
             (
-                HeaderSyncAction::QueryBestHeaderTip,
+                HeaderSyncAction::QueryBestHeaderTip { reanchor: false },
                 "query_best_header_tip",
             ),
             (
