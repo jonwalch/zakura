@@ -848,7 +848,18 @@ jobs:
           docker buildx imagetools inspect "zakuracore/zakura:zcashd-compat-${image_version}" \
             --format '{{json .Manifest}}' \
             | jq -e '
-                [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms
+                # BuildKit provenance adds an unknown/unknown attestation
+                # descriptor. Ignore only attestations, then require exactly
+                # the runnable platform published by this image.
+                [
+                  .manifests[]
+                  | select(
+                      .annotations["vnd.docker.reference.type"]
+                      != "attestation-manifest"
+                    )
+                  | .platform
+                  | "\(.os)/\(.architecture)"
+                ] as $platforms
                 | $platforms == ["linux/amd64"]
               ' >/dev/null
 
