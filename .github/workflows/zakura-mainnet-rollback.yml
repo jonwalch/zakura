@@ -28,6 +28,16 @@ on:
         required: false
         type: boolean
         default: true
+      trace_since_utc:
+        description: "Optional trace start, as YYYY-MM-DDTHH:MM:SSZ"
+        required: false
+        type: string
+        default: ""
+      trace_until_utc:
+        description: "Optional trace end, as YYYY-MM-DDTHH:MM:SSZ"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -79,6 +89,77 @@ jobs:
           echo "=== recent journal ==="; journalctl -u "$SERVICE" -n 40 --no-pager 2>/dev/null | tail -40
           echo "=== tail node log ==="; tail -n 60 /root/logs/zakurad.log 2>/dev/null
           EOF
+
+      - name: Capture bounded tracing-log window
+        if: ${{ inputs.trace_since_utc != '' && inputs.trace_until_utc != '' }}
+        env:
+          TRACE_SINCE_UTC: ${{ inputs.trace_since_utc }}
+          TRACE_UNTIL_UTC: ${{ inputs.trace_until_utc }}
+        run: |
+          set -euo pipefail
+
+          timestamp_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+          if [[ ! "$TRACE_SINCE_UTC" =~ $timestamp_re ]] ||
+             [[ ! "$TRACE_UNTIL_UTC" =~ $timestamp_re ]]; then
+            echo "::error::trace bounds must use YYYY-MM-DDTHH:MM:SSZ"
+            exit 1
+          fi
+
+          printf -v since_q '%q' "$TRACE_SINCE_UTC"
+          printf -v until_q '%q' "$TRACE_UNTIL_UTC"
+          trace_output="$RUNNER_TEMP/zakura-trace-window.log"
+
+          ssh -o BatchMode=yes -o ConnectTimeout=20 '${{ inputs.ssh_target }}' \
+            "SINCE_UTC=$since_q UNTIL_UTC=$until_q bash -s" \
+            > "$trace_output" <<'EOF'
+          set -uo pipefail
+
+          echo "=== tracing log metadata ==="
+          ls -lh /root/logs/zakura-tracing.log 2>&1
+          echo "=== tracing log window: $SINCE_UTC through $UNTIL_UTC ==="
+          python3 - "$SINCE_UTC" "$UNTIL_UTC" /root/logs/zakura-tracing.log <<'PY'
+          import datetime
+          import re
+          import sys
+
+          since = datetime.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          until = datetime.datetime.fromisoformat(sys.argv[2].replace("Z", "+00:00"))
+          timestamp_re = re.compile(
+              rb"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)"
+          )
+          in_window = False
+
+          with open(sys.argv[3], "rb") as log:
+              for line in log:
+                  match = timestamp_re.search(line)
+                  if match:
+                      timestamp = datetime.datetime.fromisoformat(
+                          match.group(1).decode().replace("Z", "+00:00")
+                      )
+                      in_window = since <= timestamp <= until
+                  if in_window:
+                      sys.stdout.buffer.write(line)
+          PY
+
+          echo "=== system warnings in window ==="
+          journalctl --since "$SINCE_UTC" --until "$UNTIL_UTC" \
+            --priority warning --no-pager 2>&1
+          echo "=== kernel warnings in window ==="
+          journalctl --dmesg --since "$SINCE_UTC" --until "$UNTIL_UTC" \
+            --priority warning --no-pager 2>&1
+          EOF
+
+          test -s "$trace_output"
+          wc -c "$trace_output"
+
+      - name: Upload bounded tracing-log window
+        if: ${{ inputs.trace_since_utc != '' && inputs.trace_until_utc != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-trace-window-${{ github.run_id }}
+          path: ${{ runner.temp }}/zakura-trace-window.log
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Restore previous binary and restart
         if: ${{ inputs.restore_bak }}
