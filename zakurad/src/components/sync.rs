@@ -1833,10 +1833,15 @@ where
 
         // Probe ambiguous hashes only when the ordered responses produced no work. They don't enter
         // `prospective_tips`, and misses don't use the required-block retry budgets.
-        if download_set.is_empty() && self.ambiguous_probe_hashes.is_empty() {
+        if download_set.is_empty() {
             debug_assert!(probe_candidates.len() <= FANOUT);
+            debug_assert!(self.ambiguous_probe_hashes.len() <= FANOUT);
 
             for candidate in probe_candidates {
+                if self.ambiguous_probe_hashes.len() >= FANOUT {
+                    break;
+                }
+
                 if self.downloads.as_ref().get_ref().contains(candidate) {
                     debug!(
                         hash = ?candidate,
