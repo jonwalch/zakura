@@ -1486,6 +1486,7 @@ where
         let our_services = self.our_services;
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
+        let latest_chain_tip = self.minimum_peer_version.chain_tip().clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
 
         // Whether this peer is exempt from the inbound-overload connection drop.
@@ -1763,6 +1764,10 @@ where
                     )
                 });
 
+            let network = config.network.clone();
+            let is_at_or_near_network_tip =
+                Box::new(move || latest_chain_tip.is_at_or_near_network_tip(&network));
+
             let server = Connection::new(
                 inbound_service,
                 server_rx,
@@ -1772,6 +1777,7 @@ where
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
+                is_at_or_near_network_tip,
             );
 
             let connection_task = tokio::spawn(

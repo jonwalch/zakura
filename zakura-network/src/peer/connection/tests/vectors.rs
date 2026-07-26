@@ -238,6 +238,134 @@ async fn connection_run_loop_message_ok() {
     assert_eq!(outbound_message, None);
 }
 
+/// A singleton `inv` completes `FindBlocks` when the committed chain is near tip.
+#[tokio::test]
+async fn find_blocks_accepts_singleton_response_near_tip() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (
+        connection,
+        mut client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = super::new_test_connection_with_tip_status::<PanicAssertion>(true);
+    let connection_join_handle = tokio::spawn(connection.run(peer_rx));
+
+    let locator = block::Hash::from([0x11; 32]);
+    let response_hash = block::Hash::from([0x22; 32]);
+    let (request_tx, request_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            },
+            tx: request_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .expect("internal request channel should accept the request");
+
+    assert_eq!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetBlocks {
+            known_blocks: vec![locator],
+            stop: None,
+        })
+    );
+
+    peer_tx
+        .try_send(Ok(Message::Inv(vec![response_hash.into()])))
+        .expect("peer response channel should accept the response");
+
+    assert_eq!(
+        request_rx
+            .await
+            .expect("connection should send a response")
+            .expect("singleton should produce a successful response"),
+        Response::BlockHashes(vec![response_hash])
+    );
+    inbound_service.expect_no_requests().await;
+    assert!(shared_error_slot.try_get_error().is_none());
+
+    connection_join_handle.abort();
+}
+
+/// A singleton `inv` is gossip, not a `FindBlocks` response, while far from tip.
+#[tokio::test]
+async fn find_blocks_routes_singleton_as_gossip_while_far_from_tip() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(2);
+    let (
+        connection,
+        mut client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = super::new_test_connection_with_tip_status::<PanicAssertion>(false);
+    let connection_join_handle = tokio::spawn(connection.run(peer_rx));
+
+    let locator = block::Hash::from([0x31; 32]);
+    let announced_tip = block::Hash::from([0x32; 32]);
+    let response_hashes = [block::Hash::from([0x33; 32]), block::Hash::from([0x34; 32])];
+    let (request_tx, mut request_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            },
+            tx: request_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .expect("internal request channel should accept the request");
+
+    assert_eq!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetBlocks {
+            known_blocks: vec![locator],
+            stop: None,
+        })
+    );
+
+    peer_tx
+        .try_send(Ok(Message::Inv(vec![announced_tip.into()])))
+        .expect("peer response channel should accept the announcement");
+    inbound_service
+        .expect_request(Request::AdvertiseBlock(announced_tip, None))
+        .await
+        .respond(Response::Nil);
+
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(request_rx.try_recv(), Ok(None)),
+        "block gossip must not complete the FindBlocks request while far from tip"
+    );
+
+    peer_tx
+        .try_send(Ok(Message::Inv(
+            response_hashes.iter().copied().map(Into::into).collect(),
+        )))
+        .expect("peer response channel should accept the response");
+
+    assert_eq!(
+        request_rx
+            .await
+            .expect("connection should send a response")
+            .expect("multi-hash inventory should produce a successful response"),
+        Response::BlockHashes(response_hashes.to_vec())
+    );
+    assert!(shared_error_slot.try_get_error().is_none());
+
+    connection_join_handle.abort();
+}
+
 /// Test that the connection run loop fails correctly when dropped
 #[tokio::test]
 async fn connection_run_loop_future_drop() {

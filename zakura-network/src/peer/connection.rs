@@ -47,6 +47,8 @@ mod peer_tx;
 #[cfg(test)]
 mod tests;
 
+type IsAtOrNearNetworkTip = Box<dyn Fn() -> bool + Send>;
+
 #[derive(Debug)]
 pub(super) enum Handler {
     /// Indicates that the handler has finished processing the request.
@@ -57,7 +59,9 @@ pub(super) enum Handler {
         ping_sent_at: Instant,
     },
     Peers,
-    FindBlocks,
+    FindBlocks {
+        accept_singleton_response: bool,
+    },
     FindHeaders,
     BlocksByHash {
         pending_hashes: HashSet<block::Hash>,
@@ -79,7 +83,7 @@ impl fmt::Display for Handler {
             Handler::Ping { .. } => "Ping".to_string(),
             Handler::Peers => "Peers".to_string(),
 
-            Handler::FindBlocks => "FindBlocks".to_string(),
+            Handler::FindBlocks { .. } => "FindBlocks".to_string(),
             Handler::FindHeaders => "FindHeaders".to_string(),
             Handler::BlocksByHash {
                 pending_hashes,
@@ -113,7 +117,7 @@ impl Handler {
             Handler::Ping { .. } => "Ping".into(),
             Handler::Peers => "Peers".into(),
 
-            Handler::FindBlocks => "FindBlocks".into(),
+            Handler::FindBlocks { .. } => "FindBlocks".into(),
             Handler::FindHeaders => "FindHeaders".into(),
 
             Handler::BlocksByHash { .. } => "BlocksByHash".into(),
@@ -399,10 +403,16 @@ impl Handler {
 
             // TODO:
             // - use `any(inv)` rather than `all(inv)`?
-            (Handler::FindBlocks, Message::Inv(items))
-                if items
-                    .iter()
-                    .all(|item| matches!(item, InventoryHash::Block(_))) =>
+            (
+                Handler::FindBlocks {
+                    accept_singleton_response,
+                },
+                Message::Inv(items),
+            ) if items
+                .iter()
+                .all(|item| matches!(item, InventoryHash::Block(_)))
+                // A singleton can be an unsolicited tip announcement.
+                && (items.len() != 1 || accept_singleton_response) =>
             {
                 Handler::Finished(Ok(Response::BlockHashes(
                     block_hashes(&items[..]).collect(),
@@ -607,6 +617,9 @@ where
     /// The configured log and metrics label for this peer. Usually the remote IP and port.
     pub(super) addr_label: String,
 
+    /// Reports whether the locally committed chain is at or near the estimated network tip.
+    is_at_or_near_network_tip: IsAtOrNearNetworkTip,
+
     /// The state for this peer, when the metrics were last updated.
     pub(super) last_metrics_state: Option<Cow<'static, str>>,
 
@@ -650,6 +663,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        is_at_or_near_network_tip: IsAtOrNearNetworkTip,
     ) -> Self {
         Connection {
             connection_info,
@@ -662,6 +676,7 @@ where
             peer_tx: peer_tx.into(),
             connection_tracker,
             addr_label,
+            is_at_or_near_network_tip,
             last_metrics_state: None,
             last_overload_time: None,
         }
@@ -1086,13 +1101,14 @@ where
             }
 
             (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
+                let accept_singleton_response = (self.is_at_or_near_network_tip)();
                 self
                     .peer_tx
                     .send(Message::GetBlocks { known_blocks, stop })
                     .await
-                    .map(|()|
-                         Handler::FindBlocks
-                    )
+                    .map(|()| Handler::FindBlocks {
+                        accept_singleton_response,
+                    })
             }
             (AwaitingRequest, FindHeaders { known_blocks, stop }) => {
                 self

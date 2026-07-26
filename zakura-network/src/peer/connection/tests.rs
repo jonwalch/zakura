@@ -82,7 +82,23 @@ fn new_test_connection<A>() -> (
     mpsc::Receiver<Message>,
     ErrorSlot,
 ) {
-    new_test_connection_with_protection(false)
+    new_test_connection_with_options(false, true)
+}
+
+/// Creates a new [`Connection`] with a fixed local near-tip estimate.
+fn new_test_connection_with_tip_status<A>(
+    is_at_or_near_network_tip: bool,
+) -> (
+    Connection<
+        MockService<Request, Response, A>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, A>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
+    new_test_connection_with_options(false, is_at_or_near_network_tip)
 }
 
 /// Creates a new [`Connection`] marked as an operator-configured protected peer
@@ -97,13 +113,13 @@ fn new_protected_test_connection<A>() -> (
     mpsc::Receiver<Message>,
     ErrorSlot,
 ) {
-    new_test_connection_with_protection(true)
+    new_test_connection_with_options(true, true)
 }
 
-/// Creates a new [`Connection`] instance for testing, setting whether it is an
-/// operator-configured protected peer.
-fn new_test_connection_with_protection<A>(
+/// Creates a new [`Connection`] instance with the requested test behavior.
+fn new_test_connection_with_options<A>(
     is_protected_peer: bool,
+    is_at_or_near_network_tip: bool,
 ) -> (
     Connection<
         MockService<Request, Response, A>,
@@ -170,6 +186,7 @@ fn new_test_connection_with_protection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        Box::new(move || is_at_or_near_network_tip),
     );
 
     (
@@ -225,6 +242,7 @@ fn new_never_closing_test_connection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        Box::new(|| true),
     );
 
     (connection, client_tx, shared_error_slot)
