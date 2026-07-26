@@ -397,15 +397,12 @@ impl Handler {
                 }
             }
 
-            // TODO:
-            // - use `any(inv)` rather than `all(inv)`?
-            (Handler::FindBlocks, Message::Inv(items))
-                if items
-                    .iter()
-                    .all(|item| matches!(item, InventoryHash::Block(_))) =>
-            {
+            (Handler::FindBlocks, Message::Headers(headers)) => {
                 Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
+                    headers
+                        .into_iter()
+                        .map(|counted_header| counted_header.header.hash())
+                        .collect(),
                 )))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
@@ -1086,9 +1083,11 @@ where
             }
 
             (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
+                // `getblocks` responses and block announcements are both `inv` messages.
+                // Use `getheaders` so tip gossip cannot be mistaken for this response.
                 self
                     .peer_tx
-                    .send(Message::GetBlocks { known_blocks, stop })
+                    .send(Message::GetHeaders { known_blocks, stop })
                     .await
                     .map(|()|
                          Handler::FindBlocks

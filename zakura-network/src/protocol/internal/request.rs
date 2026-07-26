@@ -145,17 +145,9 @@ pub enum Request {
     /// Returns
     /// [`Response::BlockHashes`](super::Response::BlockHashes).
     ///
-    /// # Warning
-    ///
-    /// This is implemented by sending a `getblocks` message. Bitcoin nodes
-    /// respond to `getblocks` with an `inv` message containing a list of the
-    /// subsequent blocks. However, Bitcoin nodes *also* send `inv` messages
-    /// unsolicited in order to gossip new blocks to their peers. These gossip
-    /// messages can race with the response to a `getblocks` request, and there
-    /// is no way for the network layer to distinguish them. For this reason, the
-    /// response may occasionally contain a single hash of a new chain tip rather
-    /// than a list of hashes of subsequent blocks. We believe that unsolicited
-    /// `inv` messages will always have exactly one block hash.
+    /// Outbound legacy TCP requests use `getheaders` and return up to 160 hashes
+    /// from the `headers` response. This keeps the response distinct from
+    /// unsolicited block announcements, which use `inv` messages.
     FindBlocks {
         /// Hashes of known blocks, ordered from highest height to lowest height.
         //

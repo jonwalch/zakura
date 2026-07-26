@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -18,7 +19,10 @@ use futures::{
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::{block, serialization::SerializationError};
+use zakura_chain::{
+    block,
+    serialization::{SerializationError, ZcashDeserializeInto},
+};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
@@ -236,6 +240,85 @@ async fn connection_run_loop_message_ok() {
     connection_join_handle.abort();
     let outbound_message = peer_outbound_messages.next().await;
     assert_eq!(outbound_message, None);
+}
+
+/// A block announcement must not satisfy an in-flight block hash discovery request.
+#[tokio::test]
+async fn find_blocks_ignores_block_gossip_before_response() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(2);
+    let (
+        connection,
+        mut client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_test_connection();
+    let connection_join_handle = tokio::spawn(connection.run(peer_rx));
+
+    let locator = block::Hash::from([0x11; 32]);
+    let announced_tip = block::Hash::from([0x22; 32]);
+    let header: block::Header = zakura_test::vectors::DUMMY_HEADER
+        .zcash_deserialize_into()
+        .expect("dummy header should deserialize");
+    let response_hash = header.hash();
+
+    let (request_tx, mut request_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            },
+            tx: request_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .expect("internal request channel should accept the request");
+
+    assert_eq!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetHeaders {
+            known_blocks: vec![locator],
+            stop: None,
+        })
+    );
+
+    peer_tx
+        .try_send(Ok(Message::Inv(vec![announced_tip.into()])))
+        .expect("peer response channel should accept the announcement");
+    inbound_service
+        .expect_request(Request::AdvertiseBlock(announced_tip, None))
+        .await
+        .respond(Response::Nil);
+
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(request_rx.try_recv(), Ok(None)),
+        "block gossip must not complete the FindBlocks request"
+    );
+
+    peer_tx
+        .try_send(Ok(Message::Headers(vec![block::CountedHeader {
+            header: Arc::new(header),
+        }])))
+        .expect("peer response channel should accept the headers response");
+
+    assert_eq!(
+        request_rx
+            .await
+            .expect("connection should send a response")
+            .expect("headers should produce a successful response"),
+        Response::BlockHashes(vec![response_hash])
+    );
+    assert!(
+        shared_error_slot.try_get_error().is_none(),
+        "the connection should remain healthy"
+    );
+
+    connection_join_handle.abort();
 }
 
 /// Test that the connection run loop fails correctly when dropped
