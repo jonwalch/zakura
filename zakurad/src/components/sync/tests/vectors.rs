@@ -22,7 +22,8 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
-    BlockError, Config as ConsensusConfig, RouterError, VerifyBlockError, VerifyCheckpointError,
+    error::TransactionError, BlockError, Config as ConsensusConfig, RouterError, VerifyBlockError,
+    VerifyCheckpointError,
 };
 use zakura_network::{InventoryResponse, PeerSocketAddr};
 use zakura_state::Config as StateConfig;
@@ -2574,12 +2575,14 @@ async fn ambiguous_probe_distinguishes_peer_and_internal_verifier_failures() {
     let scored_peer_invalid_hash = block::Hash::from([0xBD; 32]);
     let time_invalid_hash = block::Hash::from([0xBE; 32]);
     let side_chain_hash = block::Hash::from([0xBF; 32]);
-    let internal_failure_hash = block::Hash::from([0xC0; 32]);
+    let transaction_internal_hash = block::Hash::from([0xC0; 32]);
+    let state_internal_hash = block::Hash::from([0xC1; 32]);
     chain_sync.ambiguous_probe_hashes.extend([
         scored_peer_invalid_hash,
         time_invalid_hash,
         side_chain_hash,
-        internal_failure_hash,
+        transaction_internal_hash,
+        state_internal_hash,
     ]);
 
     let peer_errors = [
@@ -2611,7 +2614,7 @@ async fn ambiguous_probe_distinguishes_peer_and_internal_verifier_failures() {
         BlockDownloadVerifyError::Invalid {
             error: RouterError::Checkpoint {
                 source: Box::new(VerifyCheckpointError::UnexpectedSideChain {
-                    expected: block::Hash::from([0xC1; 32]),
+                    expected: block::Hash::from([0xC2; 32]),
                     found: side_chain_hash,
                 }),
             },
@@ -2630,23 +2633,49 @@ async fn ambiguous_probe_distinguishes_peer_and_internal_verifier_failures() {
 
     assert_eq!(
         chain_sync.ambiguous_probe_hashes,
-        HashSet::from([internal_failure_hash])
+        HashSet::from([transaction_internal_hash, state_internal_hash])
     );
 
-    let internal_error = BlockDownloadVerifyError::Invalid {
+    let transaction_internal_error = BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {
-            source: Box::new(VerifyBlockError::StateService {
-                source: crate::BoxError::from("synthetic state service failure"),
-                hash: internal_failure_hash,
-            }),
+            source: Box::new(VerifyBlockError::Transaction(
+                TransactionError::InternalDowncastError(
+                    "synthetic transaction service failure".to_string(),
+                ),
+            )),
         },
         height: Height(1),
-        hash: internal_failure_hash,
+        hash: transaction_internal_hash,
         advertiser_addr: None,
     };
 
     let result = chain_sync
-        .handle_block_response_with_missing_retry(Err(internal_error))
+        .handle_block_response_with_missing_retry(Err(transaction_internal_error))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an internal transaction verifier failure must restart the sync round"
+    );
+    assert_eq!(
+        chain_sync.ambiguous_probe_hashes,
+        HashSet::from([state_internal_hash])
+    );
+
+    let state_internal_error = BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::StateService {
+                source: crate::BoxError::from("synthetic state service failure"),
+                hash: state_internal_hash,
+            }),
+        },
+        height: Height(1),
+        hash: state_internal_hash,
+        advertiser_addr: None,
+    };
+
+    let result = chain_sync
+        .handle_block_response_with_missing_retry(Err(state_internal_error))
         .await;
 
     assert!(

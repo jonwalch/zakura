@@ -33,7 +33,9 @@ use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
-use zakura_consensus::{RouterError, VerifyBlockError, VerifyCheckpointError};
+use zakura_consensus::{
+    error::TransactionError, RouterError, VerifyBlockError, VerifyCheckpointError,
+};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -94,6 +96,7 @@ fn is_internal_block_verifier_failure(error: &VerifyBlockError) -> bool {
         | VerifyBlockError::ValidateProposal(_)
         | VerifyBlockError::StateService { .. } => true,
         VerifyBlockError::Commit(error) => is_internal_commit_failure(error),
+        VerifyBlockError::Transaction(TransactionError::InternalDowncastError(_)) => true,
         VerifyBlockError::Block { .. }
         | VerifyBlockError::Equihash { .. }
         | VerifyBlockError::Time(_)
