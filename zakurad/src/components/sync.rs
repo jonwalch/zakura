@@ -2247,11 +2247,8 @@ where
                     return Ok(());
                 }
                 Err(error) => {
-                    let is_peer_failure = matches!(
-                        error,
-                        BlockDownloadVerifyError::DownloadFailed { .. }
-                            | BlockDownloadVerifyError::Invalid { .. }
-                    );
+                    let is_peer_failure =
+                        matches!(error, BlockDownloadVerifyError::DownloadFailed { .. });
                     debug!(
                         ?hash,
                         ?error,

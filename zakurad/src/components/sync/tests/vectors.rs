@@ -2456,6 +2456,45 @@ async fn ambiguous_probe_registry_miss_does_not_schedule_required_block_retries(
     peer_set.expect_no_requests().await;
 }
 
+/// Internal verifier failures must retain the normal sync-restart behavior, even when the block
+/// was discovered through an ambiguous best-effort probe.
+#[tokio::test]
+async fn ambiguous_probe_propagates_verifier_state_service_failures() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xBD; 32]);
+    chain_sync.ambiguous_probe_hashes.insert(block_hash);
+    let error = BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::StateService {
+                source: crate::BoxError::from("synthetic state service failure"),
+                hash: block_hash,
+            }),
+        },
+        height: Height(1),
+        hash: block_hash,
+        advertiser_addr: None,
+    };
+
+    let result = chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an internal verifier failure must restart the sync round"
+    );
+    assert!(chain_sync.ambiguous_probe_hashes.is_empty());
+    peer_set.expect_no_requests().await;
+}
+
 /// A registry miss past its retry budget restarts the round and clears its retry state.
 #[tokio::test]
 async fn registry_miss_restarts_after_retry_limit() {
