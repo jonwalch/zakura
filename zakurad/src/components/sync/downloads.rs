@@ -191,6 +191,25 @@ pub(super) enum NotFoundKind {
 }
 
 impl BlockDownloadVerifyError {
+    /// Returns the block hash associated with this error, when the error identifies one.
+    pub(super) fn block_hash(&self) -> Option<block::Hash> {
+        match self {
+            Self::DuplicateBlockQueuedForDownload { hash }
+            | Self::DownloadFailed { hash, .. }
+            | Self::AboveLookaheadHeightLimit { hash, .. }
+            | Self::BehindTipHeightLimit { hash, .. }
+            | Self::InvalidHeight { hash, .. }
+            | Self::Invalid { hash, .. }
+            | Self::ValidationRequestError { hash, .. }
+            | Self::CancelledDuringDownload { hash }
+            | Self::CancelledAwaitingVerifierReadiness { hash, .. }
+            | Self::CancelledDuringVerification { hash, .. } => Some(*hash),
+            Self::NetworkServiceError { .. }
+            | Self::VerifierServiceError { .. }
+            | Self::Timeout => None,
+        }
+    }
+
     /// Returns the connected legacy peer that supplied the invalid block, if known.
     pub(super) fn advertiser_addr(&self) -> Option<PeerSocketAddr> {
         match self {
@@ -929,6 +948,11 @@ where
     /// Get the number of currently in-flight download and verify tasks.
     pub fn in_flight(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Returns `true` if this block already has an in-flight download or verification task.
+    pub(super) fn contains(&self, hash: block::Hash) -> bool {
+        self.cancel_handles.contains_key(&hash)
     }
 
     /// Returns true if there are no in-flight download and verify tasks.

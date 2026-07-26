@@ -801,6 +801,15 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
+    /// The single untrusted terminal `FindBlocks` hash currently being probed, if any.
+    ///
+    /// Mainnet and Testnet exclude the terminal response hash from trusted chain construction for
+    /// zcashd compatibility. When that leaves no other hashes, the terminal hash can still be
+    /// downloaded as a best-effort discovery hint and passed through normal block verification.
+    /// Keeping one hash here bounds that work and prevents a missing hint from entering the retry
+    /// path for required chain hashes.
+    terminal_probe_hash: Option<block::Hash>,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -954,6 +963,7 @@ where
             missing_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            terminal_probe_hash: None,
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1225,6 +1235,7 @@ where
         self.missing_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        self.terminal_probe_hash = None;
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1682,6 +1693,7 @@ where
         }
 
         let mut download_set = IndexSet::new();
+        let mut terminal_candidate = None;
         while let Some(res) = requests.next().await {
             match res
                 .unwrap_or_else(|e @ JoinError { .. }| {
@@ -1707,23 +1719,44 @@ where
                     // block we want to download. So we just accept any
                     // out-of-order first hashes.
 
-                    // We use the last hash for the tip, and we want to avoid bad
-                    // tips from zcashd's quirk of appending an unrelated hash.
-                    // So we discard the last hash on mainnet/testnet.
-                    // (We don't need to worry about missed downloads, because we
-                    // will pick them up again in ExtendTips.)
+                    // We use the last ordered hash for the tip, and we want to avoid bad tips from
+                    // zcashd's quirk of appending an unrelated hash. So we exclude the last hash
+                    // from ordered tip construction on mainnet/testnet. If it is the only response
+                    // hash, retain one bounded candidate for normal block verification without
+                    // trusting it as a tip.
                     //
-                    // In regtest we only connect to Zebra nodes, not zcashd,
-                    // so we trust all hashes in the response and keep them all.
-                    // This is necessary when there are only a small number of
-                    // blocks to sync (e.g. 2 new blocks), where stripping the
-                    // last hash leaves only 1 unknown hash and rchunks_exact(2)
-                    // would discard the entire response.
+                    // In regtest we only connect to Zebra nodes, not zcashd, so we trust all hashes
+                    // in the response and keep them all.
                     let hashes = if self.is_regtest {
                         hashes.as_slice()
                     } else {
                         match hashes.as_slice() {
                             [] => continue,
+                            [candidate] => {
+                                metrics::counter!("sync.obtain.terminal.candidate.observed.count")
+                                    .increment(1);
+
+                                // A single hash cannot establish chain order, but it is useful as
+                                // the same untrusted discovery hint as an `inv`. Keep at most one
+                                // candidate per fanout, and never start another while a previous
+                                // terminal probe is still in flight.
+                                if terminal_candidate.is_none()
+                                    && self.terminal_probe_hash.is_none()
+                                {
+                                    terminal_candidate = Some(*candidate);
+                                    debug!(
+                                        hash = ?candidate,
+                                        "retaining lone terminal FindBlocks hash as an untrusted probe candidate"
+                                    );
+                                } else {
+                                    metrics::counter!(
+                                        "sync.obtain.terminal.candidate.dropped.count"
+                                    )
+                                    .increment(1);
+                                }
+
+                                continue;
+                            }
                             [rest @ .., _last] => rest,
                         }
                     };
@@ -1755,29 +1788,35 @@ where
 
                     trace!(?unknown_hashes);
 
-                    let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
-                        CheckedTip {
+                    let new_tip = unknown_hashes
+                        .rchunks_exact(2)
+                        .next()
+                        .map(|end| CheckedTip {
                             tip: end[0],
                             expected_next: end[1],
-                        }
-                    } else {
-                        debug!("discarding response that extends only one block");
-                        continue;
-                    };
+                        });
 
                     // Make sure we get the same tips, regardless of the
                     // order of peer responses
-                    if !download_set.contains(&new_tip.expected_next) {
-                        debug!(?new_tip,
-                                        "adding new prospective tip, and removing existing tips in the new block hash list");
-                        self.prospective_tips
-                            .retain(|t| !unknown_hashes.contains(&t.expected_next));
-                        self.prospective_tips.insert(new_tip);
+                    if let Some(new_tip) = new_tip {
+                        if !download_set.contains(&new_tip.expected_next) {
+                            debug!(?new_tip,
+                                            "adding new prospective tip, and removing existing tips in the new block hash list");
+                            self.prospective_tips
+                                .retain(|t| !unknown_hashes.contains(&t.expected_next));
+                            self.prospective_tips.insert(new_tip);
+                        } else {
+                            debug!(
+                                ?new_tip,
+                                "discarding prospective tip: already in download set"
+                            );
+                        }
                     } else {
                         debug!(
-                            ?new_tip,
-                            "discarding prospective tip: already in download set"
+                            hash = ?unknown_hashes[0],
+                            "queueing one discovered block without constructing a prospective tip"
                         );
+                        metrics::counter!("sync.obtain.single.interior.hash.count").increment(1);
                     }
 
                     // security: the first response determines our download order
@@ -1804,6 +1843,37 @@ where
             debug!(?hash, "checking if state contains hash");
             if self.state_contains(*hash).await? {
                 return Err(eyre!("queued download of hash behind our chain tip"));
+            }
+        }
+
+        // Probe a lone terminal hash only when the normal ordered response produced no work. The
+        // hash is not a trusted tip and does not enter `prospective_tips`; downloading the block
+        // merely feeds the existing hash-binding, height, proof-of-work, and consensus checks.
+        if download_set.is_empty() && self.terminal_probe_hash.is_none() {
+            if let Some(candidate) = terminal_candidate {
+                if self.downloads.as_ref().get_ref().contains(candidate) {
+                    debug!(
+                        hash = ?candidate,
+                        "skipping in-flight terminal FindBlocks probe candidate"
+                    );
+                    metrics::counter!("sync.obtain.terminal.candidate.in_flight.count")
+                        .increment(1);
+                } else if self.state_contains(candidate).await? {
+                    debug!(
+                        hash = ?candidate,
+                        "skipping known terminal FindBlocks probe candidate"
+                    );
+                    metrics::counter!("sync.obtain.terminal.candidate.known.count").increment(1);
+                } else {
+                    info!(
+                        hash = ?candidate,
+                        "probing lone terminal FindBlocks hash through normal block verification"
+                    );
+                    metrics::counter!("sync.obtain.terminal.probe.queued.count").increment(1);
+                    self.trace.terminal_probe(candidate, "queued", None, None);
+                    self.terminal_probe_hash = Some(candidate);
+                    download_set.insert(candidate);
+                }
             }
         }
 
@@ -2163,11 +2233,58 @@ where
     /// speculative dispatch and re-dispatching the hash from its `select!` timer arm once the backoff
     /// elapses. Bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]; only a block that stays missing
     /// for the whole budget (e.g. a bad tip) falls through to [`Self::handle_block_response`] and
-    /// restarts the round to obtain fresh tips and peers.
+    /// restarts the round to obtain fresh tips and peers. A lone terminal-hash probe is not a
+    /// required ordered block, so a miss ends that best-effort probe without using either queue
+    /// retry budget.
     async fn handle_block_response_with_missing_retry(
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), Report> {
+        let response_hash = response
+            .as_ref()
+            .ok()
+            .map(|(_height, hash)| *hash)
+            .or_else(|| response.as_ref().err().and_then(|error| error.block_hash()));
+
+        if let Some(hash) = response_hash.filter(|hash| Some(*hash) == self.terminal_probe_hash) {
+            self.terminal_probe_hash = None;
+
+            match &response {
+                Ok((height, _hash)) => {
+                    info!(?hash, ?height, "verified lone terminal FindBlocks probe");
+                    metrics::counter!("sync.obtain.terminal.probe.verified.count").increment(1);
+                    self.trace
+                        .terminal_probe(hash, "verified", Some(*height), None);
+                }
+                Err(error) if error.not_found_download().is_some() => {
+                    // This hash was only an untrusted discovery hint, not an ordered hash required
+                    // to complete a known range. Let the next fanout discover it again rather than
+                    // applying the long registry-miss retry budget used for required blocks.
+                    debug!(
+                        ?hash,
+                        ?error,
+                        "lone terminal FindBlocks probe was unavailable"
+                    );
+                    metrics::counter!("sync.obtain.terminal.probe.unavailable.count").increment(1);
+                    self.trace
+                        .terminal_probe(hash, "unavailable", None, Some(error));
+                    self.missing_block_retry_counts.remove(&hash);
+                    self.registry_miss_retry_counts.remove(&hash);
+                    self.registry_miss_retry.remove(&hash);
+                    return Ok(());
+                }
+                Err(error) => {
+                    debug!(
+                        ?hash,
+                        ?error,
+                        "lone terminal FindBlocks probe failed normal block processing"
+                    );
+                    metrics::counter!("sync.obtain.terminal.probe.failed.count").increment(1);
+                    self.trace.terminal_probe(hash, "failed", None, Some(error));
+                }
+            }
+        }
+
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
