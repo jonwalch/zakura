@@ -1886,8 +1886,8 @@ async fn obtain_tips_ignores_known_hash_after_first_unknown() -> Result<(), crat
 }
 
 #[tokio::test]
-async fn obtain_tips_downloads_lone_terminal_hash_as_bounded_probe() -> Result<(), crate::BoxError>
-{
+async fn obtain_tips_bad_or_known_candidate_does_not_suppress_later_block(
+) -> Result<(), crate::BoxError> {
     let (
         mut chain_sync,
         _sync_status,
@@ -1903,39 +1903,56 @@ async fn obtain_tips_downloads_lone_terminal_hash_as_bounded_probe() -> Result<(
         zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
     let block0_hash = block0.hash();
     let block1_hash = block1.hash();
+    let known_hash = block::Hash::from([0x51; 32]);
+    let bad_hash = block::Hash::from([0x52; 32]);
+    let untrusted_terminal_hash = block::Hash::from([0x53; 32]);
 
     let respond_to_requests = async {
         state_service
             .expect_request(zs::Request::BlockLocator)
             .await
             .respond(zs::Response::BlockLocator(vec![block0_hash]));
-
-        // At the network tip, the only unknown block is also the terminal hash that mainnet and
-        // testnet sync normally exclude from trusted tip construction for zcashd compatibility.
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(zn::Response::BlockHashes(vec![block1_hash]));
-
-        for _ in 0..(sync::FANOUT - 1) {
+        for hashes in [
+            vec![known_hash],
+            vec![bad_hash],
+            vec![block1_hash, untrusted_terminal_hash],
+        ] {
             peer_set
                 .expect_request(zn::Request::FindBlocks {
                     known_blocks: vec![block0_hash],
                     stop: None,
                 })
                 .await
-                .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
+                .respond(zn::Response::BlockHashes(hashes));
         }
 
-        // A lone terminal hash is untrusted discovery input. It still gets the normal state,
-        // download, hash-binding, height, proof-of-work, and consensus verification path.
+        // The two-hash response leaves one unpaired interior candidate after compatibility
+        // stripping. It must use the same best-effort path as the lone candidates.
         state_service
             .expect_request(zs::Request::KnownBlock(block1_hash))
             .await
             .respond(zs::Response::KnownBlock(None));
+        state_service
+            .expect_request(zs::Request::KnownBlock(known_hash))
+            .await
+            .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+        state_service
+            .expect_request(zs::Request::KnownBlock(bad_hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+        state_service
+            .expect_request(zs::Request::KnownBlock(block1_hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+
+        // The first candidate fails immediately, but the later honest candidate is still queued.
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(bad_hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((
+                block0.clone(),
+                None,
+            ))]));
         peer_set
             .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
             .await
@@ -1954,295 +1971,39 @@ async fn obtain_tips_downloads_lone_terminal_hash_as_bounded_probe() -> Result<(
     let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
     responded?;
     assert!(extra_hashes?.is_empty());
-
-    let response = chain_sync.downloads.next().await.expect("probe was queued");
+    assert!(chain_sync.prospective_tips.is_empty());
     assert_eq!(
-        response.as_ref().expect("probe was verified"),
-        &(Height(1), block1_hash)
+        chain_sync.ambiguous_probe_hashes,
+        HashSet::from([bad_hash, block1_hash])
     );
+
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        responses.push(chain_sync.downloads.next().await.expect("probe was queued"));
+    }
+
+    let bad_index = responses
+        .iter()
+        .position(|response| {
+            matches!(response, Err(BlockDownloadVerifyError::DownloadFailed { hash, .. }) if *hash == bad_hash)
+        })
+        .expect("the bad probe failed hash binding");
+    chain_sync
+        .handle_block_response_with_missing_retry(responses.swap_remove(bad_index))
+        .await?;
+    assert_eq!(
+        chain_sync.ambiguous_probe_hashes,
+        HashSet::from([block1_hash]),
+        "a failed candidate must not cancel later honest probes"
+    );
+
+    let response = responses.pop().expect("the honest probe was queued");
+    assert!(matches!(&response, Ok((Height(1), hash)) if *hash == block1_hash));
     chain_sync
         .handle_block_response_with_missing_retry(response)
         .await?;
-    assert_eq!(chain_sync.terminal_probe_hash, None);
-    assert!(chain_sync.prospective_tips.is_empty());
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn terminal_probe_rejects_a_block_with_a_different_hash_before_verification(
-) -> Result<(), crate::BoxError> {
-    let (
-        mut chain_sync,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        mut state_service,
-        _mock_chain_tip_sender,
-    ) = setup_chain_sync();
-
-    let block0: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
-    let block1: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
-    let block2: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
-    let block0_hash = block0.hash();
-    let block1_hash = block1.hash();
-
-    let respond_to_requests = async {
-        state_service
-            .expect_request(zs::Request::BlockLocator)
-            .await
-            .respond(zs::Response::BlockLocator(vec![block0_hash]));
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(zn::Response::BlockHashes(vec![block1_hash]));
-        for _ in 0..(sync::FANOUT - 1) {
-            peer_set
-                .expect_request(zn::Request::FindBlocks {
-                    known_blocks: vec![block0_hash],
-                    stop: None,
-                })
-                .await
-                .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-        }
-        state_service
-            .expect_request(zs::Request::KnownBlock(block1_hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-
-        peer_set
-            .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
-            .await
-            .respond(zn::Response::Blocks(vec![Available((block2, None))]));
-
-        Ok::<_, crate::BoxError>(())
-    };
-
-    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
-    responded?;
-    assert!(extra_hashes?.is_empty());
-
-    let response = chain_sync
-        .downloads
-        .next()
-        .await
-        .expect("terminal probe was queued");
-    assert!(matches!(
-        &response,
-        Err(BlockDownloadVerifyError::DownloadFailed { hash, .. }) if *hash == block1_hash
-    ));
-    assert!(chain_sync
-        .handle_block_response_with_missing_retry(response)
-        .await
-        .is_err());
-    assert_eq!(chain_sync.terminal_probe_hash, None);
-    block_verifier_router.expect_no_requests().await;
-    peer_set.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn obtain_tips_downloads_one_interior_hash_without_trusting_the_terminal_hash(
-) -> Result<(), crate::BoxError> {
-    let (
-        mut chain_sync,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        mut state_service,
-        _mock_chain_tip_sender,
-    ) = setup_chain_sync();
-
-    let block0: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
-    let block1: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
-    let block0_hash = block0.hash();
-    let block1_hash = block1.hash();
-    let untrusted_terminal_hash = block::Hash::from([0xA5; 32]);
-
-    let respond_to_requests = async {
-        state_service
-            .expect_request(zs::Request::BlockLocator)
-            .await
-            .respond(zs::Response::BlockLocator(vec![block0_hash]));
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(zn::Response::BlockHashes(vec![
-                block1_hash,
-                untrusted_terminal_hash,
-            ]));
-
-        state_service
-            .expect_request(zs::Request::KnownBlock(block1_hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-        for _ in 0..(sync::FANOUT - 1) {
-            peer_set
-                .expect_request(zn::Request::FindBlocks {
-                    known_blocks: vec![block0_hash],
-                    stop: None,
-                })
-                .await
-                .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-        }
-
-        state_service
-            .expect_request(zs::Request::KnownBlock(block1_hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-        peer_set
-            .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
-            .await
-            .respond(zn::Response::Blocks(vec![Available((
-                block1.clone(),
-                None,
-            ))]));
-        block_verifier_router
-            .expect_request(zakura_consensus::Request::Commit(block1))
-            .await
-            .respond(block1_hash);
-
-        Ok::<_, crate::BoxError>(())
-    };
-
-    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
-    responded?;
-    assert!(extra_hashes?.is_empty());
-    assert!(chain_sync.prospective_tips.is_empty());
-    assert_eq!(chain_sync.terminal_probe_hash, None);
-
-    let response = chain_sync
-        .downloads
-        .next()
-        .await
-        .expect("interior hash was queued");
-    assert_eq!(response?, (Height(1), block1_hash));
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn obtain_tips_does_not_probe_a_known_lone_terminal_hash() -> Result<(), crate::BoxError> {
-    let (
-        mut chain_sync,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        mut state_service,
-        _mock_chain_tip_sender,
-    ) = setup_chain_sync();
-
-    let locator = block::Hash::from([0x41; 32]);
-    let known_terminal = block::Hash::from([0x42; 32]);
-
-    let respond_to_requests = async {
-        state_service
-            .expect_request(zs::Request::BlockLocator)
-            .await
-            .respond(zs::Response::BlockLocator(vec![locator]));
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![locator],
-                stop: None,
-            })
-            .await
-            .respond(zn::Response::BlockHashes(vec![known_terminal]));
-        for _ in 0..(sync::FANOUT - 1) {
-            peer_set
-                .expect_request(zn::Request::FindBlocks {
-                    known_blocks: vec![locator],
-                    stop: None,
-                })
-                .await
-                .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-        }
-        state_service
-            .expect_request(zs::Request::KnownBlock(known_terminal))
-            .await
-            .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
-
-        Ok::<_, crate::BoxError>(())
-    };
-
-    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
-    responded?;
-    assert!(extra_hashes?.is_empty());
-    assert_eq!(chain_sync.terminal_probe_hash, None);
-    assert!(chain_sync.prospective_tips.is_empty());
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn obtain_tips_caps_competing_lone_terminal_candidates_at_one() -> Result<(), crate::BoxError>
-{
-    let (
-        mut chain_sync,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        mut state_service,
-        _mock_chain_tip_sender,
-    ) = setup_chain_sync();
-
-    let locator = block::Hash::from([0x51; 32]);
-    let candidates = [
-        block::Hash::from([0x52; 32]),
-        block::Hash::from([0x53; 32]),
-        block::Hash::from([0x54; 32]),
-    ];
-
-    let respond_to_requests = async {
-        state_service
-            .expect_request(zs::Request::BlockLocator)
-            .await
-            .respond(zs::Response::BlockLocator(vec![locator]));
-        for candidate in candidates {
-            peer_set
-                .expect_request(zn::Request::FindBlocks {
-                    known_blocks: vec![locator],
-                    stop: None,
-                })
-                .await
-                .respond(zn::Response::BlockHashes(vec![candidate]));
-        }
-
-        state_service
-            .expect_request_that(|request| {
-                matches!(request, zs::Request::KnownBlock(hash) if candidates.contains(hash))
-            })
-            .await
-            .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
-
-        Ok::<_, crate::BoxError>(())
-    };
-
-    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
-    responded?;
-    assert!(extra_hashes?.is_empty());
-    assert_eq!(chain_sync.terminal_probe_hash, None);
+    assert!(chain_sync.ambiguous_probe_hashes.is_empty());
+    assert!(chain_sync.registry_miss_retry.is_empty());
     state_service.expect_no_requests().await;
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
@@ -2251,7 +2012,7 @@ async fn obtain_tips_caps_competing_lone_terminal_candidates_at_one() -> Result<
 }
 
 #[tokio::test]
-async fn obtain_tips_does_not_reclassify_an_in_flight_hash_as_a_terminal_probe(
+async fn obtain_tips_does_not_reclassify_an_in_flight_hash_as_an_ambiguous_probe(
 ) -> Result<(), crate::BoxError> {
     let (
         mut chain_sync,
@@ -2311,7 +2072,7 @@ async fn obtain_tips_does_not_reclassify_an_in_flight_hash_as_a_terminal_probe(
         futures::join!(chain_sync.obtain_tips(), respond_to_tip_requests);
     responded?;
     assert!(extra_hashes?.is_empty());
-    assert_eq!(chain_sync.terminal_probe_hash, None);
+    assert!(chain_sync.ambiguous_probe_hashes.is_empty());
     state_service.expect_no_requests().await;
     peer_set.expect_no_requests().await;
 
@@ -2658,11 +2419,11 @@ async fn registry_miss_schedules_backoff_retry() {
     peer_set.expect_no_requests().await;
 }
 
-/// A terminal probe is best-effort discovery, not a required ordered block. If no connected peer
+/// An ambiguous probe is best-effort discovery, not a required ordered block. If no connected peer
 /// can serve it, the next tip fanout should rediscover current work instead of spending the
 /// required-block registry retry budget on an untrusted hint.
 #[tokio::test]
-async fn terminal_probe_registry_miss_does_not_schedule_required_block_retries() {
+async fn ambiguous_probe_registry_miss_does_not_schedule_required_block_retries() {
     let (
         mut chain_sync,
         _sync_status,
@@ -2673,7 +2434,7 @@ async fn terminal_probe_registry_miss_does_not_schedule_required_block_retries()
     ) = setup_chain_sync();
 
     let block_hash = block::Hash::from([0xBC; 32]);
-    chain_sync.terminal_probe_hash = Some(block_hash);
+    chain_sync.ambiguous_probe_hashes.insert(block_hash);
     let error = BlockDownloadVerifyError::DownloadFailed {
         error: not_found_registry_error(block_hash),
         hash: block_hash,
@@ -2682,9 +2443,9 @@ async fn terminal_probe_registry_miss_does_not_schedule_required_block_retries()
     chain_sync
         .handle_block_response_with_missing_retry(Err(error))
         .await
-        .expect("an unavailable terminal probe should end without restarting the round");
+        .expect("an unavailable ambiguous probe should end without restarting the round");
 
-    assert_eq!(chain_sync.terminal_probe_hash, None);
+    assert!(chain_sync.ambiguous_probe_hashes.is_empty());
     assert!(!chain_sync.registry_miss_retry.contains_key(&block_hash));
     assert!(!chain_sync
         .registry_miss_retry_counts

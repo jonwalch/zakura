@@ -109,24 +109,6 @@ impl LegacySyncTrace {
         });
     }
 
-    /// Records the bounded terminal-hash probe lifecycle separately from generic block work.
-    pub(super) fn terminal_probe(
-        &self,
-        hash: block::Hash,
-        result: &'static str,
-        height: Option<Height>,
-        error: Option<&dyn Display>,
-    ) {
-        self.emit("terminal_probe", |row| {
-            row.insert("hash".to_string(), Value::String(hash.to_string()));
-            row.insert("result".to_string(), Value::String(result.to_string()));
-            insert_height(row, "height", height);
-            if let Some(error) = error {
-                row.insert("error".to_string(), Value::String(error.to_string()));
-            }
-        });
-    }
-
     pub(super) fn block_finish(
         &self,
         hash: block::Hash,
