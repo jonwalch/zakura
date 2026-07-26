@@ -2507,11 +2507,9 @@ async fn registry_miss_schedules_backoff_retry() {
     peer_set.expect_no_requests().await;
 }
 
-/// An ambiguous probe is best-effort discovery, not a required ordered block. If no connected peer
-/// can serve it, the next tip fanout should rediscover current work instead of spending the
-/// required-block registry retry budget on an untrusted hint.
+/// An ambiguous probe does not use required-block retries until ordered evidence promotes it.
 #[tokio::test]
-async fn ambiguous_probe_registry_miss_does_not_schedule_required_block_retries() {
+async fn ambiguous_probe_registry_miss_uses_retries_only_after_ordered_promotion() {
     let (
         mut chain_sync,
         _sync_status,
@@ -2541,6 +2539,22 @@ async fn ambiguous_probe_registry_miss_does_not_schedule_required_block_retries(
     assert!(!chain_sync
         .missing_block_retry_counts
         .contains_key(&block_hash));
+
+    chain_sync.ambiguous_probe_hashes.insert(block_hash);
+    chain_sync.promote_ambiguous_probes([&block_hash]);
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: not_found_registry_error(block_hash),
+        hash: block_hash,
+    };
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("an ordered hash within its retry budget should keep the round alive");
+    assert!(chain_sync.registry_miss_retry.contains_key(&block_hash));
+    assert_eq!(
+        chain_sync.registry_miss_retry_counts.get(&block_hash),
+        Some(&1)
+    );
     peer_set.expect_no_requests().await;
 }
 

@@ -1555,6 +1555,7 @@ where
                         // security: use the actual number of new downloads from all peers, so the
                         // last peer to respond can't toggle our mempool.
                         self.recent_syncs.push_extend_tips_length(discovered);
+                        self.promote_ambiguous_probes(&download_set);
                         reserve.extend(download_set);
                         extend = None;
                         last_progress = Instant::now();
@@ -1873,9 +1874,8 @@ where
         debug!(?self.prospective_tips);
 
         // Check that the new tips we got are actually unknown.
+        self.promote_ambiguous_probes(&download_set);
         for hash in &download_set {
-            // Ordered evidence promotes an in-flight probe to required-block retry semantics.
-            self.ambiguous_probe_hashes.remove(hash);
             debug!(?hash, "checking if state contains hash");
             if self.state_contains(*hash).await? {
                 return Err(eyre!("queued download of hash behind our chain tip"));
@@ -1928,6 +1928,15 @@ where
             .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+    }
+
+    fn promote_ambiguous_probes<'a>(
+        &mut self,
+        ordered_hashes: impl IntoIterator<Item = &'a block::Hash>,
+    ) {
+        for hash in ordered_hashes {
+            self.ambiguous_probe_hashes.remove(hash);
+        }
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block
