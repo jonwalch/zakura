@@ -33,6 +33,7 @@ use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
+use zakura_consensus::{RouterError, VerifyBlockError, VerifyCheckpointError};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -78,6 +79,56 @@ fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresse
         .advertiser_addr()
         .map(|addr| peer_addr_label(addr, expose_peer_addresses))
         .unwrap_or_else(|| "unattributed".to_string())
+}
+
+fn is_internal_commit_failure(error: &zs::CommitBlockError) -> bool {
+    !matches!(
+        error,
+        zs::CommitBlockError::Duplicate { .. } | zs::CommitBlockError::ValidateContextError(_)
+    )
+}
+
+fn is_internal_block_verifier_failure(error: &VerifyBlockError) -> bool {
+    match error {
+        VerifyBlockError::Depth { .. }
+        | VerifyBlockError::ValidateProposal(_)
+        | VerifyBlockError::StateService { .. } => true,
+        VerifyBlockError::Commit(error) => is_internal_commit_failure(error),
+        VerifyBlockError::Block { .. }
+        | VerifyBlockError::Equihash { .. }
+        | VerifyBlockError::Time(_)
+        | VerifyBlockError::Transaction(_)
+        | VerifyBlockError::Subsidy(_) => false,
+        _ => true,
+    }
+}
+
+fn is_internal_verifier_failure(error: &RouterError) -> bool {
+    match error {
+        RouterError::Block { source } => is_internal_block_verifier_failure(source),
+        RouterError::Checkpoint { source } => match source.as_ref() {
+            VerifyCheckpointError::Finished
+            | VerifyCheckpointError::TooHigh { .. }
+            | VerifyCheckpointError::AlreadyVerified { .. }
+            | VerifyCheckpointError::NewerRequest { .. }
+            | VerifyCheckpointError::Dropped
+            | VerifyCheckpointError::Tip(_)
+            | VerifyCheckpointError::CheckpointList(_)
+            | VerifyCheckpointError::QueuedLimit
+            | VerifyCheckpointError::ShuttingDown => true,
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .map(|error| is_internal_commit_failure(error.inner()))
+                .unwrap_or(true),
+            VerifyCheckpointError::VerifyBlock(error) => is_internal_block_verifier_failure(error),
+            VerifyCheckpointError::CoinbaseHeight { .. }
+            | VerifyCheckpointError::BadMerkleRoot { .. }
+            | VerifyCheckpointError::DuplicateTransaction
+            | VerifyCheckpointError::SubsidyError(_)
+            | VerifyCheckpointError::AmountError(_)
+            | VerifyCheckpointError::UnexpectedSideChain { .. } => false,
+        },
+    }
 }
 
 /// Controls how many times the syncer requeues a required block hash after a peer responds
@@ -2252,12 +2303,10 @@ where
                     return Ok(());
                 }
                 Err(error) => {
-                    // Only scored verifier errors are definitely attributable to the peer;
-                    // score-zero errors can be internal.
-                    let is_peer_failure = match error {
+                    let is_probe_local_failure = match error {
                         BlockDownloadVerifyError::DownloadFailed { .. } => true,
                         BlockDownloadVerifyError::Invalid { error, .. } => {
-                            error.misbehavior_score() != 0
+                            !is_internal_verifier_failure(error)
                         }
                         _ => false,
                     };
@@ -2268,7 +2317,7 @@ where
                     );
 
                     let result = self.handle_block_response(response);
-                    if is_peer_failure {
+                    if is_probe_local_failure {
                         // One peer's bad block must not cancel other probes from the same fanout.
                         return Ok(());
                     }

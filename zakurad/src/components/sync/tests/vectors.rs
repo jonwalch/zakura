@@ -2544,7 +2544,8 @@ async fn ambiguous_probe_registry_miss_does_not_schedule_required_block_retries(
     peer_set.expect_no_requests().await;
 }
 
-/// Peer-invalid ambiguous probes end independently, while internal verifier failures restart sync.
+/// Peer-invalid ambiguous probes end independently, including score-zero failures, while internal
+/// verifier failures restart sync.
 #[tokio::test]
 async fn ambiguous_probe_distinguishes_peer_and_internal_verifier_failures() {
     let (
@@ -2556,25 +2557,63 @@ async fn ambiguous_probe_distinguishes_peer_and_internal_verifier_failures() {
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
-    let peer_invalid_hash = block::Hash::from([0xBD; 32]);
-    let internal_failure_hash = block::Hash::from([0xBE; 32]);
-    chain_sync
-        .ambiguous_probe_hashes
-        .extend([peer_invalid_hash, internal_failure_hash]);
-    let peer_error = BlockDownloadVerifyError::Invalid {
-        error: RouterError::Block {
-            source: Box::new(VerifyBlockError::Block {
-                source: BlockError::NoTransactions,
-            }),
+    let scored_peer_invalid_hash = block::Hash::from([0xBD; 32]);
+    let time_invalid_hash = block::Hash::from([0xBE; 32]);
+    let side_chain_hash = block::Hash::from([0xBF; 32]);
+    let internal_failure_hash = block::Hash::from([0xC0; 32]);
+    chain_sync.ambiguous_probe_hashes.extend([
+        scored_peer_invalid_hash,
+        time_invalid_hash,
+        side_chain_hash,
+        internal_failure_hash,
+    ]);
+
+    let peer_errors = [
+        BlockDownloadVerifyError::Invalid {
+            error: RouterError::Block {
+                source: Box::new(VerifyBlockError::Block {
+                    source: BlockError::NoTransactions,
+                }),
+            },
+            height: Height(1),
+            hash: scored_peer_invalid_hash,
+            advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
         },
-        height: Height(1),
-        hash: peer_invalid_hash,
-        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
-    };
-    chain_sync
-        .handle_block_response_with_missing_retry(Err(peer_error))
-        .await
-        .expect("a peer-invalid candidate should not cancel sibling probes");
+        BlockDownloadVerifyError::Invalid {
+            error: RouterError::Block {
+                source: Box::new(VerifyBlockError::Time(
+                    block::BlockTimeError::InvalidBlockTime(
+                        chrono::DateTime::from_timestamp(10, 0).unwrap(),
+                        Height(1),
+                        time_invalid_hash,
+                        chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                    ),
+                )),
+            },
+            height: Height(1),
+            hash: time_invalid_hash,
+            advertiser_addr: Some("127.0.0.1:8234".parse().unwrap()),
+        },
+        BlockDownloadVerifyError::Invalid {
+            error: RouterError::Checkpoint {
+                source: Box::new(VerifyCheckpointError::UnexpectedSideChain {
+                    expected: block::Hash::from([0xC1; 32]),
+                    found: side_chain_hash,
+                }),
+            },
+            height: Height(1),
+            hash: side_chain_hash,
+            advertiser_addr: Some("127.0.0.1:8235".parse().unwrap()),
+        },
+    ];
+
+    for error in peer_errors {
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await
+            .expect("a peer-invalid candidate should not cancel sibling probes");
+    }
+
     assert_eq!(
         chain_sync.ambiguous_probe_hashes,
         HashSet::from([internal_failure_hash])
