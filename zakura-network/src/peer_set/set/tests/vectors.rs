@@ -5,6 +5,7 @@ use std::{
     collections::HashSet,
     iter,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -822,7 +823,16 @@ fn syncing_disconnects_pruned_peers() {
 
         let peer_ready = peer_set.ready().await.expect("peer set is ready");
         let request = Request::BlocksByHash(iter::once(test_hash).collect());
-        let _response = peer_ready.call(request.clone());
+        let response = peer_ready.call(request.clone());
+
+        // The mock client request channel has one buffered slot in addition to
+        // the first reserved send, so fill that slot before checking backpressure.
+        let peer_ready = peer_set
+            .ready()
+            .now_or_never()
+            .expect("archive peer has one remaining request slot")
+            .expect("peer set is ready");
+        let second_response = peer_ready.call(request.clone());
 
         assert!(
             peer_set.ready().now_or_never().is_none(),
@@ -842,6 +852,8 @@ fn syncing_disconnects_pruned_peers() {
                 .request,
             request
         );
+
+        std::mem::drop((response, second_response));
     });
 }
 
@@ -884,9 +896,8 @@ fn syncing_with_only_pruned_peers_waits_for_archive_peers() {
                 .demand_receiver()
                 .as_mut()
                 .expect("demand receiver exists")
-                .try_next()
-                .expect("demand channel is open")
-                .is_some(),
+                .try_recv()
+                .is_ok(),
             "peer set should ask the crawler for an archive peer"
         );
     });
@@ -1251,10 +1262,14 @@ fn find_blocks_stall_not_tracked_for_zcashd_compat() {
     let sidecar_ip = Ipv4Addr::LOCALHOST;
     let sidecar_addr: PeerSocketAddr =
         SocketAddr::new(IpAddr::V6(sidecar_ip.to_ipv6_mapped()), 1).into();
-    let (sidecar, mut sidecar_handle) = ClientTestHarness::build()
+    let (mut sidecar, mut sidecar_handle) = ClientTestHarness::build()
         .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
         .with_connected_addr(ConnectedAddr::new_inbound_direct(sidecar_addr))
         .finish();
+    Arc::get_mut(&mut sidecar.connection_info)
+        .expect("test client has unique connection info")
+        .remote
+        .services = PeerServices::NODE_NETWORK;
     let discovered_peers = stream::iter([Ok::<_, BoxError>(Change::Insert(
         sidecar_addr,
         sidecar.into(),
@@ -1526,16 +1541,24 @@ fn sidecar_and_ordinary_discovery() -> (
     let ordinary_addr: PeerSocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 2).into();
 
-    let (sidecar_client, sidecar_handle) = ClientTestHarness::build()
+    let (mut sidecar_client, sidecar_handle) = ClientTestHarness::build()
         .with_version(peer_version)
         .with_connected_addr(ConnectedAddr::InboundDirect { addr: sidecar_addr })
         .finish();
-    let (ordinary_client, ordinary_handle) = ClientTestHarness::build()
+    Arc::get_mut(&mut sidecar_client.connection_info)
+        .expect("test client has unique connection info")
+        .remote
+        .services = PeerServices::NODE_NETWORK;
+    let (mut ordinary_client, ordinary_handle) = ClientTestHarness::build()
         .with_version(peer_version)
         .with_connected_addr(ConnectedAddr::InboundDirect {
             addr: ordinary_addr,
         })
         .finish();
+    Arc::get_mut(&mut ordinary_client.connection_info)
+        .expect("test client has unique connection info")
+        .remote
+        .services = PeerServices::NODE_NETWORK;
 
     let discovered = stream::iter([
         Ok::<_, BoxError>(Change::Insert(
