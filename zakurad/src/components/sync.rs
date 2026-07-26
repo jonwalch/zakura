@@ -2247,8 +2247,15 @@ where
                     return Ok(());
                 }
                 Err(error) => {
-                    let is_peer_failure =
-                        matches!(error, BlockDownloadVerifyError::DownloadFailed { .. });
+                    // Only scored verifier errors are definitely attributable to the peer;
+                    // score-zero errors can be internal.
+                    let is_peer_failure = match error {
+                        BlockDownloadVerifyError::DownloadFailed { .. } => true,
+                        BlockDownloadVerifyError::Invalid { error, .. } => {
+                            error.misbehavior_score() != 0
+                        }
+                        _ => false,
+                    };
                     debug!(
                         ?hash,
                         ?error,

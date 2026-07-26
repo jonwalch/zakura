@@ -22,7 +22,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
-    Config as ConsensusConfig, RouterError, VerifyBlockError, VerifyCheckpointError,
+    BlockError, Config as ConsensusConfig, RouterError, VerifyBlockError, VerifyCheckpointError,
 };
 use zakura_network::{InventoryResponse, PeerSocketAddr};
 use zakura_state::Config as StateConfig;
@@ -2456,10 +2456,9 @@ async fn ambiguous_probe_registry_miss_does_not_schedule_required_block_retries(
     peer_set.expect_no_requests().await;
 }
 
-/// Internal verifier failures must retain the normal sync-restart behavior, even when the block
-/// was discovered through an ambiguous best-effort probe.
+/// Peer-invalid ambiguous probes end independently, while internal verifier failures restart sync.
 #[tokio::test]
-async fn ambiguous_probe_propagates_verifier_state_service_failures() {
+async fn ambiguous_probe_distinguishes_peer_and_internal_verifier_failures() {
     let (
         mut chain_sync,
         _sync_status,
@@ -2469,22 +2468,44 @@ async fn ambiguous_probe_propagates_verifier_state_service_failures() {
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
-    let block_hash = block::Hash::from([0xBD; 32]);
-    chain_sync.ambiguous_probe_hashes.insert(block_hash);
-    let error = BlockDownloadVerifyError::Invalid {
+    let peer_invalid_hash = block::Hash::from([0xBD; 32]);
+    let internal_failure_hash = block::Hash::from([0xBE; 32]);
+    chain_sync
+        .ambiguous_probe_hashes
+        .extend([peer_invalid_hash, internal_failure_hash]);
+    let peer_error = BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {
-            source: Box::new(VerifyBlockError::StateService {
-                source: crate::BoxError::from("synthetic state service failure"),
-                hash: block_hash,
+            source: Box::new(VerifyBlockError::Block {
+                source: BlockError::NoTransactions,
             }),
         },
         height: Height(1),
-        hash: block_hash,
+        hash: peer_invalid_hash,
+        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
+    };
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(peer_error))
+        .await
+        .expect("a peer-invalid candidate should not cancel sibling probes");
+    assert_eq!(
+        chain_sync.ambiguous_probe_hashes,
+        HashSet::from([internal_failure_hash])
+    );
+
+    let internal_error = BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::StateService {
+                source: crate::BoxError::from("synthetic state service failure"),
+                hash: internal_failure_hash,
+            }),
+        },
+        height: Height(1),
+        hash: internal_failure_hash,
         advertiser_addr: None,
     };
 
     let result = chain_sync
-        .handle_block_response_with_missing_retry(Err(error))
+        .handle_block_response_with_missing_retry(Err(internal_error))
         .await;
 
     assert!(
