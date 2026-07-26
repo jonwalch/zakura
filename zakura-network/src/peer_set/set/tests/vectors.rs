@@ -14,6 +14,7 @@ use tower::{discover::Change, Service, ServiceExt};
 
 use zakura_chain::{
     block,
+    chain_tip::AT_OR_NEAR_TIP_THRESHOLD,
     parameters::{Network, NetworkUpgrade},
 };
 
@@ -30,7 +31,7 @@ use crate::{
     BannedIps, BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
 };
 
-use super::{super::PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE, PeerSetBuilder, PeerVersions};
+use super::{PeerSetBuilder, PeerVersions};
 
 #[test]
 fn peer_set_ready_single_connection() {
@@ -793,9 +794,9 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
     });
 }
 
-/// Check that historical block downloads exclude pruned peers.
+/// Check that syncing disconnects pruned peers and routes blocks to archive peers.
 #[test]
-fn historical_block_downloads_require_node_network() {
+fn syncing_disconnects_pruned_peers() {
     let test_hash = block::Hash([1; 32]);
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
@@ -810,9 +811,7 @@ fn historical_block_downloads_require_node_network() {
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
     best_tip.send_best_tip_height(Some(block::Height(2_000_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(
-        PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE + 1,
-    ));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(AT_OR_NEAR_TIP_THRESHOLD + 1));
 
     runtime.block_on(async move {
         let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
@@ -826,11 +825,14 @@ fn historical_block_downloads_require_node_network() {
         let _response = peer_ready.call(request.clone());
 
         assert!(
+            peer_set.ready().now_or_never().is_none(),
+            "peer set should wait while its only archive peer is busy"
+        );
+        assert!(
             handles[0]
                 .try_to_receive_outbound_client_request()
-                .request()
-                .is_none(),
-            "historical block request routed to pruned peer"
+                .is_closed(),
+            "pruned peer should be disconnected while syncing"
         );
         assert_eq!(
             handles[1]
@@ -843,9 +845,56 @@ fn historical_block_downloads_require_node_network() {
     });
 }
 
-/// Check that pruned peers handle generic block downloads near the network tip.
+/// Check that a peer set with only pruned peers waits and asks for archive peers while syncing.
 #[test]
-fn near_tip_block_downloads_allow_pruned_peers() {
+fn syncing_with_only_pruned_peers_waits_for_archive_peers() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, mut handles) =
+        peer_versions.mock_peer_discovery_with_services(&[PeerServices::empty()]);
+    let (minimum_peer_version, best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    best_tip.send_best_tip_height(Some(block::Height(2_000_000)));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(AT_OR_NEAR_TIP_THRESHOLD + 1));
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        assert!(
+            peer_set.ready().now_or_never().is_none(),
+            "peer set should wait rather than becoming ready with only pruned peers"
+        );
+        assert!(
+            handles[0]
+                .try_to_receive_outbound_client_request()
+                .is_closed(),
+            "pruned peer should be disconnected while syncing"
+        );
+        assert!(
+            peer_set_guard
+                .demand_receiver()
+                .as_mut()
+                .expect("demand receiver exists")
+                .try_next()
+                .expect("demand channel is open")
+                .is_some(),
+            "peer set should ask the crawler for an archive peer"
+        );
+    });
+}
+
+/// Check that pruned peers handle generic block downloads at or near the network tip.
+#[test]
+fn at_or_near_tip_block_downloads_allow_pruned_peers() {
     let test_hash = block::Hash([2; 32]);
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
     let peer_versions = PeerVersions {
@@ -860,9 +909,7 @@ fn near_tip_block_downloads_allow_pruned_peers() {
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
     best_tip.send_best_tip_height(Some(block::Height(2_500_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(
-        PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE,
-    ));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(AT_OR_NEAR_TIP_THRESHOLD));
 
     runtime.block_on(async move {
         let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
@@ -885,9 +932,9 @@ fn near_tip_block_downloads_allow_pruned_peers() {
     });
 }
 
-/// Check that a pruned peer can serve a block it explicitly advertised.
+/// Check that an at-tip pruned peer can serve a block it explicitly advertised.
 #[test]
-fn advertised_block_downloads_allow_pruned_peers() {
+fn at_tip_advertised_block_downloads_allow_pruned_peers() {
     let test_hash = block::Hash([3; 32]);
     let test_peer = "127.0.0.1:1".parse().expect("test peer address is valid");
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
@@ -903,9 +950,7 @@ fn advertised_block_downloads_allow_pruned_peers() {
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
     best_tip.send_best_tip_height(Some(block::Height(2_000_000)));
-    best_tip.send_estimated_distance_to_network_chain_tip(Some(
-        PRUNED_PEER_BLOCK_ROUTING_MAX_TIP_DISTANCE + 1,
-    ));
+    best_tip.send_estimated_distance_to_network_chain_tip(Some(0));
 
     runtime.block_on(async move {
         let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
