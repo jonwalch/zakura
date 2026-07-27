@@ -22,23 +22,18 @@ use zakura_chain::{
     serialization::Duration32,
 };
 
-/// A multiplier used to calculate the inbound connection limit for the peer set,
+/// A multiplier used to calculate the inbound connection limit for the peer set.
 ///
-/// When it starts up, Zebra opens [`crate::Config::peerset_initial_target_size`]
-/// outbound connections.
+/// When it starts up, Zebra opens up to
+/// [`crate::Config::peerset_initial_target_size`] outbound connections, capped
+/// by the independent outbound connection limit.
 ///
 /// Then it opens additional outbound connections as needed for network requests,
 /// and accepts inbound connections initiated by other peers.
 ///
-/// The inbound and outbound connection limits are calculated from:
-///
 /// The inbound limit is:
 /// `crate::Config::peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER`.
 /// (This is similar to `zcashd`'s default inbound limit.)
-///
-/// The outbound limit is:
-/// `crate::Config::peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER`.
-/// (This is a bit larger than `zcashd`'s default outbound limit.)
 ///
 /// # Security
 ///
@@ -55,9 +50,10 @@ use zakura_chain::{
 /// Raise this again if these nodes need to prioritize public inbound serving.
 pub const INBOUND_PEER_LIMIT_MULTIPLIER: usize = 1;
 
-/// A multiplier used to calculate the outbound connection limit for the peer set,
+/// The legacy multiplier for deriving custom outbound connection limits from
+/// an initial target.
 ///
-/// See [`INBOUND_PEER_LIMIT_MULTIPLIER`] for details.
+/// The default outbound limit is now independent of the initial target.
 pub const OUTBOUND_PEER_LIMIT_MULTIPLIER: usize = 3;
 
 /// The default maximum number of legacy TCP peer connections Zebra will keep
@@ -78,9 +74,11 @@ pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 /// This will be used as `Config.peerset_initial_target_size` if no valid value is provided.
 pub const DEFAULT_PEERSET_INITIAL_TARGET_SIZE: usize = 100;
 
+/// The default maximum number of outbound legacy peer connections.
+pub(crate) const DEFAULT_PEERSET_OUTBOUND_CONNECTION_LIMIT: usize = 300;
+
 /// The maximum number of peers we will add to the address book after each `getaddr` request.
-pub const PEER_ADDR_RESPONSE_LIMIT: usize =
-    DEFAULT_PEERSET_INITIAL_TARGET_SIZE * OUTBOUND_PEER_LIMIT_MULTIPLIER / 2;
+pub const PEER_ADDR_RESPONSE_LIMIT: usize = DEFAULT_PEERSET_OUTBOUND_CONNECTION_LIMIT / 2;
 
 /// The buffer size for the peer set.
 ///

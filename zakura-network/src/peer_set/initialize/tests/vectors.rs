@@ -40,8 +40,8 @@ use crate::{
     peer_cache_updater::update_peer_cache_once,
     peer_set::{
         initialize::{
-            accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            DiscoveredPeer,
+            accept_inbound_connections, add_initial_peers, crawl_and_dial, limit_initial_peers,
+            open_listener, DiscoveredPeer,
         },
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
@@ -325,6 +325,25 @@ async fn peer_limit_two_testnet() {
         None,
     )
     .await;
+}
+
+/// The hard outbound limit also caps the initial connection batch.
+#[tokio::test]
+async fn outbound_limit_caps_initial_peer_target() {
+    let config = Config {
+        initial_mainnet_peers: ["1.1.1.1:8233", "8.8.8.8:8233", "9.9.9.9:8233"]
+            .map(str::to_string)
+            .into(),
+        cache_dir: CacheDir::disabled(),
+        peerset_initial_target_size: 3,
+        peerset_outbound_connection_limit_for_tests: Some(1),
+        ..Config::default()
+    };
+    let (address_book_updater, _address_book_changes) = tokio::sync::mpsc::channel(3);
+
+    let initial_peers = limit_initial_peers(&config, address_book_updater).await;
+
+    assert_eq!(initial_peers.len(), 1);
 }
 
 /// Test zakura-network writes a peer cache file, and can read it back manually.
@@ -1636,6 +1655,9 @@ async fn remnant_nonces_from_outbound_connections_are_limited() {
     let config = Config {
         listen_addr,
         peerset_initial_target_size: TEST_PEERSET_INITIAL_TARGET_SIZE,
+        peerset_outbound_connection_limit_for_tests: Some(
+            TEST_PEERSET_INITIAL_TARGET_SIZE * constants::OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        ),
         ..Config::default()
     };
 
@@ -1842,6 +1864,9 @@ where
 
     let config = Config {
         peerset_initial_target_size,
+        peerset_outbound_connection_limit_for_tests: Some(
+            peerset_initial_target_size * constants::OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        ),
 
         network,
         listen_addr: force_listen_addr.into().unwrap_or(unused_v4),
@@ -1934,6 +1959,8 @@ where
     let mut config = Config::default();
     if let Some(peerset_initial_target_size) = peerset_initial_target_size.into() {
         config.peerset_initial_target_size = peerset_initial_target_size;
+        config.peerset_outbound_connection_limit_for_tests =
+            Some(peerset_initial_target_size * constants::OUTBOUND_PEER_LIMIT_MULTIPLIER);
     }
 
     let (

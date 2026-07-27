@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
-use static_assertions::const_assert;
+use static_assertions::{const_assert, const_assert_eq};
 use zakura_chain::{
     block::Height,
     parameters::{
@@ -14,7 +14,10 @@ use zakura_chain::{
 use crate::{
     config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
     config::zakura_secret_key_file_path,
-    constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
+    constants::{
+        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DEFAULT_PEERSET_OUTBOUND_CONNECTION_LIMIT,
+        INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+    },
     zakura::{
         DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
@@ -81,10 +84,38 @@ fn ensure_peer_connection_limits_consistent() {
 
     let config = Config::default();
 
+    const_assert_eq!(
+        DEFAULT_PEERSET_OUTBOUND_CONNECTION_LIMIT,
+        DEFAULT_PEERSET_INITIAL_TARGET_SIZE * OUTBOUND_PEER_LIMIT_MULTIPLIER
+    );
     assert!(
         config.peerset_inbound_connection_limit() <= config.peerset_outbound_connection_limit(),
         "this fork caps inbound connections at or below the outbound limit, to prioritize sync",
     );
+}
+
+/// The initial target and hard outbound limit can be configured independently.
+#[test]
+fn outbound_connection_limit_is_independent() {
+    let mut config = Config::default();
+    let default_outbound_limit = config.peerset_outbound_connection_limit();
+
+    config.peerset_initial_target_size *= 2;
+
+    assert_eq!(
+        config.peerset_outbound_connection_limit(),
+        default_outbound_limit
+    );
+
+    let configured: Config = toml::from_str("peerset_initial_target_size = 25").unwrap();
+    assert_eq!(configured.peerset_initial_target_size, 25);
+    assert_eq!(
+        configured.peerset_outbound_connection_limit(),
+        default_outbound_limit
+    );
+    assert!(!toml::to_string(&configured)
+        .unwrap()
+        .contains("peerset_outbound_connection_limit"));
 }
 
 #[tokio::test]

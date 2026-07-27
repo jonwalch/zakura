@@ -588,8 +588,8 @@ where
     Ok(active_outbound_connections)
 }
 
-/// Limit the number of `initial_peers` addresses entries to the configured
-/// `peerset_initial_target_size`.
+/// Limit the number of `initial_peers` address entries to the smaller of the
+/// configured initial target and outbound connection limit.
 ///
 /// Returns randomly chosen entries from the provided set of addresses,
 /// in a random order.
@@ -601,12 +601,15 @@ async fn limit_initial_peers(
 ) -> HashSet<PeerSocketAddr> {
     let all_peers: HashSet<PeerSocketAddr> = config.initial_peers().await;
     let mut preferred_peers: BTreeMap<PeerPreference, Vec<PeerSocketAddr>> = BTreeMap::new();
+    let initial_peer_limit = config
+        .peerset_initial_target_size
+        .min(config.peerset_outbound_connection_limit());
 
     let all_peers_count = all_peers.len();
-    if all_peers_count > config.peerset_initial_target_size {
+    if all_peers_count > initial_peer_limit {
         info!(
             "limiting the initial peers list from {} to {}",
-            all_peers_count, config.peerset_initial_target_size,
+            all_peers_count, initial_peer_limit,
         );
     }
 
@@ -650,12 +653,12 @@ async fn limit_initial_peers(
         let mut better_peers = better_peers.clone();
         let (chosen_peers, _unused_peers) = better_peers.partial_shuffle(
             &mut rand::thread_rng(),
-            config.peerset_initial_target_size - initial_peers.len(),
+            initial_peer_limit - initial_peers.len(),
         );
 
         initial_peers.extend(chosen_peers.iter());
 
-        if initial_peers.len() >= config.peerset_initial_target_size {
+        if initial_peers.len() >= initial_peer_limit {
             break;
         }
     }

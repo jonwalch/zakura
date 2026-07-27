@@ -33,8 +33,8 @@ use zakura_chain::{
 use crate::{
     constants::{
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
-        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DEFAULT_PEERSET_OUTBOUND_CONNECTION_LIMIT,
+        DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER, MAX_PEER_DISK_CACHE_SIZE,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
     zakura::ZakuraConfig,
@@ -292,18 +292,22 @@ pub struct Config {
     ///
     /// When [`v2_p2p`](Self::v2_p2p) is false, these settings are parsed but no iroh endpoint is
     /// started. The total intended connection budget is roughly
-    /// `peerset_initial_target_size + zakura.max_connections`; tune both together.
+    /// the legacy outbound connection limit plus `zakura.max_connections`.
     pub zakura: ZakuraConfig,
 
     /// The initial target size for the peer set.
     ///
-    /// Also used to limit the number of inbound and outbound connections made by Zakura,
-    /// and the size of the cached peer list.
+    /// This also determines the inbound connection limit. The outbound
+    /// connection limit is set independently in code.
     ///
     /// If you have a slow network connection, and Zakura is having trouble
     /// syncing, try reducing the peer set size. You can also reduce the peer
     /// set size to reduce Zakura's bandwidth usage.
     pub peerset_initial_target_size: usize,
+
+    /// Overrides the outbound connection limit in unit tests.
+    #[cfg(test)]
+    pub(crate) peerset_outbound_connection_limit_for_tests: Option<usize>,
 
     /// How frequently we attempt to crawl the network to discover new peer
     /// addresses.
@@ -334,7 +338,8 @@ pub struct Config {
     ///
     /// If Zakura makes multiple inbound or outbound connections to the same IP, they will be dropped
     /// after the handshake, but before adding them to the peer set. The total numbers of inbound and
-    /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
+    /// outbound connections are also limited by
+    /// [`peerset_outbound_connection_limit`](Self::peerset_outbound_connection_limit).
     pub max_connections_per_ip: usize,
 
     /// Exposes legacy peer IP addresses in peer activity logs, structured trace files, and
@@ -379,7 +384,12 @@ impl Config {
     /// the handshake RTT timeout. And Zakura responds to inbound request
     /// overloads by dropping peer connections.
     pub fn peerset_outbound_connection_limit(&self) -> usize {
-        self.peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER
+        #[cfg(test)]
+        if let Some(limit) = self.peerset_outbound_connection_limit_for_tests {
+            return limit;
+        }
+
+        DEFAULT_PEERSET_OUTBOUND_CONNECTION_LIMIT
     }
 
     /// The maximum number of inbound connections that Zakura will accept at the same time.
@@ -904,6 +914,8 @@ impl Default for Config {
             // But Zakura should only make a small number of initial outbound connections,
             // so that idle peers don't use too many connection slots.
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
+            #[cfg(test)]
+            peerset_outbound_connection_limit_for_tests: None,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
         }
@@ -1107,6 +1119,7 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            ..
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1293,6 +1306,8 @@ impl<'de> Deserialize<'de> for Config {
             p2p_stack,
             zakura,
             peerset_initial_target_size,
+            #[cfg(test)]
+            peerset_outbound_connection_limit_for_tests: None,
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
