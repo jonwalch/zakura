@@ -981,18 +981,29 @@ enum CrawlerAction {
     TimerCrawlFinished,
 }
 
-/// Returns the number of outbound peers needed to reach half the configured
+const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 3;
+const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 10;
+
+/// Returns the number of outbound peers needed to reach 30% of the configured
 /// connection limit.
 ///
-/// Using [`usize::div_ceil`] preserves the threshold for odd limits, and
-/// [`usize::saturating_sub`] returns zero at or above the threshold.
+/// The target calculation avoids overflow by applying the ratio separately to
+/// the quotient and remainder. [`usize::div_ceil`] rounds partial peers upward,
+/// and [`usize::saturating_sub`] returns zero at or above the target.
 fn outbound_peer_replenishment_demand(
     active_outbound_connections: usize,
     outbound_connection_limit: usize,
 ) -> usize {
-    outbound_connection_limit
-        .div_ceil(2)
-        .saturating_sub(active_outbound_connections)
+    let target_outbound_connections = (outbound_connection_limit
+        / OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR)
+        .saturating_mul(OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR)
+        .saturating_add(
+            (outbound_connection_limit % OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR)
+                .saturating_mul(OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR)
+                .div_ceil(OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR),
+        );
+
+    target_outbound_connections.saturating_sub(active_outbound_connections)
 }
 
 /// Queue up to `connection_demand` outbound connection attempts.
@@ -1023,7 +1034,7 @@ fn queue_peer_demand(
 /// Crawl for new peers every `config.crawl_new_peer_interval`.
 /// Also crawl whenever there is demand, but no new peers in `candidates`.
 /// After a periodic crawl, queue enough outbound connection demand to reach
-/// half the configured outbound connection limit.
+/// 30% of the configured outbound connection limit.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
 /// `demand_tx`.
