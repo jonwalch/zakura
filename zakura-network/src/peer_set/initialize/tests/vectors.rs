@@ -15,7 +15,10 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -582,6 +585,75 @@ async fn crawler_replenishment_respects_hard_outbound_limit() {
     harness
         .assert_connection_attempts(CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS)
         .await;
+}
+
+/// Failed dials restore channel demand and must not permanently consume the
+/// timer replenishment budget. Without crediting, `failed_dials` attempts would
+/// shrink the successful connection count below the target.
+#[tokio::test(start_paused = true)]
+async fn crawler_failed_dials_do_not_shrink_replenishment_budget() {
+    const FAILED_DIALS: usize = 3;
+
+    let mut harness = spawn_replenishment_crawler_with(
+        0,
+        0,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        ReplenishmentCrawlerOptions {
+            fail_first_dials: FAILED_DIALS,
+            ..ReplenishmentCrawlerOptions::default()
+        },
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(
+            CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS + FAILED_DIALS,
+        )
+        .await;
+}
+
+/// Empty candidate sets must credit spent replenishment demand without
+/// busy-looping local attempts. After one empty demand crawl, local
+/// replenishment pauses until the next timer or channel demand.
+#[tokio::test(start_paused = true)]
+async fn crawler_empty_candidates_pause_local_replenishment() {
+    let mut harness = spawn_replenishment_crawler_with(
+        0,
+        0,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        ReplenishmentCrawlerOptions {
+            candidate_count: Some(0),
+            ..ReplenishmentCrawlerOptions::default()
+        },
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+
+    // Give a buggy busy-loop plenty of mocked time to spawn extra crawls.
+    for _ in 0..100 {
+        tokio::time::advance(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+        tokio::task::spawn_blocking(|| {})
+            .await
+            .expect("crawler test blocking-task synchronization should not panic");
+        tokio::task::yield_now().await;
+    }
+
+    let mut crawl_count: usize = 1;
+    while harness.crawl_started_rx.try_recv().is_ok() {
+        crawl_count = crawl_count.saturating_add(1);
+    }
+
+    assert!(
+        crawl_count <= 3,
+        "empty candidates should pause local replenishment after one demand crawl, \
+         but observed {crawl_count} crawls"
+    );
+
+    harness.assert_connection_attempts(0).await;
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
@@ -2111,10 +2183,45 @@ impl ReplenishmentCrawlerTestHarness {
     }
 }
 
+/// Options for [`spawn_replenishment_crawler_with`].
+#[derive(Clone, Debug)]
+struct ReplenishmentCrawlerOptions {
+    /// Number of address-book candidates to seed.
+    ///
+    /// `None` seeds enough candidates for the default replenishment race tests.
+    candidate_count: Option<usize>,
+    /// Fail the first N outbound dials before succeeding.
+    fail_first_dials: usize,
+}
+
+impl Default for ReplenishmentCrawlerOptions {
+    fn default() -> Self {
+        Self {
+            candidate_count: None,
+            fail_first_dials: 0,
+        }
+    }
+}
+
 async fn spawn_replenishment_crawler(
     initial_connection_count: usize,
     initial_demand_count: usize,
     crawl_new_peer_interval: Duration,
+) -> ReplenishmentCrawlerTestHarness {
+    spawn_replenishment_crawler_with(
+        initial_connection_count,
+        initial_demand_count,
+        crawl_new_peer_interval,
+        ReplenishmentCrawlerOptions::default(),
+    )
+    .await
+}
+
+async fn spawn_replenishment_crawler_with(
+    initial_connection_count: usize,
+    initial_demand_count: usize,
+    crawl_new_peer_interval: Duration,
+    options: ReplenishmentCrawlerOptions,
 ) -> ReplenishmentCrawlerTestHarness {
     let config = Config {
         peerset_initial_target_size: CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
@@ -2133,9 +2240,11 @@ async fn spawn_replenishment_crawler(
         address_book_updater_guard,
     ) = AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
 
-    let candidate_count = outbound_connection_limit
-        .saturating_mul(2)
-        .saturating_add(1);
+    let candidate_count = options.candidate_count.unwrap_or_else(|| {
+        outbound_connection_limit
+            .saturating_mul(2)
+            .saturating_add(1)
+    });
     for address_number in 0..candidate_count {
         let address_number =
             u32::try_from(address_number).expect("small replenishment test address count fits u32");
@@ -2180,7 +2289,12 @@ async fn spawn_replenishment_crawler(
     });
     let candidates = CandidateSet::new(address_book, controlled_peer_set);
 
-    let channel_capacity = candidate_count.max(initial_demand_count);
+    // Include room for failed-dial demand requeues plus the successful retries.
+    let channel_capacity = candidate_count
+        .max(initial_demand_count)
+        .saturating_add(options.fail_first_dials)
+        .saturating_add(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
+        .max(1);
     let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(channel_capacity);
     let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(channel_capacity);
     for _ in 0..initial_demand_count {
@@ -2198,20 +2312,31 @@ async fn spawn_replenishment_crawler(
         .collect();
 
     let (connection_tracker_tx, connection_tracker_rx) = tokio::sync::mpsc::unbounded_channel();
+    let remaining_failures = Arc::new(AtomicUsize::new(options.fail_first_dials));
     let outbound_connector = service_fn(move |request: OutboundConnectorRequest| {
         let connection_tracker_tx = connection_tracker_tx.clone();
+        let remaining_failures = remaining_failures.clone();
 
         async move {
             let OutboundConnectorRequest {
                 addr,
                 connection_tracker,
             } = request;
-            let (fake_client, _harness) = ClientTestHarness::build().finish();
 
             connection_tracker_tx
                 .send(connection_tracker)
                 .expect("replenishment connection observer remains open");
 
+            if remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                    failures.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err("controlled replenishment dial failure".into());
+            }
+
+            let (fake_client, _harness) = ClientTestHarness::build().finish();
             Ok((addr, fake_client))
         }
     });
