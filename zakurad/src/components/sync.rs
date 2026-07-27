@@ -832,6 +832,10 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
+    /// Earliest peer-set retry hint observed after all current connections were
+    /// in their unchanged-locator cooldown.
+    discovery_retry_at: Option<Instant>,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -985,6 +989,7 @@ where
             missing_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            discovery_retry_at: None,
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1007,11 +1012,20 @@ where
 
             self.update_metrics();
 
-            let restart_delay = if self.is_regtest {
+            let default_restart_delay = if self.is_regtest {
                 REGTEST_SYNC_RESTART_DELAY
             } else {
                 SYNC_RESTART_SLEEP
             };
+            let restart_delay = self
+                .discovery_retry_at
+                .take()
+                .map(|retry_at| {
+                    retry_at
+                        .saturating_duration_since(Instant::now())
+                        .min(default_restart_delay)
+                })
+                .unwrap_or(default_restart_delay);
             info!(
                 timeout = ?restart_delay,
                 state_tip = ?self.latest_chain_tip.best_tip_height(),
@@ -1763,13 +1777,18 @@ where
                 }
             });
 
-            if result.as_ref().err().is_some_and(|error| {
+            if let Some(retry_after) = result.as_ref().err().and_then(|error| {
                 error
                     .downcast_ref::<zn::SharedPeerError>()
                     .and_then(zn::SharedPeerError::find_blocks_retry_after)
-                    .is_some()
             }) {
                 stop_epoch = true;
+                let retry_at = Instant::now() + retry_after;
+                self.discovery_retry_at = Some(
+                    self.discovery_retry_at
+                        .map(|current| current.min(retry_at))
+                        .unwrap_or(retry_at),
+                );
             }
 
             if !cfg!(test)
