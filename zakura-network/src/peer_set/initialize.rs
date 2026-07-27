@@ -975,16 +975,16 @@ enum CrawlerAction {
     HandshakeFinished,
     /// Clear a finished failed handshake that restored demand to the channel.
     ///
-    /// Credits one unit of remaining replenishment demand so the restored
-    /// `MorePeers` message can be processed without permanently consuming the
-    /// timer-based replenishment budget.
-    HandshakeFailed,
+    /// When `restore_replenishment_demand` is set, credits one unit of remaining
+    /// replenishment demand so a restored `MorePeers` message does not
+    /// permanently consume the timer-based budget.
+    HandshakeFailed { restore_replenishment_demand: bool },
     /// Clear a finished demand crawl (DemandHandshakeOrCrawl with no peers).
     ///
-    /// Credits one unit of remaining replenishment demand because the attempt
-    /// did not consume a candidate or open a connection, and pauses further
-    /// local replenishment until timer or channel demand.
-    DemandCrawlFinished,
+    /// When `restore_replenishment_demand` is set, credits one unit of remaining
+    /// replenishment demand. Always pauses further local replenishment until
+    /// timer or channel demand so crediting cannot busy-loop empty crawls.
+    DemandCrawlFinished { restore_replenishment_demand: bool },
     /// Clear a finished TimerCrawl.
     TimerCrawlFinished,
 }
@@ -1159,6 +1159,10 @@ where
         match crawler_action {
             // Spawned tasks
             Ok(DemandHandshakeOrCrawl) => {
+                // Only credit later if this action actually consumed a timer
+                // replenishment unit. Channel demand with remaining == 0 must
+                // not invent local budget on failure or empty candidate crawls.
+                let restore_replenishment_demand = remaining_replenishment_demand > 0;
                 remaining_replenishment_demand = remaining_replenishment_demand.saturating_sub(1);
 
                 if active_outbound_connections.update_count()
@@ -1218,15 +1222,21 @@ where
                                 .await?
                                 {
                                     DialOutcome::Connected => Ok(HandshakeFinished),
-                                    DialOutcome::Failed => Ok(HandshakeFailed),
+                                    DialOutcome::Failed => Ok(HandshakeFailed {
+                                        restore_replenishment_demand,
+                                    }),
                                 }
                             } else {
                                 // There weren't any peers, so try to get more peers.
                                 debug!("demand for peers but no available candidates");
 
+                                // Release the reserved outbound slot before crawling.
+                                std::mem::drop(outbound_connection_tracker);
                                 crawl(candidates, demand_tx).await?;
 
-                                Ok(DemandCrawlFinished)
+                                Ok(DemandCrawlFinished {
+                                    restore_replenishment_demand,
+                                })
                             }
                         }
                         .in_current_span(),
@@ -1262,20 +1272,27 @@ where
             Ok(HandshakeFinished) => {
                 // Already logged in dial()
             }
-            Ok(HandshakeFailed) => {
+            Ok(HandshakeFailed {
+                restore_replenishment_demand,
+            }) => {
                 // dial() restored MorePeers to demand_rx when possible. Credit
-                // the unit spent when spawning this attempt so a restored
-                // message (or a local retry if the channel was full) does not
-                // permanently shrink the replenishment budget.
-                remaining_replenishment_demand = remaining_replenishment_demand.saturating_add(1);
-                pause_local_replenishment = false;
+                // only when this attempt consumed timer replenishment demand.
+                if restore_replenishment_demand {
+                    remaining_replenishment_demand =
+                        remaining_replenishment_demand.saturating_add(1);
+                    pause_local_replenishment = false;
+                }
             }
-            Ok(DemandCrawlFinished) => {
-                // No candidate was dialed, so credit the unit spent for this
-                // demand action. Pause local replenishment so crediting does
-                // not busy-loop empty crawls; the next timer or channel demand
-                // clears the pause and can spend the preserved budget.
-                remaining_replenishment_demand = remaining_replenishment_demand.saturating_add(1);
+            Ok(DemandCrawlFinished {
+                restore_replenishment_demand,
+            }) => {
+                // No candidate was dialed. Credit only when this attempt
+                // consumed timer replenishment demand, and always pause local
+                // replenishment so empty candidate sets cannot busy-loop.
+                if restore_replenishment_demand {
+                    remaining_replenishment_demand =
+                        remaining_replenishment_demand.saturating_add(1);
+                }
                 pause_local_replenishment = true;
 
                 // This is set to trace level because when the peerset is

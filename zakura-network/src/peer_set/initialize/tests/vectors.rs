@@ -656,6 +656,32 @@ async fn crawler_empty_candidates_pause_local_replenishment() {
     harness.assert_connection_attempts(0).await;
 }
 
+/// Channel demand at the replenishment target must not mint local budget when
+/// dials fail. Unconditional credits would leave `remaining > 0` after the
+/// successful retry and overshoot the 27% target.
+#[tokio::test(start_paused = true)]
+async fn crawler_channel_demand_failures_do_not_invent_replenishment_budget() {
+    const FAILED_DIALS: usize = 3;
+
+    let mut harness = spawn_replenishment_crawler_with(
+        CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS,
+        0,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        ReplenishmentCrawlerOptions {
+            fail_first_dials: FAILED_DIALS,
+            ..ReplenishmentCrawlerOptions::default()
+        },
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness.queue_demand(1);
+    harness
+        .assert_connection_attempts(FAILED_DIALS.saturating_add(1))
+        .await;
+}
+
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
 #[tokio::test(start_paused = true)]
 async fn crawler_peer_limit_zero_connect_panic() {
