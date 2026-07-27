@@ -9,7 +9,10 @@ use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -287,6 +290,11 @@ where
     let (mut demand_tx, demand_rx) =
         futures::channel::mpsc::channel::<MorePeers>(config.peerset_outbound_connection_limit());
 
+    // Shared count of MorePeers sitting in the demand channel. Updated by the
+    // PeerSet, crawler queueing paths, and demand drains so timer replenishment
+    // does not over-enqueue.
+    let queued_demand = Arc::new(AtomicUsize::new(0));
+
     // Create a oneshot to send background task JoinHandles to the peer set
     let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
 
@@ -296,6 +304,7 @@ where
         block_gossip_peer_ips.clone(),
         discovered_peers,
         demand_tx.clone(),
+        queued_demand.clone(),
         handle_rx,
         inv_receiver,
         bans.clone(),
@@ -363,9 +372,10 @@ where
             .peerset_initial_target_size
             .saturating_sub(active_outbound_connections.update_count());
 
-        for _ in 0..demand_count {
-            let _ = demand_tx.try_send(MorePeers);
-        }
+        // Track how many MorePeers are sitting in the demand channel so timer
+        // crawls do not enqueue a second full replenishment deficit on top.
+        // The demand channel is open during initialization; ignore a full channel.
+        let _ = queue_peer_demand(&mut demand_tx, demand_count, 0, &queued_demand);
 
         // Start the peer crawler
         let crawl_fut = crawl_and_dial(
@@ -377,15 +387,20 @@ where
             peerset_tx,
             active_outbound_connections,
             address_book_updater,
+            queued_demand,
         );
         task_handles.push(tokio::spawn(crawl_fut.in_current_span()));
     } else {
+        let queued_demand = queued_demand.clone();
         task_handles.push(tokio::spawn(
             async move {
                 let _peerset_tx = peerset_tx;
                 let mut demand_rx = demand_rx;
 
                 while let Some(MorePeers) = demand_rx.next().await {
+                    // Keep the shared counter aligned even when the legacy
+                    // crawler is not running (PeerSet may still signal demand).
+                    note_demand_dequeued(&queued_demand);
                     debug!("ignoring legacy peer demand because legacy P2P is disabled");
                 }
 
@@ -987,12 +1002,17 @@ const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 100;
 /// Returns the number of outbound peers needed to reach 27% of the configured
 /// connection limit.
 ///
+/// `queued_demand` counts pending outbound demand that should not be requested
+/// again: `MorePeers` already in the demand channel, plus timer-crawl
+/// reservations claimed before `candidates.update()` completes.
+///
 /// The target calculation avoids overflow by applying the ratio separately to
 /// the quotient and remainder. [`usize::div_ceil`] rounds partial peers upward,
 /// and [`usize::saturating_sub`] returns zero at or above the target.
 fn outbound_peer_replenishment_demand(
     active_outbound_connections: usize,
     outbound_connection_limit: usize,
+    queued_demand: usize,
 ) -> usize {
     let target_outbound_connections = (outbound_connection_limit
         / OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR)
@@ -1003,17 +1023,43 @@ fn outbound_peer_replenishment_demand(
                 .div_ceil(OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR),
         );
 
-    target_outbound_connections.saturating_sub(active_outbound_connections)
+    target_outbound_connections
+        .saturating_sub(active_outbound_connections)
+        .saturating_sub(queued_demand)
 }
 
-/// Queue up to `connection_demand` outbound connection attempts.
+/// Queue up to `desired` outbound connection attempts.
+///
+/// `already_reserved` is demand previously claimed on `queued_demand` (for
+/// example by a timer crawl before `candidates.update()` runs). This keeps the
+/// shared counter aligned with channel depth across that async gap:
+/// - adds any `desired` above the reservation before sending
+/// - releases unused reservation or failed sends when the channel is full
+///
+/// Returns the number of signals successfully placed in the channel.
 fn queue_peer_demand(
     demand_tx: &mut futures::channel::mpsc::Sender<MorePeers>,
-    connection_demand: usize,
-) -> Result<(), BoxError> {
-    for _ in 0..connection_demand {
+    desired: usize,
+    already_reserved: usize,
+    queued_demand: &AtomicUsize,
+) -> Result<usize, BoxError> {
+    if desired > already_reserved {
+        queued_demand.fetch_add(desired - already_reserved, Ordering::Relaxed);
+    } else if desired < already_reserved {
+        let _ = queued_demand.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(already_reserved - desired))
+        });
+    }
+
+    let mut sent = 0;
+    for _ in 0..desired {
         if let Err(send_error) = demand_tx.try_send(MorePeers) {
             if send_error.is_disconnected() {
+                // Release slots claimed for signals we did not enqueue.
+                let remaining = desired.saturating_sub(sent);
+                let _ = queued_demand.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(remaining))
+                });
                 // Zakura's peer set is shutting down.
                 return Err(send_error.into());
             }
@@ -1022,9 +1068,24 @@ fn queue_peer_demand(
             // channel, so additional signals are unnecessary.
             break;
         }
+
+        sent += 1;
     }
 
-    Ok(())
+    if sent < desired {
+        let _ = queued_demand.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(desired - sent))
+        });
+    }
+
+    Ok(sent)
+}
+
+/// Decrements the shared queued-demand counter without underflowing.
+fn note_demand_dequeued(queued_demand: &AtomicUsize) {
+    let _ = queued_demand.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
 }
 
 /// Given a channel `demand_rx` that signals a need for new peers, try to find
@@ -1056,6 +1117,7 @@ fn queue_peer_demand(
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        queued_demand,
     ),
     fields(
         new_peer_interval = ?config.crawl_new_peer_interval,
@@ -1070,6 +1132,7 @@ async fn crawl_and_dial<C, S>(
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     mut active_outbound_connections: ActiveConnectionCounter,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    queued_demand: Arc<AtomicUsize>,
 ) -> Result<(), BoxError>
 where
     C: Service<
@@ -1140,6 +1203,10 @@ where
             //
             // Demand is potentially unlimited, so it must go last in a biased select!.
             next_demand = demand_rx.next() => next_demand.ok_or("demand stream closed, is Zakura shutting down?".into()).map(|MorePeers|{
+                // This signal is no longer queued; it is either dropped or turned
+                // into an active/in-flight outbound connection attempt below.
+                note_demand_dequeued(&queued_demand);
+
                 if active_outbound_connections.update_count() >= config.peerset_outbound_connection_limit() {
                     // Too many open outbound connections or pending handshakes already
                     DemandDrop
@@ -1164,6 +1231,7 @@ where
                 let peerset_tx = peerset_tx.clone();
                 let address_book_updater = address_book_updater.clone();
                 let demand_tx = demand_tx.clone();
+                let queued_demand = queued_demand.clone();
                 let expose_peer_addresses = config.expose_peer_addresses;
 
                 // Increment the connection count before we spawn the connection.
@@ -1199,6 +1267,7 @@ where
                                 peerset_tx,
                                 address_book_updater,
                                 demand_tx,
+                                queued_demand,
                                 expose_peer_addresses,
                             )
                             .await?;
@@ -1208,7 +1277,7 @@ where
                             // There weren't any peers, so try to get more peers.
                             debug!("demand for peers but no available candidates");
 
-                            crawl(candidates, demand_tx, 0).await?;
+                            crawl(candidates, demand_tx, queued_demand, 0).await?;
 
                             Ok(DemandCrawlFinished)
                         }
@@ -1222,12 +1291,22 @@ where
             Ok(TimerCrawl { tick }) => {
                 let candidates = candidates.clone();
                 let demand_tx = demand_tx.clone();
+                let queued_demand = queued_demand.clone();
                 let active_outbound_connections = active_outbound_connections.update_count();
                 let outbound_connection_limit = config.peerset_outbound_connection_limit();
+                let pending_demand = queued_demand.load(Ordering::Relaxed);
                 let replenishment_demand = outbound_peer_replenishment_demand(
                     active_outbound_connections,
                     outbound_connection_limit,
+                    pending_demand,
                 );
+
+                // Claim the deficit before spawning crawl/update so a later
+                // timer tick cannot compute the same shortfall again while
+                // candidates.update() is still running.
+                if replenishment_demand > 0 {
+                    queued_demand.fetch_add(replenishment_demand, Ordering::Relaxed);
+                }
 
                 let crawl_handle = tokio::spawn(
                     async move {
@@ -1235,11 +1314,12 @@ where
                             ?tick,
                             active_outbound_connections,
                             outbound_connection_limit,
+                            pending_demand,
                             replenishment_demand,
                             "crawling for more peers in response to the crawl timer"
                         );
 
-                        crawl(candidates, demand_tx, replenishment_demand).await?;
+                        crawl(candidates, demand_tx, queued_demand, replenishment_demand).await?;
 
                         Ok(TimerCrawlFinished)
                     }
@@ -1280,13 +1360,17 @@ where
 /// Try to get more peers using `candidates`, then queue connection attempts
 /// using `demand_tx`.
 /// If the crawl discovers peers, queue at least one connection attempt. Also
-/// queue at least `minimum_connection_demand` attempts, unless the demand
-/// channel is already full.
-#[instrument(skip(candidates, demand_tx))]
+/// queue at least `pre_reserved_demand` attempts, unless the demand channel is
+/// already full.
+///
+/// `pre_reserved_demand` must already be reflected in `queued_demand` when it is
+/// non-zero (timer crawls reserve before spawning this task).
+#[instrument(skip(candidates, demand_tx, queued_demand))]
 async fn crawl<S>(
     candidates: Arc<futures::lock::Mutex<CandidateSet<S>>>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
-    minimum_connection_demand: usize,
+    queued_demand: Arc<AtomicUsize>,
+    pre_reserved_demand: usize,
 ) -> Result<(), BoxError>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Send + Sync + 'static,
@@ -1301,9 +1385,15 @@ where
         result
     };
     let connection_demand = match result {
-        Ok(Some(MorePeers)) => minimum_connection_demand.max(1),
-        Ok(None) => minimum_connection_demand,
+        Ok(Some(MorePeers)) => pre_reserved_demand.max(1),
+        Ok(None) => pre_reserved_demand,
         Err(e) => {
+            // Release any reservation that will never be enqueued.
+            if pre_reserved_demand > 0 {
+                let _ = queued_demand.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(pre_reserved_demand))
+                });
+            }
             info!(
                 ?e,
                 "candidate set returned an error, is Zakura shutting down?"
@@ -1318,7 +1408,13 @@ where
     //
     // Candidate selection rate-limits outbound handshakes, and the crawler loop
     // checks the configured outbound connection limit before starting each one.
-    queue_peer_demand(&mut demand_tx, connection_demand)
+    queue_peer_demand(
+        &mut demand_tx,
+        connection_demand,
+        pre_reserved_demand,
+        &queued_demand,
+    )
+    .map(|_| ())
 }
 
 /// Try to connect to `candidate` using `outbound_connector`.
@@ -1336,6 +1432,7 @@ where
     peerset_tx,
     address_book_updater,
     demand_tx,
+    queued_demand,
     expose_peer_addresses,
 ), fields(peer = %candidate.addr.addr_label(expose_peer_addresses)))]
 async fn dial<C>(
@@ -1346,6 +1443,7 @@ async fn dial<C>(
     mut peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
+    queued_demand: Arc<AtomicUsize>,
     expose_peer_addresses: bool,
 ) -> Result<(), BoxError>
 where
@@ -1418,12 +1516,7 @@ where
             // # Security
             //
             // Handshake failures are rate-limited by peer attempt timeouts.
-            if let Err(send_error) = demand_tx.try_send(MorePeers) {
-                if send_error.is_disconnected() {
-                    // Zakura's peer set is shutting down.
-                    return Err(send_error.into());
-                }
-            }
+            let _ = queue_peer_demand(&mut demand_tx, 1, 0, &queued_demand)?;
         }
     }
 

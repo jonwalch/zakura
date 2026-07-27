@@ -100,6 +100,10 @@ use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Instant,
 };
@@ -206,6 +210,10 @@ where
 
     /// A channel that asks the peer crawler task to connect to more peers.
     demand_signal: mpsc::Sender<MorePeers>,
+
+    /// Counts `MorePeers` signals that are sitting in [`Self::demand_signal`]'s
+    /// channel so the crawler does not over-enqueue replenishment demand.
+    queued_demand: Arc<AtomicUsize>,
 
     /// A shared list of banned IP addresses.
     bans: BannedIps,
@@ -350,6 +358,7 @@ where
     /// - `block_gossip_peer_ips`: inbound peer IPs that must always receive block inventory broadcasts.
     /// - `discover`: handles peer connects and disconnects;
     /// - `demand_signal`: requests more peers when all peers are busy (unready);
+    /// - `queued_demand`: shared count of pending `MorePeers` signals in `demand_signal`;
     /// - `handle_rx`: receives background task handles,
     ///   monitors them to make sure they're still running,
     ///   and shuts down all the tasks as soon as one task exits;
@@ -366,6 +375,7 @@ where
         block_gossip_peer_ips: Vec<IpAddr>,
         discover: D,
         demand_signal: mpsc::Sender<MorePeers>,
+        queued_demand: Arc<AtomicUsize>,
         handle_rx: tokio::sync::oneshot::Receiver<Vec<JoinHandle<Result<(), BoxError>>>>,
         inv_stream: broadcast::Receiver<InventoryChange>,
         bans: BannedIps,
@@ -378,6 +388,7 @@ where
             // New peers
             discover,
             demand_signal,
+            queued_demand,
             // Banned peers
             bans,
 
@@ -1670,7 +1681,14 @@ where
             // here, the crawler could deadlock sending a request to fetch more peers, because it
             // also empties the channel.
             trace!("no ready services, sending demand signal");
-            let _ = self.demand_signal.try_send(MorePeers);
+            // Increment before send so a concurrent crawler drain cannot observe
+            // an uncounted channel message. Roll back if the channel is full.
+            self.queued_demand.fetch_add(1, Ordering::Relaxed);
+            if self.demand_signal.try_send(MorePeers).is_err() {
+                let _ = self.queued_demand.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
+            }
 
             // # Correctness
             //

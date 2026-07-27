@@ -15,7 +15,10 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -450,30 +453,37 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
 #[test]
 fn crawler_replenishes_outbound_peers_below_twenty_seven_percent_limit() {
     let cases = [
-        (0, 0, 0),
-        (0, 1, 1),
-        (1, 1, 0),
-        (0, 2, 1),
-        (1, 2, 0),
-        (0, 3, 1),
-        (1, 3, 0),
-        (0, 4, 2),
-        (1, 4, 1),
-        (2, 4, 0),
-        (0, 10, 3),
-        (2, 10, 1),
-        (3, 10, 0),
-        (0, 300, 81),
-        (80, 300, 1),
-        (81, 300, 0),
-        (100, 300, 0),
+        // active, limit, queued, expected
+        (0, 0, 0, 0),
+        (0, 1, 0, 1),
+        (1, 1, 0, 0),
+        (0, 2, 0, 1),
+        (1, 2, 0, 0),
+        (0, 3, 0, 1),
+        (1, 3, 0, 0),
+        (0, 4, 0, 2),
+        (1, 4, 0, 1),
+        (2, 4, 0, 0),
+        (0, 10, 0, 3),
+        (2, 10, 0, 1),
+        (3, 10, 0, 0),
+        (0, 300, 0, 81),
+        (80, 300, 0, 1),
+        (81, 300, 0, 0),
+        (100, 300, 0, 0),
+        // Queued demand already covers the deficit.
+        (0, 300, 81, 0),
+        (40, 300, 41, 0),
+        // Queued demand covers only part of the deficit.
+        (0, 300, 40, 41),
+        (40, 300, 20, 21),
     ];
 
-    for (active, limit, expected) in cases {
+    for (active, limit, queued, expected) in cases {
         assert_eq!(
-            outbound_peer_replenishment_demand(active, limit),
+            outbound_peer_replenishment_demand(active, limit, queued),
             expected,
-            "unexpected replenishment decision for {active} active peers and limit {limit}",
+            "unexpected replenishment decision for {active} active peers, limit {limit}, queued {queued}",
         );
     }
 }
@@ -483,15 +493,101 @@ fn crawler_queues_full_replenishment_demand() {
     const CONNECTION_DEMAND: usize = 81;
 
     let (mut demand_tx, mut demand_rx) = mpsc::channel(CONNECTION_DEMAND);
-    queue_peer_demand(&mut demand_tx, CONNECTION_DEMAND)
+    let queued_demand = AtomicUsize::new(0);
+    let sent = queue_peer_demand(&mut demand_tx, CONNECTION_DEMAND, 0, &queued_demand)
         .expect("open demand channel accepts replenishment signals");
 
-    let mut queued_demand = 0;
+    assert_eq!(sent, CONNECTION_DEMAND);
+    assert_eq!(queued_demand.load(Ordering::Relaxed), CONNECTION_DEMAND);
+
+    let mut drained_demand = 0;
     while demand_rx.try_recv().is_ok() {
-        queued_demand += 1;
+        drained_demand += 1;
     }
 
-    assert_eq!(queued_demand, CONNECTION_DEMAND);
+    assert_eq!(drained_demand, CONNECTION_DEMAND);
+}
+
+#[test]
+fn crawler_does_not_double_count_queued_replenishment_demand() {
+    const OUTBOUND_LIMIT: usize = 300;
+    const TARGET: usize = 81;
+
+    let (mut demand_tx, mut demand_rx) = mpsc::channel(OUTBOUND_LIMIT);
+    let queued_demand = AtomicUsize::new(0);
+
+    // First crawl queues the full deficit.
+    let first = outbound_peer_replenishment_demand(0, OUTBOUND_LIMIT, queued_demand.load(Ordering::Relaxed));
+    assert_eq!(first, TARGET);
+    queue_peer_demand(&mut demand_tx, first, 0, &queued_demand)
+        .expect("open demand channel accepts first replenishment batch");
+
+    // A second crawl before the channel drains must not enqueue another full batch.
+    let second = outbound_peer_replenishment_demand(0, OUTBOUND_LIMIT, queued_demand.load(Ordering::Relaxed));
+    assert_eq!(second, 0);
+    queue_peer_demand(&mut demand_tx, second, 0, &queued_demand)
+        .expect("open demand channel accepts empty replenishment batch");
+
+    let mut drained_demand = 0;
+    while demand_rx.try_recv().is_ok() {
+        drained_demand += 1;
+    }
+
+    assert_eq!(drained_demand, TARGET);
+    assert_eq!(queued_demand.load(Ordering::Relaxed), TARGET);
+}
+
+#[test]
+fn crawler_reservation_covers_update_gap() {
+    const OUTBOUND_LIMIT: usize = 300;
+    const TARGET: usize = 81;
+
+    let (mut demand_tx, mut demand_rx) = mpsc::channel(OUTBOUND_LIMIT);
+    let queued_demand = AtomicUsize::new(0);
+
+    // Timer crawl claims the deficit before candidates.update() finishes.
+    let first = outbound_peer_replenishment_demand(0, OUTBOUND_LIMIT, queued_demand.load(Ordering::Relaxed));
+    assert_eq!(first, TARGET);
+    queued_demand.fetch_add(first, Ordering::Relaxed);
+
+    // Another timer tick during update() must see the reservation.
+    let second = outbound_peer_replenishment_demand(0, OUTBOUND_LIMIT, queued_demand.load(Ordering::Relaxed));
+    assert_eq!(second, 0);
+
+    // After update(), only the reserved batch is enqueued.
+    let sent = queue_peer_demand(&mut demand_tx, first, first, &queued_demand)
+        .expect("open demand channel accepts reserved replenishment batch");
+    assert_eq!(sent, TARGET);
+    assert_eq!(queued_demand.load(Ordering::Relaxed), TARGET);
+
+    let mut drained_demand = 0;
+    while demand_rx.try_recv().is_ok() {
+        drained_demand += 1;
+    }
+    assert_eq!(drained_demand, TARGET);
+}
+
+#[test]
+fn queue_peer_demand_releases_unused_reservation_when_channel_fills() {
+    const CAPACITY: usize = 10;
+    const RESERVED: usize = 20;
+
+    let (mut demand_tx, mut demand_rx) = mpsc::channel(CAPACITY);
+    let queued_demand = AtomicUsize::new(0);
+    queued_demand.fetch_add(RESERVED, Ordering::Relaxed);
+
+    let sent = queue_peer_demand(&mut demand_tx, RESERVED, RESERVED, &queued_demand)
+        .expect("partial enqueue is not a fatal error");
+
+    // futures::mpsc may accept slightly more than `CAPACITY` before reporting full.
+    assert!(sent < RESERVED, "channel must reject some reserved demand");
+    assert_eq!(queued_demand.load(Ordering::Relaxed), sent);
+
+    let mut drained_demand = 0;
+    while demand_rx.try_recv().is_ok() {
+        drained_demand += 1;
+    }
+    assert_eq!(drained_demand, sent);
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
@@ -2049,8 +2145,11 @@ where
     let active_outbound_connections = ActiveConnectionCounter::new_counter();
 
     // Add fake demand over the limit.
+    let queued_demand = Arc::new(AtomicUsize::new(0));
     for _ in 0..over_limit_peers {
-        let _ = demand_tx.try_send(MorePeers);
+        if demand_tx.try_send(MorePeers).is_ok() {
+            queued_demand.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let mut demand_shutdown_tx = demand_tx.clone();
 
@@ -2084,6 +2183,7 @@ where
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
+        queued_demand,
     );
     let crawl_task_handle = tokio::spawn(crawl_fut);
 

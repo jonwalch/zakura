@@ -4,7 +4,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 use futures::{channel::mpsc, stream, Stream, StreamExt};
@@ -260,6 +260,7 @@ where
             self.block_gossip_peer_ips,
             discover,
             demand_signal,
+            Arc::new(AtomicUsize::new(0)),
             handle_rx,
             inv_stream,
             bans,
