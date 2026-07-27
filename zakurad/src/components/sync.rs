@@ -31,7 +31,8 @@ use tower::{
 
 use zakura_chain::{
     block::{self, Height, HeightDiff},
-    chain_tip::ChainTip,
+    chain_tip::{ChainTip, AT_OR_NEAR_TIP_THRESHOLD},
+    parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
@@ -725,6 +726,9 @@ where
     /// The genesis hash for the configured network
     genesis_hash: block::Hash,
 
+    /// The configured network, used for local chain-tip distance estimates.
+    network: Network,
+
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
 
@@ -933,6 +937,7 @@ where
 
         let new_syncer = Self {
             genesis_hash: config.network.network.genesis_hash(),
+            network: config.network.network.clone(),
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
@@ -1547,6 +1552,23 @@ where
         Ok(first_unknown)
     }
 
+    /// Returns whether an unanchored singleton response is plausible near the
+    /// committed chain tip.
+    fn should_accept_unanchored_singleton(&self) -> bool {
+        if self.is_regtest {
+            return true;
+        }
+
+        matches!(
+            self.latest_chain_tip
+                .estimate_distance_to_network_chain_tip(&self.network),
+            Some((distance, tip_height))
+                if tip_height >= self.max_checkpoint_height
+                    && (-AT_OR_NEAR_TIP_THRESHOLD..=AT_OR_NEAR_TIP_THRESHOLD)
+                        .contains(&distance)
+        )
+    }
+
     async fn validate_extend_find_blocks_response<'a>(
         state: &mut ZS,
         hashes: &'a [block::Hash],
@@ -1635,6 +1657,10 @@ where
             "got block locator and trying to obtain new chain tips"
         );
 
+        // Snapshot this local-only estimate before issuing the fanout so every
+        // response in the round uses the same eligibility decision.
+        let accept_unanchored_singletons = self.should_accept_unanchored_singleton();
+
         let mut requests = FuturesUnordered::new();
         for attempt in 0..FANOUT {
             if attempt > 0 {
@@ -1675,6 +1701,22 @@ where
                     let hashes = hashes.as_slice();
                     if hashes.is_empty() {
                         continue;
+                    }
+
+                    if let [hash] = hashes {
+                        if !accept_unanchored_singletons {
+                            debug!(
+                                ?hash,
+                                "ignoring unanchored singleton FindBlocks response while the \
+                                 committed chain is not known to be near the network tip"
+                            );
+                            metrics::counter!(
+                                "sync.obtain.unanchored_singleton.count",
+                                "action" => "ignored"
+                            )
+                            .increment(1);
+                            continue;
+                        }
                     }
 
                     if !has_valid_tips_response_hash_count(hashes) {
@@ -2062,13 +2104,6 @@ where
                     .try_send((advertiser_addr, error.misbehavior_score()));
             }
 
-            Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit {
-                advertiser_addr: Some(advertiser_addr),
-                ..
-            }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
-            }
-
             Err(BlockDownloadVerifyError::InvalidHeight {
                 advertiser_addr: Some(advertiser_addr),
                 ..
@@ -2076,6 +2111,9 @@ where
                 let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
             }
 
+            // `AboveLookaheadHeightLimit` carries the peer that served the
+            // requested block, not the peer that supplied its discovery hash.
+            // Keep dropping the block, but do not score an unattributable peer.
             Err(_) => {}
         };
 

@@ -17,8 +17,11 @@ use futures::{Future, FutureExt, StreamExt};
 use tower::timeout::Timeout;
 
 use zakura_chain::{
-    block::{self, Block, Height},
-    chain_tip::mock::{MockChainTip, MockChainTipSender},
+    block::{self, Block, Height, HeightDiff},
+    chain_tip::{
+        mock::{MockChainTip, MockChainTipSender},
+        AT_OR_NEAR_TIP_THRESHOLD,
+    },
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
@@ -1449,10 +1452,10 @@ async fn above_lookahead_does_not_restart_sync() {
     );
 }
 
-/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now
-/// carries `advertiser_addr` so the offending peer can be scored.
+/// `AboveLookaheadHeightLimit` retains the serving peer address for
+/// diagnostics.
 #[tokio::test]
-async fn above_lookahead_has_peer_attribution() {
+async fn above_lookahead_retains_serving_peer_diagnostics() {
     let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let err = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
         height: block::Height(60_000),
@@ -1463,8 +1466,50 @@ async fn above_lookahead_has_peer_attribution() {
     assert_eq!(
         err.advertiser_addr(),
         Some(addr),
-        "AboveLookaheadHeightLimit should carry advertiser_addr for peer scoring \
-         (GHSA-gvjc-3w7c-92jx fix)"
+        "AboveLookaheadHeightLimit should retain its serving peer address"
+    );
+}
+
+#[tokio::test]
+async fn above_lookahead_does_not_score_serving_peer() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = misbehavior_sender;
+
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let hash = block::Hash::from([0xCC; 32]);
+    chain_sync
+        .handle_block_response(Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+            height: block::Height(60_000),
+            hash,
+            advertiser_addr: Some(addr),
+        }))
+        .expect("above-lookahead blocks are dropped without restarting sync");
+
+    assert_eq!(
+        misbehavior_receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+        "the serving peer did not necessarily advertise the discovery hash"
+    );
+
+    chain_sync
+        .handle_block_response(Err(BlockDownloadVerifyError::InvalidHeight {
+            hash,
+            advertiser_addr: Some(addr),
+        }))
+        .expect("invalid-height blocks are dropped without restarting sync");
+
+    assert_eq!(
+        misbehavior_receiver.try_recv(),
+        Ok((addr, 100)),
+        "independently invalid block data should still be scored"
     );
 }
 
@@ -1745,16 +1790,57 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
     Ok(())
 }
 
+#[test]
+fn unanchored_singleton_requires_a_committed_near_tip() {
+    let (
+        chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        mock_chain_tip_sender,
+    ) = setup_chain_sync_with_options(Height(10), MAX_SERVICE_REQUEST_DELAY);
+
+    assert!(!chain_sync.should_accept_unanchored_singleton());
+
+    mock_chain_tip_sender.send_best_tip_height(Height(9));
+    mock_chain_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    assert!(!chain_sync.should_accept_unanchored_singleton());
+
+    mock_chain_tip_sender.send_best_tip_height(Height(10));
+    assert!(chain_sync.should_accept_unanchored_singleton());
+
+    mock_chain_tip_sender
+        .send_estimated_distance_to_network_chain_tip(Some(AT_OR_NEAR_TIP_THRESHOLD));
+    assert!(chain_sync.should_accept_unanchored_singleton());
+
+    mock_chain_tip_sender
+        .send_estimated_distance_to_network_chain_tip(Some(AT_OR_NEAR_TIP_THRESHOLD + 1));
+    assert!(!chain_sync.should_accept_unanchored_singleton());
+
+    mock_chain_tip_sender
+        .send_estimated_distance_to_network_chain_tip(Some(-AT_OR_NEAR_TIP_THRESHOLD));
+    assert!(chain_sync.should_accept_unanchored_singleton());
+
+    mock_chain_tip_sender
+        .send_estimated_distance_to_network_chain_tip(Some(-AT_OR_NEAR_TIP_THRESHOLD - 1));
+    assert!(!chain_sync.should_accept_unanchored_singleton());
+}
+
 #[tokio::test]
-async fn obtain_tips_downloads_single_hash() -> Result<(), crate::BoxError> {
+async fn obtain_tips_downloads_single_hash_when_near_tip() -> Result<(), crate::BoxError> {
     let (
         mut chain_sync,
         _sync_status,
         mut block_verifier_router,
         mut peer_set,
         mut state_service,
-        _mock_chain_tip_sender,
+        mock_chain_tip_sender,
     ) = setup_chain_sync();
+
+    mock_chain_tip_sender.send_best_tip_height(Height(1));
+    mock_chain_tip_sender
+        .send_estimated_distance_to_network_chain_tip(Some(AT_OR_NEAR_TIP_THRESHOLD));
 
     let locator = block::Hash::from([0x01; 32]);
     let unknown = block::Hash::from([0x02; 32]);
@@ -1812,6 +1898,81 @@ async fn obtain_tips_downloads_single_hash() -> Result<(), crate::BoxError> {
     state_service.expect_no_requests().await;
 
     Ok(())
+}
+
+async fn assert_obtain_tips_ignores_singleton(
+    estimated_distance: Option<HeightDiff>,
+) -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    if let Some(estimated_distance) = estimated_distance {
+        mock_chain_tip_sender.send_best_tip_height(Height(1));
+        mock_chain_tip_sender
+            .send_estimated_distance_to_network_chain_tip(Some(estimated_distance));
+    }
+
+    let locator = block::Hash::from([0x01; 32]);
+    let unknown = block::Hash::from([0x02; 32]);
+
+    // Run two rounds so the first round's zero-length legacy sync-status
+    // update cannot unlock singleton processing in the second round.
+    for _ in 0..2 {
+        let respond_to_requests = async {
+            state_service
+                .expect_request(zs::Request::BlockLocator)
+                .await
+                .respond(zs::Response::BlockLocator(vec![locator]));
+
+            peer_set
+                .expect_request(zn::Request::FindBlocks {
+                    known_blocks: vec![locator],
+                    stop: None,
+                })
+                .await
+                .respond(zn::Response::BlockHashes(vec![unknown]));
+
+            for _ in 0..(sync::FANOUT - 1) {
+                peer_set
+                    .expect_request(zn::Request::FindBlocks {
+                        known_blocks: vec![locator],
+                        stop: None,
+                    })
+                    .await
+                    .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
+            }
+
+            Ok::<_, crate::BoxError>(())
+        };
+
+        let (extra_hashes, responded) =
+            futures::join!(chain_sync.obtain_tips(), respond_to_requests);
+        responded?;
+        assert!(extra_hashes?.is_empty());
+        assert!(chain_sync.prospective_tips.is_empty());
+
+        peer_set.expect_no_requests().await;
+        block_verifier_router.expect_no_requests().await;
+        state_service.expect_no_requests().await;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn obtain_tips_ignores_single_hash_when_tip_is_unknown() -> Result<(), crate::BoxError> {
+    assert_obtain_tips_ignores_singleton(None).await
+}
+
+#[tokio::test]
+async fn obtain_tips_ignores_single_hash_when_far_from_tip() -> Result<(), crate::BoxError> {
+    assert_obtain_tips_ignores_singleton(Some(AT_OR_NEAR_TIP_THRESHOLD + 1)).await
 }
 
 #[tokio::test]
