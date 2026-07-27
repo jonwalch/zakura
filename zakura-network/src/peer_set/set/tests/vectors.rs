@@ -1660,7 +1660,7 @@ fn find_blocks_stall_not_tracked_during_empty_chain_grace() {
             .with_minimum_peer_version(minimum_peer_version)
             .build();
 
-        for request_index in 0..FIND_RESPONSE_STALL_THRESHOLD + 1 {
+        for request_index in 0..=FIND_RESPONSE_STALL_THRESHOLD {
             let peer_ready = peer_set.ready().await.expect("peer set is ready");
 
             let response_fut = peer_ready.call(Request::FindBlocks {

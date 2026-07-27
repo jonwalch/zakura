@@ -1532,23 +1532,22 @@ where
                                 let response_hashes = batch.hashes.len();
                                 batch.hashes.truncate(capacity);
                                 if batch.hashes.len() < response_hashes {
-                                    batch.prospective_tips =
-                                        (batch.hashes.len() >= 2)
-                                            .then(|| {
-                                                let tip_index = batch.hashes.len() - 2;
-                                                let expected_next_index = batch.hashes.len() - 1;
-                                                HashSet::from([CheckedTip {
-                                                    tip: *batch
-                                                        .hashes
-                                                        .get_index(tip_index)
-                                                        .expect("tip index is in bounds"),
-                                                    expected_next: *batch
-                                                        .hashes
-                                                        .get_index(expected_next_index)
-                                                        .expect("expected-next index is in bounds"),
-                                                }])
-                                            })
-                                            .unwrap_or_default();
+                                    batch.prospective_tips = if batch.hashes.len() >= 2 {
+                                        let tip_index = batch.hashes.len() - 2;
+                                        let expected_next_index = batch.hashes.len() - 1;
+                                        HashSet::from([CheckedTip {
+                                            tip: *batch
+                                                .hashes
+                                                .get_index(tip_index)
+                                                .expect("tip index is in bounds"),
+                                            expected_next: *batch
+                                                .hashes
+                                                .get_index(expected_next_index)
+                                                .expect("expected-next index is in bounds"),
+                                        }])
+                                    } else {
+                                        HashSet::new()
+                                    };
                                 }
                                 let discovered = batch.hashes.len();
                                 self.trace.tips_extended(
