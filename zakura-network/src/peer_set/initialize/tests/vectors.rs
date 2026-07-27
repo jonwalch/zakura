@@ -448,7 +448,7 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
 }
 
 #[test]
-fn crawler_replenishes_outbound_peers_below_thirty_percent_limit() {
+fn crawler_replenishes_outbound_peers_below_twenty_seven_percent_limit() {
     let cases = [
         (0, 0, 0),
         (0, 1, 1),
@@ -463,9 +463,9 @@ fn crawler_replenishes_outbound_peers_below_thirty_percent_limit() {
         (0, 10, 3),
         (2, 10, 1),
         (3, 10, 0),
-        (0, 300, 90),
-        (89, 300, 1),
-        (90, 300, 0),
+        (0, 300, 81),
+        (80, 300, 1),
+        (81, 300, 0),
         (100, 300, 0),
     ];
 
@@ -480,7 +480,7 @@ fn crawler_replenishes_outbound_peers_below_thirty_percent_limit() {
 
 #[test]
 fn crawler_queues_full_replenishment_demand() {
-    const CONNECTION_DEMAND: usize = 90;
+    const CONNECTION_DEMAND: usize = 81;
 
     let (mut demand_tx, mut demand_rx) = mpsc::channel(CONNECTION_DEMAND);
     queue_peer_demand(&mut demand_tx, CONNECTION_DEMAND)

@@ -981,10 +981,10 @@ enum CrawlerAction {
     TimerCrawlFinished,
 }
 
-const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 3;
-const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 10;
+const OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR: usize = 27;
+const OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR: usize = 100;
 
-/// Returns the number of outbound peers needed to reach 30% of the configured
+/// Returns the number of outbound peers needed to reach 27% of the configured
 /// connection limit.
 ///
 /// The target calculation avoids overflow by applying the ratio separately to
@@ -1034,7 +1034,7 @@ fn queue_peer_demand(
 /// Crawl for new peers every `config.crawl_new_peer_interval`.
 /// Also crawl whenever there is demand, but no new peers in `candidates`.
 /// After a periodic crawl, queue enough outbound connection demand to reach
-/// 30% of the configured outbound connection limit.
+/// 27% of the configured outbound connection limit.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
 /// `demand_tx`.
