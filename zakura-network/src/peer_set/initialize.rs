@@ -981,16 +981,18 @@ enum CrawlerAction {
     TimerCrawlFinished,
 }
 
-/// Returns `true` when the crawler should replenish outbound peers.
+/// Returns the number of outbound peers needed to reach half the configured
+/// connection limit.
 ///
-/// The threshold is strictly below half the configured outbound connection
-/// limit. Using [`usize::div_ceil`] preserves that boundary for odd limits and
-/// keeps a zero limit disabled.
-fn should_replenish_outbound_peers(
+/// Using [`usize::div_ceil`] preserves the threshold for odd limits, and
+/// [`usize::saturating_sub`] returns zero at or above the threshold.
+fn outbound_peer_replenishment_demand(
     active_outbound_connections: usize,
     outbound_connection_limit: usize,
-) -> bool {
-    active_outbound_connections < outbound_connection_limit.div_ceil(2)
+) -> usize {
+    outbound_connection_limit
+        .div_ceil(2)
+        .saturating_sub(active_outbound_connections)
 }
 
 /// Given a channel `demand_rx` that signals a need for new peers, try to find
@@ -999,8 +1001,8 @@ fn should_replenish_outbound_peers(
 ///
 /// Crawl for new peers every `config.crawl_new_peer_interval`.
 /// Also crawl whenever there is demand, but no new peers in `candidates`.
-/// After a periodic crawl, request another outbound connection while fewer than
-/// half the configured outbound connection slots are active.
+/// After a periodic crawl, queue enough outbound connection demand to reach
+/// half the configured outbound connection limit.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
 /// `demand_tx`.
@@ -1174,7 +1176,7 @@ where
                             // There weren't any peers, so try to get more peers.
                             debug!("demand for peers but no available candidates");
 
-                            crawl(candidates, demand_tx, false).await?;
+                            crawl(candidates, demand_tx, 0).await?;
 
                             Ok(DemandCrawlFinished)
                         }
@@ -1190,7 +1192,7 @@ where
                 let demand_tx = demand_tx.clone();
                 let active_outbound_connections = active_outbound_connections.update_count();
                 let outbound_connection_limit = config.peerset_outbound_connection_limit();
-                let should_signal_demand = should_replenish_outbound_peers(
+                let replenishment_demand = outbound_peer_replenishment_demand(
                     active_outbound_connections,
                     outbound_connection_limit,
                 );
@@ -1201,11 +1203,11 @@ where
                             ?tick,
                             active_outbound_connections,
                             outbound_connection_limit,
-                            should_signal_demand,
+                            replenishment_demand,
                             "crawling for more peers in response to the crawl timer"
                         );
 
-                        crawl(candidates, demand_tx, should_signal_demand).await?;
+                        crawl(candidates, demand_tx, replenishment_demand).await?;
 
                         Ok(TimerCrawlFinished)
                     }
@@ -1244,13 +1246,14 @@ where
 }
 
 /// Try to get more peers using `candidates`, then queue a connection attempt using `demand_tx`.
-/// If there were no new peers and `should_signal_demand` is false, the
-/// connection attempt is skipped.
+/// If the crawl discovers peers, queue at least one connection attempt. Also
+/// queue at least `minimum_connection_demand` attempts, unless the demand
+/// channel is already full.
 #[instrument(skip(candidates, demand_tx))]
 async fn crawl<S>(
     candidates: Arc<futures::lock::Mutex<CandidateSet<S>>>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
-    should_signal_demand: bool,
+    minimum_connection_demand: usize,
 ) -> Result<(), BoxError>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Send + Sync + 'static,
@@ -1264,8 +1267,9 @@ where
         std::mem::drop(candidates);
         result
     };
-    let more_peers = match result {
-        Ok(more_peers) => more_peers.or_else(|| should_signal_demand.then_some(MorePeers)),
+    let connection_demand = match result {
+        Ok(Some(MorePeers)) => minimum_connection_demand.max(1),
+        Ok(None) => minimum_connection_demand,
         Err(e) => {
             info!(
                 ?e,
@@ -1275,22 +1279,22 @@ where
         }
     };
 
-    // If we got more peers, try to connect to a new peer on our next loop.
+    // Queue connection attempts for discovered peers or outbound replenishment.
     //
     // # Security
     //
-    // Update attempts are rate-limited by the candidate set,
-    // and we only try peers if there was actually an update.
-    //
-    // So if all peers have had a recent attempt, and there was recent update
-    // with no peers, the channel will drain. This prevents useless update attempt
-    // loops.
-    if let Some(more_peers) = more_peers {
-        if let Err(send_error) = demand_tx.try_send(more_peers) {
+    // Candidate selection rate-limits outbound handshakes, and the crawler loop
+    // checks the configured outbound connection limit before starting each one.
+    for _ in 0..connection_demand {
+        if let Err(send_error) = demand_tx.try_send(MorePeers) {
             if send_error.is_disconnected() {
                 // Zebra is shutting down
                 return Err(send_error.into());
             }
+
+            // Existing queued demand is already sufficient to fill the bounded
+            // channel, so additional signals are unnecessary.
+            break;
         }
     }
 

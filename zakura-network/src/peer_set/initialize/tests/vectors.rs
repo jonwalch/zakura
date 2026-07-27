@@ -41,7 +41,7 @@ use crate::{
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            should_replenish_outbound_peers, DiscoveredPeer,
+            outbound_peer_replenishment_demand, DiscoveredPeer,
         },
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
@@ -450,20 +450,22 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
 #[test]
 fn crawler_replenishes_outbound_peers_below_half_limit() {
     let cases = [
-        (0, 0, false),
-        (0, 1, true),
-        (1, 1, false),
-        (0, 2, true),
-        (1, 2, false),
-        (1, 3, true),
-        (2, 3, false),
-        (149, 300, true),
-        (150, 300, false),
+        (0, 0, 0),
+        (0, 1, 1),
+        (1, 1, 0),
+        (0, 2, 1),
+        (1, 2, 0),
+        (0, 3, 2),
+        (1, 3, 1),
+        (2, 3, 0),
+        (100, 300, 50),
+        (149, 300, 1),
+        (150, 300, 0),
     ];
 
     for (active, limit, expected) in cases {
         assert_eq!(
-            should_replenish_outbound_peers(active, limit),
+            outbound_peer_replenishment_demand(active, limit),
             expected,
             "unexpected replenishment decision for {active} active peers and limit {limit}",
         );
