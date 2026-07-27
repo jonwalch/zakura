@@ -170,10 +170,12 @@ pub const PEER_DISK_CACHE_UPDATE_INTERVAL: Duration = Duration::from_secs(5 * 60
 
 /// The maximum number of addresses in the peer disk cache.
 ///
-/// This is chosen to be less than the number of active peers,
-/// and approximately the same as the number of seed peers returned by DNS.
-/// It is a tradeoff between fingerprinting attacks, DNS pollution risk, and cache pollution risk.
-pub const MAX_PEER_DISK_CACHE_SIZE: usize = 75;
+/// This is less than the default hard outbound limit of
+/// [`DEFAULT_PEERSET_INITIAL_TARGET_SIZE`] * [`OUTBOUND_PEER_LIMIT_MULTIPLIER`]
+/// (300). Loading the cache does not open every entry; the connection limit is
+/// independently enforced. The cache size is a tradeoff between fingerprinting
+/// attacks, DNS pollution risk, and cache pollution risk.
+pub const MAX_PEER_DISK_CACHE_SIZE: usize = 125;
 
 /// The maximum duration since a peer was last seen to consider it reachable.
 ///

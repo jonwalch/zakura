@@ -541,8 +541,8 @@ impl AddressBook {
 
         let peers = self.peers.clone();
 
-        // Get peers in preferred order, then keep the recently active ones
-        peers
+        // Get peers in preferred order, then keep the recently active ones.
+        let mut peers: Vec<_> = peers
             .ordered_values()
             // # Security
             //
@@ -554,7 +554,13 @@ impl AddressBook {
             // which improves startup time and reliability.
             .filter(|addr| addr.is_active_for_gossip(now))
             .cloned()
-            .collect()
+            .collect();
+
+        // Prefer direct local evidence over unverified gossiped timestamps,
+        // while preserving the existing order within each group.
+        peers.sort_by_key(|peer| peer.last_response().is_none());
+
+        peers
     }
 
     /// Look up `addr` in the address book, and return its [`MetaAddr`].

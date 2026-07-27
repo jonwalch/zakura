@@ -260,6 +260,40 @@ fn reconnection_peers_skips_recently_updated_ip() {
     });
 }
 
+/// Check that the cache prefers locally observed peers over gossiped peers.
+#[test]
+fn cacheable_prefers_locally_observed_peers() {
+    let locally_observed_addr = "127.0.0.1:1".parse().unwrap();
+    let gossiped_addr = "127.0.0.2:1".parse().unwrap();
+    let now = Utc::now();
+
+    let locally_observed = MetaAddr::new_responded(locally_observed_addr, None)
+        .into_new_meta_addr(Instant::now(), now.try_into().unwrap());
+    let gossiped = MetaAddr::new_gossiped_meta_addr(
+        gossiped_addr,
+        PeerServices::NODE_NETWORK,
+        now.try_into().unwrap(),
+    );
+    let mut address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        [locally_observed, gossiped],
+    );
+
+    // A later failure does not erase the stronger evidence that this peer
+    // responded to us.
+    address_book.update(MetaAddr::new_errored(locally_observed_addr, None));
+
+    let cacheable = address_book.cacheable(Utc::now());
+
+    assert_eq!(cacheable.len(), 2);
+    assert_eq!(cacheable[0].addr, locally_observed_addr);
+    assert_eq!(cacheable[1].addr, gossiped_addr);
+}
+
 fn test_reconnection_peers_skips_recently_updated_ip<
     M: Fn(crate::PeerSocketAddr) -> crate::meta_addr::MetaAddrChange,
 >(

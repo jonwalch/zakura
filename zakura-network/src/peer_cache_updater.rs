@@ -9,7 +9,7 @@ use chrono::Utc;
 use tokio::time::sleep;
 
 use crate::{
-    constants::{DNS_LOOKUP_TIMEOUT, PEER_DISK_CACHE_UPDATE_INTERVAL},
+    constants::{DNS_LOOKUP_TIMEOUT, MAX_PEER_DISK_CACHE_SIZE, PEER_DISK_CACHE_UPDATE_INTERVAL},
     meta_addr::MetaAddr,
     AddressBook, BoxError, Config,
 };
@@ -42,7 +42,8 @@ pub async fn update_peer_cache_once(
     address_book: &Arc<Mutex<AddressBook>>,
 ) -> io::Result<()> {
     let peer_list = cacheable_peers(address_book)
-        .iter()
+        .into_iter()
+        .take(MAX_PEER_DISK_CACHE_SIZE)
         .map(|meta_addr| meta_addr.addr)
         .collect();
 
