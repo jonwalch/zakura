@@ -1003,7 +1003,7 @@ fn queue_peer_demand(
     for _ in 0..connection_demand {
         if let Err(send_error) = demand_tx.try_send(MorePeers) {
             if send_error.is_disconnected() {
-                // Zebra is shutting down
+                // Zakura's peer set is shutting down.
                 return Err(send_error.into());
             }
 
@@ -1409,7 +1409,7 @@ where
             // Handshake failures are rate-limited by peer attempt timeouts.
             if let Err(send_error) = demand_tx.try_send(MorePeers) {
                 if send_error.is_disconnected() {
-                    // Zebra is shutting down
+                    // Zakura's peer set is shutting down.
                     return Err(send_error.into());
                 }
             }
