@@ -41,7 +41,7 @@ use crate::{
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            DiscoveredPeer,
+            should_replenish_outbound_peers, DiscoveredPeer,
         },
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
@@ -445,6 +445,29 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
         .expect("test peer is valid for the mainnet address book");
 
     peer
+}
+
+#[test]
+fn crawler_replenishes_outbound_peers_below_half_limit() {
+    let cases = [
+        (0, 0, false),
+        (0, 1, true),
+        (1, 1, false),
+        (0, 2, true),
+        (1, 2, false),
+        (1, 3, true),
+        (2, 3, false),
+        (149, 300, true),
+        (150, 300, false),
+    ];
+
+    for (active, limit, expected) in cases {
+        assert_eq!(
+            should_replenish_outbound_peers(active, limit),
+            expected,
+            "unexpected replenishment decision for {active} active peers and limit {limit}",
+        );
+    }
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.

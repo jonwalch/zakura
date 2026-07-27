@@ -981,13 +981,26 @@ enum CrawlerAction {
     TimerCrawlFinished,
 }
 
+/// Returns `true` when the crawler should replenish outbound peers.
+///
+/// The threshold is strictly below half the configured outbound connection
+/// limit. Using [`usize::div_ceil`] preserves that boundary for odd limits and
+/// keeps a zero limit disabled.
+fn should_replenish_outbound_peers(
+    active_outbound_connections: usize,
+    outbound_connection_limit: usize,
+) -> bool {
+    active_outbound_connections < outbound_connection_limit.div_ceil(2)
+}
+
 /// Given a channel `demand_rx` that signals a need for new peers, try to find
 /// and connect to new peers, and send the resulting `peer::Client`s through the
 /// `peerset_tx` channel.
 ///
 /// Crawl for new peers every `config.crawl_new_peer_interval`.
 /// Also crawl whenever there is demand, but no new peers in `candidates`.
-/// After crawling, try to connect to one new peer using `outbound_connector`.
+/// After a periodic crawl, request another outbound connection while fewer than
+/// half the configured outbound connection slots are active.
 ///
 /// If a handshake fails, restore the unused demand signal by sending it to
 /// `demand_tx`.
@@ -1175,16 +1188,24 @@ where
             Ok(TimerCrawl { tick }) => {
                 let candidates = candidates.clone();
                 let demand_tx = demand_tx.clone();
-                let should_always_dial = active_outbound_connections.update_count() == 0;
+                let active_outbound_connections = active_outbound_connections.update_count();
+                let outbound_connection_limit = config.peerset_outbound_connection_limit();
+                let should_signal_demand = should_replenish_outbound_peers(
+                    active_outbound_connections,
+                    outbound_connection_limit,
+                );
 
                 let crawl_handle = tokio::spawn(
                     async move {
                         debug!(
                             ?tick,
+                            active_outbound_connections,
+                            outbound_connection_limit,
+                            should_signal_demand,
                             "crawling for more peers in response to the crawl timer"
                         );
 
-                        crawl(candidates, demand_tx, should_always_dial).await?;
+                        crawl(candidates, demand_tx, should_signal_demand).await?;
 
                         Ok(TimerCrawlFinished)
                     }
@@ -1223,12 +1244,13 @@ where
 }
 
 /// Try to get more peers using `candidates`, then queue a connection attempt using `demand_tx`.
-/// If there were no new peers and `should_always_dial` is false, the connection attempt is skipped.
+/// If there were no new peers and `should_signal_demand` is false, the
+/// connection attempt is skipped.
 #[instrument(skip(candidates, demand_tx))]
 async fn crawl<S>(
     candidates: Arc<futures::lock::Mutex<CandidateSet<S>>>,
     mut demand_tx: futures::channel::mpsc::Sender<MorePeers>,
-    should_always_dial: bool,
+    should_signal_demand: bool,
 ) -> Result<(), BoxError>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Send + Sync + 'static,
@@ -1243,7 +1265,7 @@ where
         result
     };
     let more_peers = match result {
-        Ok(more_peers) => more_peers.or_else(|| should_always_dial.then_some(MorePeers)),
+        Ok(more_peers) => more_peers.or_else(|| should_signal_demand.then_some(MorePeers)),
         Err(e) => {
             info!(
                 ?e,
