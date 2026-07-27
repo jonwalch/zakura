@@ -41,7 +41,7 @@ use crate::{
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            outbound_peer_replenishment_demand, DiscoveredPeer,
+            outbound_peer_replenishment_demand, queue_peer_demand, DiscoveredPeer,
         },
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
@@ -470,6 +470,22 @@ fn crawler_replenishes_outbound_peers_below_half_limit() {
             "unexpected replenishment decision for {active} active peers and limit {limit}",
         );
     }
+}
+
+#[test]
+fn crawler_queues_full_replenishment_demand() {
+    const CONNECTION_DEMAND: usize = 50;
+
+    let (mut demand_tx, mut demand_rx) = mpsc::channel(CONNECTION_DEMAND);
+    queue_peer_demand(&mut demand_tx, CONNECTION_DEMAND)
+        .expect("open demand channel accepts replenishment signals");
+
+    let mut queued_demand = 0;
+    while demand_rx.try_recv().is_ok() {
+        queued_demand += 1;
+    }
+
+    assert_eq!(queued_demand, CONNECTION_DEMAND);
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.

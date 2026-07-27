@@ -995,6 +995,27 @@ fn outbound_peer_replenishment_demand(
         .saturating_sub(active_outbound_connections)
 }
 
+/// Queue up to `connection_demand` outbound connection attempts.
+fn queue_peer_demand(
+    demand_tx: &mut futures::channel::mpsc::Sender<MorePeers>,
+    connection_demand: usize,
+) -> Result<(), BoxError> {
+    for _ in 0..connection_demand {
+        if let Err(send_error) = demand_tx.try_send(MorePeers) {
+            if send_error.is_disconnected() {
+                // Zebra is shutting down
+                return Err(send_error.into());
+            }
+
+            // Existing queued demand is already sufficient to fill the bounded
+            // channel, so additional signals are unnecessary.
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 /// Given a channel `demand_rx` that signals a need for new peers, try to find
 /// and connect to new peers, and send the resulting `peer::Client`s through the
 /// `peerset_tx` channel.
@@ -1245,7 +1266,8 @@ where
     }
 }
 
-/// Try to get more peers using `candidates`, then queue a connection attempt using `demand_tx`.
+/// Try to get more peers using `candidates`, then queue connection attempts
+/// using `demand_tx`.
 /// If the crawl discovers peers, queue at least one connection attempt. Also
 /// queue at least `minimum_connection_demand` attempts, unless the demand
 /// channel is already full.
@@ -1285,20 +1307,7 @@ where
     //
     // Candidate selection rate-limits outbound handshakes, and the crawler loop
     // checks the configured outbound connection limit before starting each one.
-    for _ in 0..connection_demand {
-        if let Err(send_error) = demand_tx.try_send(MorePeers) {
-            if send_error.is_disconnected() {
-                // Zebra is shutting down
-                return Err(send_error.into());
-            }
-
-            // Existing queued demand is already sufficient to fill the bounded
-            // channel, so additional signals are unnecessary.
-            break;
-        }
-    }
-
-    Ok(())
+    queue_peer_demand(&mut demand_tx, connection_demand)
 }
 
 /// Try to connect to `candidate` using `outbound_connector`.
