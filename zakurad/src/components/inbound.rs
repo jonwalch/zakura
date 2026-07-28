@@ -56,8 +56,11 @@ fn block_misbehavior(
     advertiser_addr: Option<PeerSocketAddr>,
 ) -> Option<(PeerSocketAddr, u32)> {
     let advertiser_addr = advertiser_addr?;
-    let err = err.downcast::<VerifyBlockError>().ok()?;
-    let score = err.misbehavior_score();
+    let score = if let Some(err) = err.downcast_ref::<RouterError>() {
+        err.misbehavior_score()
+    } else {
+        err.downcast_ref::<VerifyBlockError>()?.misbehavior_score()
+    };
 
     (score != 0).then_some((advertiser_addr, score))
 }

@@ -14,7 +14,26 @@ mod fake_peer_set;
 mod real_peer_set;
 
 #[test]
-fn consensus_invalid_gossip_keeps_advertiser_score() {
+fn router_consensus_invalid_gossip_keeps_advertiser_score() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let error = zakura_consensus::VerifyBlockError::Block {
+        source: zakura_consensus::BlockError::NoTransactions,
+    };
+    let router_error = zakura_consensus::RouterError::Block {
+        source: Box::new(error),
+    };
+
+    assert_eq!(
+        block_misbehavior(Box::new(router_error), Some(advertiser)),
+        Some((
+            advertiser,
+            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        )),
+    );
+}
+
+#[test]
+fn direct_consensus_invalid_gossip_keeps_advertiser_score() {
     let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
     let error = zakura_consensus::VerifyBlockError::Block {
         source: zakura_consensus::BlockError::NoTransactions,
