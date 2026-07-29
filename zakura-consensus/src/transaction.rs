@@ -78,25 +78,49 @@ const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::
 /// response from the transaction verifier.
 const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
-/// Number of blocks after NU6.3 activation during which a NU6.2 branch ID
-/// does not count as peer misbehavior.
+/// Number of blocks on either side of NU6.3 activation during which a mismatched
+/// NU6.2/NU6.3 branch ID does not count as peer misbehavior.
 const NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS: i64 = 40;
 
-/// Returns whether a mempool transaction with a NU6.2 branch ID is within the
-/// NU6.3 peer-misbehavior grace period.
+/// Returns whether a mempool transaction whose consensus branch ID mismatches the
+/// expected network upgrade is within the NU6.3 activation grace period.
+///
+/// Around NU6.3 activation, honest peers whose chain tips are a few blocks apart relay
+/// transactions signed for the branch ID on their side of the boundary, and neither
+/// direction is misbehavior:
+///
+/// * a peer still behind activation keeps relaying NU6.2 transactions after we cross it,
+///   graced for the first [`NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS`] blocks from
+///   activation onward, and
+/// * a peer already past activation relays NU6.3 transactions while we are still up to
+///   [`NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS`] blocks behind activation.
 fn is_nu6_3_branch_id_misbehavior_grace_period(
     tx: &Transaction,
     height: block::Height,
     network: &Network,
 ) -> bool {
-    tx.network_upgrade() == Some(NetworkUpgrade::Nu6_2)
-        && NetworkUpgrade::current(network, height) == NetworkUpgrade::Nu6_3
-        && NetworkUpgrade::Nu6_3
-            .activation_height(network)
-            .and_then(|activation_height| {
-                activation_height + NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS
-            })
-            .is_some_and(|grace_period_end| height < grace_period_end)
+    let Some(activation_height) = NetworkUpgrade::Nu6_3.activation_height(network) else {
+        return false;
+    };
+
+    // `Height - Height` yields an `i64` `HeightDiff` and is always exact, so the signed
+    // distance from activation cannot overflow.
+    let height_offset = height - activation_height;
+
+    match (
+        tx.network_upgrade(),
+        NetworkUpgrade::current(network, height),
+    ) {
+        // Stale NU6.2 transaction relayed after we crossed activation.
+        (Some(NetworkUpgrade::Nu6_2), NetworkUpgrade::Nu6_3) => {
+            (0..NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS).contains(&height_offset)
+        }
+        // Early NU6.3 transaction relayed while we are still behind activation.
+        (Some(NetworkUpgrade::Nu6_3), NetworkUpgrade::Nu6_2) => {
+            (-NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS..0).contains(&height_offset)
+        }
+        _ => false,
+    }
 }
 
 /// Asynchronous transaction verification.

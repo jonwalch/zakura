@@ -4265,6 +4265,24 @@ fn public_nu6_3_consensus_branch_id_boundary() {
             Ok(()),
         );
 
+        // Early direction: a peer already past activation relays NU6.3 transactions while
+        // we are still behind. These are graced for the 40 blocks before activation.
+        assert!(super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height - 1).expect("NU6.3 is not genesis"),
+            &network,
+        ));
+        assert!(super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height - 40).expect("NU6.3 activates well above the grace window"),
+            &network,
+        ));
+        assert!(!super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height - 41).expect("NU6.3 activates well above the grace window"),
+            &network,
+        ));
+
         tx.update_network_upgrade(NetworkUpgrade::Nu6_2)
             .expect("V5 transactions support the NU6.2 branch ID");
     }

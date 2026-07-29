@@ -265,7 +265,7 @@ pub enum TransactionError {
     WrongConsensusBranchId,
 
     #[error(
-        "mempool transaction uses the NU6.2 consensus branch id during the NU6.3 grace period"
+        "mempool transaction uses a mismatched NU6.2/NU6.3 consensus branch id during the NU6.3 grace period"
     )]
     WrongConsensusBranchIdNu6_3GracePeriod,
 
