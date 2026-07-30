@@ -352,7 +352,8 @@ jobs:
           sudo systemctl --no-pager --full status zakura-testnet-snapshots.service || true
 
       - name: Install public broadcast gateway
-        if: always()
+        # Switch the fleet gateway only after every backend is running the new listener.
+        if: ${{ success() && !inputs.no_restart && inputs.node == '' }}
         run: |
           set -euo pipefail
 

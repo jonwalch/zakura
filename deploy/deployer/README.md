@@ -139,7 +139,8 @@ It also installs the public broadcast-only JSON-RPC gateway on
 - TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/testnet/Caddyfile`
 
 The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
-load-balances across the testnet `:18232` backends listed in
+load-balances across the testnet transaction submission listeners on `:18237`
+listed in
 `deploy/gateway/testnet/backends.toml`.
 
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
@@ -241,7 +242,8 @@ It also installs the public broadcast-only JSON-RPC gateway on the same host
 - TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/mainnet/Caddyfile`
 
 The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
-load-balances across the mainnet `:8232` backends listed in
+load-balances across the mainnet transaction submission listeners on `:8237`
+listed in
 `deploy/gateway/mainnet/backends.toml`.
 
 It is the same `zakura-cluster-status.py` as testnet, launched with
