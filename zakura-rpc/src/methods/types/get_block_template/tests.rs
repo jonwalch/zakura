@@ -26,6 +26,36 @@ use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::MinerParams;
 
+#[test]
+fn coinbase_cache_reuses_matching_coinbase() {
+    use super::CoinbaseCache;
+
+    let net = Network::Mainnet;
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&net)
+        .expect("NU5 is active on Mainnet");
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .expect("hard-coded transparent address is valid"),
+    );
+    let fee = Amount::zero();
+    let coinbase = TransactionTemplate::new_coinbase(&net, height, &miner_params, fee)
+        .expect("valid coinbase transaction");
+    let cache = CoinbaseCache::default();
+
+    assert!(cache.get(height, fee).is_none());
+    cache.store(height, fee, coinbase.clone());
+    assert_eq!(cache.get(height, fee), Some(coinbase));
+    assert!(cache
+        .get(height.next().expect("NU5 height is below Height::MAX"), fee)
+        .is_none());
+    cache.clear();
+    assert!(cache.get(height, fee).is_none());
+}
+
 /// Tests transparent coinbase generation at every configured Sapling-and-later
 /// network upgrade activation.
 #[test]

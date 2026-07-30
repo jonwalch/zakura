@@ -10,7 +10,7 @@ mod tests;
 
 use std::{
     fmt::{self},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use derive_getters::Getters;
@@ -272,6 +272,7 @@ impl BlockTemplateResponse {
     pub(crate) fn new_internal(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
+        coinbase_cache: Option<CoinbaseCache>,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
@@ -327,10 +328,21 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
-        });
+        let coinbase_txn = precomputed_coinbase
+            .or_else(|| {
+                coinbase_cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(height, txs_fee))
+            })
+            .unwrap_or_else(|| {
+                let coinbase_txn =
+                    TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                        .expect("valid coinbase tx");
+                if let Some(cache) = &coinbase_cache {
+                    cache.store(height, txs_fee, coinbase_txn.clone());
+                }
+                coinbase_txn
+            });
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -543,6 +555,66 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
+/// Caches the most recently built coinbase transaction for the next block, keyed by its height and
+/// total transaction fees.
+#[derive(Clone, Default)]
+pub(crate) struct CoinbaseCache(
+    Arc<
+        Mutex<
+            Vec<(
+                block::Height,
+                Amount<NonNegative>,
+                TransactionTemplate<amount::NegativeOrZero>,
+            )>,
+        >,
+    >,
+);
+
+impl CoinbaseCache {
+    /// Returns the cached coinbase transaction for `height` and `fee`.
+    fn get(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+    ) -> Option<TransactionTemplate<amount::NegativeOrZero>> {
+        let cache = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .iter()
+            .find(|(cached_height, cached_fee, _)| *cached_height == height && *cached_fee == fee)
+            .map(|(_, _, coinbase)| coinbase.clone())
+    }
+
+    /// Stores `coinbase`, retaining at most the zero-fee sizing entry and one fee-bearing entry.
+    fn store(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        coinbase: TransactionTemplate<amount::NegativeOrZero>,
+    ) {
+        let mut cache = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.retain(|(cached_height, cached_fee, _)| {
+            *cached_height == height
+                && *cached_fee != fee
+                && (*cached_fee == Amount::zero() || fee == Amount::zero())
+        });
+        cache.push((height, fee, coinbase));
+    }
+
+    /// Discards all cached coinbase transactions.
+    fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -562,6 +634,9 @@ where
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
     mined_block_sender: mpsc::Sender<(block::Hash, block::Height)>,
+
+    /// The most recently built coinbase, reused by short-polling miners.
+    coinbase_cache: CoinbaseCache,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -583,12 +658,18 @@ where
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
+            coinbase_cache: CoinbaseCache::default(),
         }
     }
 
     /// Returns the miner parameters, including the address, data, and memo.
     pub fn miner_params(&self) -> Option<&MinerParams> {
         self.miner_params.as_ref()
+    }
+
+    /// Returns a handle to the coinbase transaction cache.
+    pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
+        self.coinbase_cache.clone()
     }
 
     /// Returns the sync status.
@@ -615,6 +696,7 @@ where
         if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
+            self.coinbase_cache.clear();
         }
     }
 }

@@ -23,6 +23,8 @@ use zakura_chain::{
 };
 use zakura_consensus::MAX_BLOCK_SIGOPS;
 use zakura_node_services::mempool::TransactionDependencies;
+
+use super::CoinbaseCache;
 use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
 use crate::methods::types::transaction::TransactionTemplate;
@@ -109,12 +111,21 @@ pub fn select_mempool_transactions(
     miner_params: &MinerParams,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
+    coinbase_cache: Option<&CoinbaseCache>,
 ) -> Vec<SelectedMempoolTx> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
-    let fake_coinbase_tx =
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())
-            .expect("valid coinbase transaction template");
+    let fake_coinbase_tx = coinbase_cache
+        .and_then(|cache| cache.get(height, Amount::zero()))
+        .unwrap_or_else(|| {
+            let coinbase =
+                TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())
+                    .expect("valid coinbase transaction template");
+            if let Some(cache) = coinbase_cache {
+                cache.store(height, Amount::zero(), coinbase.clone());
+            }
+            coinbase
+        });
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
