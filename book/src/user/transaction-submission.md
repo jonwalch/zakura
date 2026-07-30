@@ -42,6 +42,10 @@ Set `enabled = false` to disable the listener. Environment variable overrides
 use the same nesting, for example
 `ZAKURA_RPC__TRANSACTION_SUBMISSION__REQUESTS_PER_SECOND=20`.
 
+Zakura rejects zero limits, per-IP limits above their global limits, more than
+500 global in-flight submissions, more than 100,000 global connections, more
+than 256 trusted proxy networks, and trusted catch-all networks at startup.
+
 The maximum HTTP body size is derived from the configured mempool transaction
 size limit. Requests must use `POST /`, `Content-Type: application/json`, and a
 bounded `Content-Length`; compressed, chunked, batch, WebSocket, and HTTP/2
