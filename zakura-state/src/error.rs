@@ -934,6 +934,7 @@ impl ValidateContextError {
             // out-of-order arrival, retryable stalls, and auxiliary roots that
             // may have come from a different peer.
             | ValidateContextError::MissingSproutTipTree(_)
+            | ValidateContextError::HeaderRootAuthFrontier { .. }
             | ValidateContextError::BlockPreviouslyInvalidated { .. }
             | ValidateContextError::NotReadyToBeCommitted
             | ValidateContextError::InvalidAncestorBlock(_)
