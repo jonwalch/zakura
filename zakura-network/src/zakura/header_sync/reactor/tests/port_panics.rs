@@ -4,6 +4,7 @@ use futures::StreamExt;
 use tokio::sync::Notify;
 
 use super::*;
+use crate::zakura::testkit::{TraceCapture, TraceValue};
 use crate::zakura::CloseCause;
 use zakura_node_services::header_chain as port;
 
@@ -240,3 +241,74 @@ async fn internal_vct_port_panic_is_contained_without_peer_disconnect() {
     assert!(reactor.peer_state.contains_key(&peer));
 }
 
+#[tokio::test]
+async fn port_panic_trace_is_bounded_and_request_scope_serializes_null_generation() {
+    let mut capture =
+        TraceCapture::for_test("port_panic_trace_is_bounded").expect("trace capture starts");
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = Arc::new(PanickingPort { release: None });
+    startup.trace = crate::zakura::ZakuraTrace::new(capture.tracer(), "panic-test");
+    startup.use_direct_port();
+    let (_, _, mut reactor) =
+        build_header_sync_reactor(startup).expect("the traced reactor builds");
+    let peer = peer();
+    let (connection_cancel, _) = connected_session(&mut reactor, peer.clone(), 7);
+    let target = block::Hash([0x91; 32]);
+    let scope = zakura_header_chain::WorkScope::for_header_target(&snapshot, target);
+    reactor.emit_header_request(
+        &peer,
+        7,
+        scope,
+        HeaderSyncRequestId::new(1).expect("one is nonzero"),
+        target,
+        &zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        1,
+        AuxSchema::V1,
+    );
+    assert!(
+        reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+            peer,
+            session_id: 7,
+            target_tip_hash: target,
+            scope,
+        })
+    );
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the panic is contained");
+    reactor.handle_port_completion(completion);
+    assert!(connection_cancel.is_cancelled());
+
+    capture.flush().await;
+    let reader = capture.reader().expect("the trace reloads");
+    let header_trace = reader.table(HEADER_SYNC_TABLE.table());
+    header_trace.assert_row(
+        hs_trace::HEADER_REQUEST_SENT,
+        &[
+            (hs_trace::VERIFIED_GENERATION, TraceValue::Null),
+            (
+                hs_trace::STREAM_VERSION,
+                TraceValue::U64(u64::from(ZAKURA_HEADER_SYNC_STREAM_VERSION)),
+            ),
+        ],
+    );
+    header_trace.assert_row(
+        hs_trace::HEADER_PEER_VIOLATION,
+        &[
+            (hs_trace::BOUNDARY, TraceValue::Str("port")),
+            (hs_trace::DISPOSITION, TraceValue::Str("disconnect")),
+            (hs_trace::OPERATION, TraceValue::Str("query_header_locator")),
+        ],
+    );
+    let encoded = serde_json::to_string(&header_trace.rows()).expect("trace rows serialize");
+    assert!(!encoded.contains("unbounded panic payload"));
+    assert!(!encoded.contains("\"entries\""));
+    assert!(!encoded.contains("\"locator_hashes\""));
+    let _ = capture.finish().await.expect("trace capture finishes");
+}

@@ -1,8 +1,10 @@
 mod admission;
 mod completion;
+mod eviction;
 mod peer_faults;
 mod port_panics;
 mod serving;
+mod terminal_trace;
 mod timeouts;
 mod vct_repair;
 
