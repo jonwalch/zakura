@@ -708,13 +708,60 @@ struct CheckedTip {
 fn checkpoint_bootstrap_hash_limit(
     state_tip: Option<Height>,
     max_checkpoint_height: Height,
-    in_flight: usize,
+    pending_checkpoint_work: usize,
 ) -> usize {
     let state_tip = state_tip.unwrap_or(Height(0));
     let remaining = max_checkpoint_height.0.saturating_sub(state_tip.0);
     usize::try_from(remaining)
         .expect("block height difference fits in usize")
-        .saturating_sub(in_flight)
+        .saturating_sub(pending_checkpoint_work)
+}
+
+/// Removes pending hashes, then limits new compatibility downloads to the final checkpoint.
+fn cap_checkpoint_bootstrap_hashes(
+    hashes: &mut IndexSet<block::Hash>,
+    state_tip: Option<Height>,
+    max_checkpoint_height: Height,
+    pending: &HashMap<block::Hash, Option<Height>>,
+) -> bool {
+    let state_tip = state_tip.unwrap_or(Height(0));
+    let raw_hashes = hashes.len();
+    let overlapping_pending = hashes
+        .iter()
+        .filter(|hash| pending.contains_key(hash))
+        .count();
+    let pending_checkpoint_work = pending
+        .values()
+        .filter(|height| match height {
+            Some(height) => *height > state_tip && *height <= max_checkpoint_height,
+            None => true,
+        })
+        .count();
+
+    // A refreshed locator response repeats blocks parked in the checkpoint verifier. Remove those
+    // hashes before truncating, so they do not consume both the pending and new-download budgets.
+    hashes.retain(|hash| !pending.contains_key(hash));
+
+    let limit = checkpoint_bootstrap_hash_limit(
+        Some(state_tip),
+        max_checkpoint_height,
+        pending_checkpoint_work,
+    );
+    let reaches_checkpoint = hashes.len() >= limit;
+    hashes.truncate(limit);
+
+    debug!(
+        raw_hashes,
+        overlapping_pending,
+        pending_checkpoint_work,
+        new_hash_limit = limit,
+        retained_new_hashes = hashes.len(),
+        ?state_tip,
+        ?max_checkpoint_height,
+        "capped checkpoint bootstrap hashes",
+    );
+
+    reaches_checkpoint
 }
 
 pub struct ChainSync<ZN, ZS, ZV, ZSTip>
@@ -1629,9 +1676,8 @@ where
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
                         let (mut download_set, mut new_tips, _discovered) =
                             extended.expect("only polled while an extension is in flight")?;
-                        let reached_checkpoint = self.cap_checkpoint_bootstrap_hashes(
+                        let reached_checkpoint = self.cap_checkpoint_bootstrap_downloads(
                             &mut download_set,
-                            self.downloads.in_flight(),
                             checkpoint_bootstrap,
                         );
                         if reached_checkpoint {
@@ -1947,11 +1993,8 @@ where
             }
         }
 
-        let reached_checkpoint = self.cap_checkpoint_bootstrap_hashes(
-            &mut download_set,
-            self.downloads.in_flight(),
-            checkpoint_bootstrap,
-        );
+        let reached_checkpoint =
+            self.cap_checkpoint_bootstrap_downloads(&mut download_set, checkpoint_bootstrap);
         if reached_checkpoint {
             self.prospective_tips.clear();
         }
@@ -1985,24 +2028,22 @@ where
     /// Limits compatibility downloads to the final checkpoint while it owns
     /// initial block applies. Hashes above that boundary are left for native
     /// Zakura block sync after the durable snapshot transfers ownership.
-    fn cap_checkpoint_bootstrap_hashes(
+    fn cap_checkpoint_bootstrap_downloads(
         &self,
         hashes: &mut IndexSet<block::Hash>,
-        in_flight: usize,
         checkpoint_bootstrap: bool,
     ) -> bool {
         if !checkpoint_bootstrap {
             return false;
         }
 
-        let limit = checkpoint_bootstrap_hash_limit(
+        let pending = self.downloads.pending_hash_heights();
+        cap_checkpoint_bootstrap_hashes(
+            hashes,
             self.latest_chain_tip.best_tip_height(),
             self.max_checkpoint_height,
-            in_flight,
-        );
-        let reaches_checkpoint = hashes.len() >= limit;
-        hashes.truncate(limit);
-        reaches_checkpoint
+            &pending,
+        )
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block

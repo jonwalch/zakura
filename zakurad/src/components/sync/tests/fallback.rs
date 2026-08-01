@@ -4,13 +4,19 @@
 //! These exercise the pure decision function [`zakura_block_sync_stalled`] directly,
 //! so they are deterministic and need no clock, services, or live `ChainTip`.
 
-use zakura_chain::{block::Height, chain_sync_status::ChainSyncStatus};
+use std::collections::HashMap;
+
+use indexmap::IndexSet;
+use zakura_chain::{
+    block::{self, Height},
+    chain_sync_status::ChainSyncStatus,
+};
 
 use super::super::{
-    checkpoint_bootstrap_hash_limit, engage_legacy_fallback_alongside_zakura,
-    legacy_probe_supports_fallback, zakura_block_sync_stalled, zakura_sync_status_length,
-    zakura_watchdog_action, SyncStatus, ZakuraLegacyProbe, ZakuraStallTracker,
-    ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    cap_checkpoint_bootstrap_hashes, checkpoint_bootstrap_hash_limit,
+    engage_legacy_fallback_alongside_zakura, legacy_probe_supports_fallback,
+    zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, SyncStatus,
+    ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 #[test]
@@ -36,6 +42,22 @@ fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
     );
 }
 
+fn height_hash(height: u32) -> block::Hash {
+    let mut bytes = [0; 32];
+    bytes[..4].copy_from_slice(&height.to_le_bytes());
+    block::Hash(bytes)
+}
+
+fn height_hashes(start: u32, end: u32) -> IndexSet<block::Hash> {
+    (start..=end).map(height_hash).collect()
+}
+
+fn pending_heights(start: u32, end: u32) -> HashMap<block::Hash, Option<Height>> {
+    (start..=end)
+        .map(|height| (height_hash(height), Some(Height(height))))
+        .collect()
+}
+
 #[test]
 fn legacy_checkpoint_bootstrap_leaves_post_checkpoint_hashes_for_zakura() {
     let checkpoint = Height(200);
@@ -55,6 +77,77 @@ fn legacy_checkpoint_bootstrap_leaves_post_checkpoint_hashes_for_zakura() {
         0,
         "native Zakura owns every block after the checkpoint"
     );
+}
+
+#[test]
+fn checkpoint_cap_removes_a_repeated_pending_prefix_before_truncating() {
+    let pending = pending_heights(3_201, 3_300);
+    let mut advertised = height_hashes(3_201, 3_700);
+
+    assert!(cap_checkpoint_bootstrap_hashes(
+        &mut advertised,
+        Some(Height(3_200)),
+        Height(3_600),
+        &pending,
+    ));
+    assert_eq!(advertised, height_hashes(3_301, 3_600));
+}
+
+#[test]
+fn checkpoint_cap_stops_a_fresh_response_at_the_boundary() {
+    let mut advertised = height_hashes(3_201, 3_700);
+
+    assert!(cap_checkpoint_bootstrap_hashes(
+        &mut advertised,
+        Some(Height(3_200)),
+        Height(3_600),
+        &HashMap::new(),
+    ));
+    assert_eq!(advertised, height_hashes(3_201, 3_600));
+}
+
+#[test]
+fn checkpoint_cap_accounts_for_a_non_overlapping_pending_prefix() {
+    let pending = pending_heights(3_201, 3_300);
+    let mut advertised = height_hashes(3_301, 3_800);
+
+    assert!(cap_checkpoint_bootstrap_hashes(
+        &mut advertised,
+        Some(Height(3_200)),
+        Height(3_600),
+        &pending,
+    ));
+    assert_eq!(advertised, height_hashes(3_301, 3_600));
+}
+
+#[test]
+fn checkpoint_cap_does_not_count_stale_or_above_boundary_tasks() {
+    let stale = height_hash(3_200);
+    let above_boundary = height_hash(3_700);
+    let mut pending = HashMap::from([
+        (stale, Some(Height(3_200))),
+        (above_boundary, Some(Height(3_700))),
+    ]);
+    let mut advertised = height_hashes(3_201, 3_700);
+    advertised.insert(stale);
+
+    assert!(cap_checkpoint_bootstrap_hashes(
+        &mut advertised,
+        Some(Height(3_200)),
+        Height(3_600),
+        &pending,
+    ));
+    assert_eq!(advertised, height_hashes(3_201, 3_600));
+
+    pending.insert(height_hash(3_201), None);
+    let mut unknown_pending = height_hashes(3_201, 3_700);
+    assert!(cap_checkpoint_bootstrap_hashes(
+        &mut unknown_pending,
+        Some(Height(3_200)),
+        Height(3_600),
+        &pending,
+    ));
+    assert_eq!(unknown_pending, height_hashes(3_202, 3_600));
 }
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
