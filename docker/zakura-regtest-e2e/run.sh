@@ -619,15 +619,16 @@ wait_for_checkpoint_handoff() {
   log "node2 checkpoint bootstrap verified legacy heights 0..${expected_height} and handed off at the exact boundary"
 }
 
-# A correct handoff is ordered: legacy checkpoint completion, a fresh native
-# header request, then kind-6 body requests whose union covers the full suffix.
+# Native header negotiation can prefetch while the checkpoint verifier owns the
+# prefix. Require a complete, matching header lifecycle rooted at the checkpoint
+# boundary before kind-6 body requests cover the full post-handoff suffix.
 wait_for_native_suffix_coverage() {
   local suffix_start="$1" suffix_end="$2" block_lines_before="$3"
   local header_lines_before="$4" timeout="$5"
   local block_file="${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl"
   local header_file="${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl"
   local deadline=$((SECONDS + timeout)) request_summary covered=0
-  local first_request_ts header_count
+  local first_request_ts lifecycle_count
 
   while (( SECONDS < deadline )); do
     request_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
@@ -695,22 +696,54 @@ wait_for_native_suffix_coverage() {
     || fail "node2 native requests were not confined to the post-handoff suffix ${suffix_start}..${suffix_end}"
 
   first_request_ts=$(printf '%s' "${request_summary}" | jq -r '.first_request_ts')
-  header_count=$(trace_rows_after "${header_file}" "${header_lines_before}" \
+  lifecycle_count=$(trace_rows_after "${header_file}" "${header_lines_before}" \
     | jq -sc \
         --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
-        --argjson handoff_ts "${CHECKPOINT_HANDOFF_TS}" \
+        --argjson ancestor_height "$(( suffix_start - 1 ))" \
+        --argjson expected_count "$(( suffix_end - suffix_start + 1 ))" \
         --argjson first_request_ts "${first_request_ts}" '
-          [ .[] | select(
-              .process_trace_id == $process
-              and .event == "header_request_sent"
-              and .ts > $handoff_ts
-              and .ts < $first_request_ts
-            )
+          . as $rows
+          | [ $rows[] as $admission
+              | select(
+                  $admission.process_trace_id == $process
+                  and $admission.event == "header_target_admitted"
+                  and $admission.stage == "apply"
+                  and $admission.ts < $first_request_ts
+                )
+              | $rows[] as $response
+              | select(
+                  $response.process_trace_id == $process
+                  and $response.event == "header_response_received"
+                  and $response.request_id == $admission.request_id
+                  and $response.session_id == $admission.session_id
+                  and $response.peer == $admission.peer
+                  and $response.branch_anchor == $admission.branch_anchor
+                  and $response.branch_target == $admission.branch_target
+                  and $response.common_ancestor_hash == $response.branch_anchor
+                  and $response.common_ancestor_height == $ancestor_height
+                  and $response.header_count == $expected_count
+                  and $response.complete == true
+                  and $response.ts < $admission.ts
+                )
+              | $rows[] as $request
+              | select(
+                  $request.process_trace_id == $process
+                  and $request.event == "header_request_sent"
+                  and $request.request_id == $response.request_id
+                  and $request.session_id == $response.session_id
+                  and $request.peer == $response.peer
+                  and $request.branch_anchor == $response.branch_anchor
+                  and $request.branch_target == $response.branch_target
+                  and $request.locator_head == $response.common_ancestor_hash
+                  and $request.target_hash == $response.target_hash
+                  and $request.header_count >= $expected_count
+                  and $request.ts < $response.ts
+                )
           ] | length
         ')
-  (( header_count >= 1 )) \
-    || fail "node2 did not renegotiate native headers between checkpoint handoff and its first kind-6 body request"
-  log "node2 renegotiated headers after handoff and covered native kind-6 suffix ${suffix_start}..${suffix_end}"
+  (( lifecycle_count >= 1 )) \
+    || fail "node2 did not complete and admit the native header lifecycle before its first kind-6 body request"
+  log "node2 admitted a complete native header lifecycle and covered post-handoff kind-6 suffix ${suffix_start}..${suffix_end}"
 }
 
 wait_ready() {
