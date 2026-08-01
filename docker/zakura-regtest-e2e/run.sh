@@ -142,6 +142,10 @@ GENERATE_BLOCKS="${GENERATE_BLOCKS:-${DEFAULT_GENERATE_BLOCKS}}"
 # catch-up.
 CATCHUP_BLOCKS="${CATCHUP_BLOCKS:-${DEFAULT_CATCHUP_BLOCKS}}"
 READY_TIMEOUT="${READY_TIMEOUT:-120}"
+# A hard-stopped QUIC peer is retired by Zakura's 150s application idle
+# reaper. Allow that retirement plus the JSONL writer's ~17s flush interval;
+# the ordinary readiness timeout intentionally remains tighter for startup.
+NODE4_DISCONNECT_TIMEOUT="${NODE4_DISCONNECT_TIMEOUT:-210}"
 # Propagation to the Zakura peer can take a little while: the dual-stack tries
 # the (empty) legacy peer set first, and the legacy->Zakura upgrade re-dials a
 # few times before the connection settles. The loop exits as soon as the block
@@ -512,20 +516,6 @@ wait_metric_at_least() {
   fail "${label} ${name} stayed below ${want} within ${timeout}s"
 }
 
-wait_metric_at_most() {
-  local port="$1" name="$2" want="$3" label="$4" timeout="${5:-${READY_TIMEOUT}}"
-  local deadline=$((SECONDS + timeout)) value
-  while (( SECONDS < deadline )); do
-    value=$(metric "${port}" "${name}")
-    printf '  %s %s=%s (want <= %s)\n' "${label}" "${name}" "${value}" "${want}"
-    if awk "BEGIN{exit !(${value} <= ${want})}"; then
-      return 0
-    fi
-    sleep 3
-  done
-  fail "${label} ${name} stayed above ${want} within ${timeout}s"
-}
-
 wait_ready() {
   local port="$1" name="$2" deadline=$((SECONDS + READY_TIMEOUT))
   while (( SECONDS < deadline )); do
@@ -599,7 +589,8 @@ quiesce_optional_node4_before_extended_work() {
 
   local file="${ZAKURA_E2E_TRACE_DIR}/node4/block_sync.jsonl" last leak
   local header_file="${ZAKURA_E2E_TRACE_DIR}/node1/header_sync.jsonl"
-  local disconnects_before disconnects_after deadline
+  local active_sessions_before connections_before connections_after
+  local disconnects_before disconnects_after deadline node2_connections
   last=$(grep 'block_sync_state' "${file}" 2>/dev/null | tail -1 || true)
   [[ -n "${last}" ]] || fail "node4 pre-extended block-sync trace is missing"
   leak=$(printf '%s' "${last}" \
@@ -608,27 +599,54 @@ quiesce_optional_node4_before_extended_work() {
   [[ "${leak}" == "0" ]] \
     || fail "node4 pre-extended block-sync trace is not drained (total ${leak})"
 
+  connections_before=$(metric 19001 zakura_p2p_conn_active)
+  if ! awk "BEGIN{exit !(${connections_before} == 2)}"; then
+    fail "node1 expected exactly node2 and node4 before optional-peer quiescence, found ${connections_before} active Zakura peers"
+  fi
+  active_sessions_before=$(jq -sc '
+    ([.[] | select(.event == "header_peer_connected") | .session_id]
+      - [.[] | select(.event == "header_peer_disconnected") | .session_id])
+    | unique
+  ' "${header_file}") \
+    || fail "could not read node1 active header sessions before stopping node4"
+  [[ "$(printf '%s' "${active_sessions_before}" | jq -r 'length')" == "2" ]] \
+    || fail "node1 trace did not contain exactly two active header sessions before stopping node4"
   disconnects_before=$(grep -c '"event":"header_peer_disconnected"' "${header_file}" 2>/dev/null || true)
 
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-4 \
     || fail "could not stop optional node4 before extended work"
-  wait_metric_at_most 19001 zakura_p2p_conn_active 1 "node1 post-node4-quiesce"
 
-  deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
+  deadline=$((SECONDS + NODE4_DISCONNECT_TIMEOUT))
   while (( SECONDS < deadline )); do
+    connections_after=$(metric 19001 zakura_p2p_conn_active)
     disconnects_after=$(grep -c '"event":"header_peer_disconnected"' "${header_file}" 2>/dev/null || true)
-    if (( disconnects_after > disconnects_before )); then
+    printf '  node1 post-node4-quiesce active=%s disconnect_rows=%s (want <=1 and >%s)\n' \
+      "${connections_after}" "${disconnects_after}" "${disconnects_before}"
+    if awk "BEGIN{exit !(${connections_after} <= 1)}" \
+      && (( disconnects_after > disconnects_before )); then
       last=$(grep '"event":"header_peer_disconnected"' "${header_file}" | tail -1)
       printf '%s' "${last}" \
-        | jq -e '(.session_id | type == "number") and (.direction == "inbound" or .direction == "outbound") and ((.inbound_count + .outbound_count) <= 1) and ((.reason | strings | length) > 0)' \
+        | jq -e --argjson active "${active_sessions_before}" '
+            .session_id as $session
+            | ($session | type == "number")
+              and ($active | index($session) != null)
+              and (.direction == "inbound")
+              and (.inbound_count == 1)
+              and (.outbound_count == 0)
+              and ((.reason | strings | length) > 0)
+          ' \
           >/dev/null \
-        || fail "node1 post-node4 disconnect trace boundary is malformed"
+        || fail "node1 post-node4 disconnect trace boundary does not retire one of the two pre-stop inbound sessions"
+      node2_connections=$(metric 19002 zakura_p2p_conn_active)
+      if ! awk "BEGIN{exit !(${node2_connections} >= 1)}"; then
+        fail "node2 was not connected after node1 retired the stopped node4 session"
+      fi
       OPTIONAL_NODE4_QUIESCED=1
       return 0
     fi
     sleep 3
   done
-  fail "node1 did not flush the node4 disconnect boundary within ${TRACE_FLUSH_TIMEOUT}s"
+  fail "node1 did not retire and flush the stopped node4 session within ${NODE4_DISCONNECT_TIMEOUT}s"
 }
 
 invalidate_block_if_present() {
