@@ -512,6 +512,20 @@ wait_metric_at_least() {
   fail "${label} ${name} stayed below ${want} within ${timeout}s"
 }
 
+wait_metric_at_most() {
+  local port="$1" name="$2" want="$3" label="$4" timeout="${5:-${READY_TIMEOUT}}"
+  local deadline=$((SECONDS + timeout)) value
+  while (( SECONDS < deadline )); do
+    value=$(metric "${port}" "${name}")
+    printf '  %s %s=%s (want <= %s)\n' "${label}" "${name}" "${value}" "${want}"
+    if awk "BEGIN{exit !(${value} <= ${want})}"; then
+      return 0
+    fi
+    sleep 3
+  done
+  fail "${label} ${name} stayed above ${want} within ${timeout}s"
+}
+
 wait_ready() {
   local port="$1" name="$2" deadline=$((SECONDS + READY_TIMEOUT))
   while (( SECONDS < deadline )); do
@@ -565,32 +579,56 @@ block_count() { rpc "$1" getblockcount | jq -r '.result // 0'; }
 block_hash() { rpc "$1" getblockhash "[$2]" | jq -r '.result // empty'; }
 strict_upgrade() { [[ "${ZAKURA_REGTEST_E2E_STRICT_UPGRADE:-0}" == "1" ]]; }
 
-# The restart matrix only stresses node2. Stop the known-optional upgraded peer
-# at a verified idle trace boundary so its unrelated catch-up cannot outlive it.
-quiesce_optional_node4_for_restart_matrix() {
-  [[ "${ZAKURA_E2E_MODE}" == "restart-matrix" ]] || return 0
+# Extended lanes only stress node1 and node2 after the initial upgrade smoke.
+# Stop the known-optional upgraded peer at a verified idle trace boundary so
+# its unrelated catch-up cannot outlive it and keep header requests open.
+quiesce_optional_node4_before_extended_work() {
+  case "${ZAKURA_E2E_MODE}" in
+    checkpoint-long|no-checkpoint-long|restart-matrix) ;;
+    *) return 0 ;;
+  esac
   strict_upgrade && return 0
 
-  log "quiescing optional node4 before the node2 restart matrix"
-  wait_metric_zero 19004 sync_block_budget_reserved_bytes "node4 pre-matrix budget"
-  wait_metric_zero 19004 sync_block_reorder_buffered_bytes "node4 pre-matrix reorder"
-  wait_metric_zero 19004 sync_block_applying "node4 pre-matrix applying"
-  wait_metric_zero 19004 sync_block_outstanding "node4 pre-matrix outstanding"
-  wait_for_commit_trace_balance node4 "node4 pre-matrix"
+  log "quiescing optional node4 before extended ${ZAKURA_E2E_MODE} work"
+  wait_metric_zero 19004 sync_block_budget_reserved_bytes "node4 pre-extended budget"
+  wait_metric_zero 19004 sync_block_reorder_buffered_bytes "node4 pre-extended reorder"
+  wait_metric_zero 19004 sync_block_applying "node4 pre-extended applying"
+  wait_metric_zero 19004 sync_block_outstanding "node4 pre-extended outstanding"
+  wait_for_commit_trace_balance node4 "node4 pre-extended"
   wait_for_trace_flush
 
   local file="${ZAKURA_E2E_TRACE_DIR}/node4/block_sync.jsonl" last leak
+  local header_file="${ZAKURA_E2E_TRACE_DIR}/node1/header_sync.jsonl"
+  local disconnects_before disconnects_after deadline
   last=$(grep 'block_sync_state' "${file}" 2>/dev/null | tail -1 || true)
-  [[ -n "${last}" ]] || fail "node4 pre-matrix block-sync trace is missing"
+  [[ -n "${last}" ]] || fail "node4 pre-extended block-sync trace is missing"
   leak=$(printf '%s' "${last}" \
     | jq -er '[(.applying//0),(.budget_reserved//0),(.reorder//0),(.outstanding//0)]|add') \
-    || fail "could not read node4 pre-matrix block-sync trace"
+    || fail "could not read node4 pre-extended block-sync trace"
   [[ "${leak}" == "0" ]] \
-    || fail "node4 pre-matrix block-sync trace is not drained (total ${leak})"
+    || fail "node4 pre-extended block-sync trace is not drained (total ${leak})"
+
+  disconnects_before=$(grep -c '"event":"header_peer_disconnected"' "${header_file}" 2>/dev/null || true)
 
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-4 \
-    || fail "could not stop optional node4 before the restart matrix"
-  OPTIONAL_NODE4_QUIESCED=1
+    || fail "could not stop optional node4 before extended work"
+  wait_metric_at_most 19001 zakura_p2p_conn_active 1 "node1 post-node4-quiesce"
+
+  deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    disconnects_after=$(grep -c '"event":"header_peer_disconnected"' "${header_file}" 2>/dev/null || true)
+    if (( disconnects_after > disconnects_before )); then
+      last=$(grep '"event":"header_peer_disconnected"' "${header_file}" | tail -1)
+      printf '%s' "${last}" \
+        | jq -e '(.session_id | type == "number") and (.direction == "inbound" or .direction == "outbound") and ((.inbound_count + .outbound_count) <= 1) and ((.reason | strings | length) > 0)' \
+          >/dev/null \
+        || fail "node1 post-node4 disconnect trace boundary is malformed"
+      OPTIONAL_NODE4_QUIESCED=1
+      return 0
+    fi
+    sleep 3
+  done
+  fail "node1 did not flush the node4 disconnect boundary within ${TRACE_FLUSH_TIMEOUT}s"
 }
 
 invalidate_block_if_present() {
@@ -920,7 +958,7 @@ log "asserting Zakura body frontier reached the header tip after gossip propagat
 wait_zakura_body_frontiers_at_tip "${target}" "post-generate"
 assert_block_sync_budget_empty "post-generate"
 snapshot_timeline "post-generate"
-quiesce_optional_node4_for_restart_matrix
+quiesce_optional_node4_before_extended_work
 
 log "stopping pure-Zakura node2 before the from-scratch catch-up setup"
 wait_for_commit_trace_balance node2 "node2 pre-reset"
