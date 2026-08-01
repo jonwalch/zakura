@@ -26,6 +26,7 @@ pub(crate) async fn zakura_header_sync_driver_startup<State>(
     state: State,
     read_state: zakura_state::ReadStateService,
     network: &zakura_chain::parameters::Network,
+    max_checkpoint_height: block::Height,
 ) -> Result<ZakuraHeaderSyncDriverStartup, Report>
 where
     State: Service<
@@ -83,7 +84,9 @@ where
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
     let mut committed_snapshots = read_state.subscribe_header_chain_snapshots();
-    if finalized_tip.is_some() && committed_snapshots.borrow().is_none() {
+    if should_wait_for_durable_snapshot(finalized_tip, max_checkpoint_height)
+        && committed_snapshots.borrow().is_none()
+    {
         tokio::time::timeout(ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT, async {
             while committed_snapshots.borrow().is_none() {
                 committed_snapshots
@@ -121,6 +124,13 @@ where
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(state, read_state)),
     })
+}
+
+fn should_wait_for_durable_snapshot(
+    finalized_tip: Option<(block::Height, block::Hash)>,
+    max_checkpoint_height: block::Height,
+) -> bool {
+    finalized_tip.is_some_and(|(height, _)| height >= max_checkpoint_height)
 }
 
 #[cfg(test)]
@@ -949,6 +959,33 @@ mod tests {
             pending::<Result<zakura_state::ReadResponse, zakura_state::BoxError>>().await
         })
         .boxed_clone()
+    }
+
+    #[test]
+    fn durable_snapshot_wait_starts_only_at_checkpoint_handoff() {
+        let finalized_hash = block::Hash([5; 32]);
+        let max_checkpoint_height = block::Height(40);
+
+        assert!(!should_wait_for_durable_snapshot(
+            None,
+            max_checkpoint_height
+        ));
+        assert!(!should_wait_for_durable_snapshot(
+            Some((block::Height(0), finalized_hash)),
+            max_checkpoint_height,
+        ));
+        assert!(!should_wait_for_durable_snapshot(
+            Some((block::Height(39), finalized_hash)),
+            max_checkpoint_height,
+        ));
+        assert!(should_wait_for_durable_snapshot(
+            Some((block::Height(40), finalized_hash)),
+            max_checkpoint_height,
+        ));
+        assert!(should_wait_for_durable_snapshot(
+            Some((block::Height(41), finalized_hash)),
+            max_checkpoint_height,
+        ));
     }
 
     #[test]

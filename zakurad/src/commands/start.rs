@@ -369,7 +369,7 @@ impl StartCmd {
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
-        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        let (mut state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zakura_state::init(
                 state_config,
                 &config.network.network,
@@ -378,6 +378,11 @@ impl StartCmd {
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
             )
             .await;
+
+        state_service
+            .ready()
+            .await
+            .map_err(|error| eyre!("state service startup handoff failed: {error}"))?;
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -430,6 +435,7 @@ impl StartCmd {
                     state.clone(),
                     read_only_state_service.clone(),
                     &config.network.network,
+                    max_checkpoint_height,
                 )
                 .await?,
             )
@@ -1741,10 +1747,14 @@ mod zakura_header_sync_driver_tests {
                 })
             };
 
-            let startup =
-                zakura_header_sync_driver_startup(state.clone(), read_state.clone(), &network)
-                    .await
-                    .expect("the first durable header driver starts");
+            let startup = zakura_header_sync_driver_startup(
+                state.clone(),
+                read_state.clone(),
+                &network,
+                block::Height(0),
+            )
+            .await
+            .expect("the first durable header driver starts");
             let mut snapshots = startup.committed_snapshots.clone();
             let genesis_snapshot = wait_for_header_snapshot(&mut snapshots, block::Height(0)).await;
             let suffix: Vec<_> = blocks[..4]
@@ -1808,10 +1818,14 @@ mod zakura_header_sync_driver_tests {
                     }
                 })
             };
-            let startup =
-                zakura_header_sync_driver_startup(state.clone(), read_state.clone(), &network)
-                    .await
-                    .expect("the restarted durable header driver starts");
+            let startup = zakura_header_sync_driver_startup(
+                state.clone(),
+                read_state.clone(),
+                &network,
+                block::Height(0),
+            )
+            .await
+            .expect("the restarted durable header driver starts");
             assert_eq!(
                 startup.best_header_tip,
                 Some((block::Height(4), blocks[3].hash()))
