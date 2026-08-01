@@ -10,10 +10,9 @@ use color_eyre::eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
 use tower::{Service, ServiceExt};
 
-use zakura_chain::{
-    block::{self},
-    parallel::commitment_aux::BlockCommitmentRoots,
-};
+use zakura_chain::block::{self};
+#[cfg(test)]
+use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 #[cfg(test)]
 use zakura_network::zakura::{AuxSchema, HeaderEntry, HeaderPathPage, ZakuraPeerId};
 use zakura_network::zakura::{FullStateFrontiers, ZakuraHeaderSyncDriverStartup};
@@ -83,14 +82,32 @@ where
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let committed_snapshots = read_state.subscribe_header_chain_snapshots();
+    let mut committed_snapshots = read_state.subscribe_header_chain_snapshots();
+    if finalized_tip.is_some() && committed_snapshots.borrow().is_none() {
+        tokio::time::timeout(ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT, async {
+            while committed_snapshots.borrow().is_none() {
+                committed_snapshots
+                    .changed()
+                    .await
+                    .map_err(|_| eyre!("header-chain snapshot publisher closed during startup"))?;
+            }
+            Ok::<_, Report>(())
+        })
+        .await
+        .map_err(|_| eyre!("timed out waiting for the durable header-chain snapshot"))??;
+    }
     let vct_root_repairs = read_state.subscribe_vct_root_repairs();
-    let best_header_tip = root_covered_best_header_tip_or_verified(
-        read_state.clone(),
-        best_header_tip.unwrap_or(empty_state_tip),
-        verified_block_tip,
-    )
-    .await?;
+    let best_header_tip = committed_snapshots
+        .borrow()
+        .as_ref()
+        .map(|snapshot| {
+            (
+                snapshot.frontiers.header_best.height,
+                snapshot.frontiers.header_best.hash,
+            )
+        })
+        .or(best_header_tip)
+        .unwrap_or(empty_state_tip);
 
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: FullStateFrontiers {
@@ -106,6 +123,7 @@ where
     })
 }
 
+#[cfg(test)]
 async fn root_covered_best_header_tip_or_verified<ReadState>(
     read_state: ReadState,
     best_header_tip: (block::Height, block::Hash),
@@ -187,6 +205,7 @@ where
     root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
 }
 
+#[cfg(test)]
 pub(crate) fn block_roots_cover_range(
     start_height: block::Height,
     count: u32,

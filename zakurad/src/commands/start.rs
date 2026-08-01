@@ -1504,7 +1504,7 @@ mod zakura_header_sync_driver_tests {
     use tower::{
         service_fn,
         util::{BoxCloneService, BoxService},
-        ServiceExt,
+        Service, ServiceExt,
     };
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
@@ -1515,7 +1515,10 @@ mod zakura_header_sync_driver_tests {
         BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
     use zakura_network::P2pStack;
-    use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+    use zakura_test::vectors::{
+        BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_4_BYTES,
+        BLOCK_MAINNET_5_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
+    };
 
     use super::zakura::{
         abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
@@ -1553,6 +1556,294 @@ mod zakura_header_sync_driver_tests {
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    }
+
+    async fn wait_for_header_snapshot(
+        snapshots: &mut watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        height: block::Height,
+    ) -> zakura_header_chain::EngineSnapshot {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(snapshot) = snapshots.borrow().clone() {
+                    if snapshot.frontiers.header_best.height == height {
+                        return snapshot;
+                    }
+                }
+                snapshots
+                    .changed()
+                    .await
+                    .expect("the durable header snapshot publisher remains live");
+            }
+        })
+        .await
+        .expect("the durable header snapshot reaches the expected height")
+    }
+
+    fn durable_header_entry(
+        height: block::Height,
+        block: &Arc<block::Block>,
+        serialized_size: usize,
+    ) -> zakura_node_services::header_chain::HeaderTargetEntry {
+        zakura_node_services::header_chain::HeaderTargetEntry {
+            header: block.header.clone(),
+            body_size: u32::try_from(serialized_size).expect("mainnet block vectors fit in u32"),
+            tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+                height,
+                sapling_root: Default::default(),
+                orchard_root: Default::default(),
+                ironwood_root: Default::default(),
+                sapling_tx_count: 0,
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: [0; 32].into(),
+            }),
+        }
+    }
+
+    async fn apply_durable_header_suffix(
+        startup: &zakura_network::zakura::ZakuraHeaderSyncDriverStartup,
+        snapshot: &zakura_header_chain::EngineSnapshot,
+        common_ancestor: zakura_header_chain::Frontier,
+        blocks: &[(block::Height, Arc<block::Block>, usize)],
+        session_id: u64,
+        request_id: u64,
+    ) {
+        let (target_height, target_block, _) =
+            blocks.last().expect("the durable suffix is non-empty");
+        let target = zakura_header_chain::Frontier::new(*target_height, target_block.hash());
+        let scope =
+            zakura_header_chain::WorkScope::for_header_target(snapshot, target_block.hash());
+        let owner = scope.bind(
+            session_id,
+            std::num::NonZeroU64::new(request_id).expect("the test request ID is nonzero"),
+        );
+        let source = zakura_header_chain::SourceId::from_digest([0xd5; 32]);
+        let prepared = startup
+            .header_chain_port
+            .prepare_header_target(zakura_node_services::header_chain::PrepareHeaderTarget {
+                source,
+                network: zakura_chain::parameters::Network::Mainnet,
+                owner,
+                common_ancestor,
+                target,
+                entries: blocks
+                    .iter()
+                    .map(|(height, block, size)| durable_header_entry(*height, block, *size))
+                    .collect(),
+                completion: zakura_header_chain::TargetCompletion::TargetComplete {
+                    common_ancestor,
+                },
+            })
+            .await
+            .expect("the canonical durable suffix prepares");
+        startup
+            .header_chain_port
+            .apply_header_target(prepared)
+            .await
+            .expect("the canonical durable suffix applies");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_header_sync_restart_requests_only_missing_suffix() {
+        const PHASE_ENV: &str = "ZAKURA_DURABLE_HEADER_RESTART_PHASE";
+        const STATE_DIR_ENV: &str = "ZAKURA_DURABLE_HEADER_RESTART_STATE_DIR";
+
+        let phase = std::env::var(PHASE_ENV).ok();
+        if phase.is_none() {
+            let temp_dir = tempfile::tempdir().expect("the durable state tempdir is created");
+            for phase in ["persist", "reopen"] {
+                let status = std::process::Command::new(
+                    std::env::current_exe().expect("the current test executable has a path"),
+                )
+                .arg(
+                    "commands::start::zakura_header_sync_driver_tests::\
+                     durable_header_sync_restart_requests_only_missing_suffix",
+                )
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(PHASE_ENV, phase)
+                .env(STATE_DIR_ENV, temp_dir.path())
+                .status()
+                .expect("the durable restart phase starts");
+                assert!(
+                    status.success(),
+                    "the durable restart {phase} phase succeeds"
+                );
+            }
+            return;
+        }
+
+        let state_dir = std::path::PathBuf::from(
+            std::env::var_os(STATE_DIR_ENV)
+                .expect("the parent test supplies the durable state path"),
+        );
+        let mut state_config = zakura_state::Config::default();
+        state_config.cache_dir = state_dir;
+        state_config.ephemeral = false;
+        state_config.debug_skip_non_finalized_state_backup_task = true;
+        let network = zakura_chain::parameters::Network::Mainnet;
+        let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
+        let blocks = [
+            mainnet_block(&BLOCK_MAINNET_1_BYTES),
+            mainnet_block(&BLOCK_MAINNET_2_BYTES),
+            mainnet_block(&BLOCK_MAINNET_3_BYTES),
+            mainnet_block(&BLOCK_MAINNET_4_BYTES),
+            mainnet_block(&BLOCK_MAINNET_5_BYTES),
+        ];
+
+        if phase.as_deref() == Some("persist") {
+            let (mut state_service, read_state, latest_tip, tip_change) =
+                zakura_state::init(state_config.clone(), &network, block::Height(0), 2).await;
+            let committed = state_service
+                .ready()
+                .await
+                .expect("the persistent state is ready for genesis")
+                .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                    genesis.clone().into(),
+                ))
+                .await
+                .expect("genesis commits to the persistent state");
+            assert!(matches!(
+                committed,
+                zakura_state::Response::Committed(hash) if hash == genesis.hash()
+            ));
+            state_service
+                .ready()
+                .await
+                .expect("the persistent state performs semantic handoff");
+            let state = {
+                let state_service = Arc::new(tokio::sync::Mutex::new(state_service));
+                service_fn(move |request| {
+                    let state_service = state_service.clone();
+                    async move {
+                        state_service
+                            .lock()
+                            .await
+                            .ready()
+                            .await?
+                            .call(request)
+                            .await
+                    }
+                })
+            };
+
+            let startup =
+                zakura_header_sync_driver_startup(state.clone(), read_state.clone(), &network)
+                    .await
+                    .expect("the first durable header driver starts");
+            let mut snapshots = startup.committed_snapshots.clone();
+            let genesis_snapshot = wait_for_header_snapshot(&mut snapshots, block::Height(0)).await;
+            let suffix: Vec<_> = blocks[..4]
+                .iter()
+                .enumerate()
+                .map(|(index, block)| {
+                    (
+                        block::Height(u32::try_from(index + 1).expect("fixture height fits u32")),
+                        block.clone(),
+                        [
+                            BLOCK_MAINNET_1_BYTES.len(),
+                            BLOCK_MAINNET_2_BYTES.len(),
+                            BLOCK_MAINNET_3_BYTES.len(),
+                            BLOCK_MAINNET_4_BYTES.len(),
+                        ][index],
+                    )
+                })
+                .collect();
+            apply_durable_header_suffix(
+                &startup,
+                &genesis_snapshot,
+                zakura_header_chain::Frontier::new(block::Height(0), genesis.hash()),
+                &suffix,
+                1,
+                1,
+            )
+            .await;
+            let committed = wait_for_header_snapshot(&mut snapshots, block::Height(4)).await;
+            assert_eq!(committed.frontiers.header_best.hash, blocks[3].hash());
+
+            drop(committed);
+            drop(genesis_snapshot);
+            drop(suffix);
+            drop(snapshots);
+            drop(startup);
+            drop(read_state);
+            drop(state);
+            drop(tip_change);
+            drop(latest_tip);
+        }
+
+        if phase.as_deref() == Some("reopen") {
+            let (mut state_service, read_state, latest_tip, tip_change) =
+                zakura_state::init(state_config, &network, block::Height(0), 2).await;
+            state_service
+                .ready()
+                .await
+                .expect("the reopened state performs semantic handoff");
+            let state = {
+                let state_service = Arc::new(tokio::sync::Mutex::new(state_service));
+                service_fn(move |request| {
+                    let state_service = state_service.clone();
+                    async move {
+                        state_service
+                            .lock()
+                            .await
+                            .ready()
+                            .await?
+                            .call(request)
+                            .await
+                    }
+                })
+            };
+            let startup =
+                zakura_header_sync_driver_startup(state.clone(), read_state.clone(), &network)
+                    .await
+                    .expect("the restarted durable header driver starts");
+            assert_eq!(
+                startup.best_header_tip,
+                Some((block::Height(4), blocks[3].hash()))
+            );
+            let locator = startup
+                .header_chain_port
+                .continuation_locator()
+                .await
+                .expect("the restarted continuation locator query succeeds")
+                .expect("the restarted state has a selected-path locator");
+            assert_eq!(
+                locator.entries().first().copied(),
+                Some(zakura_header_chain::Frontier::new(
+                    block::Height(4),
+                    blocks[3].hash()
+                )),
+                "the restart requests only the missing suffix after block 4",
+            );
+
+            let mut snapshots = startup.committed_snapshots.clone();
+            let block_four_snapshot =
+                wait_for_header_snapshot(&mut snapshots, block::Height(4)).await;
+            apply_durable_header_suffix(
+                &startup,
+                &block_four_snapshot,
+                zakura_header_chain::Frontier::new(block::Height(4), blocks[3].hash()),
+                &[(
+                    block::Height(5),
+                    blocks[4].clone(),
+                    BLOCK_MAINNET_5_BYTES.len(),
+                )],
+                2,
+                1,
+            )
+            .await;
+            let committed = wait_for_header_snapshot(&mut snapshots, block::Height(5)).await;
+            assert_eq!(committed.frontiers.header_best.hash, blocks[4].hash());
+            assert_eq!(locator.entries()[0].hash, blocks[3].hash());
+
+            drop(snapshots);
+            drop(startup);
+            drop(read_state);
+            drop(state);
+            drop(tip_change);
+            drop(latest_tip);
+        }
     }
 
     fn test_block_work_owner() -> zakura_header_chain::WorkOwner {
