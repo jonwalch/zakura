@@ -2637,6 +2637,10 @@ impl HeaderSyncReactor {
             row.insert(hs_trace::PEER.into(), trace_peer_label(peer).into());
             row.insert(hs_trace::SESSION_ID.into(), session_id.into());
             row.insert(
+                hs_trace::STREAM_VERSION.into(),
+                u64::from(ZAKURA_HEADER_SYNC_STREAM_VERSION).into(),
+            );
+            row.insert(
                 hs_trace::DIRECTION.into(),
                 direction.map_or(serde_json::Value::Null, Into::into),
             );

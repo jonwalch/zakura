@@ -90,6 +90,7 @@ pub(crate) mod header_sync_trace {
     pub(crate) const BRANCH_ANCHOR: &str = "branch_anchor";
     pub(crate) const BRANCH_TARGET: &str = "branch_target";
     pub(crate) const REQUEST_ID: &str = "request_id";
+    pub(crate) const STREAM_VERSION: &str = "stream_version";
     pub(crate) const TARGET_HASH: &str = "target_hash";
     pub(crate) const COMMON_ANCESTOR_HEIGHT: &str = "common_ancestor_height";
     pub(crate) const COMMON_ANCESTOR_HASH: &str = "common_ancestor_hash";

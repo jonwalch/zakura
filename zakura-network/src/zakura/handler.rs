@@ -1398,11 +1398,10 @@ struct ConnectionServeContext {
     role: &'static str,
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
-    /// Whether this node wins same-kind ordered-stream collisions on this
-    /// connection. Both sides open their demanded ordered streams (connection
-    /// symmetry), so a kind both sides open arrives twice; the winner keeps its
-    /// own stream and the loser adopts the peer's. Computed from the node ids so
-    /// the two ends always agree: `local_node_id < remote_node_id`.
+    /// Whether this node is the deterministic proactive opener for symmetric
+    /// ordered streams on this connection. It also wins any same-kind collision
+    /// caused by an older peer racing its own offer. Computed from the node ids
+    /// so the two ends always agree: `local_node_id < remote_node_id`.
     i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
 }
@@ -1414,10 +1413,9 @@ struct RegisteredConnectionServeContext {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     accepted_capabilities: u64,
-    /// Whether this side dialed the connection. The dialer (initiator) opens all
-    /// of its demanded ordered streams as before; the responder additionally
-    /// opens only block-sync (the sole symmetric service), keeping the legacy
-    /// initiator-opens behaviour for gossip/header-sync/discovery.
+    /// Whether this side dialed the connection. The dialer (initiator) opens
+    /// ordinary ordered streams. The node-id winner opens block sync (the sole
+    /// symmetric service), independently of which side dialed.
     is_initiator: bool,
     /// See [`ConnectionServeContext::i_open_collision_winner`].
     i_open_collision_winner: bool,
@@ -1622,18 +1620,36 @@ fn may_open_ordered_stream(policy: OrderedStreamPolicy, is_initiator: bool) -> b
     is_initiator || policy.opening == OrderedStreamOpening::EitherSide
 }
 
+/// Whether this endpoint proactively opens an ordered stream.
+///
+/// Either-side services use the connection's mirror-stable node-id tiebreak so
+/// exactly one endpoint opens the bidirectional session. Both endpoints still
+/// accept either-side streams, preserving compatibility with peers that race
+/// an offer during upgrade.
+fn opens_ordered_stream_locally(
+    policy: OrderedStreamPolicy,
+    is_initiator: bool,
+    i_open_collision_winner: bool,
+) -> bool {
+    match policy.opening {
+        OrderedStreamOpening::InitiatorOnly => is_initiator,
+        OrderedStreamOpening::EitherSide => i_open_collision_winner,
+    }
+}
+
 /// An ordered service session can be locally parked while its connection and
-/// sibling services remain healthy. Any side entitled by the transport policy
-/// to open a replacement keeps offering one with bounded backoff.
+/// sibling services remain healthy. The endpoint designated by the transport
+/// policy keeps offering a replacement with bounded backoff.
 fn should_reopen_ordered_session(
     exited: OrderedSessionExit,
     policy: OrderedStreamPolicy,
     is_initiator: bool,
+    i_open_collision_winner: bool,
     connection_cancelled: bool,
 ) -> bool {
     exited.stream.mode == StreamMode::Ordered
         && policy.reopen
-        && may_open_ordered_stream(policy, is_initiator)
+        && opens_ordered_stream_locally(policy, is_initiator, i_open_collision_winner)
         && !connection_cancelled
 }
 
@@ -1823,12 +1839,11 @@ fn native_connection_transcript_hash(
     *initiator.as_bytes()
 }
 
-/// Whether the local node wins same-kind ordered-stream collisions against
-/// `remote_node_id`. Both sides open their demanded ordered streams, so a kind
-/// both sides open arrives twice; the lexicographically smaller node id wins and
-/// keeps its own stream while the other adopts the peer's. The two ends always
-/// compute complementary answers from the same (distinct) node ids, so they
-/// converge on a single surviving stream without any extra round trip.
+/// Whether the local node is the proactive opener for symmetric ordered streams
+/// against `remote_node_id`. The lexicographically smaller node id opens, and
+/// the other endpoint accepts that stream. The result is also the collision
+/// tiebreak for compatibility with older peers that race their own offer. The
+/// two ends compute complementary answers from the same distinct node ids.
 fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
     local_node_id.as_bytes() < remote_node_id.as_bytes()
 }
@@ -2152,19 +2167,20 @@ impl ZakuraProtocolHandler {
             .copied()
             .map(|stream| (stream.kind, OrderedSessionState::new(stream)))
             .collect();
-        // Block-sync connection symmetry: the dialer (initiator) proactively
-        // opens all of its demanded ordered streams as before; the responder
-        // additionally opens block-sync so a two-way block-sync channel exists
-        // regardless of who dialed (the reactor treats every peer the same). The
-        // other ordered services (gossip/header-sync/discovery) keep the legacy
-        // initiator-opens/responder-accepts behaviour. A block-sync stream both
-        // sides open arrives twice and is resolved by the node-id collision
-        // tiebreak in the accept loop below.
+        // The dialer opens ordinary ordered streams. For symmetric block sync,
+        // the mirror-stable node-id tiebreak designates one proactive opener,
+        // avoiding crossed service generations while retaining one bidirectional
+        // session regardless of who dialed. The accept path still resolves raced
+        // offers from older peers with the same tiebreak.
         let mut ordered_streams = Vec::new();
         let mut deferred_ordered_streams = Vec::new();
         for stream in negotiated_ordered_streams.iter().copied() {
             let policy = self.registry.ordered_stream_policy(stream.kind);
-            if !may_open_ordered_stream(policy, context.is_initiator) {
+            if !opens_ordered_stream_locally(
+                policy,
+                context.is_initiator,
+                context.i_open_collision_winner,
+            ) {
                 continue;
             }
 
@@ -2337,9 +2353,10 @@ impl ZakuraProtocolHandler {
                         && !session.has_active_session()
                         && should_reopen_ordered_session(
                         exited,
-                        policy,
-                        context.is_initiator,
-                        connection_token.is_cancelled(),
+                            policy,
+                            context.is_initiator,
+                            context.i_open_collision_winner,
+                            connection_token.is_cancelled(),
                     )
                     {
                         if let Some(delay) =
@@ -2363,7 +2380,11 @@ impl ZakuraProtocolHandler {
                     let stream = session.stream;
                     let policy = self.registry.ordered_stream_policy(stream.kind);
                     if connection_token.is_cancelled()
-                        || !may_open_ordered_stream(policy, context.is_initiator)
+                        || !opens_ordered_stream_locally(
+                            policy,
+                            context.is_initiator,
+                            context.i_open_collision_winner,
+                        )
                         || session.has_active_session()
                     {
                         continue;
@@ -2576,7 +2597,11 @@ impl ZakuraProtocolHandler {
                                     // local demand. Otherwise the entitled remote
                                     // opener observes the parked stream and retries.
                                     if policy.reopen
-                                        && may_open_ordered_stream(policy, context.is_initiator)
+                                        && opens_ordered_stream_locally(
+                                            policy,
+                                            context.is_initiator,
+                                            context.i_open_collision_winner,
+                                        )
                                     {
                                         session.schedule_demand(
                                             &mut ordered_session_waits,
@@ -3015,9 +3040,9 @@ impl ZakuraProtocolHandler {
         remote_ip: Option<IpAddr>,
         context: ConnectionServeContext,
     ) -> Result<(), ZakuraHandlerError> {
-        // Both sides now proactively open their demanded ordered streams
-        // (connection symmetry), so bound the precheck by what this side will
-        // actually open: the demand-narrowed escalation set.
+        // Bound the precheck by the demand-narrowed set of service sessions this
+        // connection can admit. This counts a symmetric session regardless of
+        // which endpoint is its deterministic proactive opener.
         let ordered_stream_count = self
             .registry
             .ordered_streams_for_escalation(
@@ -5147,8 +5172,9 @@ mod tests {
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncPeerSession, ServicePeerLimits,
-            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -6848,24 +6874,28 @@ mod tests {
             exit,
             initiator_policy,
             true,
-            false
-        ));
-        assert!(!should_reopen_ordered_session(
-            exit,
-            initiator_policy,
             false,
             false
         ));
         assert!(!should_reopen_ordered_session(
             exit,
             initiator_policy,
+            false,
             true,
+            false
+        ));
+        assert!(!should_reopen_ordered_session(
+            exit,
+            initiator_policy,
+            true,
+            false,
             true
         ));
         assert!(!should_reopen_ordered_session(
             exit,
             OrderedStreamPolicy::default(),
             true,
+            false,
             false,
         ));
 
@@ -6878,6 +6908,7 @@ mod tests {
             },
             initiator_policy,
             true,
+            false,
             false,
         ));
 
@@ -6896,14 +6927,18 @@ mod tests {
             either_peer,
             either_policy,
             true,
+            true,
             false
         ));
-        assert!(should_reopen_ordered_session(
+        assert!(!should_reopen_ordered_session(
             either_peer,
             either_policy,
             false,
+            false,
             false
         ));
+        assert!(opens_ordered_stream_locally(either_policy, false, true));
+        assert!(!opens_ordered_stream_locally(either_policy, true, false));
 
         let request_response = OrderedSessionExit {
             stream: Stream {
@@ -6917,8 +6952,49 @@ mod tests {
             request_response,
             either_policy,
             true,
+            true,
             false,
         ));
+    }
+
+    #[test]
+    fn either_side_session_has_one_proactive_opener_across_connection_roles() {
+        let policy = OrderedStreamPolicy {
+            opening: OrderedStreamOpening::EitherSide,
+            reopen: true,
+        };
+        let exit = OrderedSessionExit {
+            stream: Stream {
+                kind: ZAKURA_STREAM_BLOCK_SYNC,
+                version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                frame_cap: 1,
+                capability: ZAKURA_CAP_BLOCK_SYNC,
+                mode: StreamMode::Ordered,
+            },
+            session_id: 1,
+            opened_locally: false,
+        };
+
+        for winner_is_initiator in [false, true] {
+            let opens = [
+                opens_ordered_stream_locally(policy, winner_is_initiator, true),
+                opens_ordered_stream_locally(policy, !winner_is_initiator, false),
+            ];
+            assert_eq!(opens, [true, false]);
+            assert_eq!(opens.into_iter().filter(|opens| *opens).count(), 1);
+
+            let reopens = [
+                should_reopen_ordered_session(exit, policy, winner_is_initiator, true, false),
+                should_reopen_ordered_session(exit, policy, !winner_is_initiator, false, false),
+            ];
+            assert_eq!(reopens, [true, false]);
+            assert_eq!(reopens.into_iter().filter(|reopens| *reopens).count(), 1);
+        }
+
+        // Both endpoints continue accepting an offer for interoperability with
+        // peers that still proactively open either-side streams themselves.
+        assert!(may_open_ordered_stream(policy, true));
+        assert!(may_open_ordered_stream(policy, false));
     }
 
     #[test]

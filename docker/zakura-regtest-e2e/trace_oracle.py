@@ -40,6 +40,7 @@ BLOCK_SYNC_STATE = "block_sync_state"
 HEADER_FRONTIER_ADVANCED = "header_frontier_advanced"
 HEADER_FRONTIER_REANCHORED = "header_frontier_reanchored"
 HEADER_GET_HEADERS_SENT = "header_get_headers_sent"
+HEADER_REQUEST_SENT = "header_request_sent"
 HEADER_RANGE_COMMITTED = "header_range_committed"
 HEADER_RANGE_REJECTED = "header_range_rejected"
 HEADER_PEER_VIOLATION = "header_peer_violation"
@@ -883,27 +884,40 @@ def check_v7_request_ids(nodes: list[NodeTrace]) -> list[Failure]:
     requests = [
         row
         for node in nodes
-        for row in node.events("header_sync", HEADER_GET_HEADERS_SENT)
+        for row in node.events("header_sync", HEADER_REQUEST_SENT)
     ]
-    v7_requests = [
-        row
-        for row in requests
-        if int_field(row.row, "stream_version") is not None
-        and int_field(row.row, "stream_version") >= 7
-    ]
-    if not v7_requests:
+    if not requests:
         node = nodes[0] if nodes else NodeTrace("<none>", {})
         return [
             failure(
                 node,
                 "v7_header_request_ids_present",
-                requests[-1] if requests else None,
-                {"header_get_headers_sent_rows": len(requests)},
+                None,
+                {"header_request_sent_rows": 0},
+            )
+        ]
+
+    invalid_versions = [
+        row
+        for row in requests
+        if (int_field(row.row, "stream_version") or 0) < 7
+    ]
+    if invalid_versions:
+        node = next(node for node in nodes if node.node == invalid_versions[0].node)
+        return [
+            failure(
+                node,
+                "v7_header_request_version_attributed",
+                invalid_versions[0],
+                {"header_request_sent_rows": len(requests)},
             )
         ]
 
     missing_or_zero = [
-        row for row in v7_requests if (int_field(row.row, "request_id") or 0) == 0
+        row
+        for row in requests
+        if (int_field(row.row, "session_id") or 0) == 0
+        or (int_field(row.row, "request_id") or 0) == 0
     ]
     if missing_or_zero:
         node = next(node for node in nodes if node.node == missing_or_zero[0].node)
@@ -912,27 +926,46 @@ def check_v7_request_ids(nodes: list[NodeTrace]) -> list[Failure]:
                 node,
                 "v7_header_request_ids_nonzero",
                 missing_or_zero[0],
-                {"v7_header_get_headers_sent_rows": len(v7_requests)},
+                {"v7_header_request_sent_rows": len(requests)},
             )
         ]
 
-    duplicate_ids: set[tuple[str, int, int]] = set()
-    seen_ids: set[tuple[str, int, int]] = set()
-    for row in v7_requests:
+    missing_process = [
+        row
+        for row in requests
+        if not isinstance(row.row.get("process_trace_id"), str)
+        or not row.row.get("process_trace_id")
+    ]
+    if missing_process:
+        node = next(node for node in nodes if node.node == missing_process[0].node)
+        return [
+            failure(
+                node,
+                "v7_header_request_process_attributed",
+                missing_process[0],
+                {"v7_header_request_sent_rows": len(requests)},
+            )
+        ]
+
+    duplicate_ids: set[tuple[str, str, int, int]] = set()
+    seen_ids: set[tuple[str, str, int, int]] = set()
+    for row in requests:
         request_id = int_field(row.row, "request_id")
         session_id = int_field(row.row, "session_id")
-        if request_id is None or session_id is None:
+        process_trace_id = row.row.get("process_trace_id")
+        if request_id is None or session_id is None or not isinstance(process_trace_id, str):
             continue
-        key = (row.node, session_id, request_id)
+        key = (row.node, process_trace_id, session_id, request_id)
         if key in seen_ids:
             duplicate_ids.add(key)
         seen_ids.add(key)
     if duplicate_ids:
         first_duplicate = next(
             row
-            for row in v7_requests
+            for row in requests
             if (
                 row.node,
+                row.row.get("process_trace_id"),
                 int_field(row.row, "session_id"),
                 int_field(row.row, "request_id"),
             )
@@ -1046,8 +1079,9 @@ def run_self_test() -> None:
             [
                 {
                     "ts": 1,
-                    "event": HEADER_GET_HEADERS_SENT,
-                    "stream_version": 7,
+                    "event": HEADER_REQUEST_SENT,
+                    "stream_version": 8,
+                    "process_trace_id": "request-process",
                     "session_id": 11,
                     "request_id": 1,
                     "range_start": 1,
@@ -1055,8 +1089,9 @@ def run_self_test() -> None:
                 },
                 {
                     "ts": 2,
-                    "event": HEADER_GET_HEADERS_SENT,
-                    "stream_version": 7,
+                    "event": HEADER_REQUEST_SENT,
+                    "stream_version": 8,
+                    "process_trace_id": "request-process",
                     "session_id": 12,
                     "request_id": 1,
                     "range_start": 81,
@@ -1064,10 +1099,62 @@ def run_self_test() -> None:
                 },
             ],
         )
-        assert not run_oracle(
-            root / "v7_ids",
-            OracleOptions(require_v7_request_ids=True),
+        assert not check_v7_request_ids(
+            load_traces(root / "v7_ids")
         ), "v7 request IDs should pass when nonzero and unique per session"
+
+        for name, mutations, expected in (
+            (
+                "v7_missing_version",
+                {"stream_version": None},
+                "v7_header_request_version_attributed",
+            ),
+            ("v7_zero_id", {"request_id": 0}, "v7_header_request_ids_nonzero"),
+        ):
+            directory = root / name / "node2"
+            row = {
+                "ts": 1,
+                "event": HEADER_REQUEST_SENT,
+                "stream_version": 8,
+                "process_trace_id": "request-process",
+                "session_id": 11,
+                "request_id": 1,
+                **mutations,
+            }
+            write_jsonl(directory / "header_sync.jsonl", [row])
+            assert any(
+                failure.invariant == expected
+                for failure in check_v7_request_ids(load_traces(root / name))
+            )
+
+        duplicate_ids = root / "v7_duplicate_ids" / "node2"
+        duplicate = {
+            "event": HEADER_REQUEST_SENT,
+            "stream_version": 8,
+            "process_trace_id": "request-process",
+            "session_id": 11,
+            "request_id": 1,
+        }
+        write_jsonl(
+            duplicate_ids / "header_sync.jsonl",
+            [{"ts": 1, **duplicate}, {"ts": 2, **duplicate}],
+        )
+        assert any(
+            failure.invariant == "v7_header_request_ids_unique_per_session"
+            for failure in check_v7_request_ids(load_traces(root / "v7_duplicate_ids"))
+        )
+
+        cross_process_ids = root / "v7_cross_process_ids" / "node2"
+        write_jsonl(
+            cross_process_ids / "header_sync.jsonl",
+            [
+                {"ts": 1, **duplicate},
+                {"ts": 1, **duplicate, "process_trace_id": "restarted-process"},
+            ],
+        )
+        assert not check_v7_request_ids(
+            load_traces(root / "v7_cross_process_ids")
+        ), "request IDs may restart in a distinct traced process"
 
         handoff = root / "handoff" / "node2"
         write_jsonl(
