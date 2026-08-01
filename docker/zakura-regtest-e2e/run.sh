@@ -26,9 +26,11 @@
 #   6. Zakura v2 nodes reach sync.block.verified_tip.height ==
 #      sync.block.best_header_tip.height after gossip propagation,
 #   7. after a from-scratch reset of the pure-Zakura node2 (empty state while
-#      node1 sits idle at the tip), node2 re-downloads the whole chain over
-#      kind-6 block sync — gossip cannot help because node1 re-advertises
-#      nothing, so this exercises the production Mainnet-from-0 / catch-up path,
+#      node1 sits idle at the tip), node2 downloads the configured checkpoint
+#      prefix through legacy requests, explicitly hands off to native header
+#      sync, and downloads the remaining suffix over kind-6 block sync. Gossip
+#      cannot help because node1 re-advertises nothing, so this exercises the
+#      production Mainnet-from-0 / catch-up path,
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
 #
 # Each container runs a zakurad binary bind-mounted into debian:trixie-slim.
@@ -514,6 +516,201 @@ wait_metric_at_least() {
     sleep 3
   done
   fail "${label} ${name} stayed below ${want} within ${timeout}s"
+}
+
+trace_line_count() {
+  local file="$1"
+  if [[ -f "${file}" ]]; then
+    wc -l < "${file}"
+  else
+    printf '0\n'
+  fi
+}
+
+trace_rows_after() {
+  local file="$1" lines_before="$2"
+  [[ -f "${file}" ]] || return 0
+  awk -v lines_before="${lines_before}" 'NR > lines_before' "${file}"
+}
+
+# The checkpoint verifier intentionally runs before native header/body sync.
+# Follow the append-only legacy trace from this restart so the long checkpoint
+# phase reports real progress, then validate the exact durable handoff boundary.
+wait_for_checkpoint_handoff() {
+  local expected_height="$1" lines_before="$2" timeout="$3"
+  local file="${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.jsonl"
+  local deadline=$((SECONDS + timeout)) summary verified_height handoff_count
+  local handoff_row legacy_summary
+
+  while (( SECONDS < deadline )); do
+    summary=$(trace_rows_after "${file}" "${lines_before}" \
+      | jq -sc --argjson expected "${expected_height}" '
+          [ .[] | select(
+              .event == "block_finish"
+              and .result == "verified"
+              and (.height | type == "number")
+              and .height <= $expected
+            )
+          ] as $verified
+          | [ .[] | select(
+              .event == "round_finish"
+              and .reason == "checkpoint_handoff"
+            )
+          ] as $handoffs
+          | {
+              verified_height: (($verified | map(.height) | max) // -1),
+              handoff_count: ($handoffs | length),
+              handoff: ($handoffs | last // null)
+            }
+        ')
+    verified_height=$(printf '%s' "${summary}" | jq -r '.verified_height')
+    handoff_count=$(printf '%s' "${summary}" | jq -r '.handoff_count')
+    printf '  node2 checkpoint bootstrap legacy_verified=%s handoffs=%s (target %s)\n' \
+      "${verified_height}" "${handoff_count}" "${expected_height}"
+    if (( handoff_count >= 1 )); then
+      handoff_row=$(printf '%s' "${summary}" | jq -c '.handoff')
+      break
+    fi
+    sleep 3
+  done
+
+  [[ -n "${handoff_row:-}" ]] \
+    || fail "node2 did not emit checkpoint handoff at height ${expected_height} within ${timeout}s"
+  [[ "${handoff_count}" == "1" ]] \
+    || fail "node2 emitted ${handoff_count} checkpoint handoffs at height ${expected_height} during one catch-up"
+  printf '%s' "${handoff_row}" \
+    | jq -e --argjson expected "${expected_height}" '
+        .checkpoint_height == $expected
+        and .state_tip == $expected
+        and ((.process_trace_id | strings | length) > 0)
+        and (.ts | type == "number")
+      ' >/dev/null \
+    || fail "node2 checkpoint handoff did not match the exact expected state boundary ${expected_height}"
+
+  CHECKPOINT_HANDOFF_PROCESS_TRACE_ID=$(printf '%s' "${handoff_row}" | jq -r '.process_trace_id')
+  CHECKPOINT_HANDOFF_TS=$(printf '%s' "${handoff_row}" | jq -r '.ts')
+  legacy_summary=$(trace_rows_after "${file}" "${lines_before}" \
+    | jq -sc \
+        --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
+        --argjson expected "${expected_height}" '
+          [ .[] | select(
+              .process_trace_id == $process
+              and .event == "block_finish"
+              and .result == "verified"
+              and (.height | type == "number")
+              and .height >= 0
+              and .height <= $expected
+            )
+            | .height
+          ]
+          | unique
+          | sort
+          | {
+              first: (first // -1),
+              last: (last // -1),
+              count: length
+            }
+        ')
+  printf '%s' "${legacy_summary}" \
+    | jq -e --argjson expected "${expected_height}" '
+        .first == 0 and .last == $expected and .count == ($expected + 1)
+      ' >/dev/null \
+    || fail "node2 legacy checkpoint trace did not verify every height 0..${expected_height} before handoff"
+  log "node2 checkpoint bootstrap verified legacy heights 0..${expected_height} and handed off at the exact boundary"
+}
+
+# A correct handoff is ordered: legacy checkpoint completion, a fresh native
+# header request, then kind-6 body requests whose union covers the full suffix.
+wait_for_native_suffix_coverage() {
+  local suffix_start="$1" suffix_end="$2" block_lines_before="$3"
+  local header_lines_before="$4" timeout="$5"
+  local block_file="${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl"
+  local header_file="${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl"
+  local deadline=$((SECONDS + timeout)) request_summary covered=0
+  local first_request_ts header_count
+
+  while (( SECONDS < deadline )); do
+    request_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
+      | jq -sc \
+          --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
+          --argjson handoff_ts "${CHECKPOINT_HANDOFF_TS}" \
+          --argjson suffix_start "${suffix_start}" \
+          --argjson suffix_end "${suffix_end}" '
+            [ .[] | select(
+                .process_trace_id == $process
+                and .event == "block_get_blocks_sent"
+                and (.range_start | type == "number")
+                and (.range_count | type == "number")
+              )
+            ] as $requests
+            | [ $requests[]
+                | select(.ts > $handoff_ts)
+                | range(.range_start; (.range_start + .range_count))
+                | select(. >= $suffix_start and . <= $suffix_end)
+              ]
+              | unique
+              | sort as $covered
+            | {
+                request_count: ($requests | length),
+                requests_before_or_at_handoff:
+                  ([$requests[] | select(.ts <= $handoff_ts)] | length),
+                first_request_ts: (($requests | map(.ts) | min) // null),
+                out_of_suffix:
+                  ([$requests[]
+                    | select(
+                        .range_start < $suffix_start
+                        or (.range_start + .range_count - 1) > $suffix_end
+                      )
+                   ] | length),
+                covered_first: ($covered | first // null),
+                covered_last: ($covered | last // null),
+                covered_count: ($covered | length),
+                expected_count: ($suffix_end - $suffix_start + 1)
+              }
+          ')
+    covered=$(printf '%s' "${request_summary}" \
+      | jq -r '(.covered_count == .expected_count) and (.expected_count > 0)')
+    printf '  node2 native suffix request coverage=%s/%s requests=%s (target %s..%s)\n' \
+      "$(printf '%s' "${request_summary}" | jq -r '.covered_count')" \
+      "$(printf '%s' "${request_summary}" | jq -r '.expected_count')" \
+      "$(printf '%s' "${request_summary}" | jq -r '.request_count')" \
+      "${suffix_start}" "${suffix_end}"
+    [[ "${covered}" == "true" ]] && break
+    sleep 3
+  done
+
+  [[ "${covered}" == "true" ]] \
+    || fail "node2 native kind-6 requests did not cover checkpoint suffix ${suffix_start}..${suffix_end} within ${timeout}s"
+  printf '%s' "${request_summary}" \
+    | jq -e \
+        --argjson suffix_start "${suffix_start}" \
+        --argjson suffix_end "${suffix_end}" '
+          .requests_before_or_at_handoff == 0
+          and .out_of_suffix == 0
+          and .covered_first == $suffix_start
+          and .covered_last == $suffix_end
+          and .covered_count == .expected_count
+          and (.first_request_ts | type == "number")
+        ' >/dev/null \
+    || fail "node2 native requests were not confined to the post-handoff suffix ${suffix_start}..${suffix_end}"
+
+  first_request_ts=$(printf '%s' "${request_summary}" | jq -r '.first_request_ts')
+  header_count=$(trace_rows_after "${header_file}" "${header_lines_before}" \
+    | jq -sc \
+        --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
+        --argjson handoff_ts "${CHECKPOINT_HANDOFF_TS}" \
+        --argjson first_request_ts "${first_request_ts}" '
+          [ .[] | select(
+              .process_trace_id == $process
+              and .event == "header_request_sent"
+              and .ts > $handoff_ts
+              and .ts < $first_request_ts
+            )
+          ] | length
+        ')
+  (( header_count >= 1 )) \
+    || fail "node2 did not renegotiate native headers between checkpoint handoff and its first kind-6 body request"
+  log "node2 renegotiated headers after handoff and covered native kind-6 suffix ${suffix_start}..${suffix_end}"
 }
 
 wait_ready() {
@@ -1014,13 +1211,16 @@ if (( CATCHUP_BLOCKS > 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-# Exercise kind-6 block sync via a from-scratch reset of the pure-Zakura node.
+# Exercise the production checkpoint-to-native sync transition via a
+# from-scratch reset of the pure-Zakura node.
 #
 # Above, node2 reached the initial tip through inbound gossip, then was stopped
 # and its state discarded before node1 deepened the chain. On reconnect node2
-# has a real, gossip-unfillable gap (node1 re-advertises nothing), so it must
-# re-download every existing block over the dedicated block-sync stream. This
-# is the production Mainnet-from-0 / restart-catch-up path.
+# has a real, gossip-unfillable gap (node1 re-advertises nothing). With derived
+# checkpoints enabled it downloads the checkpoint prefix through legacy
+# requests, hands off to the native header engine, then downloads only the
+# post-checkpoint suffix over the dedicated block-sync stream. This is the
+# production Mainnet-from-0 / restart-catch-up path.
 log "starting pure-Zakura node2 for a from-scratch kind-6 catch-up"
 catchup_target=$(block_count 18232)
 [[ "${catchup_target}" -ge 1 ]] || fail \
@@ -1042,6 +1242,7 @@ snapshot_timeline "pre-reset-catch-up"
 # Keep the highest checkpoint strictly below the tip so the trailing tip reorg later is never
 # blocked by a final (immutable) checkpoint.
 checkpoint_ceiling=$(( catchup_target - 2 ))
+checkpoint_handoff_height=-1
 if [[ "${ZAKURA_E2E_DISABLE_CHECKPOINTS}" == "1" ]]; then
   log "node2 Regtest checkpoints are disabled; catch-up verifies through the full verifier after genesis"
 elif (( CHECKPOINT_INTERVAL > 0 && checkpoint_ceiling >= CHECKPOINT_INTERVAL )); then
@@ -1076,21 +1277,44 @@ elif (( CHECKPOINT_INTERVAL > 0 && checkpoint_ceiling >= CHECKPOINT_INTERVAL ));
     "${CONFIG_DIR}/node2.toml"
   grep -q '^network = { params = ' "${CONFIG_DIR}/node2.toml" \
     || fail "failed to inject derived checkpoints into node2 config"
-  log "node2 will checkpoint-verify its kind-6 catch-up against ${cp_count} derived checkpoint(s) up to height ${checkpoint_ceiling}"
+  checkpoint_handoff_height=$(( h - CHECKPOINT_INTERVAL ))
+  log "node2 will legacy checkpoint-bootstrap through height ${checkpoint_handoff_height} using ${cp_count} derived checkpoint(s) (selection ceiling ${checkpoint_ceiling}), then hand off to native sync"
 else
   log "chain too short (tip ${catchup_target}, interval ${CHECKPOINT_INTERVAL}); node2 catches up with the genesis-only checkpoint list"
 fi
 
+node2_legacy_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.jsonl")
+node2_block_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl")
+node2_header_lines_before=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl")
 start_node2_after_reset "post-reset catch-up"
 snapshot_timeline "post-reset-catch-up-started"
 
-# node2's own counters restart from zero, so assert absolute kind-6 activity, not a
-# delta. With node1 idle at the tip, reaching catchup_target from an empty state is
-# only possible by downloading every body over block sync.
+# Do not treat a zero native-request counter as a stall while the checkpoint
+# verifier owns the prefix. Observe that phase directly and require its explicit
+# handoff before waiting for native block-sync activity.
+if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
+  (( checkpoint_handoff_height >= 0 )) \
+    || fail "${ZAKURA_E2E_MODE} requires a checkpoint handoff, but no derived checkpoint boundary was configured"
+  (( checkpoint_handoff_height < catchup_target )) \
+    || fail "checkpoint handoff height ${checkpoint_handoff_height} leaves no native suffix below target ${catchup_target}"
+  wait_for_checkpoint_handoff \
+    "${checkpoint_handoff_height}" "${node2_legacy_lines_before}" "${CATCHUP_TIMEOUT}"
+fi
+
+# node2's counters restart from zero, so assert absolute native activity, not a
+# delta. With node1 idle, the post-checkpoint gap can only arrive over kind-6.
 wait_metric_at_least 19002 sync_block_request_sent 1 "node2 catch-up" "${CATCHUP_TIMEOUT}"
 wait_metric_at_least 19002 sync_block_body_received 1 "node2 catch-up" "${CATCHUP_TIMEOUT}"
 wait_block_count_at_least 18332 "${catchup_target}" "node2 catch-up" "${CATCHUP_TIMEOUT}"
 wait_zakura_body_frontier_at_tip 19002 18332 "${catchup_target}" "node2 catch-up" "${CATCHUP_TIMEOUT}"
+if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
+  wait_for_native_suffix_coverage \
+    "$(( checkpoint_handoff_height + 1 ))" \
+    "${catchup_target}" \
+    "${node2_block_lines_before}" \
+    "${node2_header_lines_before}" \
+    "${CATCHUP_TIMEOUT}"
+fi
 
 # node2 dials only node1, so node1 must have served the catch-up bodies over kind-6.
 after_node1_served=$(metric 19001 sync_block_body_served)
@@ -1100,7 +1324,11 @@ if ! awk "BEGIN{exit !(${after_node1_served} > ${before_node1_served})}"; then
   fail "node2 caught up from scratch but node1's kind-6 body-served metric did not increase — bodies did not flow over block sync"
 fi
 assert_block_sync_budget_empty "post-catch-up"
-log "node2 re-downloaded ${catchup_target} block(s) from scratch over kind-6 block sync"
+if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
+  log "node2 checkpoint-bootstrapped legacy heights 0..${checkpoint_handoff_height}, handed off, then downloaded native kind-6 suffix $(( checkpoint_handoff_height + 1 ))..${catchup_target}"
+else
+  log "node2 completed its from-scratch catch-up to height ${catchup_target} with native kind-6 activity"
+fi
 snapshot_timeline "post-catch-up"
 
 if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
