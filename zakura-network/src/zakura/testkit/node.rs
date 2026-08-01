@@ -754,57 +754,59 @@ mod tests {
             .spawn()
             .await
             .expect("peer1 spawns");
-        let peer2 = ZakuraTestNode::builder(9202)
-            .spawn()
-            .await
-            .expect("peer2 spawns");
         let node = ZakuraTestNode::builder(9203)
             .max_connections_per_ip(1)
             .spawn()
             .await
             .expect("dialer spawns");
 
-        // Advertise peer1 with an unreachable decoy (RFC 5737 TEST-NET-1,
-        // guaranteed non-routable) ahead of its real loopback address. The dial
-        // is served over loopback, so the connection must be charged to
-        // 127.0.0.1, not the decoy.
+        // Advertise peer1 with an unreachable decoy ahead of its real loopback
+        // address. The dial is served over loopback, so the connection must be
+        // charged to 127.0.0.1, not the decoy.
+        //
+        // `NodeAddr::direct_addresses` is a `BTreeSet`, so "first advertised"
+        // means lowest-sorting, not insertion order. The decoy must therefore
+        // sort *below* 127.0.0.1 or it is never the address a pre-fix charge
+        // would pick, and the test cannot fail. RFC 6598 shared address space
+        // (100.64.0.0/10) is both non-routable and below the loopback range;
+        // RFC 5737 TEST-NET ranges all sort above it and do not work here.
         let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
-        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
         let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
             std::iter::once(decoy).chain(peer1_loopback.direct_addresses().copied()),
+        );
+        assert_eq!(
+            decoy_first.direct_addresses().next(),
+            Some(&decoy),
+            "the decoy must sort first, or this test cannot discriminate",
         );
         node.connect_native_to_addr(decoy_first, TEST_NET_TIMEOUT)
             .await
             .expect("peer1 registers over its reachable loopback path despite the decoy");
 
-        // With the connection correctly charged to the confirmed loopback IP,
-        // the per-IP cap of 1 must turn away a second distinct identity from
-        // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
-        // the loopback bucket empty and wrongly admitting peer2.
-        let peer2_addr = ipv4_loopback_addr(&peer2.node_addr().await);
-        let excess = tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::zakura::handler::serve_native_dial_connection(
-                &node.endpoint(),
-                peer2_addr,
-                node.limits(),
-            ),
-        )
-        .await
-        .expect("the rejected one-shot dial must finish promptly");
+        // Assert on the per-IP bucket directly rather than on a second dial's
+        // outcome. `serve_native_dial_connection` returns `Ok` both when it
+        // rejects a peer and when it finishes serving one, and it deregisters
+        // before returning — so a post-serve `registered_ids()` count is the
+        // same with and without the fix and proves nothing. The bucket state is
+        // what the fix actually changes.
+        let supervisor = node.supervisor();
         assert!(
-            excess.is_ok(),
-            "second same-loopback identity must be rejected by the per-IP cap, proving the \
-             first dial was charged to the confirmed path and not the advertised decoy",
+            !supervisor
+                .can_accept_remote_ip_with_in_flight(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+                .await,
+            "peer1 must be charged to the confirmed loopback path, filling the cap-1 bucket for \
+             127.0.0.1 so a second same-loopback identity is turned away",
         );
-        assert_eq!(
-            node.supervisor().registered_ids().await.len(),
-            1,
-            "the rejected peer must not be registered",
+        assert!(
+            supervisor
+                .can_accept_remote_ip_with_in_flight(decoy.ip(), 0)
+                .await,
+            "the advertised decoy address was never connected to, so its bucket must be empty; \
+             charging it there is the bypass this test guards",
         );
 
         node.shutdown().await;
         peer1.shutdown().await;
-        peer2.shutdown().await;
     }
 }
