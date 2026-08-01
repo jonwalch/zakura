@@ -380,6 +380,18 @@ pub(crate) async fn drive_header_sync_actions(
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 tracing::debug!(?peer, ?reason, "recorded Zakura header-sync peer violation");
             }
+            HeaderSyncAction::DropPeer {
+                peer,
+                session_id,
+                reason,
+            } => {
+                tracing::debug!(
+                    ?peer,
+                    session_id,
+                    reason,
+                    "dropped an unproductive Zakura header-sync peer"
+                );
+            }
             HeaderSyncAction::QueryHeaderLocator {
                 peer,
                 session_id,

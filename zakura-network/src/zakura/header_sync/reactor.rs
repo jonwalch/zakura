@@ -269,6 +269,73 @@ struct PortPanicContext {
     lease_id: Option<u64>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HeaderRequestTerminal {
+    TargetNotRetained,
+    NoLocatorIntersection,
+    HistoryPruned,
+    Busy,
+    AlreadyKnown,
+    Disconnected,
+    LocalError,
+    MalformedResponse,
+    RepairObsolete,
+    SendError,
+    SessionReplaced,
+    Shutdown,
+    SnapshotObsolete,
+    StagingRefused,
+    TargetAdmitted,
+    TargetRejected,
+    TimedOut,
+}
+
+impl HeaderRequestTerminal {
+    fn needs_terminal_trace(self) -> bool {
+        !matches!(
+            self,
+            Self::Disconnected
+                | Self::SessionReplaced
+                | Self::SnapshotObsolete
+                | Self::TargetAdmitted
+                | Self::TargetRejected
+        )
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::TargetNotRetained => "target_not_retained",
+            Self::NoLocatorIntersection => "no_locator_intersection",
+            Self::HistoryPruned => "history_pruned",
+            Self::Busy => "busy",
+            Self::AlreadyKnown => "already_known",
+            Self::Disconnected => "disconnected",
+            Self::LocalError => "local_error",
+            Self::MalformedResponse => "malformed_response",
+            Self::RepairObsolete => "repair_obsolete",
+            Self::SendError => "send_error",
+            Self::SessionReplaced => "session_replaced",
+            Self::Shutdown => "shutdown",
+            Self::SnapshotObsolete => "snapshot_obsolete",
+            Self::StagingRefused => "staging_refused",
+            Self::TargetAdmitted => "target_admitted",
+            Self::TargetRejected => "target_rejected",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+impl From<HeadersOutcomeCode> for HeaderRequestTerminal {
+    fn from(outcome: HeadersOutcomeCode) -> Self {
+        match outcome {
+            HeadersOutcomeCode::TargetNotRetained => Self::TargetNotRetained,
+            HeadersOutcomeCode::NoLocatorIntersection => Self::NoLocatorIntersection,
+            HeadersOutcomeCode::HistoryPruned => Self::HistoryPruned,
+            HeadersOutcomeCode::Busy => Self::Busy,
+        }
+    }
+}
+
 fn vct_repair_task(
     snapshot: &zakura_header_chain::EngineSnapshot,
     status: zakura_header_chain::VctRootRepairStatus,
@@ -379,19 +446,19 @@ impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
-        loop {
+        let terminal_outcome = loop {
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
                 biased;
-                _ = self.startup.shutdown.cancelled() => break,
+                _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
                 event = self.lifecycle.recv() => match event {
                     Some(event) => self.handle_event(event),
-                    None => break,
+                    None => break HeaderRequestTerminal::Shutdown,
                 },
                 event = self.events.recv() => match event {
                     Some(event) => self.handle_event(event),
-                    None => break,
+                    None => break HeaderRequestTerminal::Shutdown,
                 },
                 completion = async {
                     if self.pending_port_operations.is_empty() {
@@ -439,7 +506,8 @@ impl HeaderSyncReactor {
                 }
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
             }
-        }
+        };
+        self.retire_all_peer_work(terminal_outcome);
     }
 
     fn handle_event(&mut self, event: HeaderSyncEvent) {
@@ -583,6 +651,10 @@ impl HeaderSyncReactor {
                 Instant::now(),
             )
         });
+        if self.peer_state.contains_key(&peer) {
+            self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
+            self.release_served_path(&peer);
+        }
         if let Some(previous) = self.peer_state.insert(
             peer.clone(),
             PeerState {
@@ -593,10 +665,8 @@ impl HeaderSyncReactor {
             },
         ) {
             previous.session.cancel_token().cancel();
-            self.retire_peer_work(&peer);
-            self.release_served_path(&peer);
             if let Some((owner, source)) = replaced_repair {
-                self.retry_vct_repair(owner, source);
+                self.retry_vct_repair(owner, source, HeaderRequestTerminal::SessionReplaced);
             }
         }
         self.publish_peer_state();
@@ -633,10 +703,10 @@ impl HeaderSyncReactor {
             )
             .then_some((active.owner, active.source))
         });
+        self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         self.peer_state.remove(peer);
-        self.retire_peer_work(peer);
         if let Some((owner, source)) = abandoned_repair {
-            self.retry_vct_repair(owner, source);
+            self.retry_vct_repair(owner, source, HeaderRequestTerminal::Disconnected);
         }
         self.publish_peer_state();
         self.emit_peer_lifecycle(
@@ -953,13 +1023,17 @@ impl HeaderSyncReactor {
                 && response.entries[0].tree_aux.is_some()
                 && response.entries[0].header.hash() == selected_target.hash;
             if !exact_shape {
-                self.retry_vct_repair(active.owner, active.source);
+                self.retry_vct_repair(
+                    active.owner,
+                    active.source,
+                    HeaderRequestTerminal::MalformedResponse,
+                );
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
         }
         if !active.matches_response_page(response.target_tip_hash, returned_ancestor) {
-            self.retire_peer_work(&peer);
+            self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
@@ -968,7 +1042,7 @@ impl HeaderSyncReactor {
             && returned_ancestor.hash == response.target_tip_hash
             && response.target_tip_hash == active.target.status.selected_tip_hash
         {
-            self.retire_peer_work(&peer);
+            self.retire_peer_work(&peer, HeaderRequestTerminal::AlreadyKnown);
             metrics::counter!("sync.header.target.already_known.total").increment(1);
             return;
         }
@@ -976,7 +1050,7 @@ impl HeaderSyncReactor {
             .peer_work_queue
             .has_staging_capacity(response.entries.len())
         {
-            self.retire_peer_work(&peer);
+            self.retire_peer_work(&peer, HeaderRequestTerminal::StagingRefused);
             metrics::counter!("sync.header.target.staging_capacity_refused").increment(1);
             return;
         }
@@ -1004,14 +1078,14 @@ impl HeaderSyncReactor {
         active.common_ancestor.get_or_insert(returned_ancestor);
         active.entries.extend(response.entries);
         let Some(staged_tip) = active.staged_tip() else {
-            self.retire_peer_work(&peer);
+            self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
 
         if complete {
             if staged_tip.hash != active.target.status.selected_tip_hash {
-                self.retire_peer_work(&peer);
+                self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
@@ -1036,19 +1110,19 @@ impl HeaderSyncReactor {
             let _ = active;
             if let Some((owner, source)) = repair {
                 let Some(task) = self.vct_repair.get(owner) else {
-                    self.retire_peer_work(&peer);
+                    self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
                     return;
                 };
                 if !matches!(task.state, RepairPolicyState::Assigned { .. }) {
-                    self.retry_vct_repair(owner, source);
+                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::RepairObsolete);
                     return;
                 }
             }
             if !self.dispatch_action(action) {
                 if let Some((owner, source)) = repair {
-                    self.retry_vct_repair(owner, source);
+                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::LocalError);
                 } else {
-                    self.retire_peer_work(&peer);
+                    self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
                 }
             }
             return;
@@ -1065,7 +1139,7 @@ impl HeaderSyncReactor {
             .get(&peer)
             .map(|state| state.session.clone())
         else {
-            self.retire_peer_work(&peer);
+            self.retire_peer_work(&peer, HeaderRequestTerminal::Disconnected);
             return;
         };
         match session.try_send_get_headers(
@@ -1097,7 +1171,7 @@ impl HeaderSyncReactor {
             }
             Err(error) => {
                 self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
-                self.retire_peer_work(&peer);
+                self.retire_peer_work(&peer, HeaderRequestTerminal::SendError);
             }
         }
     }
@@ -1130,10 +1204,15 @@ impl HeaderSyncReactor {
             active.purpose,
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
         );
-        if is_repair {
-            self.retry_vct_repair(active.owner, active.source);
+        let terminal_outcome = if matches {
+            HeaderRequestTerminal::from(response.outcome)
         } else {
-            self.retire_peer_work(&peer);
+            HeaderRequestTerminal::MalformedResponse
+        };
+        if is_repair {
+            self.retry_vct_repair(active.owner, active.source, terminal_outcome);
+        } else {
+            self.retire_peer_work(&peer, terminal_outcome);
         }
         if matches {
             if is_repair {
@@ -1197,7 +1276,13 @@ impl HeaderSyncReactor {
                 );
             }
         }
-        self.retire_peer_work(&peer);
+        self.retire_peer_work(
+            &peer,
+            match &result {
+                HeaderTargetAdmissionResult::Applied => HeaderRequestTerminal::TargetAdmitted,
+                HeaderTargetAdmissionResult::Failed(_) => HeaderRequestTerminal::TargetRejected,
+            },
+        );
         if let Some(repair_generation) = repair_generation {
             match result {
                 HeaderTargetAdmissionResult::Applied => {
@@ -1265,7 +1350,7 @@ impl HeaderSyncReactor {
                         insert.target_tip_hash == context.target.hash && insert.aux.len() == 1
                     });
                     if !valid {
-                        self.retry_vct_repair(owner, source);
+                        self.retry_vct_repair(owner, source, HeaderRequestTerminal::RepairObsolete);
                         return;
                     }
                 }
@@ -1283,9 +1368,9 @@ impl HeaderSyncReactor {
                     insert,
                 }) {
                 } else if is_repair {
-                    self.retry_vct_repair(owner, source);
+                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::LocalError);
                 } else {
-                    self.retire_peer_work(&peer);
+                    self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
                 }
             }
             HeaderTargetPreparationResult::Failed(error) => {
@@ -1297,9 +1382,9 @@ impl HeaderSyncReactor {
                     Some(&error),
                 );
                 if is_repair {
-                    self.retry_vct_repair(owner, source);
+                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::TargetRejected);
                 } else {
-                    self.retire_peer_work(&peer);
+                    self.retire_peer_work(&peer, HeaderRequestTerminal::TargetRejected);
                 }
                 self.handle_typed_failure(peer, source, &error);
             }
@@ -1348,7 +1433,11 @@ impl HeaderSyncReactor {
         &mut self,
         owner: zakura_header_chain::WorkOwner,
         source: zakura_header_chain::SourceId,
+        terminal_outcome: HeaderRequestTerminal,
     ) {
+        if let Some(active) = self.peer_work_queue.active_owner(owner).cloned() {
+            self.emit_request_terminal(&active, terminal_outcome);
+        }
         self.cancel_owned_request(source, owner);
         self.peer_work_queue.remove_owner(owner);
         let peer = self
@@ -1417,7 +1506,7 @@ impl HeaderSyncReactor {
                 .active_owner(task.owner)
                 .map(|active| active.peer.clone())
             {
-                self.retire_peer_work(&peer);
+                self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
             }
         }
     }
@@ -2182,7 +2271,7 @@ impl HeaderSyncReactor {
                 })
             {
                 session.cancel_request(request_id);
-                self.retry_vct_repair(wire_owner, source);
+                self.retry_vct_repair(wire_owner, source, HeaderRequestTerminal::LocalError);
                 return;
             }
             metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
@@ -2259,13 +2348,14 @@ impl HeaderSyncReactor {
                 .active_owner(task.owner)
                 .map(|active| active.peer.clone())
             {
-                self.retire_peer_work(&peer);
+                self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
             }
         }
         self.completed_targets
             .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
         for active in self.peer_work_queue.retire_obsolete_active(snapshot) {
             self.request_deadlines.remove(&active.peer);
+            self.emit_request_terminal(&active, HeaderRequestTerminal::SnapshotObsolete);
             self.cancel_active_request(&active);
         }
     }
@@ -2318,6 +2408,7 @@ impl HeaderSyncReactor {
         self.retry_pending_lease_releases(now);
         self.retire_timed_out_requests(now);
         self.release_idle_served_paths(now);
+        self.prune_unproductive_cooldowns(now);
         let peers: Vec<_> = self
             .peer_state
             .iter()
@@ -2380,14 +2471,14 @@ impl HeaderSyncReactor {
                 if let Some(task) = self.vct_repair.get(owner) {
                     self.emit_vct_repair_state(task, "timeout", Some("timed_out"));
                 }
-                self.retry_vct_repair(owner, source);
+                self.retry_vct_repair(owner, source, HeaderRequestTerminal::TimedOut);
                 metrics::counter!("sync.header.vct.repair.timed_out.total").increment(1);
             } else {
                 let session_id = self
                     .peer_work_queue
                     .active(&peer)
                     .map(|active| active.owner.session_id);
-                self.retire_peer_work(&peer);
+                self.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
                 metrics::counter!("sync.header.target.timed_out.total").increment(1);
                 if let Some(session_id) = session_id {
                     self.charge_unproductive_request(&peer, session_id, "unresponsive");
@@ -3205,6 +3296,17 @@ impl HeaderSyncReactor {
                 None,
                 None,
             ),
+            HeaderPortOperation::DropPeer {
+                peer, session_id, ..
+            } => (
+                "drop_peer",
+                Some(peer.clone()),
+                Some(*session_id),
+                None,
+                None,
+                None,
+                None,
+            ),
         };
         let session = peer.as_ref().and_then(|peer| {
             self.peer_state.get(peer).and_then(|state| {
@@ -3326,9 +3428,9 @@ impl HeaderSyncReactor {
                     .then_some((active.owner, active.source))
                 });
                 if let Some((owner, source)) = repair {
-                    self.retry_vct_repair(owner, source);
+                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::LocalError);
                 } else {
-                    self.retire_peer_work(peer);
+                    self.retire_peer_work(peer, HeaderRequestTerminal::LocalError);
                 }
             }
         }
@@ -3464,11 +3566,60 @@ impl HeaderSyncReactor {
             .retain(|_, until| *until > now);
     }
 
-    fn retire_peer_work(&mut self, peer: &ZakuraPeerId) {
+    fn retire_peer_work(&mut self, peer: &ZakuraPeerId, terminal_outcome: HeaderRequestTerminal) {
+        self.request_deadlines.remove(peer);
+        if let Some(active) = self.peer_work_queue.remove(peer) {
+            self.emit_request_terminal(&active, terminal_outcome);
+            self.cancel_active_request(&active);
+        }
+    }
+
+    #[cfg(test)]
+    fn clear_peer_work_for_test(&mut self, peer: &ZakuraPeerId) {
         self.request_deadlines.remove(peer);
         if let Some(active) = self.peer_work_queue.remove(peer) {
             self.cancel_active_request(&active);
         }
+    }
+
+    fn retire_all_peer_work(&mut self, terminal_outcome: HeaderRequestTerminal) {
+        let peers: Vec<_> = self.peer_state.keys().cloned().collect();
+        for peer in peers {
+            self.retire_peer_work(&peer, terminal_outcome);
+        }
+    }
+
+    fn emit_request_terminal(
+        &self,
+        active: &ActiveHeaderRequest,
+        terminal_outcome: HeaderRequestTerminal,
+    ) {
+        if !terminal_outcome.needs_terminal_trace() {
+            return;
+        }
+        let direction = self.peer_state.get(&active.peer).and_then(|state| {
+            (state.session.session_id() == active.owner.session_id)
+                .then(|| header_direction_label(state.session.direction()))
+        });
+        self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
+            row.insert(
+                hs_trace::EVENT.into(),
+                hs_trace::HEADER_REQUEST_TERMINAL.into(),
+            );
+            row.insert(hs_trace::PEER.into(), trace_peer_label(&active.peer).into());
+            row.insert(hs_trace::SESSION_ID.into(), active.owner.session_id.into());
+            row.insert(
+                hs_trace::DIRECTION.into(),
+                direction.map_or(serde_json::Value::Null, Into::into),
+            );
+            insert_header_scope(row, active.owner.scope());
+            row.insert(hs_trace::REQUEST_ID.into(), active.request_id.get().into());
+            row.insert(
+                hs_trace::TARGET_HASH.into(),
+                active.target.status.selected_tip_hash.to_string().into(),
+            );
+            row.insert(hs_trace::OUTCOME.into(), terminal_outcome.label().into());
+        });
     }
 
     fn cancel_active_request(&self, active: &ActiveHeaderRequest) {

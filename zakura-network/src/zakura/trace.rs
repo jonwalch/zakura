@@ -129,6 +129,7 @@ pub(crate) mod header_sync_trace {
     pub(crate) const HEADER_STATUS_SENT: &str = "header_status_sent";
     pub(crate) const HEADER_STATUS_RECEIVED: &str = "header_status_received";
     pub(crate) const HEADER_REQUEST_SENT: &str = "header_request_sent";
+    pub(crate) const HEADER_REQUEST_TERMINAL: &str = "header_request_terminal";
     pub(crate) const HEADER_RESPONSE_RECEIVED: &str = "header_response_received";
     pub(crate) const HEADER_RESPONSE_SERVED: &str = "header_response_served";
     pub(crate) const HEADER_OUTCOME: &str = "header_outcome";
