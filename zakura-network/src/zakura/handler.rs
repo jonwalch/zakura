@@ -3221,6 +3221,37 @@ fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId
         .len()
 }
 
+/// Enable header sync for new handshakes and disconnect connections that were
+/// negotiated before the capability became available.
+///
+/// Negotiated capabilities are immutable for a connection. Keeping an
+/// existing connection alive after checkpoint bootstrap would therefore leave
+/// it permanently unable to open a header-sync stream, even though subsequent
+/// handshakes advertise the capability.
+async fn enable_header_sync_and_renegotiate(
+    handler: &ZakuraProtocolHandler,
+    supervisor: &ZakuraSupervisorHandle,
+) -> usize {
+    handler.set_header_sync_enabled(true);
+
+    let peers = supervisor.registered_ids().await;
+    let mut disconnected = 0;
+    for peer in &peers {
+        disconnected += usize::from(supervisor.disconnect_peer(peer).await);
+    }
+
+    if disconnected > 0 {
+        metrics::counter!("zakura.p2p.header_sync.capability_reconnects")
+            .increment(u64::try_from(disconnected).expect("peer count always fits in u64"));
+        info!(
+            disconnected,
+            "reconnecting peers to negotiate header sync after checkpoint bootstrap"
+        );
+    }
+
+    disconnected
+}
+
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -3402,11 +3433,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
 
     if let Some(mut snapshots) = committed_snapshots {
         let capability_handler = endpoint.handler.clone();
+        let capability_supervisor = endpoint.supervisor.clone();
         let shutdown = endpoint.background_shutdown_token();
         let task = tokio::spawn(async move {
             loop {
                 if snapshots.borrow().is_some() {
-                    capability_handler.set_header_sync_enabled(true);
+                    enable_header_sync_and_renegotiate(&capability_handler, &capability_supervisor)
+                        .await;
                     break;
                 }
                 tokio::select! {
@@ -5236,6 +5269,34 @@ mod tests {
             handler.current_handshake_config().supported_capabilities,
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
         );
+    }
+
+    #[tokio::test]
+    async fn enabling_header_sync_reconnects_peers_negotiated_without_it() {
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+        handler.set_header_sync_enabled(false);
+
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        register_test_peer(&supervisor, test_peer(31), first_token.clone()).await;
+        register_test_peer(&supervisor, test_peer(32), second_token.clone()).await;
+
+        assert_eq!(
+            enable_header_sync_and_renegotiate(&handler, &supervisor).await,
+            2
+        );
+        assert_ne!(
+            handler.current_handshake_config().supported_capabilities & ZAKURA_CAP_HEADER_SYNC,
+            0
+        );
+        assert!(first_token.is_cancelled());
+        assert!(second_token.is_cancelled());
     }
 
     /// With no configured `zakura.listen_addr`, the native endpoint must bind
