@@ -426,6 +426,7 @@ where
                 supervisor,
                 config.legacy_p2p(),
                 trace,
+                config.zakura.stream_open_rate_per_second,
             );
             Buffer::new(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
         }
