@@ -7,9 +7,10 @@
 use zakura_chain::{block::Height, chain_sync_status::ChainSyncStatus};
 
 use super::super::{
-    engage_legacy_fallback_alongside_zakura, legacy_probe_supports_fallback,
-    zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, SyncStatus,
-    ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    checkpoint_bootstrap_hash_limit, engage_legacy_fallback_alongside_zakura,
+    legacy_probe_supports_fallback, zakura_block_sync_stalled, zakura_sync_status_length,
+    zakura_watchdog_action, SyncStatus, ZakuraLegacyProbe, ZakuraStallTracker,
+    ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 #[test]
@@ -32,6 +33,27 @@ fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
     assert!(
         handoff.clone().begin_apply().is_some(),
         "repeating the one-way bootstrap signal must leave Zakura as owner"
+    );
+}
+
+#[test]
+fn legacy_checkpoint_bootstrap_leaves_post_checkpoint_hashes_for_zakura() {
+    let checkpoint = Height(200);
+
+    assert_eq!(
+        checkpoint_bootstrap_hash_limit(Some(Height(0)), checkpoint, 23),
+        177,
+        "fresh bootstrap must stop queued compatibility work at checkpoint 200"
+    );
+    assert_eq!(
+        checkpoint_bootstrap_hash_limit(Some(Height(100)), checkpoint, 23),
+        77,
+        "a resumed checkpoint range must apply the same exact boundary"
+    );
+    assert_eq!(
+        checkpoint_bootstrap_hash_limit(Some(checkpoint), checkpoint, 0),
+        0,
+        "native Zakura owns every block after the checkpoint"
     );
 }
 

@@ -705,6 +705,18 @@ struct CheckedTip {
     expected_next: block::Hash,
 }
 
+fn checkpoint_bootstrap_hash_limit(
+    state_tip: Option<Height>,
+    max_checkpoint_height: Height,
+    in_flight: usize,
+) -> usize {
+    let state_tip = state_tip.unwrap_or(Height(0));
+    let remaining = max_checkpoint_height.0.saturating_sub(state_tip.0);
+    usize::try_from(remaining)
+        .expect("block height difference fits in usize")
+        .saturating_sub(in_flight)
+}
+
 pub struct ChainSync<ZN, ZS, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>
@@ -1276,7 +1288,8 @@ where
         }
 
         info!(?state_tip, "starting sync, obtaining new tips");
-        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
+        let checkpoint_bootstrap = committed_snapshots.is_some();
+        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
             .await
             .map_err(Into::into)
             // TODO: replace with flatten() when it stabilises (#70142)
@@ -1331,6 +1344,8 @@ where
             &mut watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
         >,
     ) -> Result<(), Report> {
+        let checkpoint_bootstrap = committed_snapshots.is_some();
+
         // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
 
@@ -1506,11 +1521,12 @@ where
                         );
                         metrics::counter!("sync.tip.refresh").increment(1);
 
-                        let refreshed = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
-                            .await
-                            .map_err(Into::into)
-                            // TODO: replace with flatten() when it stabilises (#70142)
-                            .and_then(convert::identity)?;
+                        let refreshed =
+                            timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
+                                .await
+                                .map_err(Into::into)
+                                // TODO: replace with flatten() when it stabilises (#70142)
+                                .and_then(convert::identity)?;
 
                         // A refresh is not progress, even when it returns hashes.
                         //
@@ -1604,8 +1620,17 @@ where
                     }
 
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (download_set, new_tips, discovered) =
+                        let (mut download_set, mut new_tips, _discovered) =
                             extended.expect("only polled while an extension is in flight")?;
+                        let reached_checkpoint = self.cap_checkpoint_bootstrap_hashes(
+                            &mut download_set,
+                            self.downloads.in_flight(),
+                            checkpoint_bootstrap,
+                        );
+                        if reached_checkpoint {
+                            new_tips.clear();
+                        }
+                        let discovered = download_set.len();
                         self.trace.tips_extended(discovered, new_tips.len());
                         self.prospective_tips = new_tips;
                         // security: use the actual number of new downloads from all peers, so the
@@ -1754,7 +1779,10 @@ where
     /// Given a block_locator list fan out request for subsequent hashes to
     /// multiple peers
     #[instrument(skip(self))]
-    async fn obtain_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+    async fn obtain_tips(
+        &mut self,
+        checkpoint_bootstrap: bool,
+    ) -> Result<IndexSet<block::Hash>, Report> {
         let stage_start = std::time::Instant::now();
 
         let block_locator = self
@@ -1912,6 +1940,15 @@ where
             }
         }
 
+        let reached_checkpoint = self.cap_checkpoint_bootstrap_hashes(
+            &mut download_set,
+            self.downloads.in_flight(),
+            checkpoint_bootstrap,
+        );
+        if reached_checkpoint {
+            self.prospective_tips.clear();
+        }
+
         debug!(?self.prospective_tips);
 
         // Check that the new tips we got are actually unknown.
@@ -1936,6 +1973,29 @@ where
             .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+    }
+
+    /// Limits compatibility downloads to the final checkpoint while it owns
+    /// initial block applies. Hashes above that boundary are left for native
+    /// Zakura block sync after the durable snapshot transfers ownership.
+    fn cap_checkpoint_bootstrap_hashes(
+        &self,
+        hashes: &mut IndexSet<block::Hash>,
+        in_flight: usize,
+        checkpoint_bootstrap: bool,
+    ) -> bool {
+        if !checkpoint_bootstrap {
+            return false;
+        }
+
+        let limit = checkpoint_bootstrap_hash_limit(
+            self.latest_chain_tip.best_tip_height(),
+            self.max_checkpoint_height,
+            in_flight,
+        );
+        let reaches_checkpoint = hashes.len() >= limit;
+        hashes.truncate(limit);
+        reaches_checkpoint
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block
