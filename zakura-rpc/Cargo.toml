@@ -119,8 +119,6 @@ zakura-node-services = { path = "../zakura-node-services", version = "3.0.0", fe
 ] }
 zakura-script = { path = "../zakura-script", version = "3.0.0" }
 zakura-state = { path = "../zakura-state", version = "6.0.0" }
-rustls = "0.23.40"
-tokio-rustls = "0.26.4"
 
 [build-dependencies]
 openrpsee = { workspace = true }
