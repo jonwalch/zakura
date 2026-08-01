@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::OnceLock,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -62,6 +62,24 @@ pub fn node_id() -> &'static str {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown".to_string())
+        })
+        .as_str()
+}
+
+/// Returns an opaque identifier shared by every JSONL emitter in this process.
+///
+/// The identifier disambiguates appended trace rows across process restarts,
+/// where emitter-local monotonic timestamps restart from zero. It is only a
+/// correlation label, not a random value or security identity.
+pub fn process_trace_id() -> &'static str {
+    static PROCESS_TRACE_ID: OnceLock<String> = OnceLock::new();
+    PROCESS_TRACE_ID
+        .get_or_init(|| {
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{}-{started}", std::process::id())
         })
         .as_str()
 }

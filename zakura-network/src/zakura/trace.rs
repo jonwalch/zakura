@@ -556,6 +556,10 @@ impl ZakuraTrace {
         let mut row = Map::new();
         row.insert("ts".to_string(), elapsed_micros(self.started.elapsed()));
         row.insert("node".to_string(), Value::String(self.node.to_string()));
+        row.insert(
+            "process_trace_id".to_string(),
+            Value::String(zakura_jsonl_trace::process_trace_id().to_string()),
+        );
         build(&mut row);
 
         if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {

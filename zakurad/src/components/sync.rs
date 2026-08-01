@@ -1072,6 +1072,15 @@ where
             }
         }
 
+        let handoff_state_tip = committed_snapshots
+            .borrow()
+            .as_ref()
+            .expect("checkpoint bootstrap stops only after a committed snapshot is published")
+            .frontiers
+            .verified_best
+            .height;
+        self.trace
+            .checkpoint_handoff(Some(handoff_state_tip), self.max_checkpoint_height);
         block_sync_handoff.finish_legacy_bootstrap();
         info!(
             checkpoint = ?self.max_checkpoint_height,
@@ -1282,8 +1291,6 @@ where
             .as_ref()
             .is_some_and(|snapshots| snapshots.borrow().is_some())
         {
-            self.trace
-                .round_finish("checkpoint_handoff", state_tip, None);
             return Ok(());
         }
 

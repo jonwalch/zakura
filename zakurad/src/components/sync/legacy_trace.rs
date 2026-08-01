@@ -62,6 +62,10 @@ impl LegacySyncTrace {
         let mut row = Map::new();
         row.insert("ts".to_string(), elapsed_micros(self.started.elapsed()));
         row.insert("node".to_string(), Value::String(self.node.to_string()));
+        row.insert(
+            "process_trace_id".to_string(),
+            Value::String(zakura_jsonl_trace::process_trace_id().to_string()),
+        );
         row.insert("event".to_string(), Value::String(event.to_string()));
         build(&mut row);
 
@@ -92,6 +96,17 @@ impl LegacySyncTrace {
             if let Some(error) = error {
                 row.insert("error".to_string(), Value::String(error.to_string()));
             }
+        });
+    }
+
+    pub(super) fn checkpoint_handoff(&self, state_tip: Option<Height>, checkpoint_height: Height) {
+        self.emit("round_finish", |row| {
+            row.insert(
+                "reason".to_string(),
+                Value::String("checkpoint_handoff".to_string()),
+            );
+            insert_height(row, "state_tip", state_tip);
+            insert_height(row, "checkpoint_height", Some(checkpoint_height));
         });
     }
 
@@ -199,6 +214,31 @@ mod tests {
         assert_eq!(event["event"], "round_start");
         assert_eq!(event["node"], "test-node");
         assert_eq!(event["state_tip"], 42);
+    }
+
+    #[tokio::test]
+    async fn writes_checkpoint_handoff_boundary() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = LegacySyncTrace {
+            tracer: guard.tracer(),
+            node: "test-node".into(),
+            started: Instant::now(),
+            expose_peer_addresses: false,
+        };
+
+        trace.checkpoint_handoff(Some(Height(160)), Height(160));
+        drop(trace);
+        guard.shutdown().await;
+
+        let event = std::fs::read_to_string(dir.path().join(FILE_NAME))
+            .expect("legacy trace file is written");
+        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        assert_eq!(event["event"], "round_finish");
+        assert_eq!(event["reason"], "checkpoint_handoff");
+        assert_eq!(event["state_tip"], 160);
+        assert_eq!(event["checkpoint_height"], 160);
+        assert!(event["process_trace_id"].is_string());
     }
 
     #[test]
