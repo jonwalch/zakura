@@ -652,13 +652,23 @@ impl MetaAddr {
     }
 
     /// Is this address ready for a new outbound connection attempt?
+    ///
+    /// # Security
+    ///
+    /// Addresses learned from inbound connections are excluded. An inbound
+    /// peer's address is the remote end of *its* connection to us, so its port
+    /// is an ephemeral source port rather than a listener we can dial. Dialing
+    /// those addresses spends the crawler's connection budget on attempts that
+    /// can never succeed, and leaves the address book full of permanently
+    /// failing entries that crowd out reachable candidates.
     pub fn is_ready_for_connection_attempt(
         &self,
         instant_now: Instant,
         chrono_now: chrono::DateTime<Utc>,
         network: &Network,
     ) -> bool {
-        self.last_known_info_is_valid_for_outbound(network)
+        !self.is_inbound
+            && self.last_known_info_is_valid_for_outbound(network)
             && !self.was_recently_updated(instant_now, chrono_now)
             && self.is_probably_reachable(chrono_now)
     }
