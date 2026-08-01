@@ -970,7 +970,7 @@ where
         self.request_genesis().await?;
 
         loop {
-            if self.try_to_sync().await.is_err() {
+            if self.try_to_sync(None).await.is_err() {
                 self.downloads.cancel_all();
             }
 
@@ -990,12 +990,15 @@ where
         }
     }
 
-    /// Downloads and verifies genesis, then hands body sync to native Zakura sync
-    /// while watching for progress, optionally falling back to the legacy syncer if
-    /// Zakura makes none.
+    /// Downloads and verifies through checkpoint semantic handoff, then hands
+    /// body sync to native Zakura while watching for progress, optionally
+    /// falling back to the legacy syncer if Zakura makes none.
     ///
-    /// Zakura block sync uses this bootstrap path because header range validation needs the
-    /// committed genesis header before native Zakura header/body sync can advance from scratch.
+    /// Zakura block sync uses this bootstrap path because state does not publish
+    /// the authenticated header snapshot until its configured checkpoint range
+    /// has committed. The legacy-compatible downloader keeps ownership until
+    /// that snapshot appears, stops dispatching, and drains its already-started
+    /// verifier work before native applies are enabled.
     ///
     /// After genesis, native Zakura sync is expected to drive body downloads. But
     /// it cannot always: a node whose reachable peers are legacy-only (no
@@ -1015,10 +1018,11 @@ where
     /// for the legacy-informed cross-check, which only probes legacy peers when
     /// the verified tip is frozen and the node looks caught up to its own header
     /// frontier.
-    #[instrument(skip(self, read_state, block_sync_handoff))]
+    #[instrument(skip(self, read_state, committed_snapshots, block_sync_handoff))]
     pub(crate) async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
+        mut committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
         legacy_fallback: bool,
         block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
     ) -> Result<(), Report>
@@ -1029,8 +1033,37 @@ where
         RS::Future: Send,
     {
         self.request_genesis().await?;
+
+        while committed_snapshots.borrow().is_none() {
+            if self
+                .try_to_sync(Some(&mut committed_snapshots))
+                .await
+                .is_err()
+            {
+                self.downloads.cancel_all();
+            }
+            self.update_metrics();
+
+            if committed_snapshots.borrow().is_none() {
+                let restart_delay = if self.is_regtest {
+                    REGTEST_SYNC_RESTART_DELAY
+                } else {
+                    SYNC_RESTART_SLEEP
+                };
+                info!(
+                    timeout = ?restart_delay,
+                    state_tip = ?self.latest_chain_tip.best_tip_height(),
+                    checkpoint = ?self.max_checkpoint_height,
+                    "waiting to resume pre-handoff checkpoint bootstrap"
+                );
+                sleep(restart_delay).await;
+            }
+        }
+
+        block_sync_handoff.finish_legacy_bootstrap();
         info!(
-            "Zakura block sync replacement completed genesis bootstrap; \
+            checkpoint = ?self.max_checkpoint_height,
+            "Zakura block sync replacement completed checkpoint bootstrap; \
              monitoring for Zakura body-sync progress"
         );
 
@@ -1220,13 +1253,27 @@ where
     /// necessary. This includes outer timeouts, where an entire syncing step takes an extremely
     /// long time. (These usually indicate hangs.)
     #[instrument(skip(self))]
-    async fn try_to_sync(&mut self) -> Result<(), Report> {
+    async fn try_to_sync(
+        &mut self,
+        committed_snapshots: Option<
+            &mut watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        >,
+    ) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
+
+        if committed_snapshots
+            .as_ref()
+            .is_some_and(|snapshots| snapshots.borrow().is_some())
+        {
+            self.trace
+                .round_finish("checkpoint_handoff", state_tip, None);
+            return Ok(());
+        }
 
         info!(?state_tip, "starting sync, obtaining new tips");
         let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
@@ -1250,7 +1297,7 @@ where
         self.trace
             .tips_obtained(extra_hashes.len(), self.prospective_tips.len());
 
-        if let Err(error) = self.sync_round(extra_hashes).await {
+        if let Err(error) = self.sync_round(extra_hashes, committed_snapshots).await {
             self.trace_sync_snapshot("round_error_snapshot", 0);
             self.trace.round_finish(
                 "sync_error",
@@ -1277,7 +1324,13 @@ where
     /// Returns `Ok(())` once the round is exhausted: nothing in flight, nothing queued, and no tips
     /// left to extend. Returns `Err` if an unrecoverable error means the sync should restart.
     #[instrument(skip(self, reserve))]
-    async fn sync_round(&mut self, mut reserve: IndexSet<block::Hash>) -> Result<(), Report> {
+    async fn sync_round(
+        &mut self,
+        mut reserve: IndexSet<block::Hash>,
+        committed_snapshots: Option<
+            &mut watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        >,
+    ) -> Result<(), Report> {
         // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
 
@@ -1295,13 +1348,47 @@ where
         // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
         let mut last_progress = Instant::now();
 
-        loop {
+        'sync_round: loop {
+            if committed_snapshots
+                .as_ref()
+                .is_some_and(|snapshots| snapshots.borrow().is_some())
+            {
+                reserve.clear();
+                self.prospective_tips.clear();
+                self.registry_miss_retry.clear();
+
+                while let Some(response) = self.downloads.next().await {
+                    if let Err(error) = response {
+                        debug!(
+                            ?error,
+                            "legacy bootstrap download finished with an error while draining at \
+                             the checkpoint handoff"
+                        );
+                    }
+                }
+                break;
+            }
+
             // Opportunistically handle any block tasks that are already finished, without blocking.
             while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
-                self.handle_block_response_with_missing_retry(rsp).await?;
+                let result = self.handle_block_response_with_missing_retry(rsp).await;
+                if committed_snapshots
+                    .as_ref()
+                    .is_some_and(|snapshots| snapshots.borrow().is_some())
+                {
+                    if let Err(error) = result {
+                        debug!(
+                            ?error,
+                            "legacy bootstrap download finished with an error at the checkpoint \
+                             handoff"
+                        );
+                    }
+                    continue 'sync_round;
+                }
+                result?;
                 last_progress = Instant::now();
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
@@ -1384,7 +1471,21 @@ where
 
                 match completed {
                     Ok(Some(rsp)) => {
-                        self.handle_block_response_with_missing_retry(rsp).await?;
+                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        if committed_snapshots
+                            .as_ref()
+                            .is_some_and(|snapshots| snapshots.borrow().is_some())
+                        {
+                            if let Err(error) = result {
+                                debug!(
+                                    ?error,
+                                    "legacy bootstrap download finished with an error at the \
+                                     checkpoint handoff"
+                                );
+                            }
+                            continue 'sync_round;
+                        }
+                        result?;
                         last_progress = Instant::now();
                         self.update_metrics();
                     }
@@ -1483,7 +1584,21 @@ where
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
-                        self.handle_block_response_with_missing_retry(rsp).await?;
+                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        if committed_snapshots
+                            .as_ref()
+                            .is_some_and(|snapshots| snapshots.borrow().is_some())
+                        {
+                            if let Err(error) = result {
+                                debug!(
+                                    ?error,
+                                    "legacy bootstrap download finished with an error at the \
+                                     checkpoint handoff"
+                                );
+                            }
+                            return Ok(());
+                        }
+                        result?;
                         last_progress = Instant::now();
                         self.update_metrics();
                     }

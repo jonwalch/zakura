@@ -7,20 +7,26 @@ use zakura_network::zakura::{
     ZakuraTrace, COMMIT_STATE_TABLE,
 };
 
-/// Hands the Zakura block-sync bulk-apply pipeline over to legacy `ChainSync`
-/// fallback.
+/// Serializes block-apply ownership across initial checkpoint bootstrap, native
+/// Zakura block sync, and legacy `ChainSync` fallback.
 ///
 /// Two sync engines submitting bulk commits concurrently race in the applying
-/// queue, so fallback must be a commit barrier: once yielded to legacy sync,
-/// the block-sync driver starts no new applies, and the watchdog waits for
-/// in-flight applies to finish before resuming legacy sync. The Zakura reactors
-/// stay alive throughout; only bulk body applies are gated.
+/// queue. A fresh state therefore stays legacy-owned until checkpoint semantic
+/// handoff, and fallback is a later commit barrier: once yielded back to legacy
+/// sync, the block-sync driver starts no new applies and the watchdog waits for
+/// in-flight applies to finish. The Zakura reactors stay alive throughout; only
+/// bulk body applies are gated.
 #[derive(Debug)]
 pub(crate) struct BlockSyncHandoff {
-    yielded_to_legacy: std::sync::atomic::AtomicBool,
+    owner: std::sync::atomic::AtomicU8,
     in_flight: std::sync::atomic::AtomicUsize,
     drained: tokio::sync::Notify,
+    owner_changed: tokio::sync::Notify,
 }
+
+const LEGACY_BOOTSTRAP_OWNER: u8 = 0;
+const ZAKURA_OWNER: u8 = 1;
+const LEGACY_FALLBACK_OWNER: u8 = 2;
 
 /// Tracks one in-flight Zakura block apply; dropping it releases the slot and
 /// wakes a pending [`BlockSyncHandoff::yield_to_legacy`].
@@ -29,23 +35,66 @@ pub(crate) struct BlockApplyPermit(std::sync::Arc<BlockSyncHandoff>);
 
 impl BlockSyncHandoff {
     pub(crate) fn new() -> std::sync::Arc<Self> {
+        Self::new_with_owner(ZAKURA_OWNER)
+    }
+
+    /// Starts with the legacy-compatible downloader owning block applies until
+    /// the checkpoint verifier publishes the durable semantic-handoff snapshot.
+    pub(crate) fn new_legacy_bootstrap() -> std::sync::Arc<Self> {
+        Self::new_with_owner(LEGACY_BOOTSTRAP_OWNER)
+    }
+
+    fn new_with_owner(owner: u8) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            yielded_to_legacy: std::sync::atomic::AtomicBool::new(false),
+            owner: std::sync::atomic::AtomicU8::new(owner),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
+            owner_changed: tokio::sync::Notify::new(),
         })
     }
 
     /// Whether the pipeline has been yielded to legacy sync.
     pub(crate) fn is_yielded_to_legacy(&self) -> bool {
-        self.yielded_to_legacy
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.owner.load(std::sync::atomic::Ordering::SeqCst) == LEGACY_FALLBACK_OWNER
     }
 
-    /// Returns a permit for one block apply, or `None` once the pipeline has
-    /// been yielded to legacy sync.
+    /// Whether native Zakura sync currently owns block applies.
+    pub(crate) fn zakura_owns_applies(&self) -> bool {
+        self.owner.load(std::sync::atomic::Ordering::SeqCst) == ZAKURA_OWNER
+    }
+
+    /// Transfers initial block-apply ownership to native Zakura sync exactly once.
+    pub(crate) fn finish_legacy_bootstrap(&self) {
+        if self
+            .owner
+            .compare_exchange(
+                LEGACY_BOOTSTRAP_OWNER,
+                ZAKURA_OWNER,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.owner_changed.notify_waiters();
+        }
+    }
+
+    /// Waits until initial legacy bootstrap transfers apply ownership to Zakura.
+    pub(crate) async fn wait_for_zakura_ownership(&self) {
+        loop {
+            let changed = self.owner_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.zakura_owns_applies() || self.is_yielded_to_legacy() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Returns a permit for one native block apply only while Zakura owns the pipeline.
     pub(crate) fn begin_apply(self: &std::sync::Arc<Self>) -> Option<BlockApplyPermit> {
-        if self.is_yielded_to_legacy() {
+        if !self.zakura_owns_applies() {
             return None;
         }
 
@@ -56,7 +105,7 @@ impl BlockSyncHandoff {
         // concurrent fallback either sees this apply in `in_flight` or rejects
         // the permit and releases it here. That makes the drain a real commit
         // barrier without locking the hot path.
-        if self.is_yielded_to_legacy() {
+        if !self.zakura_owns_applies() {
             self.release();
             return None;
         }
@@ -82,8 +131,9 @@ impl BlockSyncHandoff {
     }
 
     fn stop_new_applies(&self) {
-        self.yielded_to_legacy
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.owner
+            .store(LEGACY_FALLBACK_OWNER, std::sync::atomic::Ordering::SeqCst);
+        self.owner_changed.notify_waiters();
     }
 
     async fn wait_for_applies(&self, timeout: Duration) {

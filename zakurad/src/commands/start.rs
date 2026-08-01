@@ -411,6 +411,19 @@ impl StartCmd {
             .buffer(Self::state_buffer_bound())
             .service(state_service);
 
+        let zakura_bootstrap_snapshots = config
+            .network
+            .v2_p2p()
+            .then(|| read_only_state_service.subscribe_header_chain_snapshots());
+        let legacy_bootstrap_needed = zakura_bootstrap_snapshots
+            .as_ref()
+            .is_some_and(|snapshots| snapshots.borrow().is_none());
+        let zakura_block_sync_handoff = if legacy_bootstrap_needed {
+            zakura::BlockSyncHandoff::new_legacy_bootstrap()
+        } else {
+            zakura::BlockSyncHandoff::new()
+        };
+
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
                 zakura_header_sync_driver_startup(
@@ -480,10 +493,6 @@ impl StartCmd {
                 tx_verifier_setup_rx,
             )
             .await;
-
-        // Hands off the Zakura bulk-apply pipeline so legacy fallback can drain
-        // in-flight applies before driving commits through the same pipeline.
-        let zakura_block_sync_handoff = zakura::BlockSyncHandoff::new();
 
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
@@ -757,7 +766,10 @@ impl StartCmd {
             )
         }
         let syncer_task_handle = if use_zakura_block_sync(&config.network) {
-            info!("Zakura block sync is replacing the legacy ChainSync body downloader");
+            info!(
+                "legacy ChainSync will bootstrap checkpoint handoff before Zakura block sync \
+                 takes ownership"
+            );
             // Only dual-stack nodes (Zakura + legacy peers) fall back to legacy ChainSync on a
             // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. The
             // fallback resumes legacy ChainSync as the body-sync driver while the Zakura
@@ -767,6 +779,8 @@ impl StartCmd {
                 syncer
                     .bootstrap_genesis_then_pause(
                         read_only_state_service.clone(),
+                        zakura_bootstrap_snapshots
+                            .expect("Zakura block sync has a durable snapshot receiver"),
                         legacy_fallback,
                         zakura_block_sync_handoff.clone(),
                     )

@@ -12,6 +12,29 @@ use super::super::{
     ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
+#[test]
+fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new_legacy_bootstrap();
+
+    assert!(
+        handoff.clone().begin_apply().is_none(),
+        "native applies must stay disabled while legacy checkpoint bootstrap owns the verifier"
+    );
+
+    handoff.finish_legacy_bootstrap();
+    let permit = handoff
+        .clone()
+        .begin_apply()
+        .expect("native applies start after the durable checkpoint handoff");
+    drop(permit);
+
+    handoff.finish_legacy_bootstrap();
+    assert!(
+        handoff.clone().begin_apply().is_some(),
+        "repeating the one-way bootstrap signal must leave Zakura as owner"
+    );
+}
+
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
 /// hole: any increase in the verified tip — including a gossip-trickled block —
 /// resets the idle counter, so the watchdog never falls back.
