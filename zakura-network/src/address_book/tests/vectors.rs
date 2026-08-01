@@ -11,7 +11,10 @@ use zakura_chain::{
 };
 
 use crate::{
-    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
+        MIN_PEER_RECONNECTION_DELAY,
+    },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
     AddressBook,
@@ -300,4 +303,59 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     } else {
         assert_ne!(next_reconnection_peer, None,);
     }
+}
+
+/// Peers learned from inbound connections are neither dialed nor cached.
+///
+/// Their port is the peer's ephemeral source port rather than a listener, so
+/// dialing them wastes the crawler's connection budget. They are also connected
+/// right now, which makes them rank as maximally active — without the filter
+/// they crowd dialable peers out of the disk cache and a restarted node comes
+/// back with mostly undialable candidates.
+#[test]
+fn inbound_peers_are_not_reconnection_or_cache_candidates() {
+    let inbound_addr = "127.0.0.1:54321".parse().unwrap();
+    let outbound_addr = "127.0.0.2:8233".parse().unwrap();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let inbound_peer = MetaAddr::new_connected(inbound_addr, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(instant_now, local_now);
+    let outbound_peer = MetaAddr::new_connected(outbound_addr, &PeerServices::NODE_NETWORK, false)
+        .into_new_meta_addr(instant_now, local_now);
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        vec![inbound_peer, outbound_peer],
+    );
+
+    // Both peers are active for gossip, so activity is not what separates them.
+    assert!(inbound_peer.is_active_for_gossip(chrono_now));
+    assert!(outbound_peer.is_active_for_gossip(chrono_now));
+
+    // Look at the book after the reconnection delay, so neither peer is held
+    // back by `was_recently_updated`.
+    let later_instant = instant_now + MIN_PEER_RECONNECTION_DELAY * 2;
+    let later_chrono = chrono_now
+        + chrono::Duration::from_std(MIN_PEER_RECONNECTION_DELAY * 2)
+            .expect("test reconnection delay fits in chrono");
+
+    let reconnection_addrs: Vec<_> = address_book
+        .reconnection_peers(later_instant, later_chrono)
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(reconnection_addrs, vec![outbound_addr]);
+
+    let cacheable_addrs: Vec<_> = address_book
+        .cacheable(chrono_now)
+        .into_iter()
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(cacheable_addrs, vec![outbound_addr]);
 }
