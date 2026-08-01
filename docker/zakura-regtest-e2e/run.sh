@@ -57,9 +57,25 @@ sed_in_place() {
     || { rm -f "${tmp}"; return 1; }
 }
 
-ZAKURA_E2E_MODE="${ZAKURA_E2E_MODE:-smoke}"
-ZAKURA_E2E_LONG_BLOCKS="${ZAKURA_E2E_LONG_BLOCKS:-4000}"
+# Rewrite a bind-mounted config without replacing its inode. Restart-matrix
+# debug-stop containers are restarted rather than recreated after the stop.
+# Keeping the inode lets that existing container observe the restored config
+# through its file bind mount.
+rewrite_mounted_config_in_place() {
+  local script="$1"
+  local file="$2"
+  local tmp="${file}.tmp.$$"
+  sed "${script}" "${file}" > "${tmp}" \
+    && cp "${tmp}" "${file}" \
+    && rm -f "${tmp}" \
+    || { rm -f "${tmp}"; return 1; }
+}
 
+ZAKURA_E2E_MODE="${ZAKURA_E2E_MODE:-smoke}"
+
+# Keep the dedicated long lanes deep, but scale the restart matrix to the
+# checkpoint boundaries it needs. An explicit ZAKURA_E2E_LONG_BLOCKS overrides
+# the mode-specific total in either lane.
 case "${ZAKURA_E2E_MODE}" in
   smoke)
     DEFAULT_GENERATE_BLOCKS=3
@@ -82,6 +98,7 @@ case "${ZAKURA_E2E_MODE}" in
     ZAKURA_E2E_REQUIRE_HANDOFF=1
     ;;
   checkpoint-long)
+    ZAKURA_E2E_LONG_BLOCKS="${ZAKURA_E2E_LONG_BLOCKS:-4000}"
     DEFAULT_GENERATE_BLOCKS=3
     DEFAULT_CATCHUP_BLOCKS=$(( ZAKURA_E2E_LONG_BLOCKS - DEFAULT_GENERATE_BLOCKS ))
     DEFAULT_CHECKPOINT_INTERVAL=400
@@ -92,6 +109,7 @@ case "${ZAKURA_E2E_MODE}" in
     ZAKURA_E2E_REQUIRE_HANDOFF=1
     ;;
   no-checkpoint-long)
+    ZAKURA_E2E_LONG_BLOCKS="${ZAKURA_E2E_LONG_BLOCKS:-4000}"
     DEFAULT_GENERATE_BLOCKS=3
     DEFAULT_CATCHUP_BLOCKS=$(( ZAKURA_E2E_LONG_BLOCKS - DEFAULT_GENERATE_BLOCKS ))
     DEFAULT_CHECKPOINT_INTERVAL=0
@@ -102,9 +120,10 @@ case "${ZAKURA_E2E_MODE}" in
     ZAKURA_E2E_REQUIRE_HANDOFF=0
     ;;
   restart-matrix)
+    ZAKURA_E2E_LONG_BLOCKS="${ZAKURA_E2E_LONG_BLOCKS:-400}"
     DEFAULT_GENERATE_BLOCKS=3
     DEFAULT_CATCHUP_BLOCKS=$(( ZAKURA_E2E_LONG_BLOCKS - DEFAULT_GENERATE_BLOCKS ))
-    DEFAULT_CHECKPOINT_INTERVAL=400
+    DEFAULT_CHECKPOINT_INTERVAL=40
     DEFAULT_PROPAGATE_TIMEOUT=300
     DEFAULT_CATCHUP_TIMEOUT=1800
     ZAKURA_E2E_DISABLE_CHECKPOINTS=0
@@ -173,6 +192,11 @@ CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-${DEFAULT_CATCHUP_TIMEOUT}}"
 TRACE_FLUSH_TIMEOUT="${TRACE_FLUSH_TIMEOUT:-45}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-${DEFAULT_CHECKPOINT_INTERVAL}}"
 RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-${ZAKURA_E2E_MODE}}"
+RUN_LABEL_DIGEST=$(printf '%s' "${RUN_LABEL}" | sha256sum | cut -c1-16)
+ZAKURA_NODE2_STATE_VOLUME="${ZAKURA_NODE2_STATE_VOLUME:-zakura-regtest-e2e-node2-state-${RUN_LABEL_DIGEST}}"
+[[ "${ZAKURA_NODE2_STATE_VOLUME}" =~ ^zakura-regtest-e2e-node2-state-[0-9a-f]{16}$ ]] \
+  || fail "unsafe node2 state volume name: ${ZAKURA_NODE2_STATE_VOLUME}"
+export ZAKURA_NODE2_STATE_VOLUME
 
 command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
@@ -224,10 +248,12 @@ if [[ "${ZAKURA_E2E_DISABLE_CHECKPOINTS}" == "1" ]]; then
 fi
 if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
   sed_in_place \
-    's|^ephemeral = true$|cache_dir = "/tmp/zakura-node2-state"\nephemeral = false|' \
+    's|^ephemeral = true$|cache_dir = "/tmp/zakura-node2-state"\nephemeral = false\ndebug_skip_non_finalized_state_backup_task = true|' \
     "${CONFIG_DIR}/node2.toml"
   grep -q '^ephemeral = false$' "${CONFIG_DIR}/node2.toml" \
     || fail "failed to make node2 state persistent for restart-matrix"
+  grep -q '^debug_skip_non_finalized_state_backup_task = true$' "${CONFIG_DIR}/node2.toml" \
+    || fail "failed to make restart-matrix non-finalized backups synchronous"
 fi
 # Header sync has no block-relay toggle. Kind-6 block sync is exercised by the
 # from-scratch reset phase below, which removes gossip as a body source entirely.
@@ -377,7 +403,15 @@ cleanup() {
       > "${ZAKURA_E2E_TRACE_DIR}/docker-compose.log" 2>&1 || true
   fi
   log "tearing down"
-  docker compose -f "${COMPOSE_FILE}" down --remove-orphans --timeout 5 || true
+  docker compose -f "${COMPOSE_FILE}" down --volumes --remove-orphans --timeout 5 || true
+  if docker volume inspect "${ZAKURA_NODE2_STATE_VOLUME}" >/dev/null 2>&1; then
+    log "node2 run-scoped state volume leaked after compose teardown: ${ZAKURA_NODE2_STATE_VOLUME}"
+    docker volume rm "${ZAKURA_NODE2_STATE_VOLUME}" >/dev/null 2>&1 || true
+    if docker volume inspect "${ZAKURA_NODE2_STATE_VOLUME}" >/dev/null 2>&1; then
+      log "could not remove leaked node2 run-scoped state volume"
+      (( status == 0 )) && status=1
+    fi
+  fi
   rm -rf "${CONFIG_DIR}"
   return "${status}"
 }
@@ -619,16 +653,17 @@ wait_for_checkpoint_handoff() {
   log "node2 checkpoint bootstrap verified legacy heights 0..${expected_height} and handed off at the exact boundary"
 }
 
-# Native header negotiation can prefetch while the checkpoint verifier owns the
+# Native header/body work can prefetch while the checkpoint verifier owns the
 # prefix. Require a complete, matching header lifecycle rooted at the checkpoint
-# boundary before kind-6 body requests cover the full post-handoff suffix.
+# boundary before kind-6 requests cover the suffix, but gate every committed
+# native apply on the durable checkpoint handoff.
 wait_for_native_suffix_coverage() {
   local suffix_start="$1" suffix_end="$2" block_lines_before="$3"
   local header_lines_before="$4" timeout="$5"
   local block_file="${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl"
   local header_file="${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl"
   local deadline=$((SECONDS + timeout)) request_summary covered=0
-  local first_request_ts lifecycle_count
+  local first_request_ts lifecycle_count apply_summary
 
   while (( SECONDS < deadline )); do
     request_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
@@ -645,7 +680,6 @@ wait_for_native_suffix_coverage() {
               )
             ] as $requests
             | [ $requests[]
-                | select(.ts > $handoff_ts)
                 | range(.range_start; (.range_start + .range_count))
                 | select(. >= $suffix_start and . <= $suffix_end)
               ]
@@ -653,7 +687,7 @@ wait_for_native_suffix_coverage() {
               | sort as $covered
             | {
                 request_count: ($requests | length),
-                requests_before_or_at_handoff:
+                prefetched_requests:
                   ([$requests[] | select(.ts <= $handoff_ts)] | length),
                 first_request_ts: (($requests | map(.ts) | min) // null),
                 out_of_suffix:
@@ -686,14 +720,58 @@ wait_for_native_suffix_coverage() {
     | jq -e \
         --argjson suffix_start "${suffix_start}" \
         --argjson suffix_end "${suffix_end}" '
-          .requests_before_or_at_handoff == 0
-          and .out_of_suffix == 0
+          .out_of_suffix == 0
           and .covered_first == $suffix_start
           and .covered_last == $suffix_end
           and .covered_count == .expected_count
           and (.first_request_ts | type == "number")
         ' >/dev/null \
-    || fail "node2 native requests were not confined to the post-handoff suffix ${suffix_start}..${suffix_end}"
+    || fail "node2 native requests were not confined to suffix ${suffix_start}..${suffix_end}"
+
+  apply_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
+    | jq -sc \
+        --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
+        --argjson handoff_ts "${CHECKPOINT_HANDOFF_TS}" \
+        --argjson suffix_start "${suffix_start}" \
+        --argjson suffix_end "${suffix_end}" '
+          [ .[] | select(
+              .process_trace_id == $process
+              and .event == "block_apply_finished"
+              and .result == "committed"
+              and (.height | type == "number")
+            )
+          ] as $applies
+          | [ $applies[]
+              | select(.ts > $handoff_ts)
+              | .height
+              | select(. >= $suffix_start and . <= $suffix_end)
+            ]
+            | unique
+            | sort as $committed
+          | {
+              applies_before_or_at_handoff:
+                ([$applies[] | select(.ts <= $handoff_ts)] | length),
+              out_of_suffix:
+                ([$applies[] | select(
+                    .height < $suffix_start or .height > $suffix_end
+                  )] | length),
+              committed_first: ($committed | first // null),
+              committed_last: ($committed | last // null),
+              committed_count: ($committed | length),
+              expected_count: ($suffix_end - $suffix_start + 1)
+            }
+        ')
+  printf '%s' "${apply_summary}" \
+    | jq -e \
+        --argjson suffix_start "${suffix_start}" \
+        --argjson suffix_end "${suffix_end}" '
+          .applies_before_or_at_handoff == 0
+          and .out_of_suffix == 0
+          and .committed_first == $suffix_start
+          and .committed_last == $suffix_end
+          and .committed_count == .expected_count
+        ' >/dev/null \
+    || fail "node2 did not commit exactly the native suffix ${suffix_start}..${suffix_end} after checkpoint handoff"
 
   first_request_ts=$(printf '%s' "${request_summary}" | jq -r '.first_request_ts')
   lifecycle_count=$(trace_rows_after "${header_file}" "${header_lines_before}" \
@@ -743,7 +821,7 @@ wait_for_native_suffix_coverage() {
         ')
   (( lifecycle_count >= 1 )) \
     || fail "node2 did not complete and admit the native header lifecycle before its first kind-6 body request"
-  log "node2 admitted a complete native header lifecycle and covered post-handoff kind-6 suffix ${suffix_start}..${suffix_end}"
+  log "node2 prefetched an authenticated native suffix and committed it only after checkpoint handoff (${suffix_start}..${suffix_end})"
 }
 
 wait_ready() {
@@ -764,6 +842,16 @@ stop_node2_for_reset() {
   if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
     docker compose -f "${COMPOSE_FILE}" rm -f zakura-node-2 \
       || fail "could not remove node2 container for ${label}"
+    if docker volume inspect "${ZAKURA_NODE2_STATE_VOLUME}" >/dev/null 2>&1; then
+      local volume_project
+      volume_project=$(docker volume inspect \
+        --format '{{ index .Labels "com.docker.compose.project" }}' \
+        "${ZAKURA_NODE2_STATE_VOLUME}")
+      [[ "${volume_project}" == "zakura-regtest-e2e" ]] \
+        || fail "refusing to reset node2 volume with unexpected Compose owner: ${volume_project:-<none>}"
+      docker volume rm "${ZAKURA_NODE2_STATE_VOLUME}" >/dev/null \
+        || fail "could not reset run-scoped node2 state volume for ${label}"
+    fi
   fi
 }
 
@@ -792,6 +880,165 @@ restart_node2_preserving_state() {
   docker compose -f "${COMPOSE_FILE}" start zakura-node-2 \
     || fail "could not restart node2 for ${label}"
   wait_ready 18332 "node2 (${label})"
+}
+
+docker_log_line_count() {
+  docker logs zakura-node-2 2>&1 | wc -l
+}
+
+node2_logs_after() {
+  local lines_before="$1"
+  docker logs zakura-node-2 2>&1 | awk -v lines_before="${lines_before}" 'NR > lines_before'
+}
+
+wait_for_node2_exact_reopen() {
+  local height="$1" lines_before="$2" label="$3" timeout="$4"
+  local deadline=$((SECONDS + timeout)) logs
+
+  while (( SECONDS < deadline )); do
+    logs=$(node2_logs_after "${lines_before}")
+    if printf '%s\n' "${logs}" \
+      | grep -F "starting sync, obtaining new tips state_tip=Some(Height(${height}))" >/dev/null
+    then
+      if printf '%s\n' "${logs}" \
+        | grep -F "starting genesis block download and verify" >/dev/null
+      then
+        fail "node2 ${label} replayed genesis instead of reopening durable height ${height}"
+      fi
+      printf '  node2 %s reopened the existing database at exact height %s without genesis replay\n' \
+        "${label}" "${height}"
+      return 0
+    fi
+    sleep 2
+  done
+
+  fail "node2 ${label} did not log an exact durable reopen at height ${height}"
+}
+
+assert_node2_post_reorg_restore() {
+  local lines_before="$1" target="$2" expected_hash="$3"
+  local logs restored_count reopened_hash
+
+  logs=$(node2_logs_after "${lines_before}")
+  if printf '%s\n' "${logs}" \
+    | grep -F "starting genesis block download and verify" >/dev/null
+  then
+    fail "node2 post-reorg restart replayed genesis instead of restoring its database"
+  fi
+  restored_count=$(printf '%s\n' "${logs}" \
+    | sed -n 's/.*num_blocks_restored=\([0-9][0-9]*\).*/\1/p' \
+    | tail -1)
+  [[ -n "${restored_count}" && "${restored_count}" -gt 0 ]] \
+    || fail "node2 post-reorg restart did not prove non-finalized backup restoration"
+  reopened_hash=$(block_hash 18332 "${target}")
+  [[ "${reopened_hash}" == "${expected_hash}" ]] \
+    || fail "node2 post-reorg restart selected ${reopened_hash:-<none>} at height ${target}, expected ${expected_hash}"
+  printf '  node2 post-reorg restart restored %s non-finalized block(s) and exact tip %s\n' \
+    "${restored_count}" "${expected_hash}"
+}
+
+configure_node2_debug_stop() {
+  local height="$1"
+  local config="${CONFIG_DIR}/node2.toml"
+  local debug_trace_dir="/traces/debug-stops/node2-height-${height}"
+  local evidence_dir="${ZAKURA_E2E_TRACE_DIR}/debug-stops/node2-height-${height}"
+
+  [[ "${height}" =~ ^[0-9]+$ ]] || fail "invalid node2 debug stop height: ${height}"
+  ! grep -q '^debug_stop_at_height = ' "${config}" \
+    || fail "node2 debug stop height is already configured"
+  grep -q '^trace_dir = "/traces/node2"$' "${config}" \
+    || fail "node2 trace directory is not in its normal configuration"
+
+  # Create the bind-mounted destination as the host user before the container
+  # tracer writes into it, so the harness can also preserve docker.log and the
+  # exit code beside the raw intentional-stop traces.
+  mkdir -p "${evidence_dir}" \
+    || fail "could not create node2 debug-stop evidence directory at height ${height}"
+  [[ -w "${evidence_dir}" ]] \
+    || fail "node2 debug-stop evidence directory is not host-writable at height ${height}"
+
+  # debug_stop_at_height exits from the state writer before the ordinary
+  # block-sync driver can emit commit_finish. Preserve those intentional-stop
+  # traces as raw evidence, but keep them out of node2's strict-oracle stream.
+  rewrite_mounted_config_in_place \
+    "s|^trace_dir = \"/traces/node2\"$|trace_dir = \"${debug_trace_dir}\"|; /^ephemeral = false$/a\\
+debug_stop_at_height = ${height}" \
+    "${config}" \
+    || fail "could not configure node2 debug stop at height ${height}"
+
+  grep -q "^debug_stop_at_height = ${height}$" "${config}" \
+    || fail "node2 debug stop height ${height} was not injected"
+  grep -q "^trace_dir = \"${debug_trace_dir}\"$" "${config}" \
+    || fail "node2 debug-stop trace directory was not injected"
+}
+
+clear_node2_debug_stop() {
+  local height="$1"
+  local config="${CONFIG_DIR}/node2.toml"
+  local debug_trace_dir="/traces/debug-stops/node2-height-${height}"
+
+  grep -q "^debug_stop_at_height = ${height}$" "${config}" \
+    || fail "node2 debug stop height ${height} is missing before restore"
+  grep -q "^trace_dir = \"${debug_trace_dir}\"$" "${config}" \
+    || fail "node2 debug-stop trace directory is missing before restore"
+
+  rewrite_mounted_config_in_place \
+    "/^debug_stop_at_height = ${height}$/d; s|^trace_dir = \"${debug_trace_dir}\"$|trace_dir = \"/traces/node2\"|" \
+    "${config}" \
+    || fail "could not clear node2 debug stop at height ${height}"
+
+  ! grep -q '^debug_stop_at_height = ' "${config}" \
+    || fail "node2 debug stop height remained configured after restore"
+  grep -q '^trace_dir = "/traces/node2"$' "${config}" \
+    || fail "node2 normal trace directory was not restored"
+}
+
+wait_for_node2_debug_stop() {
+  local height="$1" label="$2" timeout="$3"
+  local deadline=$((SECONDS + timeout)) status exit_code
+  local evidence_dir="${ZAKURA_E2E_TRACE_DIR}/debug-stops/node2-height-${height}"
+  local evidence_log="${evidence_dir}/docker.log"
+
+  log "waiting for node2 to durably stop at exact height ${height} (${label})"
+  while (( SECONDS < deadline )); do
+    status=$(docker inspect --format '{{.State.Status}}' zakura-node-2 2>/dev/null || true)
+    case "${status}" in
+      exited)
+        exit_code=$(docker inspect --format '{{.State.ExitCode}}' zakura-node-2 2>/dev/null || true)
+        [[ "${exit_code}" == "0" ]] \
+          || fail "node2 debug stop at height ${height} exited with status ${exit_code:-unknown}"
+        mkdir -p "${evidence_dir}"
+        docker logs zakura-node-2 > "${evidence_log}" 2>&1 \
+          || fail "could not preserve node2 debug-stop log at height ${height}"
+        printf '%s\n' "${exit_code}" > "${evidence_dir}/docker.exit.txt"
+        if ! awk -v height="${height}" '
+              /stopping at configured height, flushing database to disk/ {
+                exact_height = "height=Height\\(" height "\\)"
+                plain_height = "height=" height "([^0-9]|$)"
+                if ($0 ~ exact_height || $0 ~ plain_height) found = 1
+              }
+              END { exit(found ? 0 : 1) }
+            ' "${evidence_log}"
+        then
+          fail "node2 exited cleanly without proving its durable debug stop at exact height ${height}"
+        fi
+        printf '  node2 %s durably stopped at exact height %s with exit code 0\n' \
+          "${label}" "${height}"
+        return 0
+        ;;
+      dead)
+        fail "node2 container died while stopping at height ${height}"
+        ;;
+      created|running|restarting|paused|removing|"")
+        sleep 2
+        ;;
+      *)
+        fail "node2 had unexpected container status '${status}' while stopping at height ${height}"
+        ;;
+    esac
+  done
+
+  fail "node2 did not durably stop at exact height ${height} within ${timeout}s"
 }
 
 peer_count() { rpc "$1" getpeerinfo | jq -r 'if .result then (.result | length) else 0 end'; }
@@ -988,24 +1235,26 @@ assert_block_sync_budget_empty() {
 }
 
 restart_node2_at_height_then_catch_up() {
-  local restart_height="$1" label="$2" target="$3"
-  log "restart-matrix: resetting node2, restarting around height ${restart_height} (${label})"
-  reset_node2_from_scratch "restart-matrix ${label} reset"
-  if (( restart_height > 0 )); then
-    wait_block_count_at_least 18332 "${restart_height}" "node2 restart-matrix ${label} pre-restart" "${CATCHUP_TIMEOUT}"
-  else
-    local n2_genesis=""
-    local deadline=$((SECONDS + READY_TIMEOUT))
-    while (( SECONDS < deadline )); do
-      n2_genesis=$(block_hash 18332 0)
-      printf '  node2 restart-matrix %s genesis=%s\n' "${label}" "${n2_genesis:-<none>}"
-      [[ -n "${n2_genesis}" ]] && break
-      sleep 3
-    done
-    [[ -n "${n2_genesis}" ]] || fail "node2 did not bootstrap genesis before ${label} restart"
-  fi
+  local restart_height="$1" label="$2" target="$3" reopen_log_lines
+  log "restart-matrix: resetting node2 and creating exact durable height ${restart_height} (${label})"
+  stop_node2_for_reset "restart-matrix ${label} exact-height reset"
+  configure_node2_debug_stop "${restart_height}"
+  docker compose -f "${COMPOSE_FILE}" up -d zakura-node-2 \
+    || fail "could not recreate node2 for restart-matrix ${label} debug stop"
+  # Do not wait for RPC readiness: height 0 can commit and stop before the RPC
+  # server is observable. The clean container exit and exact state-writer log
+  # are the debug-stop contract proving the durable pre-restart height.
+  wait_for_node2_debug_stop "${restart_height}" "restart-matrix ${label}" "${CATCHUP_TIMEOUT}"
 
-  restart_node2_preserving_state "restart-matrix ${label}"
+  # Restore the config through the existing bind mount, then restart this same
+  # container so its named-volume database survives the reopen.
+  clear_node2_debug_stop "${restart_height}"
+  reopen_log_lines=$(docker_log_line_count)
+  docker compose -f "${COMPOSE_FILE}" start zakura-node-2 \
+    || fail "could not reopen node2 at restart-matrix ${label}"
+  wait_ready 18332 "node2 (restart-matrix ${label} reopen)"
+  wait_for_node2_exact_reopen \
+    "${restart_height}" "${reopen_log_lines}" "restart-matrix ${label}" "${READY_TIMEOUT}"
   if (( $(block_count 18332) < target )); then
     wait_metric_at_least 19002 sync_block_request_sent 1 "node2 restart-matrix ${label}" "${CATCHUP_TIMEOUT}"
   fi
@@ -1016,18 +1265,21 @@ restart_node2_at_height_then_catch_up() {
 
 run_restart_matrix() {
   local target="$1"
-  local around_399=$(( target > 399 ? 399 : target ))
-  local around_400=$(( target > 400 ? 400 : target ))
-  local around_401=$(( target > 401 ? 401 : target ))
-  local around_mid=$(( target > 2000 ? 2000 : target / 2 ))
-  local near_tip_gap_height=$(( target > 1000 ? target - 1000 : 0 ))
+  # Exercise both sides of the configured checkpoint boundary, then two
+  # target-relative points so the same matrix scales with an explicit long run.
+  local before_checkpoint=$(( CHECKPOINT_INTERVAL - 1 ))
+  local at_checkpoint=${CHECKPOINT_INTERVAL}
+  local after_checkpoint=$(( CHECKPOINT_INTERVAL + 1 ))
+  local midpoint=$(( target / 2 ))
+  local near_tip_gap=$(( target / 4 ))
+  local near_tip_gap_height=$(( target - near_tip_gap ))
 
   restart_node2_at_height_then_catch_up 0 "height-0" "${target}"
-  restart_node2_at_height_then_catch_up "${around_399}" "height-399" "${target}"
-  restart_node2_at_height_then_catch_up "${around_400}" "height-400" "${target}"
-  restart_node2_at_height_then_catch_up "${around_401}" "height-401" "${target}"
-  restart_node2_at_height_then_catch_up "${around_mid}" "height-2000" "${target}"
-  restart_node2_at_height_then_catch_up "${near_tip_gap_height}" "near-tip-1000-gap" "${target}"
+  restart_node2_at_height_then_catch_up "${before_checkpoint}" "height-${before_checkpoint}" "${target}"
+  restart_node2_at_height_then_catch_up "${at_checkpoint}" "height-${at_checkpoint}" "${target}"
+  restart_node2_at_height_then_catch_up "${after_checkpoint}" "height-${after_checkpoint}" "${target}"
+  restart_node2_at_height_then_catch_up "${midpoint}" "height-${midpoint}" "${target}"
+  restart_node2_at_height_then_catch_up "${near_tip_gap_height}" "near-tip-${near_tip_gap}-gap" "${target}"
 }
 
 log "starting bootstrap node"
@@ -1408,9 +1660,14 @@ snapshot_timeline "post-reorg"
 
 if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
   log "restart-matrix: restarting node2 after the non-finalized reorg"
+  post_reorg_hash=$(block_hash 18332 "${target}")
+  [[ -n "${post_reorg_hash}" ]] || fail "could not read node2 post-reorg tip hash before restart"
+  post_reorg_log_lines=$(docker_log_line_count)
   restart_node2_preserving_state "restart-matrix post-reorg"
   wait_block_count_at_least 18332 "${target}" "node2 restart-matrix post-reorg" "${CATCHUP_TIMEOUT}"
   wait_zakura_body_frontier_at_tip 19002 18332 "${target}" "node2 restart-matrix post-reorg" "${CATCHUP_TIMEOUT}"
+  assert_node2_post_reorg_restore \
+    "${post_reorg_log_lines}" "${target}" "${post_reorg_hash}"
   assert_block_sync_budget_empty "restart-matrix post-reorg"
 fi
 
