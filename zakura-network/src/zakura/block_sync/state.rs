@@ -198,7 +198,6 @@ impl BlockSyncHandle {
     /// Park `peer` for `cooldown`, exactly as the no-progress liveness deadline
     /// does when it evicts an unproductive block-sync peer.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn park_peer_for_test(&self, peer: &ZakuraPeerId, cooldown: std::time::Duration) {
         let wiring = self
             .routine_wiring
@@ -211,7 +210,6 @@ impl BlockSyncHandle {
 
     /// Park this connection's session exactly as its no-progress routine does.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn park_session_for_test(
         &self,
         peer: &ZakuraPeerId,

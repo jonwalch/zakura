@@ -25,6 +25,7 @@ use super::{
     state::*,
     work_queue::WorkQueue,
 };
+use crate::zakura::OrderedSessionDemand;
 use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
@@ -473,10 +474,16 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
         .as_ref()
         .expect("the spawned reactor exposes its shared test wiring");
     let supplier = peer(0x54);
-    let generation =
-        wiring
-            .registry
-            .admit(&supplier, ServicePeerDirection::Outbound, &wiring.config);
+    let generation = wiring
+        .registry
+        .admit_session(
+            &supplier,
+            ServicePeerDirection::Outbound,
+            &wiring.config,
+            0,
+            std::time::Instant::now(),
+        )
+        .generation();
     wiring.registry.upsert_status(
         &supplier,
         generation,
@@ -13709,5 +13716,102 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
         "misbehavior is record-only: a repeatedly-misbehaving peer must NOT be disconnected",
     );
 
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let peer = peer(93);
+    let old_conn_id = 7;
+    let new_conn_id = 8;
+    handle.park_session_for_test(&peer, old_conn_id, Duration::ZERO);
+
+    assert!(matches!(
+        service.ordered_session_demand(
+            old_conn_id,
+            &peer,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::WaitForChange(_),
+    ));
+
+    service.remove_peer(&peer, old_conn_id);
+    assert!(matches!(
+        service.ordered_session_demand(
+            new_conn_id,
+            &peer,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_work() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let peer = peer(9);
+    let conn_id = 17;
+    handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
+
+    let demand = service.ordered_session_demand(
+        conn_id,
+        &peer,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::WaitForChange(changed) = demand else {
+        panic!("a locally parked session must stay absent while block sync is at tip");
+    };
+
+    handle
+        .send_control(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            size: BlockSizeEstimate::Advertised(1_000),
+        }]))
+        .expect("the block-sync reactor is live");
+    tokio::time::timeout(Duration::from_secs(1), changed)
+        .await
+        .expect("new block work wakes the parked session demand");
+
+    assert!(matches!(
+        service.ordered_session_demand(
+            conn_id,
+            &peer,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow,
+    ));
     reactor_task.abort();
 }

@@ -144,7 +144,7 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::HostilePeer;
+    use super::super::{HostilePeer, TraceValue};
     use super::*;
     use crate::{
         zakura::trace::block_sync_trace as bs_trace,
@@ -152,11 +152,11 @@ mod tests {
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
-            DiscoveryMessage, Frame, FramedSend, FullStateFrontiers, Peer, Service,
-            ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits,
-            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
-            ZAKURA_STREAM_HEADER_SYNC,
+            DiscoveryMessage, Frame, FramedSend, FullStateFrontiers, HeaderEntry, HeaderSyncAction,
+            HeaderSyncEvent, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
+            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, MAX_BS_RESPONSE_BYTES,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -177,7 +177,310 @@ mod tests {
             Network,
         },
         serialization::{ZcashDeserializeInto, ZcashSerialize},
+        work::difficulty::U256,
     };
+
+    #[tokio::test]
+    async fn protocol_v8_status_and_correlated_response_cross_real_wire() -> Result<(), BoxError> {
+        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let block_one = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let target = (block::Height(1), block_one.hash());
+        let victim = ZakuraTestNode::builder(70)
+            .header_sync_driver(
+                Network::Mainnet,
+                anchor,
+                FullStateFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: anchor.0,
+                    verified_block_hash: anchor.1,
+                },
+                Some(anchor),
+            )
+            .spawn()
+            .await?;
+        let mut actions = victim
+            .take_header_sync_actions()
+            .await
+            .expect("the external header driver is enabled");
+        let header_sync = victim
+            .header_sync()
+            .expect("the real header service is enabled");
+        let codec = header_sync.codec();
+        let hostile =
+            HostilePeer::connect_native_with_capabilities(&victim, 71, ZAKURA_CAP_HEADER_SYNC)
+                .await?;
+        let hostile_id = hostile.id()?;
+
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                hostile.recv_header_sync_message(&codec)
+            )
+            .await
+            .map_err(|_| -> BoxError { "timed out waiting for initial v8 Status".into() })??,
+            HeaderSyncMessage::Status(_)
+        ));
+
+        hostile
+            .send_header_sync_message(
+                &codec,
+                &HeaderSyncMessage::Status(Status {
+                    work_anchor_height: anchor.0,
+                    work_anchor_hash: anchor.1,
+                    selected_tip_height: target.0,
+                    selected_tip_hash: target.1,
+                    suffix_cumulative_work: U256::from(1_u8),
+                    oldest_retained_height: anchor.0,
+                    max_headers_per_response: 16,
+                    max_inflight_requests: 1,
+                    max_message_bytes: 1_000_000,
+                    tree_aux_schema_mask: 0,
+                }),
+            )
+            .await?;
+
+        let (session_id, scope) = match tokio::time::timeout(Duration::from_secs(5), actions.recv())
+            .await
+            .map_err(|_| -> BoxError { "timed out waiting for QueryHeaderLocator".into() })?
+            .ok_or("header action channel closed")?
+        {
+            HeaderSyncAction::QueryHeaderLocator {
+                peer,
+                session_id,
+                target_tip_hash,
+                scope,
+            } => {
+                assert_eq!(peer, hostile_id);
+                assert_eq!(target_tip_hash, target.1);
+                (session_id, scope)
+            }
+            action => return Err(format!("unexpected header action: {action:?}").into()),
+        };
+        header_sync
+            .send(HeaderSyncEvent::HeaderLocatorReady {
+                peer: hostile_id.clone(),
+                session_id,
+                target_tip_hash: target.1,
+                scope,
+                locator: Some(zakura_header_chain::HeaderLocator::for_continuation(
+                    zakura_header_chain::Frontier::new(anchor.0, anchor.1),
+                )),
+            })
+            .await?;
+
+        let request = match tokio::time::timeout(
+            Duration::from_secs(5),
+            hostile.recv_header_sync_message(&codec),
+        )
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for v8 GetHeaders".into() })??
+        {
+            HeaderSyncMessage::GetHeaders(request) => request,
+            message => return Err(format!("unexpected header message: {message:?}").into()),
+        };
+        assert_ne!(request.request_id, 0);
+        assert_eq!(request.target_tip_hash, target.1);
+        assert_eq!(request.locator_hashes.first(), Some(&anchor.1));
+
+        hostile
+            .send_header_sync_message(
+                &codec,
+                &HeaderSyncMessage::Headers(Headers {
+                    request_id: request.request_id,
+                    target_tip_hash: target.1,
+                    common_ancestor_height: anchor.0,
+                    common_ancestor_hash: anchor.1,
+                    complete: true,
+                    tree_aux_schema: crate::zakura::AuxSchema::None,
+                    entries: vec![HeaderEntry {
+                        header: block_one.header.clone(),
+                        body_size: u32::try_from(block_one.zcash_serialized_size())
+                            .unwrap_or(u32::MAX),
+                        tree_aux: None,
+                    }],
+                }),
+            )
+            .await?;
+
+        match tokio::time::timeout(Duration::from_secs(5), actions.recv())
+            .await
+            .map_err(|_| -> BoxError { "timed out waiting for PrepareHeaderTarget".into() })?
+            .ok_or("header action channel closed")?
+        {
+            HeaderSyncAction::PrepareHeaderTarget {
+                peer,
+                owner,
+                common_ancestor,
+                target: prepared_target,
+                entries,
+                ..
+            } => {
+                assert_eq!(peer, hostile_id);
+                assert_eq!(owner.session_id, session_id);
+                assert_eq!(owner.scope(), scope);
+                assert_eq!(
+                    common_ancestor,
+                    zakura_header_chain::Frontier::new(anchor.0, anchor.1)
+                );
+                assert_eq!(
+                    prepared_target,
+                    zakura_header_chain::Frontier::new(target.0, target.1)
+                );
+                assert_eq!(entries.len(), 1);
+            }
+            action => return Err(format!("unexpected header action: {action:?}").into()),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), actions.recv())
+                .await
+                .is_err(),
+            "one correlated response schedules exactly one preparation",
+        );
+        assert!(victim
+            .supervisor()
+            .registered_ids()
+            .await
+            .contains(&hostile_id));
+
+        hostile.shutdown().await;
+        victim.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_v8_hostile_frames_disconnect_with_boundary_attribution(
+    ) -> Result<(), BoxError> {
+        let mut capture = TraceCapture::for_test_with_keep_override(
+            "protocol_v8_hostile_frames_disconnect",
+            false,
+        )?;
+        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let victim = ZakuraTestNode::builder(72)
+            .max_connections_per_ip(8)
+            .tracer(capture.tracer_for_node(72))
+            .header_sync_driver(
+                Network::Mainnet,
+                anchor,
+                FullStateFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: anchor.0,
+                    verified_block_hash: anchor.1,
+                },
+                Some(anchor),
+            )
+            .spawn()
+            .await?;
+        let header_sync = victim
+            .header_sync()
+            .expect("the real header service is enabled");
+        let codec = header_sync.codec();
+        let mut actions = victim
+            .take_header_sync_actions()
+            .await
+            .expect("the external header driver is enabled");
+        let control =
+            HostilePeer::connect_native_with_capabilities(&victim, 73, ZAKURA_CAP_HEADER_SYNC)
+                .await?;
+        let control_id = control.id()?;
+
+        for (seed, case) in [(74, "unknown"), (75, "unsolicited"), (76, "oversize")] {
+            let hostile = HostilePeer::connect_native_with_capabilities(
+                &victim,
+                seed,
+                ZAKURA_CAP_HEADER_SYNC,
+            )
+            .await?;
+            let hostile_id = hostile.id()?;
+            match case {
+                "unknown" => {
+                    hostile
+                        .send_raw_frame(
+                            ZAKURA_STREAM_HEADER_SYNC,
+                            Frame {
+                                message_type: 99,
+                                flags: 0,
+                                payload: vec![99],
+                            },
+                        )
+                        .await?;
+                }
+                "unsolicited" => {
+                    hostile
+                        .send_header_sync_message(
+                            &codec,
+                            &HeaderSyncMessage::Headers(Headers {
+                                request_id: 999,
+                                target_tip_hash: anchor.1,
+                                common_ancestor_height: anchor.0,
+                                common_ancestor_hash: anchor.1,
+                                complete: true,
+                                tree_aux_schema: crate::zakura::AuxSchema::None,
+                                entries: Vec::new(),
+                            }),
+                        )
+                        .await?;
+                }
+                "oversize" => {
+                    hostile
+                        .oversize_frame_declared_len(ZAKURA_STREAM_HEADER_SYNC)
+                        .await?;
+                }
+                _ => unreachable!("the hostile matrix cases are fixed"),
+            }
+            hostile
+                .wait_for_connection_close(Duration::from_secs(5))
+                .await?;
+            await_until(
+                "hostile header peer removed",
+                Duration::from_secs(5),
+                || {
+                    !victim
+                        .supervisor()
+                        .subscribe()
+                        .borrow()
+                        .contains(&hostile_id)
+                },
+            )
+            .await?;
+            assert!(
+                victim
+                    .supervisor()
+                    .registered_ids()
+                    .await
+                    .contains(&control_id),
+                "the normal control peer remains connected after {case}"
+            );
+            hostile.shutdown().await;
+        }
+        assert!(
+            actions.try_recv().is_err(),
+            "hostile frames never schedule target preparation or admission"
+        );
+
+        control.shutdown().await;
+        victim.shutdown().await;
+        capture.flush().await;
+        let trace = capture.reader()?;
+        let header_rows = trace.node("72").table("header_sync");
+        header_rows.assert_row(
+            "header_peer_violation",
+            &[
+                ("boundary", TraceValue::Str("pipe")),
+                ("reason", TraceValue::Str("unknown_message_type")),
+                ("disposition", TraceValue::Str("disconnect")),
+            ],
+        );
+        header_rows.assert_row(
+            "header_peer_violation",
+            &[
+                ("boundary", TraceValue::Str("pipe")),
+                ("reason", TraceValue::Str("unsolicited_response")),
+                ("disposition", TraceValue::Str("disconnect")),
+            ],
+        );
+        assert!(capture.finish().await?.is_none());
+        Ok(())
+    }
     use zakura_test::vectors::{
         BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_4_BYTES,
         BLOCK_MAINNET_5_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
@@ -1216,10 +1519,10 @@ mod tests {
         let _guard = zakura_test::init();
         // Advertise dialable (non-loopback) addresses so the gossiped records are
         // kept in the dialable book rather than dropped as locally non-dialable.
-        let addr_a = "203.0.113.10:9"
+        let addr_a = "45.33.30.10:9"
             .parse::<std::net::SocketAddr>()
             .expect("valid test addr");
-        let addr_b = "203.0.113.11:9"
+        let addr_b = "45.33.30.11:9"
             .parse::<std::net::SocketAddr>()
             .expect("valid test addr");
         let a = ZakuraTestNode::builder(52)

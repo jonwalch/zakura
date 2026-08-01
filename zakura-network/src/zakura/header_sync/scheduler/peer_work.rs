@@ -398,6 +398,21 @@ impl PeerWorkQueue {
         }
     }
 
+    pub(in crate::zakura::header_sync) fn remove_awaiting(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        target_tip_hash: zakura_chain::block::Hash,
+        scope: WorkScope,
+    ) {
+        if self
+            .awaiting(peer, session_id, target_tip_hash, scope)
+            .is_some()
+        {
+            self.work_by_peer.remove(peer);
+        }
+    }
+
     pub(in crate::zakura::header_sync) fn active(
         &self,
         peer: &ZakuraPeerId,

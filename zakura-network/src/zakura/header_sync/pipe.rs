@@ -11,11 +11,13 @@ use super::{
 use crate::zakura::{Frame, FramedRecv, SinkReject, ZakuraPeerId};
 
 /// Run the sole peer-owned header-sync decode pipe.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_peer(
     handle: HeaderSyncHandle,
     codec: HeaderSyncCodec,
     peer: ZakuraPeerId,
     session_id: u64,
+    direction: crate::zakura::ServicePeerDirection,
     mut commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
     mut recv: FramedRecv,
     cancel: CancellationToken,
@@ -60,9 +62,16 @@ pub(super) async fn run_peer(
         ) {
             let request_id =
                 HeaderSyncCodec::peek_response_request_id(&frame).map_err(protocol_reject)?;
-            let response = expected
-                .remove(&request_id)
-                .ok_or_else(|| protocol_reject("unsolicited header-sync response"))?;
+            let Some(response) = expected.remove(&request_id) else {
+                emit_pipe_violation(
+                    &handle,
+                    &peer,
+                    session_id,
+                    direction,
+                    "unsolicited_response",
+                );
+                return Err(protocol_reject("unsolicited header-sync response"));
+            };
             Some(response)
         } else {
             None
@@ -72,7 +81,18 @@ pub(super) async fn run_peer(
         });
         let msg = codec
             .decode_frame(frame, response_context)
-            .map_err(protocol_reject)?;
+            .map_err(|error| {
+                let reason = match error {
+                    super::HeaderSyncWireError::UnknownMessageType(_)
+                    | super::HeaderSyncWireError::UnknownFrameMessageType(_)
+                    | super::HeaderSyncWireError::MismatchedFrameMessageType { .. } => {
+                        "unknown_message_type"
+                    }
+                    _ => "malformed_message",
+                };
+                emit_pipe_violation(&handle, &peer, session_id, direction, reason);
+                protocol_reject(error)
+            })?;
         let event = match expected_response {
             Some(response) => HeaderSyncEvent::SessionResponse {
                 peer: peer.clone(),
@@ -94,6 +114,32 @@ pub(super) async fn run_peer(
             }
         }
     }
+}
+
+fn emit_pipe_violation(
+    handle: &HeaderSyncHandle,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    direction: crate::zakura::ServicePeerDirection,
+    reason: &'static str,
+) {
+    use crate::zakura::trace::{header_sync_trace as hs_trace, peer_label, HEADER_SYNC_TABLE};
+    let direction = match direction {
+        crate::zakura::ServicePeerDirection::Inbound => "inbound",
+        crate::zakura::ServicePeerDirection::Outbound => "outbound",
+    };
+    handle.trace.emit_with(HEADER_SYNC_TABLE, |row| {
+        row.insert(
+            hs_trace::EVENT.into(),
+            hs_trace::HEADER_PEER_VIOLATION.into(),
+        );
+        row.insert(hs_trace::PEER.into(), peer_label(peer).into());
+        row.insert(hs_trace::SESSION_ID.into(), session_id.into());
+        row.insert(hs_trace::DIRECTION.into(), direction.into());
+        row.insert(hs_trace::REASON.into(), reason.into());
+        row.insert(hs_trace::BOUNDARY.into(), "pipe".into());
+        row.insert(hs_trace::DISPOSITION.into(), "disconnect".into());
+    });
 }
 
 fn apply_command(
@@ -151,6 +197,7 @@ mod tests {
                 peers,
                 candidates,
                 codec,
+                trace: crate::zakura::ZakuraTrace::noop(),
             },
             receiver,
         )
@@ -186,6 +233,7 @@ mod tests {
             codec,
             peer(),
             1,
+            crate::zakura::ServicePeerDirection::Inbound,
             commands,
             recv,
             CancellationToken::new(),
@@ -238,6 +286,7 @@ mod tests {
                 codec,
                 peer(),
                 1,
+                crate::zakura::ServicePeerDirection::Inbound,
                 commands,
                 recv,
                 CancellationToken::new(),

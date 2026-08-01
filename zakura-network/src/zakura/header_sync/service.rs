@@ -14,10 +14,15 @@ use super::{events::*, pipe::run_peer, wire::*, FRAME_HEADER_BYTES};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Frame, FramedRecv, FramedSend,
-    OrderedSendError, Peer, PeerStreamSession, Service, ServicePeerDirection, Sink, SinkReject,
-    Stream, StreamMode, ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
+    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, CloseCause, Frame, FramedRecv,
+    FramedSend, OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy,
+    Peer, PeerStreamSession, Service, ServicePeerDirection, Sink, SinkReject, Stream, StreamMode,
+    ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
+
+/// Conservative re-offer delay for a peer header sync has advised itself to back
+/// off from, used when no explicit backoff deadline is published for the node.
+const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 const HEADER_SYNC_FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
 
@@ -68,6 +73,8 @@ pub struct HeaderSyncPeerSession {
 struct HeaderSyncPeerSessionInner {
     send: FramedSend,
     cancel_token: CancellationToken,
+    connection_cancel_token: CancellationToken,
+    close_cause: CloseCause,
     commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
     next_request_id: AtomicU64,
 }
@@ -78,6 +85,8 @@ impl HeaderSyncPeerSession {
         direction: ServicePeerDirection,
         commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
         session_id: u64,
+        connection_cancel_token: CancellationToken,
+        close_cause: CloseCause,
     ) -> Self {
         debug_assert_eq!(
             session.stream_version(),
@@ -90,6 +99,8 @@ impl HeaderSyncPeerSession {
             direction,
             session.sender(),
             session.cancel_token(),
+            connection_cancel_token,
+            close_cause,
             Some(commands),
         )
     }
@@ -115,7 +126,30 @@ impl HeaderSyncPeerSession {
             session_id,
             ServicePeerDirection::Inbound,
             send,
+            cancel_token.clone(),
             cancel_token,
+            CloseCause::new(),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_with_connection(
+        peer_id: ZakuraPeerId,
+        session_id: u64,
+        send: FramedSend,
+        service_cancel_token: CancellationToken,
+        connection_cancel_token: CancellationToken,
+        close_cause: CloseCause,
+    ) -> Self {
+        Self::from_parts_with_direction_and_commands(
+            peer_id,
+            session_id,
+            ServicePeerDirection::Inbound,
+            send,
+            service_cancel_token,
+            connection_cancel_token,
+            close_cause,
             None,
         )
     }
@@ -132,17 +166,22 @@ impl HeaderSyncPeerSession {
             0,
             direction,
             send,
+            cancel_token.clone(),
             cancel_token,
+            CloseCause::new(),
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
         session_id: u64,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
+        connection_cancel_token: CancellationToken,
+        close_cause: CloseCause,
         commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
     ) -> Self {
         Self {
@@ -152,6 +191,8 @@ impl HeaderSyncPeerSession {
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
+                connection_cancel_token,
+                close_cause,
                 commands,
                 next_request_id: AtomicU64::new(1),
             }),
@@ -176,6 +217,11 @@ impl HeaderSyncPeerSession {
     /// Peer disconnect/local shutdown token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
+    }
+
+    pub(super) fn disconnect_for_port_panic(&self) {
+        self.inner.close_cause.record("header_port_panic");
+        self.inner.connection_cancel_token.cancel();
     }
 
     /// Current free slots in the bounded outbound queue.
@@ -417,6 +463,54 @@ impl Service for HeaderSyncService {
         header_sync_streams()
     }
 
+    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
+        OrderedStreamPolicy {
+            opening: OrderedStreamOpening::InitiatorOnly,
+            reopen: true,
+        }
+    }
+
+    fn ordered_session_demand(
+        &self,
+        _conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        let mut peers = self.header_sync.subscribe_peer_snapshot();
+        let snapshot = *peers.borrow_and_update();
+        let slots_free = match direction {
+            ServicePeerDirection::Inbound => snapshot.inbound_slots_free,
+            ServicePeerDirection::Outbound => snapshot.outbound_slots_free,
+        };
+        if slots_free == 0 {
+            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                if peers.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }));
+        }
+
+        let Some(node_id) = header_peer_node_id(peer) else {
+            return OrderedSessionDemand::Retire;
+        };
+        if self
+            .header_sync
+            .candidate_state()
+            .backed_off_node_ids
+            .contains(&node_id)
+        {
+            // The reactor publishes the backed-off set but no per-node expiry, so
+            // re-offer after a conservative full backoff window rather than
+            // spinning the transport against a peer we just advised away from.
+            return OrderedSessionDemand::RetryAt(
+                std::time::Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF,
+            );
+        }
+
+        OrderedSessionDemand::OpenNow
+    }
+
     fn wants_peer(
         &self,
         peer: &ZakuraPeerId,
@@ -468,6 +562,8 @@ impl Service for HeaderSyncService {
             peer.direction,
             commands_tx,
             session_id,
+            connection_cancel_token.clone(),
+            close_cause.clone(),
         );
 
         {
@@ -515,6 +611,7 @@ impl Service for HeaderSyncService {
                     codec,
                     pipe_peer,
                     session_id,
+                    peer.direction,
                     commands_rx,
                     recv,
                     pipe_cancel,
@@ -526,6 +623,7 @@ impl Service for HeaderSyncService {
         let teardown_handle = self.header_sync.clone();
         let teardown_peers = self.peers.clone();
         let teardown_peer = peer_id.clone();
+        let teardown_close_cause = close_cause.clone();
         let on_teardown = move || {
             let should_notify = {
                 let mut peers = teardown_peers
@@ -541,8 +639,11 @@ impl Service for HeaderSyncService {
                 }
             };
             if should_notify {
-                let _ = teardown_handle
-                    .send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
+                let _ = teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected {
+                    peer: teardown_peer,
+                    session_id,
+                    reason: teardown_close_cause.get_or("stream_closed"),
+                });
             }
         };
         let panic_connection_cancel = connection_cancel_token.clone();
@@ -552,6 +653,28 @@ impl Service for HeaderSyncService {
             panic_connection_cancel.cancel();
         };
         spawn_supervised_pipe(peer_id, service_cancel_token, on_teardown, on_panic, pipe);
+    }
+
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        let owns_stream = self
+            .peers
+            .lock()
+            .expect("header-sync peer map mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|record| record.conn_id == conn_id);
+        if !owns_stream {
+            return false;
+        }
+        let Ok(bytes) = <[u8; 32]>::try_from(peer.as_bytes()) else {
+            return false;
+        };
+        let Ok(node_id) = iroh::NodeId::from_bytes(&bytes) else {
+            return false;
+        };
+        self.header_sync
+            .candidate_state()
+            .admitted_node_ids
+            .contains(&node_id)
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
@@ -573,7 +696,11 @@ impl Service for HeaderSyncService {
             record.cancel_token.cancel();
             let _ = self
                 .header_sync
-                .send_lifecycle(HeaderSyncEvent::PeerDisconnected(peer.clone()));
+                .send_lifecycle(HeaderSyncEvent::PeerDisconnected {
+                    peer: peer.clone(),
+                    session_id: record.session_id,
+                    reason: "service_removed",
+                });
         }
     }
 
@@ -620,6 +747,21 @@ impl Service for HeaderSyncPassthroughService {
 
     fn streams(&self) -> &[Stream] {
         header_sync_streams()
+    }
+
+    fn ordered_stream_policy(&self, kind: u16) -> OrderedStreamPolicy {
+        self.inner.ordered_stream_policy(kind)
+    }
+
+    fn ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        self.inner
+            .ordered_session_demand(conn_id, peer, negotiated, direction)
     }
 
     fn wants_peer(
@@ -682,4 +824,10 @@ impl Sink for HeaderSyncPassthroughSink {
             }
         })
     }
+}
+
+/// The iroh node identity behind a header-sync peer id, if it is well-formed.
+fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<iroh::NodeId> {
+    let bytes = <[u8; 32]>::try_from(peer.as_bytes()).ok()?;
+    iroh::NodeId::from_bytes(&bytes).ok()
 }

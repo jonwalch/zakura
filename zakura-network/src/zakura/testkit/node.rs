@@ -17,8 +17,9 @@ use crate::{
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncStartup, DiscoveryService, FullStateFrontiers, HeaderSyncAction, HeaderSyncHandle,
         HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
-        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId,
-        ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
+        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraHeaderSyncDriverStartup,
+        ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
+        ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -131,6 +132,17 @@ impl ZakuraTestNode {
         timeout: Duration,
     ) -> Result<(), BoxError> {
         let peer_addr = peer.node_addr().await;
+        self.connect_native_to_addr(peer_addr, timeout).await
+    }
+
+    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
+    /// registers it. Lets tests advertise a specific direct-address list (for
+    /// example a decoy address ahead of the reachable one).
+    pub async fn connect_native_to_addr(
+        &self,
+        peer_addr: NodeAddr,
+        timeout: Duration,
+    ) -> Result<(), BoxError> {
         self.endpoint.add_node_addr(peer_addr.clone())?;
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
         let peer_id = peer_addr.node_id.as_bytes().to_vec();
@@ -224,6 +236,7 @@ struct TestHeaderSyncStartup {
     frontiers: FullStateFrontiers,
     best_header_tip: Option<(block::Height, block::Hash)>,
     verified_block_tip_hash: block::Hash,
+    state_driver: Option<ZakuraHeaderSyncDriverStartup>,
 }
 
 impl fmt::Debug for ZakuraTestNodeBuilder {
@@ -353,6 +366,25 @@ impl ZakuraTestNodeBuilder {
             frontiers,
             best_header_tip,
             verified_block_tip_hash: anchor.1,
+            state_driver: None,
+        });
+        self
+    }
+
+    /// Enable the real header-sync service with direct typed state dispatch.
+    pub fn header_sync_state_driver(
+        mut self,
+        network: Network,
+        anchor: (block::Height, block::Hash),
+        state_driver: ZakuraHeaderSyncDriverStartup,
+    ) -> Self {
+        self.header_sync = Some(TestHeaderSyncStartup {
+            network,
+            anchor,
+            frontiers: state_driver.frontiers,
+            best_header_tip: state_driver.best_header_tip,
+            verified_block_tip_hash: state_driver.verified_block_tip_hash,
+            state_driver: Some(state_driver),
         });
         self
     }
@@ -429,6 +461,7 @@ impl ZakuraTestNodeBuilder {
                 frontiers,
                 best_header_tip,
                 verified_block_tip_hash,
+                state_driver,
             } = header_sync;
             let mut startup = HeaderSyncStartup::new(
                 network,
@@ -442,6 +475,40 @@ impl ZakuraTestNodeBuilder {
                 startup.request_timeout = request_timeout;
             }
             startup.status_refresh_interval = Duration::from_millis(200);
+            if let Some(state_driver) = state_driver {
+                startup.committed_snapshots = Some(state_driver.committed_snapshots);
+                startup.vct_root_repairs = state_driver.vct_root_repairs;
+                startup.header_chain_port = state_driver.header_chain_port;
+                startup.use_direct_port();
+            } else if frontiers.finalized_height == anchor.0 {
+                let finalized = zakura_header_chain::Frontier::new(anchor.0, anchor.1);
+                let header_best = best_header_tip
+                    .map(|(height, hash)| zakura_header_chain::Frontier::new(height, hash))
+                    .unwrap_or(finalized);
+                let verified_best = zakura_header_chain::Frontier::new(
+                    frontiers.verified_block_tip,
+                    verified_block_tip_hash,
+                );
+                let snapshot = zakura_header_chain::EngineSnapshot {
+                    mode: zakura_header_chain::EngineMode::Integrated,
+                    state_version: zakura_header_chain::StateVersion::new(1),
+                    header_generation: zakura_header_chain::HeaderGeneration::new(1),
+                    verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+                    frontiers: zakura_header_chain::FrontierSet {
+                        finalized,
+                        header_best,
+                        verified_best,
+                    },
+                    header_best_score: zakura_header_chain::ChainScore::new(
+                        zakura_header_chain::SuffixWork::zero(),
+                        header_best.hash,
+                    ),
+                    oldest_retained_height: finalized.height,
+                    alarms: Default::default(),
+                };
+                let (_snapshots_tx, snapshots_rx) = tokio::sync::watch::channel(Some(snapshot));
+                startup.committed_snapshots = Some(snapshots_rx);
+            }
             let shutdown = CancellationToken::new();
             startup.shutdown = shutdown.clone();
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
@@ -484,9 +551,9 @@ impl ZakuraTestNodeBuilder {
                 discovery.clone(),
                 header_sync.clone(),
                 block_sync_handle.clone(),
-            )) as Arc<dyn Service>
+            ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone())) as Arc<dyn Service>
+            Arc::new(DiscoveryService::new(discovery.clone()))
         };
         let registry = service_registry(
             &supervisor,
@@ -652,6 +719,89 @@ mod tests {
         node.connect_native(&peer2, TEST_NET_TIMEOUT)
             .await
             .expect("second same-IP peer registers with raised per-IP cap");
+
+        node.shutdown().await;
+        peer1.shutdown().await;
+        peer2.shutdown().await;
+    }
+
+    // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
+    // dials share one source IP (test nodes also bind an IPv6 loopback socket).
+    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
+        let addr = NodeAddr::new(peer_addr.node_id).with_direct_addresses(
+            peer_addr
+                .direct_addresses()
+                .copied()
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+        );
+        assert!(
+            addr.direct_addresses().next().is_some(),
+            "test peer must advertise an IPv4 loopback direct address",
+        );
+        addr
+    }
+
+    #[tokio::test]
+    async fn outbound_dial_charges_confirmed_path_not_advertised_decoy() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Regression for the per-IP cap bypass in `serve_native_dial_connection`:
+        // it used to charge the connection to the first *advertised* direct
+        // address instead of the path iroh actually confirmed. A record could
+        // then list an unreachable decoy first and escape the per-IP cap while
+        // being served over a different (shared) address.
+        let peer1 = ZakuraTestNode::builder(9201)
+            .spawn()
+            .await
+            .expect("peer1 spawns");
+        let peer2 = ZakuraTestNode::builder(9202)
+            .spawn()
+            .await
+            .expect("peer2 spawns");
+        let node = ZakuraTestNode::builder(9203)
+            .max_connections_per_ip(1)
+            .spawn()
+            .await
+            .expect("dialer spawns");
+
+        // Advertise peer1 with an unreachable decoy (RFC 5737 TEST-NET-1,
+        // guaranteed non-routable) ahead of its real loopback address. The dial
+        // is served over loopback, so the connection must be charged to
+        // 127.0.0.1, not the decoy.
+        let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
+        let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
+            std::iter::once(decoy).chain(peer1_loopback.direct_addresses().copied()),
+        );
+        node.connect_native_to_addr(decoy_first, TEST_NET_TIMEOUT)
+            .await
+            .expect("peer1 registers over its reachable loopback path despite the decoy");
+
+        // With the connection correctly charged to the confirmed loopback IP,
+        // the per-IP cap of 1 must turn away a second distinct identity from
+        // 127.0.0.1. Before the fix, peer1 was charged to the decoy IP, leaving
+        // the loopback bucket empty and wrongly admitting peer2.
+        let peer2_addr = ipv4_loopback_addr(&peer2.node_addr().await);
+        let excess = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::zakura::handler::serve_native_dial_connection(
+                &node.endpoint(),
+                peer2_addr,
+                node.limits(),
+            ),
+        )
+        .await
+        .expect("the rejected one-shot dial must finish promptly");
+        assert!(
+            excess.is_ok(),
+            "second same-loopback identity must be rejected by the per-IP cap, proving the \
+             first dial was charged to the confirmed path and not the advertised decoy",
+        );
+        assert_eq!(
+            node.supervisor().registered_ids().await.len(),
+            1,
+            "the rejected peer must not be registered",
+        );
 
         node.shutdown().await;
         peer1.shutdown().await;

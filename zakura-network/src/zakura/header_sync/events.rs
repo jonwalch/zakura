@@ -41,6 +41,8 @@ pub struct HeaderSyncStartup {
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed durable header-chain operations.
     pub header_chain_port: Arc<dyn zakura_node_services::header_chain::HeaderChainPort>,
+    /// Selects whether reactor operations use the typed port or the test observer.
+    pub(crate) port_dispatch: HeaderPortDispatch,
     /// Local header-sync configuration.
     pub config: ZakuraHeaderSyncConfig,
     /// Application frame cap for header-sync messages.
@@ -79,6 +81,10 @@ impl HeaderSyncStartup {
             ),
             #[cfg(test)]
             header_chain_port: Arc::new(zakura_node_services::header_chain::InertHeaderChainPort),
+            #[cfg(not(any(test, feature = "zakura-testkit")))]
+            port_dispatch: HeaderPortDispatch::Direct,
+            #[cfg(any(test, feature = "zakura-testkit"))]
+            port_dispatch: HeaderPortDispatch::External,
             config,
             max_frame_bytes,
             request_timeout: Duration::from_secs(30),
@@ -87,6 +93,21 @@ impl HeaderSyncStartup {
             shutdown: CancellationToken::new(),
         }
     }
+
+    /// Use the installed typed header-chain port directly.
+    pub(crate) fn use_direct_port(&mut self) {
+        self.port_dispatch = HeaderPortDispatch::Direct;
+    }
+}
+
+/// Explicit reactor port-dispatch policy.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HeaderPortDispatch {
+    /// Execute operations through the installed typed port.
+    Direct,
+    /// Publish operations to the test driver channel.
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    External,
 }
 
 /// Cheap cloneable handle used by transport and discovery services.
@@ -98,6 +119,7 @@ pub struct HeaderSyncHandle {
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
     pub(super) codec: HeaderSyncCodec,
+    pub(super) trace: ZakuraTrace,
 }
 
 impl HeaderSyncHandle {
@@ -169,7 +191,14 @@ pub enum HeaderSyncEvent {
     /// A canonical header-sync stream opened.
     PeerConnected(HeaderSyncPeerSession),
     /// A canonical header-sync stream closed.
-    PeerDisconnected(ZakuraPeerId),
+    PeerDisconnected {
+        /// Authenticated peer identity.
+        peer: ZakuraPeerId,
+        /// Exact ordered-stream generation that closed.
+        session_id: u64,
+        /// Bounded first-cause teardown reason.
+        reason: &'static str,
+    },
     /// First-party discovery summary used only for dial preference.
     AdvisoryHeaderSummary {
         /// Peer that supplied the summary.
@@ -290,7 +319,7 @@ impl HeaderSyncEvent {
     pub(super) fn metrics_label(&self) -> &'static str {
         match self {
             Self::PeerConnected(_) => "peer_connected",
-            Self::PeerDisconnected(_) => "peer_disconnected",
+            Self::PeerDisconnected { .. } => "peer_disconnected",
             Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
             Self::SessionWireMessage { .. } => "session_wire_message",
             Self::SessionResponse { .. } => "session_response",

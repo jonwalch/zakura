@@ -74,6 +74,70 @@ pub const HEADER_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable {
     file_name: "header_sync.jsonl",
 };
 
+/// Stable header-sync JSONL event and field names.
+#[allow(dead_code)]
+pub(crate) mod header_sync_trace {
+    pub(crate) const EVENT: &str = "event";
+    pub(crate) const PEER: &str = "peer";
+    pub(crate) const SESSION_ID: &str = "session_id";
+    pub(crate) const DIRECTION: &str = "direction";
+    pub(crate) const REASON: &str = "reason";
+    pub(crate) const BOUNDARY: &str = "boundary";
+    pub(crate) const DISPOSITION: &str = "disposition";
+    pub(crate) const STATE_VERSION: &str = "state_version";
+    pub(crate) const HEADER_GENERATION: &str = "header_generation";
+    pub(crate) const VERIFIED_GENERATION: &str = "verified_generation";
+    pub(crate) const BRANCH_ANCHOR: &str = "branch_anchor";
+    pub(crate) const BRANCH_TARGET: &str = "branch_target";
+    pub(crate) const REQUEST_ID: &str = "request_id";
+    pub(crate) const TARGET_HASH: &str = "target_hash";
+    pub(crate) const COMMON_ANCESTOR_HEIGHT: &str = "common_ancestor_height";
+    pub(crate) const COMMON_ANCESTOR_HASH: &str = "common_ancestor_hash";
+    pub(crate) const LOCATOR_COUNT: &str = "locator_count";
+    pub(crate) const LOCATOR_HEAD: &str = "locator_head";
+    pub(crate) const HEADER_COUNT: &str = "header_count";
+    pub(crate) const COMPLETE: &str = "complete";
+    pub(crate) const TREE_AUX_SCHEMA: &str = "tree_aux_schema";
+    pub(crate) const OUTCOME: &str = "outcome";
+    pub(crate) const INBOUND_COUNT: &str = "inbound_count";
+    pub(crate) const OUTBOUND_COUNT: &str = "outbound_count";
+    pub(crate) const STAGE: &str = "stage";
+    pub(crate) const CATEGORY: &str = "category";
+    pub(crate) const ATTRIBUTION: &str = "attribution";
+    pub(crate) const CAUSE: &str = "cause";
+    pub(crate) const OPERATION: &str = "operation";
+    pub(crate) const WORK_ANCHOR_HEIGHT: &str = "work_anchor_height";
+    pub(crate) const WORK_ANCHOR_HASH: &str = "work_anchor_hash";
+    pub(crate) const SELECTED_TIP_HEIGHT: &str = "selected_tip_height";
+    pub(crate) const SELECTED_TIP_HASH: &str = "selected_tip_hash";
+    pub(crate) const MAX_HEADERS_PER_RESPONSE: &str = "max_headers_per_response";
+    pub(crate) const MAX_INFLIGHT_REQUESTS: &str = "max_inflight_requests";
+    pub(crate) const MAX_MESSAGE_BYTES: &str = "max_message_bytes";
+    pub(crate) const TREE_AUX_SCHEMA_MASK: &str = "tree_aux_schema_mask";
+    pub(crate) const OLD_SELECTED_HEIGHT: &str = "old_selected_height";
+    pub(crate) const OLD_SELECTED_HASH: &str = "old_selected_hash";
+    pub(crate) const NEW_SELECTED_HEIGHT: &str = "new_selected_height";
+    pub(crate) const NEW_SELECTED_HASH: &str = "new_selected_hash";
+    pub(crate) const HEIGHT: &str = "height";
+    pub(crate) const REPAIR_GENERATION: &str = "repair_generation";
+    pub(crate) const PHASE: &str = "phase";
+    pub(crate) const SUPPLIER_COUNT: &str = "supplier_count";
+
+    pub(crate) const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
+    pub(crate) const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
+    pub(crate) const HEADER_STATUS_SENT: &str = "header_status_sent";
+    pub(crate) const HEADER_STATUS_RECEIVED: &str = "header_status_received";
+    pub(crate) const HEADER_REQUEST_SENT: &str = "header_request_sent";
+    pub(crate) const HEADER_RESPONSE_RECEIVED: &str = "header_response_received";
+    pub(crate) const HEADER_RESPONSE_SERVED: &str = "header_response_served";
+    pub(crate) const HEADER_OUTCOME: &str = "header_outcome";
+    pub(crate) const HEADER_TARGET_ADMITTED: &str = "header_target_admitted";
+    pub(crate) const HEADER_TARGET_REJECTED: &str = "header_target_rejected";
+    pub(crate) const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
+    pub(crate) const HEADER_SNAPSHOT_OBSERVED: &str = "header_snapshot_observed";
+    pub(crate) const HEADER_VCT_REPAIR_STATE: &str = "header_vct_repair_state";
+}
+
 /// Legacy compatibility request/response events.
 pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable = ZakuraTraceTable {
     table: "legacy_request",
@@ -122,6 +186,10 @@ pub mod queue_send_trace {
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
+    /// Ordered stream generation.
+    pub const SESSION_ID: &str = "session_id";
+    /// Correlated request identifier, when applicable.
+    pub const REQUEST_ID: &str = "request_id";
 }
 
 /// Shared block-sync trace event names and field keys.

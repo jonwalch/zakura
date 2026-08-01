@@ -1,6 +1,7 @@
 mod admission;
 mod completion;
 mod peer_faults;
+mod port_panics;
 mod serving;
 mod timeouts;
 mod vct_repair;
