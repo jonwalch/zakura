@@ -1716,7 +1716,17 @@ mod tests {
     #[test]
     fn custom_network_does_not_consume_mainnet_repair_input() {
         let (_cache, config) = persistent_config();
-        let network = Network::new_regtest(Default::default());
+        // Keep Heartwood above the seeded handoff height: the header-root
+        // authentication cutover fails closed on an empty history tree at or
+        // after Heartwood activation, which default Regtest puts at Height(1).
+        let network = Network::new_regtest(zakura_chain::parameters::testnet::RegtestParameters {
+            activation_heights: zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+                heartwood: Some(10_000),
+                canopy: Some(10_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let handoff = Height(1);
         let hash = block::Hash([1; 32]);
         let path = seed_repair_db(&config, &network, handoff, &[(handoff, hash)]);

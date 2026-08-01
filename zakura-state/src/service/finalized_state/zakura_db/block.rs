@@ -519,8 +519,19 @@ impl ZakuraDb {
         Some((hash, header))
     }
 
+    /// Returns the canonical hash for a full-state or header-only height.
+    ///
+    /// Resolves from the consensus `hash_by_height` rows *ungated* by header-body
+    /// availability, then falls back to the provisional Zakura frontier. Gating this
+    /// on the header row as well would make a height whose hash is stored but whose
+    /// header row is absent read as unknown, which the durable frontier's coherence
+    /// checks report as a canonical-hash mismatch.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.header_by_height(height).map(|(hash, _header)| hash)
+        self.hash(height).or_else(|| {
+            let hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+            self.db.zs_get(&hash_by_height, &height)
+        })
     }
 
     /// Returns the height for a canonical full-state or header-only hash.

@@ -130,7 +130,7 @@ fn format_upgrades(
         Box::new(header_root_auth_frontier::Upgrade),
         Box::new(no_migration::NoMigration::new(
             "add fork-aware header-chain column families and codecs",
-            Version::new(28, 1, 1),
+            Version::new(28, 1, 3),
         )),
     ] as [Box<dyn DiskFormatUpgrade>; 12])
         .into_iter()
@@ -1084,15 +1084,20 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 }
 
 #[test]
-fn vct_format_changes_include_ironwood_then_sprout_repair() {
+fn vct_format_changes_include_root_auth_metadata_updates() {
     use crate::constants::state_database_format_version_in_code;
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0)), None).collect();
 
-    assert_eq!(upgrades.len(), 3);
+    assert_eq!(upgrades.len(), 4);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
-    assert_eq!(upgrades[2].version(), Version::new(28, 1, 1));
+    assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
+    assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
+    assert!(
+        !upgrades[3].needs_migration(),
+        "the header-chain column families are created on open without rebasing authenticated roots"
+    );
     assert_eq!(
         upgrades
             .last()
