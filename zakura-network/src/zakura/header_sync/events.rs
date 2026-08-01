@@ -510,6 +510,19 @@ pub enum HeaderPortOperation {
         /// Classification.
         reason: HeaderSyncMisbehavior,
     },
+    /// Close one exact header-sync session that stopped making progress.
+    ///
+    /// Deliberately distinct from [`Misbehavior`](Self::Misbehavior): an unresponsive peer
+    /// is not a protocol violator, and conflating the two would feed a future ban score.
+    DropPeer {
+        /// Peer whose session is being closed.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation being closed, so a strike recorded against a
+        /// superseded session can never close the session that replaced it.
+        session_id: u64,
+        /// Stable metrics and trace label for why the session was closed.
+        reason: &'static str,
+    },
 }
 
 /// Testkit observer for reactor-local port scheduling.

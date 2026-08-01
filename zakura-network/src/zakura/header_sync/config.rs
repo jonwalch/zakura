@@ -10,6 +10,8 @@ const COMMON_HEADER_BYTES: usize = 1_487;
 const REGTEST_HEADER_BYTES: usize = 177;
 const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 1;
 const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS: u32 = 3;
+const DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Header-sync configuration nested under the Zakura P2P-v2 config.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -22,6 +24,19 @@ pub struct ZakuraHeaderSyncConfig {
     pub status_refresh_interval: Duration,
     /// Header-sync peer caps and queue limits owned by this reactor.
     pub peer_limits: ServicePeerLimits,
+    /// Consecutive unproductive header requests before this node drops the peer's session.
+    ///
+    /// A request is unproductive when it times out, or when the peer answers a continuation
+    /// page that stages no new header. A peer that reports it is already at our selected tip
+    /// has answered correctly and is never charged. Set to `0` to never drop a peer.
+    pub max_unproductive_header_requests: u32,
+    /// How long a peer dropped for being unproductive is refused header-sync readmission.
+    ///
+    /// Discovery's dial backoff keys on dial *failure*, and a drop follows a dial that
+    /// succeeded, so without this window an evicted peer is redialled immediately. Set to
+    /// zero to readmit without delay.
+    #[serde(with = "humantime_serde")]
+    pub unproductive_peer_cooldown: Duration,
     /// Optional trusted header-sync anchor height.
     ///
     /// When unset, header sync starts from genesis. When set, [`anchor_hash`](Self::anchor_hash)
@@ -40,6 +55,8 @@ impl Default for ZakuraHeaderSyncConfig {
             max_headers_per_response: DEFAULT_HS_RANGE,
             status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
             peer_limits: ServicePeerLimits::default(),
+            max_unproductive_header_requests: DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS,
+            unproductive_peer_cooldown: DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN,
             anchor_height: None,
             anchor_hash: None,
         }

@@ -144,6 +144,7 @@ fn build_header_sync_reactor(
         committed_snapshot,
         vct_repair_status,
         peer_state: HashMap::new(),
+        unproductive_peer_cooldowns: HashMap::new(),
         peer_work_queue: PeerWorkQueue::default(),
         request_deadlines: HashMap::new(),
         completed_targets: CompletedHeaderTargets::default(),
@@ -165,6 +166,8 @@ struct PeerState {
     session: HeaderSyncPeerSession,
     status_publisher: Option<StatusPublisher>,
     last_status: Option<Status>,
+    /// Consecutive requests this session answered with nothing usable.
+    unproductive_requests: u32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -229,6 +232,12 @@ struct HeaderSyncReactor {
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
     vct_repair_status: zakura_header_chain::VctRootRepairStatus,
     peer_state: HashMap<ZakuraPeerId, PeerState>,
+    /// Instants before which a dropped peer is refused header-sync readmission.
+    ///
+    /// Bounded by admission: every entry costs the peer one admitted session that survived
+    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts, and
+    /// expired entries are pruned whenever one is added and on every maintenance pass.
+    unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     peer_work_queue: PeerWorkQueue,
     request_deadlines: HashMap<ZakuraPeerId, Instant>,
     completed_targets: CompletedHeaderTargets,
@@ -531,6 +540,15 @@ impl HeaderSyncReactor {
         }
 
         let peer = session.peer_id().clone();
+        if self
+            .unproductive_peer_cooldowns
+            .get(&peer)
+            .is_some_and(|until| *until > Instant::now())
+        {
+            session.cancel_token().cancel();
+            metrics::counter!("sync.header.peer.readmission_refused.total").increment(1);
+            return;
+        }
         let direction = session.direction();
         let replaces_same_direction = self
             .peer_state
@@ -571,6 +589,7 @@ impl HeaderSyncReactor {
                 session,
                 status_publisher,
                 last_status: None,
+                unproductive_requests: 0,
             },
         ) {
             previous.session.cancel_token().cancel();
@@ -960,6 +979,18 @@ impl HeaderSyncReactor {
             self.retire_peer_work(&peer);
             metrics::counter!("sync.header.target.staging_capacity_refused").increment(1);
             return;
+        }
+        // A page that stages nothing leaves the continuation locator unchanged, so a peer can
+        // answer empty pages forever and keep resetting its own deadline below. Charge those,
+        // and clear the count as soon as the peer supplies a header. The already-known branch
+        // above returned before this point: a peer that reports it is at our selected tip
+        // answered correctly and must never be charged, or every synced peer is evicted.
+        if response.entries.is_empty() {
+            if self.charge_unproductive_request(&peer, session_id, "empty_header_page") {
+                return;
+            }
+        } else {
+            self.reset_unproductive_requests(&peer, session_id);
         }
         self.request_deadlines
             .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
@@ -2352,8 +2383,15 @@ impl HeaderSyncReactor {
                 self.retry_vct_repair(owner, source);
                 metrics::counter!("sync.header.vct.repair.timed_out.total").increment(1);
             } else {
+                let session_id = self
+                    .peer_work_queue
+                    .active(&peer)
+                    .map(|active| active.owner.session_id);
                 self.retire_peer_work(&peer);
                 metrics::counter!("sync.header.target.timed_out.total").increment(1);
+                if let Some(session_id) = session_id {
+                    self.charge_unproductive_request(&peer, session_id, "unresponsive");
+                }
             }
         }
     }
@@ -2777,6 +2815,19 @@ impl HeaderSyncReactor {
             match action {
                 HeaderPortOperation::Misbehavior { peer, reason } => {
                     tracing::debug!(?peer, ?reason, "recorded Zakura header-sync peer violation");
+                    return true;
+                }
+                HeaderPortOperation::DropPeer {
+                    peer,
+                    session_id,
+                    reason,
+                } => {
+                    tracing::debug!(
+                        ?peer,
+                        session_id,
+                        reason,
+                        "dropped an unproductive Zakura header-sync peer"
+                    );
                     return true;
                 }
                 HeaderPortOperation::QueryHeaderLocator {
@@ -3339,6 +3390,78 @@ impl HeaderSyncReactor {
                 false
             }
         }
+    }
+
+    /// Charges one unproductive request against `peer`'s exact session, dropping that
+    /// session once it reaches the configured limit.
+    ///
+    /// Session-scoped by construction: a strike raised for a session that has already been
+    /// replaced is discarded rather than charged to its replacement. Returns whether the
+    /// session was dropped.
+    fn charge_unproductive_request(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        let limit = self.startup.config.max_unproductive_header_requests;
+        let Some(state) = self.peer_state.get_mut(peer) else {
+            return false;
+        };
+        if state.session.session_id() != session_id {
+            return false;
+        }
+        state.unproductive_requests = state.unproductive_requests.saturating_add(1);
+        if limit == 0 || state.unproductive_requests < limit {
+            return false;
+        }
+        self.drop_unproductive_peer(peer, session_id, reason);
+        true
+    }
+
+    /// Clears `peer`'s strike count after its session supplies usable work.
+    fn reset_unproductive_requests(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        if let Some(state) = self.peer_state.get_mut(peer) {
+            if state.session.session_id() == session_id {
+                state.unproductive_requests = 0;
+            }
+        }
+    }
+
+    /// Closes one exact unproductive session and blocks its readmission for the cooldown.
+    fn drop_unproductive_peer(
+        &mut self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+        reason: &'static str,
+    ) {
+        let Some(state) = self.peer_state.get(peer) else {
+            return;
+        };
+        if state.session.session_id() != session_id {
+            return;
+        }
+        state.session.cancel_token().cancel();
+
+        let cooldown = self.startup.config.unproductive_peer_cooldown;
+        if !cooldown.is_zero() {
+            let now = Instant::now();
+            self.prune_unproductive_cooldowns(now);
+            self.unproductive_peer_cooldowns
+                .insert(peer.clone(), now + cooldown);
+        }
+        metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
+        self.dispatch_action(HeaderPortOperation::DropPeer {
+            peer: peer.clone(),
+            session_id,
+            reason,
+        });
+        self.handle_peer_disconnected(peer, session_id, reason);
+    }
+
+    fn prune_unproductive_cooldowns(&mut self, now: Instant) {
+        self.unproductive_peer_cooldowns
+            .retain(|_, until| *until > now);
     }
 
     fn retire_peer_work(&mut self, peer: &ZakuraPeerId) {
