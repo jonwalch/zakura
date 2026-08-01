@@ -553,6 +553,14 @@ impl AddressBook {
             // This prevents Zebra from caching nodes that are likely unreachable,
             // which improves startup time and reliability.
             .filter(|addr| addr.is_active_for_gossip(now))
+            // # Security
+            //
+            // Remove addresses learned from inbound connections, whose ports are
+            // the peer's ephemeral source port rather than its listener. They
+            // are connected right now, so they rank as maximally active and
+            // would otherwise dominate the cache, leaving a restarted node with
+            // mostly undialable candidates.
+            .filter(|addr| !addr.is_inbound())
             .cloned()
             .collect()
     }
