@@ -11622,7 +11622,7 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
 #[tokio::test]
 async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
     let mut config = ZakuraBlockSyncConfig {
-        status_refresh_interval: Duration::from_secs(60),
+        status_refresh_interval: Duration::from_millis(100),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11701,6 +11701,14 @@ async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
             .is_err(),
         "rapid serving-tip changes must be debounced to one Status per window"
     );
+
+    match next_outbound_message(&mut outbound_rx).await {
+        BlockSyncMessage::Status(status) => {
+            assert_eq!(status.servable_high, block::Height(3));
+            assert_eq!(handle.local_status().servable_high, block::Height(3));
+        }
+        msg => panic!("expected coalesced Status after debounce window, got {msg:?}"),
+    }
 
     reactor_task.abort();
 }

@@ -1937,11 +1937,15 @@ impl BlockSyncReactor {
         // first real advertisement after connect is silently dropped (the
         // connect-time retry would have already taken the window).
         let status = self.local_status();
-        let status_changed = self.state.pending_status_refresh
-            && status != self.state.last_advertised_status
-            && self.state.status_refresh.try_take(now);
+        let status_needs_refresh =
+            self.state.pending_status_refresh && status != self.state.last_advertised_status;
+        let status_changed = status_needs_refresh && self.state.status_refresh.try_take(now);
 
-        self.state.pending_status_refresh = false;
+        // Keep a rate-limited change pending so the periodic tick advertises the
+        // latest coalesced status once the debounce window opens. Clearing it here
+        // loses a serving-tip advance forever when several commits land inside one
+        // refresh interval.
+        self.state.pending_status_refresh = status_needs_refresh && !status_changed;
         if status_changed {
             self.state.last_advertised_status = status;
             let _ = self.status.send(status);
