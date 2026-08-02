@@ -608,7 +608,7 @@ impl Config {
         let peer_list: HashSet<PeerSocketAddr> = peer_list
             .lines()
             .filter_map(|peer| {
-                peer.parse()
+                peer.parse::<PeerSocketAddr>()
                     .map_err(|peer_parse_error| {
                         info!(
                             ?peer_parse_error,
@@ -620,16 +620,36 @@ impl Config {
             })
             .collect();
 
+        // # Security
+        //
+        // Cached addresses become initial peers, which are dialed directly and enter
+        // the address book as if we had chosen them ourselves. The cache file holds
+        // bare socket addresses, so the port is all we know about them, and an
+        // address that is not on this network's port cannot be a listener we reached.
+        // Dropping them here stops a cache written by an older release — or edited by
+        // hand — from refilling the address book with the ephemeral source ports of
+        // past inbound peers.
+        let parsed_ip_count = peer_list.len();
+        let peer_list: HashSet<PeerSocketAddr> = peer_list
+            .into_iter()
+            .filter(|peer| peer.port() == self.network.default_port())
+            .collect();
+        let skipped_ip_count = parsed_ip_count - peer_list.len();
+
         // This log is needed for user debugging, but it's annoying during tests.
         #[cfg(not(test))]
         info!(
             cached_ip_count = ?peer_list.len(),
+            ?skipped_ip_count,
+            default_port = ?self.network.default_port(),
             ?peer_cache_file,
             "loaded cached peer IP addresses"
         );
         #[cfg(test)]
         debug!(
             cached_ip_count = ?peer_list.len(),
+            ?skipped_ip_count,
+            default_port = ?self.network.default_port(),
             ?peer_cache_file,
             "loaded cached peer IP addresses"
         );

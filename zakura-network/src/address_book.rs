@@ -561,6 +561,17 @@ impl AddressBook {
             // would otherwise dominate the cache, leaving a restarted node with
             // mostly undialable candidates.
             .filter(|addr| !addr.is_inbound())
+            // # Security
+            //
+            // Only cache addresses that have answered one of our own connections.
+            // The cache file stores bare socket addresses, so nothing else in this
+            // entry survives a restart: an address we cache on someone else's word
+            // is re-read as an ordinary initial peer, with no record of where it
+            // came from. Requiring a response of our own means an undialable
+            // address can never enter the cache, however it reached the address
+            // book — gossip, a hand-edited cache file, or an earlier cache written
+            // by a release without this filter.
+            .filter(|addr| addr.has_ever_responded())
             .cloned()
             .collect()
     }

@@ -128,6 +128,50 @@ async fn empty_peer_cache_update_preserves_existing_cache() {
     );
 }
 
+/// Cached addresses that are not on the network's port are dropped when the cache is read.
+///
+/// Releases before this filter cached the ephemeral source ports of inbound peers, and
+/// those addresses are still gossiped by peers running older code. They are re-read as
+/// ordinary initial peers and dialed directly at startup, so a node that restarts on a
+/// polluted cache spends its whole initial peer budget on addresses nothing listens on.
+#[tokio::test]
+async fn cached_peers_on_other_ports_are_not_loaded() {
+    let _init_guard = zakura_test::init();
+
+    let cache_dir = tempfile::tempdir().expect("temporary peer cache directory creation failed");
+    let config = Config {
+        cache_dir: CacheDir::custom_path(cache_dir.path()),
+        ..Config::default()
+    };
+    let peer_cache_file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .expect("test cache directory enables the peer cache");
+    fs::create_dir_all(
+        peer_cache_file
+            .parent()
+            .expect("peer cache file has a parent directory"),
+    )
+    .expect("peer cache directory should be creatable");
+    // One dialable listener, and three ephemeral source ports of the same inbound peer.
+    fs::write(
+        &peer_cache_file,
+        "127.0.0.1:8233\n127.0.0.2:34138\n127.0.0.2:38788\n127.0.0.2:48150\n",
+    )
+    .expect("pre-seeded peer cache should be writable");
+
+    let cached_peers = config
+        .load_peer_cache()
+        .await
+        .expect("pre-seeded peer cache should load");
+
+    assert_eq!(
+        cached_peers,
+        HashSet::from(["127.0.0.1:8233".parse().expect("valid test peer address")]),
+        "only addresses on the network's port may be loaded from the peer cache",
+    );
+}
+
 #[test]
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zakura_test::init();

@@ -359,3 +359,52 @@ fn inbound_peers_are_not_reconnection_or_cache_candidates() {
         .collect();
     assert_eq!(cacheable_addrs, vec![outbound_addr]);
 }
+
+/// Addresses we have never connected to ourselves are not written to the disk cache.
+///
+/// The cache file stores bare socket addresses, so an entry read back from disk has
+/// no record of where it came from: it is re-added as an ordinary initial peer, with
+/// no inbound flag. Caching an address on another peer's word therefore launders it,
+/// and the ephemeral source ports that inbound peers gossip around the network
+/// survive every restart. Requiring a response of our own is the only property that
+/// outlives the round trip through the cache file.
+#[test]
+fn peers_we_have_never_connected_to_are_not_cached() {
+    let gossiped_addr = "127.0.0.1:54321".parse().unwrap();
+    let connected_addr = "127.0.0.2:8233".parse().unwrap();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let gossiped_peer =
+        MetaAddr::new_gossiped_meta_addr(gossiped_addr, PeerServices::NODE_NETWORK, local_now)
+            .new_gossiped_change()
+            .expect("recently gossiped peer creates an address book change")
+            .into_new_meta_addr(instant_now, local_now);
+    let connected_peer =
+        MetaAddr::new_connected(connected_addr, &PeerServices::NODE_NETWORK, false)
+            .into_new_meta_addr(instant_now, local_now);
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        vec![gossiped_peer, connected_peer],
+    );
+
+    // The gossiped peer passes every other cache filter: it is not inbound, and its
+    // gossiped last seen time makes it active for gossip.
+    assert!(!gossiped_peer.is_inbound());
+    assert!(gossiped_peer.is_active_for_gossip(chrono_now));
+    assert!(!gossiped_peer.has_ever_responded());
+
+    let cacheable_addrs: Vec<_> = address_book
+        .cacheable(chrono_now)
+        .into_iter()
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(cacheable_addrs, vec![connected_addr]);
+}
