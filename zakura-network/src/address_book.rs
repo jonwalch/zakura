@@ -601,6 +601,21 @@ impl AddressBook {
             return false;
         };
 
+        // # Correctness
+        //
+        // This cache exists to space out our own outbound connections to one IP, and
+        // `Config::max_connections_per_ip` is only enforced when we accept inbound
+        // connections, never when we dial. An inbound peer refreshes its entry with
+        // every message it sends, so it would hold its IP's slot for as long as it
+        // stays connected, and the address we would refuse to dial is a different
+        // address on that IP: the peer's own listener, which is the address we want.
+        // Recording inbound entries here stops us dialing exactly the peers that are
+        // most active on the network, and the more inbound connections we accept, the
+        // fewer peers we are able to reach.
+        if updated.is_inbound() {
+            return false;
+        }
+
         if let Some(previous) = most_recent_by_ip.get(&updated.addr.ip()) {
             updated.last_connection_state == PeerAddrState::Responded
                 && updated.last_response() > previous.last_response()
@@ -869,6 +884,12 @@ impl AddressBook {
             // If there's no entry for this IP, any connection is allowed
             return true;
         };
+        if same_ip_peer.is_inbound() {
+            // An address can become inbound after it is recorded here, because
+            // `is_inbound` is sticky. Ignore it once it does, for the reasons in
+            // `should_update_most_recent_by_ip`.
+            return true;
+        }
         !same_ip_peer.has_connection_recently_responded(chrono_now)
     }
 
