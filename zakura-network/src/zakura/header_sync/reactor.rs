@@ -1896,7 +1896,11 @@ impl HeaderSyncReactor {
             .max_headers_per_response
             .min(self.serving_limits.max_headers_per_response())
             .min(byte_limited_count)
-            .min(MAX_HS_RANGE);
+            .min(MAX_HS_RANGE)
+            .min(
+                u32::try_from(self.peer_work_queue.staging_capacity_remaining())
+                    .unwrap_or(u32::MAX),
+            );
         if max_header_count == 0 {
             self.peer_work_queue.remove_unstarted(&peer);
             return;

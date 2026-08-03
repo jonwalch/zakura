@@ -7,7 +7,11 @@ use zakura_header_chain::{
 use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
 
 /// Exact aggregate cap for response headers awaiting one complete-target admission.
-pub(in crate::zakura::header_sync) const MAX_STAGED_HEADERS_V1: usize = 4_096;
+///
+/// Integrated nodes advance finality while body sync is active, retiring header work owned by
+/// the previous finality anchor. Keep one preparation window short enough to finish between those
+/// commits while still amortizing each durable header-chain write across a fixed-size batch.
+pub(in crate::zakura::header_sync) const MAX_STAGED_HEADERS_V1: usize = 128;
 
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -720,27 +724,34 @@ mod tests {
             tree_aux: None,
         };
         let mut queue = PeerWorkQueue::default();
+        let first_count = MAX_STAGED_HEADERS_V1 * 3 / 4;
+        let remaining = MAX_STAGED_HEADERS_V1 - first_count;
 
         let first = advertisement(1);
         assert_eq!(
             queue.stage(peer(1), first.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::NeedsLocator
         );
-        assert!(queue.start(active_request(1, first, &local, vec![entry.clone(); 3_000],)));
-        assert!(queue.has_staging_capacity(1_096));
-        assert!(!queue.has_staging_capacity(1_097));
+        assert!(queue.start(active_request(
+            1,
+            first,
+            &local,
+            vec![entry.clone(); first_count],
+        )));
+        assert!(queue.has_staging_capacity(remaining));
+        assert!(!queue.has_staging_capacity(remaining + 1));
 
         let second = advertisement(2);
         assert_eq!(
             queue.stage(peer(2), second.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::NeedsLocator
         );
-        assert!(queue.start(active_request(2, second, &local, vec![entry; 1_096],)));
+        assert!(queue.start(active_request(2, second, &local, vec![entry; remaining],)));
         assert!(queue.has_staging_capacity(0));
         assert!(!queue.has_staging_capacity(1));
 
         queue.remove(&peer(1));
-        assert!(queue.has_staging_capacity(3_000));
+        assert!(queue.has_staging_capacity(first_count));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::header_sync::scheduler::peer_work::MAX_STAGED_HEADERS_V1;
 
 #[test]
 fn empty_complete_response_at_target_is_benign() {
@@ -80,7 +81,7 @@ fn empty_complete_response_requires_the_exact_height_qualified_ancestor() {
 }
 
 #[test]
-fn requester_admits_a_bounded_prefix_before_the_next_page_would_overflow_staging() {
+fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
     let active = reactor
         .peer_work_queue
@@ -89,8 +90,8 @@ fn requester_admits_a_bounded_prefix_before_the_next_page_would_overflow_staging
     let entry = active.entries[0].clone();
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = Some(snapshot.frontiers.finalized);
-    active.entries = vec![entry; 3_096];
-    active.max_header_count = 1_000;
+    active.entries = vec![entry; MAX_STAGED_HEADERS_V1 - 1];
+    active.max_header_count = 1;
     let staged_tip = active
         .staged_tip()
         .expect("the bounded staged fixture has an inferred tip");
@@ -113,7 +114,7 @@ fn requester_admits_a_bounded_prefix_before_the_next_page_would_overflow_staging
             common_ancestor_hash: staged_tip.hash,
             complete: false,
             tree_aux_schema: AuxSchema::None,
-            entries: vec![next_entry; 1_000],
+            entries: vec![next_entry],
         },
     );
 
@@ -131,8 +132,13 @@ fn requester_admits_a_bounded_prefix_before_the_next_page_would_overflow_staging
         panic!("the full staging window must prepare a header target");
     };
     assert_eq!(common_ancestor, snapshot.frontiers.finalized);
-    assert_eq!(entries.len(), 4_096);
-    assert_eq!(target.height, block::Height(4_096));
+    assert_eq!(entries.len(), MAX_STAGED_HEADERS_V1);
+    assert_eq!(
+        target.height,
+        block::Height(
+            u32::try_from(MAX_STAGED_HEADERS_V1).expect("the staging cap fits in a height")
+        )
+    );
     assert_eq!(prefix_owner.branch.target_tip_hash, target.hash);
     assert_ne!(target.hash, owner.branch.target_tip_hash);
     assert_eq!(
@@ -328,7 +334,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         selected_tip_hash: target.hash,
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
-        max_headers_per_response: 1,
+        max_headers_per_response: u32::MAX,
         max_inflight_requests: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: 0,
@@ -367,6 +373,10 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         HeaderSyncMessage::GetHeaders(request) => request,
         other => panic!("expected GetHeaders, got {other:?}"),
     };
+    assert_eq!(
+        first_request.max_header_count,
+        u32::try_from(MAX_STAGED_HEADERS_V1).expect("the staging cap fits on the wire")
+    );
     handle
         .send(HeaderSyncEvent::SessionResponse {
             peer: peer.clone(),
