@@ -256,11 +256,41 @@ pub fn derive_historical_frontiers(
     height: Height,
     max_replay_blocks: u64,
 ) -> Result<Arc<DerivedFrontiers>, HistoricalTreeDerivationError> {
+    derive_historical_frontiers_measured(db, cache, height, max_replay_blocks)
+        .map(|derivation| derivation.frontiers)
+}
+
+/// A completed derivation, and what it cost.
+#[derive(Clone, Debug)]
+pub struct Derivation {
+    /// The frontiers as of the end of the requested height.
+    pub frontiers: Arc<DerivedFrontiers>,
+
+    /// How many blocks were replayed to produce them.
+    ///
+    /// Zero when the height was already memoized. Callers measuring cost must read this rather
+    /// than infer it from the height, because the anchor may have come from the memo or from a
+    /// published grid rather than from genesis.
+    pub replayed_blocks: u64,
+}
+
+/// Derives the frontiers at `height`, reporting how many blocks the replay covered.
+///
+/// See [`derive_historical_frontiers`].
+pub fn derive_historical_frontiers_measured(
+    db: &ZakuraDb,
+    cache: &Mutex<HistoricalTreeCache>,
+    height: Height,
+    max_replay_blocks: u64,
+) -> Result<Derivation, HistoricalTreeDerivationError> {
     let anchor = anchor_for(db, cache, height)?;
 
     if let Some((anchor_height, frontiers)) = &anchor {
         if *anchor_height == height {
-            return Ok(frontiers.clone());
+            return Ok(Derivation {
+                frontiers: frontiers.clone(),
+                replayed_blocks: 0,
+            });
         }
     }
 
@@ -286,7 +316,10 @@ pub fn derive_historical_frontiers(
     let frontiers = Arc::new(frontiers);
     lock(cache).insert(height, frontiers.clone());
 
-    Ok(frontiers)
+    Ok(Derivation {
+        frontiers,
+        replayed_blocks: blocks,
+    })
 }
 
 /// Returns the frontiers to replay forward from, and the height they are the state at the end of.

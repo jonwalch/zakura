@@ -17,8 +17,10 @@ use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
 use crate::service::{
     finalized_state::ZakuraDb,
     read::{
-        derive_historical_frontiers,
-        historical_tree::{replay_with_subtrees, HistoricalTreeDerivationError, ShieldedPool},
+        historical_tree::{
+            derive_historical_frontiers_measured, replay_with_subtrees,
+            HistoricalTreeDerivationError, ShieldedPool,
+        },
         DerivedFrontiers, HistoricalTreeCache,
     },
 };
@@ -160,23 +162,15 @@ pub fn measure_derivations(
     mut on_sample: impl FnMut(&DerivationSample),
 ) -> Result<Vec<DerivationSample>, (Height, HistoricalTreeDerivationError)> {
     let mut samples = Vec::new();
-    // Tracks what the previous derivation left memoized, so each sample reports the blocks this
-    // derivation actually replayed rather than its distance from the bottom of the band.
-    let mut highest_derived: Option<Height> = None;
 
     for height in heights {
-        let replayed_blocks = match highest_derived {
-            Some(previous) if previous < height => u64::from(height.0 - previous.0),
-            Some(_) => 0,
-            None => u64::from(height.0) + 1,
-        };
-
         let start = Instant::now();
-        derive_historical_frontiers(db, cache, height, max_replay_blocks)
+        // The derivation reports its own replay length: it may have anchored on the memo, on a
+        // published grid entry, or on genesis, and only it knows which.
+        let derivation = derive_historical_frontiers_measured(db, cache, height, max_replay_blocks)
             .map_err(|error| (height, error))?;
         let elapsed = start.elapsed();
-
-        highest_derived = Some(highest_derived.map_or(height, |previous| previous.max(height)));
+        let replayed_blocks = derivation.replayed_blocks;
 
         let sample = DerivationSample {
             height,
