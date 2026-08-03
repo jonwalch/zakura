@@ -204,6 +204,11 @@ pub(crate) use header_sync_driver::{block_roots_cover_range, root_covered_query_
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time for reconstructing the durable header chain from authenticated full state.
+///
+/// Unlike ordinary driver requests, this one-time startup operation scans the finalized header
+/// history. Multi-million-block production databases can take longer than the request deadline.
+pub(crate) const ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub(crate) const ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn emit_commit_state(

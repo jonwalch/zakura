@@ -20,7 +20,10 @@ use zakura_node_services::header_chain::{
     self as port, HeaderChainFuture, HeaderChainPort, HeaderChainPortError,
 };
 
-use super::{verified_block_tip_from_state, ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT};
+use super::{
+    verified_block_tip_from_state, ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT,
+    ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+};
 
 pub(crate) async fn zakura_header_sync_driver_startup<State>(
     state: State,
@@ -87,17 +90,7 @@ where
     if should_wait_for_durable_snapshot(finalized_tip, max_checkpoint_height)
         && committed_snapshots.borrow().is_none()
     {
-        tokio::time::timeout(ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT, async {
-            while committed_snapshots.borrow().is_none() {
-                committed_snapshots
-                    .changed()
-                    .await
-                    .map_err(|_| eyre!("header-chain snapshot publisher closed during startup"))?;
-            }
-            Ok::<_, Report>(())
-        })
-        .await
-        .map_err(|_| eyre!("timed out waiting for the durable header-chain snapshot"))??;
+        wait_for_durable_snapshot(&mut committed_snapshots).await?;
     }
     let vct_root_repairs = read_state.subscribe_vct_root_repairs();
     let best_header_tip = committed_snapshots
@@ -124,6 +117,23 @@ where
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(state, read_state)),
     })
+}
+
+async fn wait_for_durable_snapshot(
+    snapshots: &mut tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+) -> Result<(), Report> {
+    tokio::time::timeout(ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT, async {
+        while snapshots.borrow().is_none() {
+            snapshots
+                .changed()
+                .await
+                .map_err(|_| eyre!("header-chain snapshot publisher closed during startup"))?;
+        }
+        Ok::<_, Report>(())
+    })
+    .await
+    .map_err(|_| eyre!("timed out waiting for the durable header-chain snapshot"))??;
+    Ok(())
 }
 
 fn should_wait_for_durable_snapshot(
@@ -986,6 +996,22 @@ mod tests {
             Some((block::Height(41), finalized_hash)),
             max_checkpoint_height,
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn durable_snapshot_startup_wait_outlives_driver_request_deadline() {
+        let (_snapshot_sender, mut snapshots) = tokio::sync::watch::channel(None);
+
+        let early_result = tokio::time::timeout(
+            ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT + std::time::Duration::from_secs(1),
+            wait_for_durable_snapshot(&mut snapshots),
+        )
+        .await;
+
+        assert!(
+            early_result.is_err(),
+            "full-state reconstruction must not inherit the ordinary driver request deadline"
+        );
     }
 
     #[test]
