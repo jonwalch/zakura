@@ -42,15 +42,23 @@ use crate::service::{
 
 /// Estimated replay cost of reading and applying one block, in microseconds.
 ///
-/// Fitted to the phase A2 walk over Mainnet: pre-Sapling blocks carry no commitments, so their
-/// cost is almost entirely reading and deserialising the block body, which this represents.
-const COST_PER_BLOCK_US: u64 = 120;
+/// Measured directly on Mainnet in regions that carry no commitments, where the cost is entirely
+/// reading and deserialising the block body: 277 us/block median over heights 0-400k in the phase
+/// A2 walk, and 323 us/block for a 1,000-block replay at height 99k during generation.
+///
+/// Do not derive this by discounting a per-derivation measurement for root-computation overhead.
+/// A tree's root is cached until something is appended, so a block with no commitments pays no
+/// root cost at all — the discount applies only where there is shielded activity, which is
+/// already covered by [`COST_PER_COMMITMENT_US`]. Applying it here once produced a constant 2.5x
+/// too low, which under-spaced quiet regions badly enough to blow the cold-request budget.
+const COST_PER_BLOCK_US: u64 = 300;
 
 /// Estimated replay cost of appending one note commitment, in microseconds.
 ///
-/// Fitted the same way, from the difference between quiet and dense regions. Appending dominates
-/// wherever there is shielded activity.
-const COST_PER_COMMITMENT_US: u64 = 49;
+/// Fitted so the model reproduces the measured whole-band replay time (6,879 s over 3,358,006
+/// blocks and ~124M Sapling and Orchard commitments) given [`COST_PER_BLOCK_US`]. Appending
+/// dominates wherever there is shielded activity.
+const COST_PER_COMMITMENT_US: u64 = 47;
 
 /// How the grid's height spacing is chosen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
