@@ -42,9 +42,9 @@ use super::{
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
-    DiskDb, DiskWriteBatch, WriteDisk, HEADER_AUX_DELIVERY, HEADER_CHILD, HEADER_DEFERRED,
-    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH,
-    HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+    DiskDb, DiskWriteBatch, ReadDisk, WriteDisk, HEADER_AUX_DELIVERY, HEADER_CHILD,
+    HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
 };
 
 const METADATA_KEY: &[u8] = b"";
@@ -311,29 +311,32 @@ struct RetainedPathLeaseRegistry {
     by_peer: HashMap<SourceId, RetainedPathLease>,
 }
 
+#[derive(Debug)]
+struct RetainedPathLeaseSpec {
+    peer: SourceId,
+    session_id: u64,
+    target: Frontier,
+    common_ancestor: Frontier,
+    finalized_path_end: Option<Frontier>,
+    path: Arc<[block::Hash]>,
+    scope: WorkScope,
+}
+
 impl RetainedPathLeaseRegistry {
     fn expire(&mut self, now: Instant) {
         self.by_peer.retain(|_, lease| lease.idle_deadline > now);
     }
 
-    fn insert(
-        &mut self,
-        peer: SourceId,
-        session_id: u64,
-        frontiers: (Frontier, Frontier),
-        path: Arc<[block::Hash]>,
-        scope: zakura_header_chain::WorkScope,
-        now: Instant,
-    ) -> RetainedPathLeaseOutcome {
+    fn insert(&mut self, spec: RetainedPathLeaseSpec, now: Instant) -> RetainedPathLeaseOutcome {
         self.expire(now);
         if self
             .by_peer
-            .get(&peer)
-            .is_some_and(|lease| lease.session_id == session_id)
+            .get(&spec.peer)
+            .is_some_and(|lease| lease.session_id == spec.session_id)
         {
             return RetainedPathLeaseOutcome::Busy;
         }
-        self.by_peer.remove(&peer);
+        self.by_peer.remove(&spec.peer);
         if self.by_peer.len() >= MAX_RETAINED_PATH_LEASES {
             return RetainedPathLeaseOutcome::Busy;
         }
@@ -343,15 +346,16 @@ impl RetainedPathLeaseRegistry {
         self.next_lease_id = lease_id;
         let lease = RetainedPathLease {
             lease_id,
-            peer,
-            session_id,
-            target: frontiers.0,
-            common_ancestor: frontiers.1,
-            path,
-            scope,
+            peer: spec.peer,
+            session_id: spec.session_id,
+            target: spec.target,
+            common_ancestor: spec.common_ancestor,
+            finalized_path_end: spec.finalized_path_end,
+            path: spec.path,
+            scope: spec.scope,
             idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
         };
-        self.by_peer.insert(peer, lease.clone());
+        self.by_peer.insert(spec.peer, lease.clone());
         RetainedPathLeaseOutcome::Acquired(Box::new(lease))
     }
 
@@ -402,7 +406,13 @@ impl RetainedPathLeaseRegistry {
         self.by_peer
             .values()
             .flat_map(|lease| {
-                std::iter::once(lease.common_ancestor.hash).chain(lease.path.iter().copied())
+                let common_ancestor = lease
+                    .finalized_path_end
+                    .is_none()
+                    .then_some(lease.common_ancestor.hash);
+                common_ancestor
+                    .into_iter()
+                    .chain(lease.path.iter().copied())
             })
             .collect()
     }
@@ -454,6 +464,44 @@ impl HeaderChainReader {
             )));
         }
         Ok(deliveries)
+    }
+
+    fn finalized_frontier(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Option<Frontier>, HeaderChainStoreError> {
+        let height_by_hash = self.store.cf("height_by_hash")?;
+        let height: Option<block::Height> = self.store.db.zs_get(&height_by_hash, &hash);
+        let Some(height) = height else {
+            return Ok(None);
+        };
+        let hash_by_height = self.store.cf("hash_by_height")?;
+        let canonical_hash: Option<block::Hash> = self.store.db.zs_get(&hash_by_height, &height);
+        if canonical_hash != Some(hash) {
+            return Err(StoreError::Incoherent("finalized height/hash indexes disagree").into());
+        }
+        Ok(Some(Frontier::new(height, hash)))
+    }
+
+    fn finalized_header(
+        &self,
+        frontier: Frontier,
+    ) -> Result<Arc<block::Header>, HeaderChainStoreError> {
+        let block_header_by_height = self.store.cf("block_header_by_height")?;
+        let header: Option<Arc<block::Header>> = self
+            .store
+            .db
+            .zs_get(&block_header_by_height, &frontier.height);
+        let header = header.ok_or(StoreError::Incoherent(
+            "finalized header path has a missing header",
+        ))?;
+        if header.hash() != frontier.hash {
+            return Err(StoreError::Incoherent(
+                "finalized header disagrees with its canonical hash index",
+            )
+            .into());
+        }
+        Ok(header)
     }
 
     fn selected_aux_delivery(
@@ -738,16 +786,30 @@ impl HeaderChainReader {
             return Ok(RetainedPathLeaseOutcome::HistoryPruned);
         }
         reverse_path.reverse();
-        let common_index = locator_hashes.iter().find_map(|locator_hash| {
-            reverse_path
+        let mut intersection = None;
+        for locator_hash in locator_hashes {
+            if let Some(common_index) = reverse_path
                 .iter()
                 .position(|frontier| frontier.hash == *locator_hash)
-        });
-        let Some(common_index) = common_index else {
+            {
+                intersection = Some((
+                    reverse_path[common_index],
+                    None,
+                    common_index.saturating_add(1),
+                ));
+                break;
+            }
+            if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
+                if frontier.height < snapshot.frontiers.finalized.height {
+                    intersection = Some((frontier, Some(snapshot.frontiers.finalized), 1));
+                    break;
+                }
+            }
+        }
+        let Some((common_ancestor, finalized_path_end, retained_start)) = intersection else {
             return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
         };
-        let common_ancestor = reverse_path[common_index];
-        let path: Arc<[block::Hash]> = reverse_path[common_index.saturating_add(1)..]
+        let path: Arc<[block::Hash]> = reverse_path[retained_start..]
             .iter()
             .map(|frontier| frontier.hash)
             .collect();
@@ -756,11 +818,15 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         Ok(leases.insert(
-            peer,
-            session_id,
-            (target, common_ancestor),
-            path,
-            scope,
+            RetainedPathLeaseSpec {
+                peer,
+                session_id,
+                target,
+                common_ancestor,
+                finalized_path_end,
+                path,
+                scope,
+            },
             Instant::now(),
         ))
     }
@@ -795,8 +861,42 @@ impl HeaderChainReader {
         if lease.scope != scope {
             return Ok(RetainedPathReadOutcome::Unavailable);
         }
-        let (start, page_ancestor) = if after_hash == lease.common_ancestor.hash {
-            (0, lease.common_ancestor)
+        let mut historical_next = None;
+        let mut retained_start = None;
+        let page_ancestor = if after_hash == lease.common_ancestor.hash {
+            if lease.finalized_path_end.is_some() {
+                historical_next = Some(lease.common_ancestor.height.next().map_err(|_| {
+                    StoreError::Incoherent("finalized header path start height overflowed")
+                })?);
+            } else {
+                retained_start = Some(0);
+            }
+            lease.common_ancestor
+        } else if let Some(finalized_path_end) = lease.finalized_path_end {
+            if let Some(frontier) = self.finalized_frontier(after_hash)? {
+                if frontier.height <= lease.common_ancestor.height
+                    || frontier.height > finalized_path_end.height
+                {
+                    return Ok(RetainedPathReadOutcome::Unavailable);
+                }
+                if frontier.height == finalized_path_end.height {
+                    retained_start = Some(0);
+                } else {
+                    historical_next = Some(frontier.height.next().map_err(|_| {
+                        StoreError::Incoherent("finalized header path cursor height overflowed")
+                    })?);
+                }
+                frontier
+            } else {
+                let Some(index) = lease.path.iter().position(|hash| *hash == after_hash) else {
+                    return Ok(RetainedPathReadOutcome::Unavailable);
+                };
+                let node = self.store.node(after_hash)?.ok_or(StoreError::Incoherent(
+                    "active retained path page ancestor is absent",
+                ))?;
+                retained_start = Some(index.saturating_add(1));
+                Frontier::new(node.height, node.hash)
+            }
         } else {
             let Some(index) = lease.path.iter().position(|hash| *hash == after_hash) else {
                 return Ok(RetainedPathReadOutcome::Unavailable);
@@ -804,21 +904,60 @@ impl HeaderChainReader {
             let node = self.store.node(after_hash)?.ok_or(StoreError::Incoherent(
                 "active retained path page ancestor is absent",
             ))?;
-            (
-                index.saturating_add(1),
-                Frontier::new(node.height, node.hash),
-            )
+            retained_start = Some(index.saturating_add(1));
+            Frontier::new(node.height, node.hash)
         };
         let count = usize::try_from(max_count).unwrap_or(usize::MAX);
-        let end = start.saturating_add(count).min(lease.path.len());
-        let mut nodes = Vec::with_capacity(end.saturating_sub(start));
-        let mut aux_deliveries = Vec::with_capacity(end.saturating_sub(start));
+        let mut headers = Vec::with_capacity(count.min(usize::from(u16::MAX)));
+        let mut aux_deliveries = Vec::with_capacity(headers.capacity());
+        let mut previous = page_ancestor;
+        while let (Some(height), Some(finalized_path_end)) =
+            (historical_next, lease.finalized_path_end)
+        {
+            if headers.len() >= count {
+                break;
+            }
+            let hash_by_height = self.store.cf("hash_by_height")?;
+            let hash: Option<block::Hash> = self.store.db.zs_get(&hash_by_height, &height);
+            let hash = hash.ok_or(StoreError::Incoherent(
+                "finalized header path has a missing hash",
+            ))?;
+            let frontier = Frontier::new(height, hash);
+            let header = self.finalized_header(frontier)?;
+            if header.previous_block_hash != previous.hash {
+                return Err(StoreError::Incoherent(
+                    "finalized header path has a non-contiguous parent",
+                )
+                .into());
+            }
+            headers.push(header);
+            aux_deliveries.push(Vec::new());
+            previous = frontier;
+            if height == finalized_path_end.height {
+                historical_next = None;
+                retained_start = Some(0);
+            } else {
+                historical_next = Some(height.next().map_err(|_| {
+                    StoreError::Incoherent("finalized header path page height overflowed")
+                })?);
+            }
+        }
+        let start = retained_start.unwrap_or(lease.path.len());
+        let retained_count = count.saturating_sub(headers.len());
+        let end = start.saturating_add(retained_count).min(lease.path.len());
         for hash in &lease.path[start..end] {
             let node = self.store.node(*hash)?.ok_or(StoreError::Incoherent(
                 "active retained path node is absent",
             ))?;
+            if node.parent_hash != previous.hash {
+                return Err(StoreError::Incoherent(
+                    "active retained path has a non-contiguous parent",
+                )
+                .into());
+            }
             aux_deliveries.push(self.coherent_aux_deliveries(&node)?);
-            nodes.push(node);
+            previous = Frontier::new(node.height, node.hash);
+            headers.push(node.header);
         }
         let renewed = leases.renew(peer, session_id, lease_id, Instant::now());
         debug_assert!(renewed, "the lease registry is locked across the page read");
@@ -827,9 +966,9 @@ impl HeaderChainReader {
             common_ancestor: page_ancestor,
             target: lease.target,
             scope: lease.scope,
-            nodes,
+            headers,
             aux_deliveries,
-            complete: end == lease.path.len(),
+            complete: previous == lease.target,
         })))
     }
 

@@ -140,9 +140,9 @@ pub struct RetainedHeaderPathPage {
     pub target: Frontier,
     /// Exact generation and branch fixed at acquisition.
     pub scope: WorkScope,
-    /// Retained nodes in parent-first order.
-    pub nodes: Vec<zakura_header_chain::HeaderNode>,
-    /// Parallel auxiliary deliveries for each retained node.
+    /// Canonical headers in parent-first order.
+    pub headers: Vec<Arc<block::Header>>,
+    /// Parallel auxiliary deliveries for each retained header.
     pub aux_deliveries: Vec<Vec<AuxDelivery>>,
     /// Whether this page reaches the immutable target.
     pub complete: bool,

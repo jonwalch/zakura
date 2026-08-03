@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::time::Instant;
 use zakura_chain::block;
-use zakura_header_chain::{AuxDelivery, Frontier, HeaderNode, SourceId, WorkScope};
+use zakura_header_chain::{AuxDelivery, Frontier, SourceId, WorkScope};
 
 pub use zakura_header_chain::{
     AlarmSet as HeaderChainAlarmSet, BodyUnavailableSummary as HeaderChainBodyUnavailableSummary,
@@ -31,7 +31,13 @@ pub struct RetainedPathLease {
     pub target: Frontier,
     /// First requester-order locator intersection.
     pub common_ancestor: Frontier,
-    /// Immutable hashes strictly after the ancestor through the target.
+    /// Canonical finalized endpoint when the locator predates retained header history.
+    ///
+    /// The full-state path strictly after `common_ancestor` through this frontier is
+    /// immutable and is read lazily by height rather than copied into the lease.
+    pub finalized_path_end: Option<Frontier>,
+    /// Immutable retained hashes strictly after the finalized path (or the common
+    /// ancestor when there is no finalized path) through the target.
     pub path: Arc<[block::Hash]>,
     /// Exact generation and branch observed while the snapshot was acquired.
     pub scope: WorkScope,
@@ -65,9 +71,9 @@ pub struct RetainedPathPage {
     pub target: Frontier,
     /// Exact generation and branch fixed by the lease.
     pub scope: WorkScope,
-    /// Hash-keyed nodes in path order.
-    pub nodes: Vec<HeaderNode>,
-    /// Hash-keyed auxiliary deliveries parallel to `nodes`.
+    /// Canonical headers in path order.
+    pub headers: Vec<Arc<block::Header>>,
+    /// Hash-keyed auxiliary deliveries parallel to `headers`.
     pub aux_deliveries: Vec<Vec<AuxDelivery>>,
     /// True when this page reaches the immutable target.
     pub complete: bool,

@@ -100,6 +100,115 @@ fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the empty schema initializes");
+
+    let genesis = VerifiedHeaderRef {
+        height: anchor.height,
+        hash: anchor.hash,
+        header: anchor.header.clone(),
+    };
+    let mut path = Vec::new();
+    let mut parent = genesis.clone();
+    for marker in 1..=3 {
+        let mut header = *parent.header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = marker;
+        let header = Arc::new(header);
+        let height = parent
+            .height
+            .next()
+            .expect("the three-header fixture stays in range");
+        let hash = header.hash();
+        let child = VerifiedHeaderRef {
+            height,
+            hash,
+            header,
+        };
+        path.push(child.clone());
+        parent = child;
+    }
+
+    let hash_by_height = db
+        .cf_handle("hash_by_height")
+        .expect("the finalized hash index exists");
+    let height_by_hash = db
+        .cf_handle("height_by_hash")
+        .expect("the finalized height index exists");
+    let block_header_by_height = db
+        .cf_handle("block_header_by_height")
+        .expect("the finalized header column exists");
+    let mut batch = DiskWriteBatch::new();
+    for header in std::iter::once(&genesis).chain(path[..2].iter()) {
+        batch.zs_insert(&hash_by_height, header.height, header.hash);
+        batch.zs_insert(&height_by_hash, header.hash, header.height);
+        batch.zs_insert(
+            &block_header_by_height,
+            header.height,
+            header.header.as_ref(),
+        );
+    }
+    db.write(batch)
+        .expect("the canonical finalized header fixture commits");
+
+    let finalized = Frontier::new(path[1].height, path[1].hash);
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            finalized,
+            path[..2].to_vec(),
+            path[2..].to_vec(),
+        )
+        .expect("the finalized prefix and retained suffix reconcile");
+    let reader = runtime.reader();
+    let target = Frontier::new(path[2].height, path[2].hash);
+    let scope = WorkScope::for_header_target(&runtime.publisher().snapshot(), target.hash);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(
+            SourceId::from_digest([0x71; 32]),
+            9,
+            target.hash,
+            &[genesis.hash],
+            scope,
+        )
+        .expect("the finalized locator is a coherent retained path")
+    else {
+        panic!("the finalized locator should acquire a lease");
+    };
+    assert_eq!(
+        lease.common_ancestor,
+        Frontier::new(genesis.height, genesis.hash)
+    );
+    assert_eq!(lease.finalized_path_end, Some(finalized));
+    assert_eq!(lease.path.as_ref(), &[target.hash]);
+
+    let owner = SourceId::from_digest([0x71; 32]);
+    let mut after = genesis.hash;
+    for (expected, complete) in path.iter().zip([false, false, true]) {
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(owner, 9, lease.lease_id, scope, after, 1)
+            .expect("the historical path page is coherent")
+        else {
+            panic!("the historical path lease should remain available");
+        };
+        assert_eq!(
+            page.headers.as_slice(),
+            std::slice::from_ref(&expected.header)
+        );
+        assert_eq!(page.aux_deliveries, vec![Vec::new()]);
+        assert_eq!(page.complete, complete);
+        after = expected.hash;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
@@ -295,6 +404,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         Frontier::new(grandchild.height, grandchild.hash)
     );
     assert_eq!(lease.common_ancestor, anchor_frontier);
+    assert_eq!(lease.finalized_path_end, None);
     assert_eq!(lease.path.as_ref(), &[child.hash, grandchild.hash]);
     assert_eq!(lease.scope, lease_scope);
     let mut wrong_scope = lease_scope;
@@ -341,8 +451,8 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     else {
         panic!("the current owner should read its lease");
     };
-    assert_eq!(page.nodes.len(), 1);
-    assert_eq!(page.nodes[0].hash, child.hash);
+    assert_eq!(page.headers.len(), 1);
+    assert_eq!(page.headers[0].hash(), child.hash);
     assert_eq!(page.common_ancestor, anchor_frontier);
     assert_eq!(page.scope, lease_scope);
     assert_eq!(page.aux_deliveries, vec![vec![delivery]]);
@@ -357,7 +467,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         continuation.common_ancestor,
         Frontier::new(child.height, child.hash)
     );
-    assert_eq!(continuation.nodes[0].hash, grandchild.hash);
+    assert_eq!(continuation.headers[0].hash(), grandchild.hash);
     assert!(continuation.complete);
 
     let before = runtime.publisher().snapshot();
@@ -392,7 +502,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     else {
         panic!("the lease remains available after reselection");
     };
-    assert_eq!(page_after_reselection.nodes[0].hash, child.hash);
+    assert_eq!(page_after_reselection.headers[0].hash(), child.hash);
 
     assert_eq!(
         reader
@@ -440,6 +550,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         panic!("the target itself intersects the locator");
     };
     assert_eq!(target_intersection.common_ancestor.hash, child.hash);
+    assert_eq!(target_intersection.finalized_path_end, None);
     assert!(target_intersection.path.is_empty());
     assert!(reader
         .release_retained_path(

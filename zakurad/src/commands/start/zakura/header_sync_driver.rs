@@ -793,7 +793,7 @@ where
                 common_ancestor: page.common_ancestor,
                 target: page.target,
                 scope: page.scope,
-                nodes: page.nodes,
+                headers: page.headers,
                 aux_deliveries: page.aux_deliveries,
                 complete: page.complete,
             },
@@ -815,7 +815,7 @@ fn assemble_header_path_page(
     page: port::RetainedHeaderPathPage,
     requested_schema: AuxSchema,
 ) -> Option<HeaderPathPage> {
-    if page.nodes.len() != page.aux_deliveries.len() {
+    if page.headers.len() != page.aux_deliveries.len() {
         return None;
     }
 
@@ -830,13 +830,13 @@ fn assemble_header_path_page(
         AuxSchema::None
     };
     let entries = page
-        .nodes
+        .headers
         .into_iter()
         .zip(page.aux_deliveries)
-        .map(|(node, deliveries)| {
+        .map(|(header, deliveries)| {
             let delivery = selected_aux_delivery(&deliveries, tree_aux_schema);
             HeaderEntry {
-                header: node.header,
+                header,
                 body_size: delivery.map_or(0, |delivery| match delivery.body_size {
                     zakura_header_chain::BodySizeHint::Unknown => 0,
                     zakura_header_chain::BodySizeHint::Known(size) => size.get(),
@@ -1105,7 +1105,7 @@ mod tests {
             common_ancestor: frontier,
             target: frontier,
             scope: owner().scope(),
-            nodes: vec![node],
+            headers: vec![node.header],
             aux_deliveries: vec![Vec::new()],
             complete: true,
         };

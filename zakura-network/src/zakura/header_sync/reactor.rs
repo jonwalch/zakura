@@ -369,7 +369,7 @@ fn assemble_port_header_path_page(
     page: zakura_node_services::header_chain::RetainedHeaderPathPage,
     requested_schema: AuxSchema,
 ) -> Option<HeaderPathPage> {
-    if page.nodes.len() != page.aux_deliveries.len() {
+    if page.headers.len() != page.aux_deliveries.len() {
         return None;
     }
     let tree_aux_schema = if requested_schema == AuxSchema::V1
@@ -383,13 +383,13 @@ fn assemble_port_header_path_page(
         AuxSchema::None
     };
     let entries = page
-        .nodes
+        .headers
         .into_iter()
         .zip(page.aux_deliveries)
-        .map(|(node, deliveries)| {
+        .map(|(header, deliveries)| {
             let delivery = selected_port_aux_delivery(&deliveries, tree_aux_schema);
             HeaderEntry {
-                header: node.header,
+                header,
                 body_size: delivery.map_or(0, |delivery| match delivery.body_size {
                     zakura_header_chain::BodySizeHint::Unknown => 0,
                     zakura_header_chain::BodySizeHint::Known(size) => size.get(),
