@@ -68,6 +68,17 @@ pub struct AuditHistoricalTreestatesCmd {
     #[clap(long, help = "clear the memo before each derivation")]
     cold: bool,
 
+    /// Check replay-derived subtree roots against the ones stored above the handoff.
+    ///
+    /// Subtree roots are interior nodes, so the per-height root check does not test them. Above
+    /// the handoff the database stores them, which makes that band the one place a replay can be
+    /// checked against ground truth.
+    #[clap(
+        long,
+        help = "verify replay-derived subtree roots against stored rows above the handoff"
+    )]
+    verify_subtrees: bool,
+
     /// Skip the root-index and block-body scans, reporting only the cheap markers.
     ///
     /// Those scans visit every height in the band, which takes minutes on Mainnet. Skipping them
@@ -104,6 +115,38 @@ impl AuditHistoricalTreestatesCmd {
 
         let inventory = zakura_state::vct_treestate_inventory(&db, !self.no_scan);
         print_inventory(&inventory);
+
+        if self.verify_subtrees {
+            let handoff = inventory
+                .handoff_height
+                .ok_or_else(|| eyre!("this database has no handoff, so there is no stored band"))?;
+            let tip = inventory
+                .finalized_tip
+                .ok_or_else(|| eyre!("this database has no finalized tip"))?;
+
+            println!();
+            println!(
+                "verifying replay-derived subtree roots against stored rows in ({}, {}]",
+                handoff.0, tip.0
+            );
+
+            let outcome = zakura_state::verify_subtrees_against_stored(&db, handoff, tip)
+                .map_err(|error| eyre!("{error}"))?;
+
+            println!("  matched:    {}", outcome.matched);
+            println!("  unstored:   {}", outcome.unstored);
+            println!("  mismatched: {}", outcome.mismatched.len());
+            for (index, pool) in &outcome.mismatched {
+                println!("    {pool} subtree {}", index.0);
+            }
+
+            if !outcome.mismatched.is_empty() {
+                return Err(eyre!(
+                    "replay does not reproduce stored subtree roots, so generated subtree \
+                     artifacts cannot be trusted"
+                ));
+            }
+        }
 
         if !self.walk {
             return Ok(());

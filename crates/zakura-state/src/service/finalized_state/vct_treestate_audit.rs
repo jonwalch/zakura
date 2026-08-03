@@ -12,13 +12,14 @@
 
 use std::time::{Duration, Instant};
 
-use zakura_chain::block::Height;
+use zakura_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
 
 use crate::service::{
     finalized_state::ZakuraDb,
     read::{
-        derive_historical_frontiers, historical_tree::HistoricalTreeDerivationError,
-        HistoricalTreeCache,
+        derive_historical_frontiers,
+        historical_tree::{replay_with_subtrees, HistoricalTreeDerivationError, ShieldedPool},
+        DerivedFrontiers, HistoricalTreeCache,
     },
 };
 
@@ -187,4 +188,88 @@ pub fn measure_derivations(
     }
 
     Ok(samples)
+}
+
+/// The outcome of checking replay-derived subtree roots against the ones the database stored.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SubtreeVerification {
+    /// Subtrees that completed during the replay and matched the stored root.
+    pub matched: usize,
+
+    /// Subtrees that completed during the replay but whose stored root differs.
+    ///
+    /// Any entry here falsifies the claim that replay reproduces subtree roots, which is what the
+    /// generated subtree artifact rests on.
+    pub mismatched: Vec<(NoteCommitmentSubtreeIndex, &'static str)>,
+
+    /// Subtrees that completed during the replay with no stored row to compare against.
+    pub unstored: usize,
+}
+
+/// Replays `(from, to]` and checks every subtree that completes against the stored subtree rows.
+///
+/// This exists because subtree roots produced by replay are otherwise unvalidated: they are
+/// interior nodes, so the per-height root check does not test them directly. Above a fast-synced
+/// node's handoff the database *does* store subtree rows, which makes that band the one place the
+/// two can be compared. `from` must be a height whose per-height trees are present, so the replay
+/// starts from a known-good frontier rather than reconstructing one.
+pub fn verify_subtrees_against_stored(
+    db: &ZakuraDb,
+    from: Height,
+    to: Height,
+) -> Result<SubtreeVerification, HistoricalTreeDerivationError> {
+    let (Some(sapling), Some(orchard), Some(ironwood)) = (
+        db.sapling_tree_by_height(&from),
+        db.orchard_tree_by_height(&from),
+        db.ironwood_tree_by_height(&from),
+    ) else {
+        return Err(HistoricalTreeDerivationError::MissingAnchor {
+            height: to,
+            anchor: from,
+        });
+    };
+
+    let anchor = DerivedFrontiers {
+        sapling,
+        orchard,
+        ironwood,
+    };
+
+    let mut completions = Vec::new();
+    replay_with_subtrees(db, to, from.0 + 1, anchor, |pool, completed| {
+        completions.push((pool, completed))
+    })?;
+
+    let mut outcome = SubtreeVerification::default();
+
+    for (pool, completed) in completions {
+        let stored = match pool {
+            ShieldedPool::Sapling => db
+                .sapling_subtree_list_by_index_range(completed.index..=completed.index)
+                .get(&completed.index)
+                .map(|data| data.root.to_bytes()),
+            ShieldedPool::Orchard => db
+                .orchard_subtree_list_by_index_range(completed.index..=completed.index)
+                .get(&completed.index)
+                .map(|data| data.root.to_repr()),
+            ShieldedPool::Ironwood => db
+                .ironwood_subtree_list_by_index_range(completed.index..=completed.index)
+                .get(&completed.index)
+                .map(|data| data.root.to_repr()),
+        };
+
+        let pool_name = match pool {
+            ShieldedPool::Sapling => "sapling",
+            ShieldedPool::Orchard => "orchard",
+            ShieldedPool::Ironwood => "ironwood",
+        };
+
+        match stored {
+            Some(root) if root == completed.root => outcome.matched += 1,
+            Some(_) => outcome.mismatched.push((completed.index, pool_name)),
+            None => outcome.unstored += 1,
+        }
+    }
+
+    Ok(outcome)
 }

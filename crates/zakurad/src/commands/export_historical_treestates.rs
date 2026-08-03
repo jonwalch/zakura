@@ -5,7 +5,7 @@
 //! subtree roots (§4.6). Every grid entry is checked against the authenticated roots the database
 //! already holds, so generation fails rather than publishing an entry that does not match.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Instant};
 
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
@@ -83,12 +83,24 @@ impl ExportHistoricalTreestatesCmd {
             zakura_state::init_read_only(state_config, &self.network)?;
 
         println!("generating with grid spacing {}", self.spacing);
+
+        // Time each grid step. One step is exactly the replay a serving node performs for a cold
+        // request at this spacing, so the run doubles as the measurement that sizes the grid.
+        let mut entries = 0u64;
+        let mut previous = Instant::now();
         let export =
             zakura_state::export_treestate_artifacts(&db, self.spacing, |height, blocks| {
-                // Entries are cheap relative to the replay between them, so reporting every 100 keeps
-                // a multi-million-block run visible without flooding the log.
-                if height.0 % (self.spacing.saturating_mul(100)).max(1) < self.spacing {
-                    println!("  reached height {:>9} after {blocks:>9} blocks", height.0);
+                let step = previous.elapsed();
+                previous = Instant::now();
+                entries += 1;
+
+                if entries % 100 == 0 {
+                    println!(
+                        "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
+                         last step {:>8.1}ms",
+                        height.0,
+                        step.as_secs_f64() * 1e3,
+                    );
                 }
             })
             .map_err(|error| eyre!("{error}"))?;

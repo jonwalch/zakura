@@ -93,8 +93,8 @@ pub use service::finalized_state::{
     HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
 };
 pub use service::finalized_state::{
-    inventory as vct_treestate_inventory, measure_derivations, DerivationSample,
-    VctTreestateInventory,
+    inventory as vct_treestate_inventory, measure_derivations, verify_subtrees_against_stored,
+    DerivationSample, SubtreeVerification, VctTreestateInventory,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
