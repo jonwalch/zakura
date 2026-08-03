@@ -160,6 +160,22 @@ pub struct Config {
     /// this has no effect in [`StorageMode::Pruned`].
     pub derive_historical_trees: bool,
 
+    /// Path to a frontier artifact used to anchor historical tree derivation.
+    ///
+    /// Set to `None` by default. The artifact holds note commitment frontiers at a sparse height
+    /// grid, so a cold request replays from the nearest grid entry instead of from genesis. Every
+    /// entry is checked against the authenticated root this node already stores before it is used,
+    /// so a corrupt or hostile artifact is rejected rather than absorbed, and the file needs no
+    /// trust of its own. Only consulted when [`Self::derive_historical_trees`] is set.
+    pub historical_frontier_artifact: Option<PathBuf>,
+
+    /// Path to a subtree-root artifact used to serve `z_getsubtreesbyindex` below the handoff.
+    ///
+    /// Set to `None` by default. Unlike the frontier artifact, a node cannot check these records
+    /// against a stored root without replaying each subtree's 65,536 leaves, so this file is
+    /// trusted after its framing and digest validate.
+    pub historical_subtree_artifact: Option<PathBuf>,
+
     /// The most blocks one historical tree derivation may replay.
     ///
     /// Set to [`DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] by default, which is large enough to
@@ -455,6 +471,8 @@ impl Default for Config {
             checkpoint_sync: true,
             vct_fast_sync: true,
             derive_historical_trees: false,
+            historical_frontier_artifact: None,
+            historical_subtree_artifact: None,
             max_historical_tree_replay_blocks: DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
             delete_old_database: true,
             storage_mode: StorageMode::default(),

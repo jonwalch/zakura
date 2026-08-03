@@ -15,6 +15,7 @@ use zakura_chain::{
     amount::Amount,
     block::{Block, Height},
     history_tree::HistoryTree,
+    orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parallel::commitment_aux_verify::verify_supplied_roots_from_parts,
     parameters::{
@@ -22,6 +23,7 @@ use zakura_chain::{
         NetworkUpgrade,
     },
     primitives::Groth16Proof,
+    sapling,
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto},
     sprout::JoinSplit,
     transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
@@ -1734,6 +1736,89 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 derive_historical_frontiers(&fast.db, &cache, Height(last as u32 - 1), 0).is_ok(),
                 "a memoized height is served without replaying, whatever the bound"
             );
+            // Artifact generation (design §4.1, §5) is the same replay, stopping at a grid. Its
+            // entries must agree with the legacy node's own per-height trees, and the artifact
+            // must survive a byte round trip, since consumers only ever see the encoded form.
+            let export = super::super::export_treestate_artifacts(&fast.db, 4, |_, _| {})
+                .expect("the fast-synced fixture exports");
+
+            prop_assert_eq!(export.frontiers.handoff, handoff);
+            prop_assert!(!export.frontiers.entries.is_empty(), "the grid is not empty");
+            prop_assert_eq!(
+                export.frontiers.entries.last().expect("the grid is not empty").height,
+                Height(handoff.0 - 1),
+                "the grid ends on the last height of the band"
+            );
+
+            for entry in &export.frontiers.entries {
+                prop_assert_eq!(
+                    entry.sapling.root(),
+                    legacy.db.sapling_tree_by_height(&entry.height).expect("legacy stores every tree").root(),
+                    "exported Sapling entry matches the legacy node at {:?}", entry.height
+                );
+                prop_assert_eq!(
+                    entry.orchard.root(),
+                    legacy.db.orchard_tree_by_height(&entry.height).expect("legacy stores every tree").root(),
+                    "exported Orchard entry matches the legacy node at {:?}", entry.height
+                );
+            }
+
+            let encoded = export.frontiers.encode(&network);
+            let decoded = super::super::FrontierArtifact::decode(&encoded, &network)
+                .expect("a freshly generated artifact decodes");
+            prop_assert_eq!(decoded.entries.len(), export.frontiers.entries.len());
+            for (decoded, original) in decoded.entries.iter().zip(&export.frontiers.entries) {
+                prop_assert_eq!(decoded.sapling.root(), original.sapling.root());
+                prop_assert_eq!(decoded.orchard.root(), original.orchard.root());
+                prop_assert_eq!(decoded.ironwood.root(), original.ironwood.root());
+            }
+
+            // Two runs must agree byte for byte: that reproducibility is the determinism gate
+            // phase C relies on, and for the subtree artifact it carries the whole trust argument.
+            let second = super::super::export_treestate_artifacts(&fast.db, 4, |_, _| {})
+                .expect("a second export succeeds");
+            prop_assert_eq!(
+                second.frontiers.encode(&network),
+                encoded,
+                "two independent exports must be byte-identical"
+            );
+            prop_assert_eq!(
+                second.subtrees.encode(&network),
+                export.subtrees.encode(&network),
+                "two independent subtree exports must be byte-identical"
+            );
+
+            // A node configured with the published grid anchors on it instead of replaying from
+            // genesis, which is the whole point of §4.1: the artifact turns a cold request into a
+            // short replay.
+            let artifact = Arc::new(decoded);
+            let anchored = Mutex::new(HistoricalTreeCache::with_artifact(artifact.clone()));
+            let probe = Height(handoff.0 - 1);
+            let from_artifact = derive_historical_frontiers(&fast.db, &anchored, probe, u64::MAX)
+                .expect("an artifact-anchored derivation succeeds");
+            prop_assert_eq!(
+                from_artifact.sapling.root(),
+                legacy.db.sapling_tree_by_height(&probe).expect("legacy stores every tree").root(),
+                "an artifact-anchored derivation agrees with the legacy node"
+            );
+
+            // §4.2 is the security claim: the artifact carries no trust. Corrupt every entry and
+            // the node must still answer correctly, by rejecting the bad anchors and replaying
+            // further — not by trusting them, and not by refusing to serve.
+            let mut corrupt = (*artifact).clone();
+            for entry in &mut corrupt.entries {
+                entry.sapling = Arc::new(sapling::tree::NoteCommitmentTree::default());
+                entry.orchard = Arc::new(orchard::tree::NoteCommitmentTree::default());
+            }
+            let corrupted = Mutex::new(HistoricalTreeCache::with_artifact(Arc::new(corrupt)));
+            let from_corrupt = derive_historical_frontiers(&fast.db, &corrupted, probe, u64::MAX)
+                .expect("a corrupt artifact must not stop the node from serving");
+            prop_assert_eq!(
+                from_corrupt.sapling.root(),
+                from_artifact.sapling.root(),
+                "a corrupt artifact is ignored, not absorbed"
+            );
+
             let cold_cache = Mutex::new(HistoricalTreeCache::default());
             let cold_height = Height(last as u32 - 1);
             prop_assert_eq!(

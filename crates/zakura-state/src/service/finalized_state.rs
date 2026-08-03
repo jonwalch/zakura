@@ -82,6 +82,8 @@ pub(crate) mod commitment_aux;
 pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
+pub mod treestate_artifact;
+pub mod treestate_export;
 mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
@@ -111,6 +113,12 @@ pub use disk_format::upgrade::repair_vct_sprout_history::{
 pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
+};
+pub use treestate_artifact::{
+    FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
+};
+pub use treestate_export::{
+    export as export_treestate_artifacts, TreestateExport, TreestateExportError,
 };
 pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,

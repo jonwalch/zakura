@@ -17,6 +17,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    ops::Bound,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -259,6 +260,12 @@ pub struct ReadStateService {
     /// Shared across clones so a wallet's sequential scan anchors each request on the previous
     /// one. Empty, and never written, unless `derive_historical_trees` is configured.
     historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
+
+    /// Published completed subtree roots for heights below the checkpoint handoff.
+    ///
+    /// `None` when no artifact is configured or it failed to validate, in which case
+    /// `z_getsubtreesbyindex` keeps reporting the absent band rather than serving unchecked data.
+    historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
@@ -1132,12 +1139,18 @@ impl ReadStateService {
             Option<finalized_state::HeaderRootAuthState>,
         >,
     ) -> Self {
+        let (historical_trees, historical_subtrees) = load_historical_treestate_artifacts(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+        );
+
         let read_service = Self {
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
-            historical_trees: Arc::default(),
+            historical_trees,
+            historical_subtrees,
             highest_completed_checkpoint_receiver,
             _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
@@ -1675,6 +1688,93 @@ where
         .collect()
 }
 
+/// Returns the index range a subtree request covers, as a concrete range type.
+///
+/// Mirrors the read path's handling of an absent or overflowing end bound, where the request is
+/// served to the end of what exists.
+fn range_for(
+    start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
+) -> (
+    Bound<NoteCommitmentSubtreeIndex>,
+    Bound<NoteCommitmentSubtreeIndex>,
+) {
+    (
+        Bound::Included(start_index),
+        end_index.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+/// Loads the historical-treestate artifacts named in `config`, if any.
+///
+/// A missing or invalid artifact is logged and skipped rather than fatal: the node still works,
+/// it just falls back to replaying further, or to reporting the absent band for subtrees. Refusing
+/// to start over a serving-only input would be a worse trade.
+fn load_historical_treestate_artifacts(
+    network: &Network,
+    config: &Config,
+) -> (
+    Arc<Mutex<read::HistoricalTreeCache>>,
+    Option<Arc<finalized_state::SubtreeArtifact>>,
+) {
+    let frontiers = config.historical_frontier_artifact.as_ref().and_then(
+        |path| match std::fs::read(path) {
+            Ok(bytes) => match finalized_state::FrontierArtifact::decode(&bytes, network) {
+                Ok(artifact) => {
+                    tracing::info!(
+                        ?path,
+                        entries = artifact.entries.len(),
+                        spacing = artifact.spacing,
+                        "loaded historical frontier artifact"
+                    );
+                    Some(Arc::new(artifact))
+                }
+                Err(error) => {
+                    tracing::warn!(?path, %error, "ignoring invalid historical frontier artifact");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(?path, %error, "cannot read historical frontier artifact");
+                None
+            }
+        },
+    );
+
+    let subtrees = config
+        .historical_subtree_artifact
+        .as_ref()
+        .and_then(|path| match std::fs::read(path) {
+            Ok(bytes) => match finalized_state::SubtreeArtifact::decode(&bytes, network) {
+                Ok(artifact) => {
+                    tracing::info!(
+                        ?path,
+                        sapling = artifact.sapling.len(),
+                        orchard = artifact.orchard.len(),
+                        ironwood = artifact.ironwood.len(),
+                        "loaded historical subtree-root artifact"
+                    );
+                    Some(Arc::new(artifact))
+                }
+                Err(error) => {
+                    tracing::warn!(?path, %error, "ignoring invalid historical subtree-root artifact");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(?path, %error, "cannot read historical subtree-root artifact");
+                None
+            }
+        });
+
+    let cache = frontiers.map_or_else(
+        || Mutex::new(read::HistoricalTreeCache::default()),
+        |artifact| Mutex::new(read::HistoricalTreeCache::with_artifact(artifact)),
+    );
+
+    (Arc::new(cache), subtrees)
+}
+
 /// Returns the note commitment frontiers for `hash_or_height` when the stored per-height trees are
 /// absent because this is a verified-commitment-trees fast-synced database.
 ///
@@ -2153,6 +2253,24 @@ impl Service<ReadRequest> for ReadStateService {
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
                 };
 
+                let sapling_subtrees = if sapling_subtrees.contains_key(&start_index) {
+                    sapling_subtrees
+                } else {
+                    // The stored range does not cover `start_index`. Published records fill the
+                    // absent band; outside it there are none, and the check below decides whether
+                    // an empty list is an honest answer or the archive-mode error.
+                    let published = state
+                        .historical_subtrees
+                        .as_ref()
+                        .map_or_else(Default::default, |artifact| {
+                            artifact.sapling_range(range_for(start_index, end_index))
+                        });
+
+                    let mut merged = sapling_subtrees;
+                    merged.extend(published);
+                    merged
+                };
+
                 read::check_historical_sapling_subtrees_available(
                     &state.db,
                     start_index,
@@ -2178,6 +2296,24 @@ impl Service<ReadRequest> for ReadStateService {
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
                 };
 
+                let orchard_subtrees = if orchard_subtrees.contains_key(&start_index) {
+                    orchard_subtrees
+                } else {
+                    // The stored range does not cover `start_index`. Published records fill the
+                    // absent band; outside it there are none, and the check below decides whether
+                    // an empty list is an honest answer or the archive-mode error.
+                    let published = state
+                        .historical_subtrees
+                        .as_ref()
+                        .map_or_else(Default::default, |artifact| {
+                            artifact.orchard_range(range_for(start_index, end_index))
+                        });
+
+                    let mut merged = orchard_subtrees;
+                    merged.extend(published);
+                    merged
+                };
+
                 read::check_historical_orchard_subtrees_available(
                     &state.db,
                     start_index,
@@ -2197,6 +2333,24 @@ impl Service<ReadRequest> for ReadStateService {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
+                };
+
+                let ironwood_subtrees = if ironwood_subtrees.contains_key(&start_index) {
+                    ironwood_subtrees
+                } else {
+                    // The stored range does not cover `start_index`. Published records fill the
+                    // absent band; outside it there are none, and the check below decides whether
+                    // an empty list is an honest answer or the archive-mode error.
+                    let published = state
+                        .historical_subtrees
+                        .as_ref()
+                        .map_or_else(Default::default, |artifact| {
+                            artifact.ironwood_range(range_for(start_index, end_index))
+                        });
+
+                    let mut merged = ironwood_subtrees;
+                    merged.extend(published);
+                    merged
                 };
 
                 read::check_historical_ironwood_subtrees_available(

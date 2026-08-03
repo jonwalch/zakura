@@ -27,7 +27,9 @@ use zakura_chain::{
     block::Height, ironwood, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling,
 };
 
-use crate::service::finalized_state::ZakuraDb;
+use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
+
+use crate::service::finalized_state::{treestate_artifact::FrontierArtifact, ZakuraDb};
 
 /// The most derived frontiers to keep memoized per node.
 ///
@@ -35,6 +37,30 @@ use crate::service::finalized_state::ZakuraDb;
 /// one batch of replay. The rest of the budget covers concurrent clients scanning different parts
 /// of the band. Each entry is a few kilobytes, so this is a negligible amount of memory.
 pub const MAX_MEMOIZED_FRONTIERS: usize = 64;
+
+/// Which shielded pool a replay event belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShieldedPool {
+    /// The Sapling pool.
+    Sapling,
+    /// The Orchard pool.
+    Orchard,
+    /// The Ironwood pool.
+    Ironwood,
+}
+
+/// A subtree that finished filling during a replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedSubtree {
+    /// The subtree index.
+    pub index: NoteCommitmentSubtreeIndex,
+
+    /// The height whose block added the subtree's last leaf.
+    pub end_height: Height,
+
+    /// The subtree root.
+    pub root: [u8; 32],
+}
 
 /// Per-pool note commitment frontiers as of the end of one block.
 #[derive(Clone, Debug)]
@@ -51,7 +77,7 @@ pub struct DerivedFrontiers {
 
 impl DerivedFrontiers {
     /// Returns empty frontiers, the state before any block has been applied.
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             sapling: Arc::<sapling::tree::NoteCommitmentTree>::default(),
             orchard: Arc::<orchard::tree::NoteCommitmentTree>::default(),
@@ -150,9 +176,38 @@ pub enum HistoricalTreeDerivationError {
 pub struct HistoricalTreeCache {
     /// Verified frontiers, keyed by the height they are the state at the end of.
     frontiers: BTreeMap<Height, Arc<DerivedFrontiers>>,
+
+    /// A published frontier grid to fall back on when the memo has nothing nearby.
+    ///
+    /// Entries here are *not* trusted: one is root-checked before it anchors anything, exactly
+    /// like a locally derived frontier, which is what lets the grid be coarse and distributed
+    /// outside the binary.
+    artifact: Option<Arc<FrontierArtifact>>,
 }
 
 impl HistoricalTreeCache {
+    /// Returns a cache that can also anchor on `artifact`'s published grid.
+    pub fn with_artifact(artifact: Arc<FrontierArtifact>) -> Self {
+        Self {
+            frontiers: BTreeMap::new(),
+            artifact: Some(artifact),
+        }
+    }
+
+    /// Returns the highest published grid entry at or below `height`, if any.
+    fn artifact_anchor_at_or_below(&self, height: Height) -> Option<(Height, DerivedFrontiers)> {
+        let entry = self.artifact.as_ref()?.anchor_at_or_below(height)?;
+
+        Some((
+            entry.height,
+            DerivedFrontiers {
+                sapling: entry.sapling.clone(),
+                orchard: entry.orchard.clone(),
+                ironwood: entry.ironwood.clone(),
+            },
+        ))
+    }
+
     /// Returns the highest memoized frontier at or below `height`, if any.
     fn anchor_at_or_below(&self, height: Height) -> Option<(Height, Arc<DerivedFrontiers>)> {
         self.frontiers
@@ -226,10 +281,7 @@ pub fn derive_historical_frontiers(
     });
     let frontiers = replay(db, height, replay_from, frontiers)?;
 
-    let roots = authenticated_roots(db, height)?;
-    if !frontiers.matches(&roots) {
-        return Err(HistoricalTreeDerivationError::RootMismatch { height });
-    }
+    verify_against_index(db, height, &frontiers)?;
 
     let frontiers = Arc::new(frontiers);
     lock(cache).insert(height, frontiers.clone());
@@ -250,6 +302,33 @@ fn anchor_for(
 
     if memoized.is_some() {
         return Ok(memoized);
+    }
+
+    // Fall back to the published grid. The entry is checked against this node's own authenticated
+    // root before it anchors anything, so a wrong or hostile artifact cannot steer a derivation.
+    //
+    // A failed check is deliberately *not* fatal: the artifact is an optimization with no trust
+    // weight, so a bad entry is ignored and the derivation falls back to replaying further. Making
+    // it fatal would hand anyone who can supply a corrupt artifact a denial of service over a
+    // node that is perfectly capable of answering without one.
+    let published = lock(cache).artifact_anchor_at_or_below(height);
+    if let Some((anchor_height, frontiers)) = published {
+        match verify_against_index(db, anchor_height, &frontiers) {
+            Ok(()) => {
+                let frontiers = Arc::new(frontiers);
+                lock(cache).insert(anchor_height, frontiers.clone());
+
+                return Ok(Some((anchor_height, frontiers)));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?anchor_height,
+                    %error,
+                    "ignoring a published frontier entry that does not match the authenticated root",
+                );
+                metrics::counter!("state.historical_tree.artifact_entry_rejected").increment(1);
+            }
+        }
     }
 
     // Below the upgrade height `U` this binary did not run, so per-height trees are present. The
@@ -284,6 +363,22 @@ fn replay(
     replay_from: u32,
     frontiers: DerivedFrontiers,
 ) -> Result<DerivedFrontiers, HistoricalTreeDerivationError> {
+    replay_with_subtrees(db, height, replay_from, frontiers, |_, _| {})
+}
+
+/// Appends the note commitments of blocks `replay_from..=height` to `frontiers`, reporting every
+/// subtree that completes along the way.
+///
+/// `on_subtree` sees each completion in order. A subtree root reported here is pinned by the same
+/// root check that validates the replay's endpoints: the replay is deterministic, so an error
+/// anywhere in it would have to cancel out exactly to still reproduce the verified end root.
+pub fn replay_with_subtrees(
+    db: &ZakuraDb,
+    height: Height,
+    replay_from: u32,
+    frontiers: DerivedFrontiers,
+    mut on_subtree: impl FnMut(ShieldedPool, CompletedSubtree),
+) -> Result<DerivedFrontiers, HistoricalTreeDerivationError> {
     let DerivedFrontiers {
         sapling,
         orchard,
@@ -313,23 +408,53 @@ fn replay(
         // 65,536 commitments a subtree holds, so a single batch append is always valid.
         let sapling_commitments: Vec<_> = block.sapling_note_commitments().cloned().collect();
         if !sapling_commitments.is_empty() {
-            sapling
+            let completed = sapling
                 .append_batch(&sapling_commitments)
                 .map_err(|error| append_error(&error))?;
+            if let Some((index, root)) = completed {
+                on_subtree(
+                    ShieldedPool::Sapling,
+                    CompletedSubtree {
+                        index,
+                        end_height: block_height,
+                        root: root.to_bytes(),
+                    },
+                );
+            }
         }
 
         let orchard_commitments: Vec<_> = block.orchard_note_commitments().cloned().collect();
         if !orchard_commitments.is_empty() {
-            orchard
+            let completed = orchard
                 .append_batch(&orchard_commitments)
                 .map_err(|error| append_error(&error))?;
+            if let Some((index, root)) = completed {
+                on_subtree(
+                    ShieldedPool::Orchard,
+                    CompletedSubtree {
+                        index,
+                        end_height: block_height,
+                        root: root.to_repr(),
+                    },
+                );
+            }
         }
 
         let ironwood_commitments: Vec<_> = block.ironwood_note_commitments().cloned().collect();
         if !ironwood_commitments.is_empty() {
-            ironwood
+            let completed = ironwood
                 .append_batch(&ironwood_commitments)
                 .map_err(|error| append_error(&error))?;
+            if let Some((index, root)) = completed {
+                on_subtree(
+                    ShieldedPool::Ironwood,
+                    CompletedSubtree {
+                        index,
+                        end_height: block_height,
+                        root: root.to_repr(),
+                    },
+                );
+            }
         }
     }
 
@@ -338,6 +463,26 @@ fn replay(
         orchard: Arc::new(orchard),
         ironwood: Arc::new(ironwood),
     })
+}
+
+/// Checks `frontiers` against the authenticated roots stored for `height`.
+///
+/// This is the check the whole design rests on: a note commitment root is a binding commitment to
+/// its frontier, so a frontier that reproduces the authenticated root *is* the frontier, whatever
+/// source it came from. Both the serving path and the artifact generator route through here so the
+/// two can never drift apart.
+pub fn verify_against_index(
+    db: &ZakuraDb,
+    height: Height,
+    frontiers: &DerivedFrontiers,
+) -> Result<(), HistoricalTreeDerivationError> {
+    let roots = authenticated_roots(db, height)?;
+
+    if frontiers.matches(&roots) {
+        Ok(())
+    } else {
+        Err(HistoricalTreeDerivationError::RootMismatch { height })
+    }
 }
 
 /// Returns the authenticated per-pool roots stored for `height`.
