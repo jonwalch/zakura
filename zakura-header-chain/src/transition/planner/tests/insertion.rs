@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(1).expect("one is nonzero");
+    let clock = ManualClock(Utc::now());
+
+    let refused = apply_transition(
+        &store,
+        insertion(&store, 2, EvidenceId::from_digest([0x30; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("resource refusal produces an alarm-only plan");
+    assert_eq!(refused.cause(), TransitionCause::ResourceStalled);
+    assert!(refused.change_set.metadata.alarms.resource_stalled);
+    assert_eq!(
+        refused.change_set.metadata.state_version,
+        StateVersion::new(1)
+    );
+    assert!(refused.change_set.put_nodes.is_empty());
+    assert!(refused.change_set.delete_nodes.is_empty());
+    assert_eq!(refused.projected.node_count(), 1);
+    assert_eq!(
+        refused.change_set.metadata.frontiers,
+        store.metadata.frontiers
+    );
+    store.commit(&refused);
+
+    let recovered = apply_transition(
+        &store,
+        insertion(&store, 1, EvidenceId::from_digest([0x31; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("an insertion within the bound clears the resource alarm");
+    assert_eq!(recovered.cause(), TransitionCause::Event);
+    assert!(!recovered.change_set.metadata.alarms.resource_stalled);
+    assert_eq!(
+        recovered.change_set.metadata.state_version,
+        StateVersion::new(2)
+    );
+    assert_eq!(recovered.projected.node_count(), 2);
+}
+
+#[test]
 fn engine_rejects_context_free_batch_with_invalid_retained_time() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(regtest_genesis_block().header.time + chrono::Duration::hours(1));

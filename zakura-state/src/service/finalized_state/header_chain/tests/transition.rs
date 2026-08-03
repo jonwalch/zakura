@@ -518,6 +518,114 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
 }
 
 #[test]
+fn resource_stall_alarm_is_published_and_durable_before_refusal() {
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let (mut engine_config, anchor, metadata) = fixture();
+    engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the header schema initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the coherent store starts");
+    let initial = runtime.publisher().snapshot();
+    let anchor_frontier = initial.frontiers.finalized;
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the initialized anchor is retained");
+    let rules = HeaderRules::for_validation_lease(engine_config.network.clone(), &lease)
+        .expect("the authenticated regtest policy is valid");
+    let mut first_header = *anchor.header;
+    first_header.previous_block_hash = anchor.hash;
+    first_header.time += chrono::Duration::seconds(1);
+    let first_header = Arc::new(first_header);
+    let mut second_header = *first_header;
+    second_header.previous_block_hash = first_header.hash();
+    second_header.time += chrono::Duration::seconds(1);
+    let second_header = Arc::new(second_header);
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&[first_header, second_header.clone()]),
+        &lease,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the two-child batch prepares through production validation");
+    let target = Frontier::new(block::Height(2), second_header.hash());
+    let result = runtime.apply(
+        TransitionRequest {
+            expected_version: initial.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner: WorkOwner {
+                    state_version: initial.state_version,
+                    header_generation: initial.header_generation,
+                    verified_generation: None,
+                    branch: BranchId::new(anchor.hash, target.hash),
+                    session_id: 1,
+                    request_id: NonZeroU64::new(1).expect("one is nonzero"),
+                },
+                source: SourceId::from_digest([0x70; 32]),
+                parent_hash: anchor.hash,
+                target_tip_hash: target.hash,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: anchor_frontier,
+                },
+                batch,
+                aux: Vec::new(),
+            })),
+        },
+        &TransitionContext {
+            config: &engine_config,
+            clock: &SystemClock,
+            full_state_authority: None,
+            retention_references: &[],
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(HeaderChainStoreError::Transition(
+            TransitionFailure::ResourceStalled
+        ))
+    ));
+
+    let published = runtime.publisher().snapshot();
+    assert!(published.alarms.resource_stalled);
+    assert_eq!(published.state_version, StateVersion::new(2));
+    assert_eq!(published.frontiers, initial.frontiers);
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the resource alarm metadata is readable")
+            .snapshot(),
+        published
+    );
+    assert_eq!(
+        runtime
+            .store
+            .all_nodes()
+            .expect("the retained graph is readable"),
+        vec![anchor]
+    );
+
+    drop(runtime);
+    let (reopened, report) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("the resource-stalled store reopens coherently");
+    assert!(report.current.alarms.resource_stalled);
+    assert_eq!(reopened.publisher().snapshot(), published);
+}
+
+#[test]
 fn stale_prepared_full_state_transition_is_a_hard_error() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

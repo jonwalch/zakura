@@ -19,10 +19,10 @@ use zakura_header_chain::{
     EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
     FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderLocator, HeaderNode,
     MemHeaderStore, NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId,
-    StaleReceipt, StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionContext,
-    TransitionEvent, TransitionFailure, TransitionRequest, ValidationContextRecord,
-    ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef, WorkOwner,
-    WorkScope,
+    StaleReceipt, StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionCause,
+    TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest,
+    ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
+    VerifiedHeaderRef, WorkOwner, WorkScope,
 };
 
 use crate::{
@@ -1212,6 +1212,7 @@ impl HeaderChainRuntime {
                 return Err(HeaderChainStoreError::VerifiedFrontierMismatch { expected, actual });
             }
         }
+        let resource_stalled = transition.cause() == TransitionCause::ResourceStalled;
         if transition.is_no_change() {
             #[cfg(test)]
             fault(FaultPoint::BeforeCommit)?;
@@ -1221,6 +1222,9 @@ impl HeaderChainRuntime {
             memory_swap();
             #[cfg(test)]
             fault(FaultPoint::AfterMemorySwap)?;
+            if resource_stalled {
+                return Err(TransitionFailure::ResourceStalled.into());
+            }
             return Ok(ApplyResult::NoChange(NoChangeReceipt {
                 state_version: transition.before().state_version,
                 event,
@@ -1247,6 +1251,9 @@ impl HeaderChainRuntime {
         self.publisher.publish(current);
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
+        if resource_stalled {
+            return Err(TransitionFailure::ResourceStalled.into());
+        }
         Ok(ApplyResult::Committed)
     }
 }

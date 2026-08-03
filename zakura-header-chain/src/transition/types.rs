@@ -880,6 +880,8 @@ pub struct ChangeSet {
 pub enum TransitionCause {
     /// One of the externally typed evidence categories.
     Event,
+    /// Admission was refused without applying the event because protected state filled a limit.
+    ResourceStalled,
     /// Headers-only depth finality occurred in the same insertion/reselection.
     HeadersOnlyFinality,
     /// Startup recovery reconstructed state.

@@ -231,7 +231,9 @@ pub(super) fn apply_transition_engine(
         context.config.limits,
     )?;
     if retention.admission_refused {
-        return Err(TransitionFailure::ResourceStalled);
+        let plan = resource_stalled(engine, before, context)?;
+        super::verify_plan(engine, &plan)?;
+        return Ok(plan);
     }
     header_best = graph.select_header_best()?.0;
     let selected = path(&graph, header_best)?;
@@ -1140,6 +1142,36 @@ fn no_change(
         },
         projected: graph,
         cause: TransitionCause::Event,
+        trust_pins: invariant_pins(context),
+        limits: context.config.limits,
+    })
+}
+
+fn resource_stalled(
+    engine: &HeaderChainEngine,
+    before: EngineSnapshot,
+    context: &TransitionContext<'_>,
+) -> Result<TransitionPlan, TransitionFailure> {
+    let mut metadata = engine.metadata().clone();
+    if !metadata.alarms.resource_stalled {
+        metadata.alarms.resource_stalled = true;
+        metadata.state_version = metadata.state_version.checked_next()?;
+    }
+    Ok(TransitionPlan {
+        before,
+        change_set: ChangeSet {
+            put_nodes: Vec::new(),
+            delete_nodes: Vec::new(),
+            index_changes: IndexChanges::default(),
+            selected_projection: ProjectionDelta::default(),
+            verified_projection: ProjectionDelta::default(),
+            eligibility_changes: Vec::new(),
+            aux_changes: Vec::new(),
+            finality_append: None,
+            metadata,
+        },
+        projected: engine.graph().clone(),
+        cause: TransitionCause::ResourceStalled,
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
     })

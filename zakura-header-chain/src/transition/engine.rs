@@ -190,6 +190,11 @@ impl EngineTransition {
         self.plan.is_no_change()
     }
 
+    /// Return the classified transition cause.
+    pub const fn cause(&self) -> crate::TransitionCause {
+        self.plan.cause()
+    }
+
     /// Consume the verified transition and return its complete projected engine state.
     pub fn into_projected_engine(self) -> HeaderChainEngine {
         self.projected
