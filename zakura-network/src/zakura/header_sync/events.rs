@@ -485,8 +485,10 @@ pub enum HeaderPortOperation {
         owner: zakura_header_chain::WorkOwner,
         /// Exact initial locator intersection.
         common_ancestor: zakura_header_chain::Frontier,
-        /// Exact advertised target.
+        /// Exact admitted target, which can be a bounded prefix of the advertised target.
         target: zakura_header_chain::Frontier,
+        /// Proof that this batch completes either the advertised target or a bounded prefix.
+        completion: zakura_header_chain::TargetCompletion,
         /// All response entries in parent-first order.
         entries: Vec<HeaderEntry>,
     },

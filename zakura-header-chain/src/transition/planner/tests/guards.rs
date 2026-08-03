@@ -43,6 +43,28 @@ fn peer_target_completion_must_match_the_validation_lease_ancestor() {
 }
 
 #[test]
+fn bounded_target_prefix_has_the_same_exact_owner_and_validation_guards() {
+    let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+    let clock = ManualClock(Utc::now());
+    let mut request = insertion(&store, 2, EvidenceId::from_digest([0x66; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+        panic!("the fixture constructs a header insertion");
+    };
+    insert.completion = TargetCompletion::TargetPrefix {
+        common_ancestor: store.lease.parent,
+    };
+    let expected_target = insert.target_tip_hash;
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, None))
+        .expect("a validated bounded prefix is admitted under its exact target owner");
+
+    assert_eq!(
+        plan.change_set.metadata.frontiers.header_best.hash,
+        expected_target
+    );
+}
+
+#[test]
 fn header_acceptance_cannot_construct_body_or_state_validity() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

@@ -79,6 +79,79 @@ fn empty_complete_response_requires_the_exact_height_qualified_ancestor() {
     ));
 }
 
+#[test]
+fn requester_admits_a_bounded_prefix_before_the_next_page_would_overflow_staging() {
+    let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+    let active = reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the fixture has active work");
+    let entry = active.entries[0].clone();
+    active.phase = HeaderTargetPhase::Receiving;
+    active.common_ancestor = Some(snapshot.frontiers.finalized);
+    active.entries = vec![entry; 3_096];
+    active.max_header_count = 1_000;
+    let staged_tip = active
+        .staged_tip()
+        .expect("the bounded staged fixture has an inferred tip");
+    let mut next_header = *regtest_genesis_block().header;
+    next_header.previous_block_hash = staged_tip.hash;
+    let next_entry = HeaderEntry {
+        header: Arc::new(next_header),
+        body_size: 0,
+        tree_aux: None,
+    };
+
+    reactor.handle_headers(
+        peer.clone(),
+        owner.session_id,
+        owner.scope(),
+        Headers {
+            request_id: owner.request_id.get(),
+            target_tip_hash: owner.branch.target_tip_hash,
+            common_ancestor_height: staged_tip.height,
+            common_ancestor_hash: staged_tip.hash,
+            complete: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![next_entry; 1_000],
+        },
+    );
+
+    let HeaderPortOperation::PrepareHeaderTarget {
+        owner: prefix_owner,
+        common_ancestor,
+        target,
+        completion,
+        entries,
+        ..
+    } = actions
+        .try_recv()
+        .expect("the full staging window prepares a bounded prefix")
+    else {
+        panic!("the full staging window must prepare a header target");
+    };
+    assert_eq!(common_ancestor, snapshot.frontiers.finalized);
+    assert_eq!(entries.len(), 4_096);
+    assert_eq!(target.height, block::Height(4_096));
+    assert_eq!(prefix_owner.branch.target_tip_hash, target.hash);
+    assert_ne!(target.hash, owner.branch.target_tip_hash);
+    assert_eq!(
+        completion,
+        zakura_header_chain::TargetCompletion::TargetPrefix { common_ancestor }
+    );
+    assert!(matches!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .map(|active| active.phase),
+        Some(HeaderTargetPhase::Preparing)
+    ));
+    assert!(
+        actions.try_recv().is_err(),
+        "prefix preparation replaces the overflowing continuation request"
+    );
+}
+
 #[tokio::test]
 async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
     let shutdown = CancellationToken::new();

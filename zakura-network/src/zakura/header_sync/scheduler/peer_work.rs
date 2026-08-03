@@ -437,15 +437,20 @@ impl PeerWorkQueue {
         &self,
         additional_headers: usize,
     ) -> bool {
-        self.work_by_peer
+        additional_headers <= self.staging_capacity_remaining()
+    }
+
+    /// Return the exact aggregate capacity not yet occupied by staged response headers.
+    pub(in crate::zakura::header_sync) fn staging_capacity_remaining(&self) -> usize {
+        let staged = self
+            .work_by_peer
             .values()
             .filter_map(|work| match work {
                 PeerWorkState::Active(request) => Some(request.entries.len()),
                 PeerWorkState::AwaitingLocator { .. } => None,
             })
-            .fold(0usize, usize::saturating_add)
-            .saturating_add(additional_headers)
-            <= MAX_STAGED_HEADERS_V1
+            .fold(0usize, usize::saturating_add);
+        MAX_STAGED_HEADERS_V1.saturating_sub(staged)
     }
 }
 

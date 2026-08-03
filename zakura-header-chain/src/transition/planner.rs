@@ -460,6 +460,7 @@ fn apply_event(
             }
             let common_ancestor = match event.completion {
                 TargetCompletion::TargetComplete { common_ancestor }
+                | TargetCompletion::TargetPrefix { common_ancestor }
                 | TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor, ..
                 } => common_ancestor,
@@ -558,7 +559,7 @@ fn apply_event(
                         ));
                     }
                 }
-                TargetCompletion::TargetComplete { .. } => {
+                TargetCompletion::TargetComplete { .. } | TargetCompletion::TargetPrefix { .. } => {
                     if event.owner.branch.target_tip_hash != event.target_tip_hash {
                         return Err(TransitionFailure::InvalidEvidence(
                             "target completion does not end at the pursued hash",

@@ -350,6 +350,14 @@ pub enum TargetCompletion {
         /// Exact locator intersection.
         common_ancestor: Frontier,
     },
+    /// A bounded prefix of a larger peer-advertised target was completed.
+    ///
+    /// Prefix admission bounds requester memory while preserving exact validation and
+    /// ownership for the last header actually supplied in this batch.
+    TargetPrefix {
+        /// Exact locator intersection.
+        common_ancestor: Frontier,
+    },
     /// One already-selected interior header was redelivered solely to replace auxiliary metadata.
     SelectedAuxiliaryRepair {
         /// Exact selected predecessor used as the single-entry locator.
@@ -725,7 +733,9 @@ impl TransitionEvent {
                 TargetCompletion::SelectedAuxiliaryRepair { .. } => {
                     event.aux.first().map(|delivery| delivery.delivery_id)
                 }
-                TargetCompletion::TargetComplete { .. } => Some(event.batch.evidence()),
+                TargetCompletion::TargetComplete { .. } | TargetCompletion::TargetPrefix { .. } => {
+                    Some(event.batch.evidence())
+                }
             },
             Self::VerifiedChainChanged(event) => Some(event.full_state_transition_id),
             Self::VerifiedBlockAccepted(event) => Some(event.full_state_transition_id),

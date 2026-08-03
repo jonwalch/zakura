@@ -1082,13 +1082,41 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
+        let _ = active;
+        // A target can be arbitrarily far ahead, but response staging is deliberately bounded.
+        // Admit a validated prefix when the aggregate cap is full. Continuations below are
+        // reduced to the remaining capacity, so one peer cannot force tiny prefix commits by
+        // returning pages much smaller than requested.
+        let bounded_prefix = !complete && !self.peer_work_queue.has_staging_capacity(1);
+        let active = self
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the matching active request remains staged");
 
-        if complete {
-            if staged_tip.hash != active.target.status.selected_tip_hash {
+        if complete || bounded_prefix {
+            if complete && staged_tip.hash != active.target.status.selected_tip_hash {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
+            let common_ancestor = active
+                .common_ancestor
+                .expect("a response page fixed its exact ancestor");
+            let completion = match active.purpose {
+                HeaderTargetPurpose::Normal if bounded_prefix => {
+                    active.owner.branch.target_tip_hash = staged_tip.hash;
+                    zakura_header_chain::TargetCompletion::TargetPrefix { common_ancestor }
+                }
+                HeaderTargetPurpose::Normal => {
+                    zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor }
+                }
+                HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                    selected_target, ..
+                } => zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor,
+                    selected_target,
+                },
+            };
             let repair = matches!(
                 active.purpose,
                 HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
@@ -1101,10 +1129,9 @@ impl HeaderSyncReactor {
                 source: active.source,
                 network: self.startup.network.clone(),
                 owner: active.owner,
-                common_ancestor: active
-                    .common_ancestor
-                    .expect("a response page fixed its exact ancestor"),
+                common_ancestor,
                 target: staged_tip,
+                completion,
                 entries: active.entries.clone(),
             };
             let _ = active;
@@ -1129,11 +1156,18 @@ impl HeaderSyncReactor {
         }
 
         let locator = active.continuation_locator(staged_tip);
-        let max_header_count = active.max_header_count;
+        let negotiated_header_count = active.max_header_count;
         let tree_aux_schema = active.tree_aux_schema;
         let target_tip_hash = active.target.status.selected_tip_hash;
         let request_scope = active.owner.scope();
         let _ = active;
+        let max_header_count = negotiated_header_count.min(
+            u32::try_from(self.peer_work_queue.staging_capacity_remaining()).unwrap_or(u32::MAX),
+        );
+        debug_assert!(
+            max_header_count > 0,
+            "a full staging window prepared a prefix"
+        );
         let Some(session) = self
             .peer_state
             .get(&peer)
@@ -1144,7 +1178,7 @@ impl HeaderSyncReactor {
         };
         match session.try_send_get_headers(
             &self.codec,
-            active.owner.scope(),
+            request_scope,
             target_tip_hash,
             &locator,
             max_header_count,
@@ -3111,34 +3145,27 @@ impl HeaderSyncReactor {
                     owner,
                     common_ancestor,
                     target,
+                    completion,
                     entries,
                 } => Box::pin(async move {
-                    let completion = match purpose {
-                        HeaderTargetPurpose::Normal => {
-                            zakura_header_chain::TargetCompletion::TargetComplete {
-                                common_ancestor,
-                            }
-                        }
-                        HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                            selected_target, ..
-                        } if selected_target == target && entries.len() == 1 => {
+                    if matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
+                        && !matches!(
+                            completion,
                             zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
-                                common_ancestor,
                                 selected_target,
-                            }
-                        }
-                        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. } => {
-                            let result =
-                                HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
-                                    zakura_header_chain::HeaderChainError::stale_target(
-                                        zakura_header_chain::ErrorSubject::Branch(owner.branch),
-                                    ),
-                                ));
-                            return Box::new(move |reactor: &mut HeaderSyncReactor| {
-                                reactor.handle_header_target_prepared(peer, source, owner, result);
-                            }) as HeaderSyncPortCompletion;
-                        }
-                    };
+                                ..
+                            } if selected_target == target && entries.len() == 1
+                        )
+                    {
+                        let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
+                            zakura_header_chain::HeaderChainError::stale_target(
+                                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                            ),
+                        ));
+                        return Box::new(move |reactor: &mut HeaderSyncReactor| {
+                            reactor.handle_header_target_prepared(peer, source, owner, result);
+                        }) as HeaderSyncPortCompletion;
+                    }
                     let result = header_chain
                         .prepare_header_target(port::PrepareHeaderTarget {
                             source,
