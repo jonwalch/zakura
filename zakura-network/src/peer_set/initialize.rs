@@ -37,6 +37,7 @@ use tracing_futures::Instrument;
 use zakura_chain::{chain_tip::ChainTip, diagnostic::task::WaitForPanics};
 
 use crate::{
+    address_book_trace::AddressBookTrace,
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
     constants,
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -339,7 +340,12 @@ where
         let initial_peers_join = tokio::spawn(initial_peers_fut.in_current_span());
 
         // 3. Outgoing peers we connect to in response to load.
-        let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
+        let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone()).with_trace(
+            AddressBookTrace::new(
+                config.zakura.trace_dir.clone(),
+                config.expose_peer_addresses,
+            ),
+        );
 
         // Wait for the initial seed peer count
         let mut active_outbound_connections = initial_peers_join

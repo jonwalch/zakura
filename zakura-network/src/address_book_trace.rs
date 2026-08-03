@@ -45,9 +45,38 @@ impl AddressBookTrace {
         }
     }
 
+    /// Creates a trace writer that discards everything.
+    pub(crate) fn disabled() -> Self {
+        Self::new(None, false)
+    }
+
     /// Returns whether snapshots are being written.
     pub(crate) fn is_enabled(&self) -> bool {
         self.tracer.is_enabled()
+    }
+
+    /// Records the outcome of one `GetAddr` fanout.
+    ///
+    /// Peer discovery is the only way an address book gains addresses it did not
+    /// start with, and a crawl that reaches its peers but learns nothing looks the
+    /// same from outside as one whose addresses are all rejected on insert.
+    /// `received` counts the addresses peers sent, `sent` the addresses forwarded to
+    /// the address book, which decides separately whether to keep each one.
+    pub(crate) fn crawl(
+        &self,
+        fanout: usize,
+        response_ok: usize,
+        response_err: usize,
+        received: usize,
+        sent: usize,
+    ) {
+        self.emit("crawl", |row| {
+            insert_count(row, "fanout", fanout);
+            insert_count(row, "response_ok", response_ok);
+            insert_count(row, "response_err", response_err);
+            insert_count(row, "addrs_received", received);
+            insert_count(row, "addrs_sent", sent);
+        });
     }
 
     /// Writes one summary row for `report`, then one row per reported address.
