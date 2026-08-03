@@ -302,6 +302,86 @@ pub struct AddressBook {
     last_address_log: Option<Instant>,
 }
 
+/// Why each address in an [`AddressBook`] can or cannot be dialed.
+///
+/// See [`AddressBook::dial_candidate_report`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DialCandidateReport {
+    /// The number of addresses in the address book.
+    pub total: usize,
+
+    /// The number of addresses the crawler could dial right now.
+    pub ready: usize,
+
+    /// The number of addresses learned from an inbound connection.
+    pub inbound: usize,
+
+    /// The number of addresses whose port or advertised services rule out an
+    /// outbound connection on this network.
+    pub invalid_for_outbound: usize,
+
+    /// The number of addresses we have recently contacted, or that recently
+    /// contacted us, which are waiting out the reconnection delay.
+    pub recently_updated: usize,
+
+    /// The number of addresses that failed and have not been seen recently.
+    pub unreachable: usize,
+
+    /// The number of addresses whose IP has another address we contacted recently.
+    pub ip_busy: usize,
+
+    /// The number of addresses in the `Responded` state.
+    pub responded: usize,
+
+    /// The number of addresses in the `NeverAttemptedGossiped` state.
+    pub never_attempted_gossiped: usize,
+
+    /// The number of addresses in the `Failed` state.
+    pub failed: usize,
+
+    /// The number of addresses in the `AttemptPending` state.
+    pub attempt_pending: usize,
+
+    /// Individual addresses, in reconnection order, up to the requested limit.
+    pub entries: Vec<DialCandidateEntry>,
+}
+
+/// Why a single address book entry can or cannot be dialed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DialCandidateEntry {
+    /// The peer's address.
+    pub addr: PeerSocketAddr,
+
+    /// The outcome of our most recent communication attempt with this peer.
+    pub state: PeerAddrState,
+
+    /// Whether this address was learned from an inbound connection.
+    pub is_inbound: bool,
+
+    /// Whether this address is unusable for outbound connections on this network.
+    pub invalid_for_outbound: bool,
+
+    /// Whether this address is waiting out the reconnection delay.
+    pub recently_updated: bool,
+
+    /// Whether this address failed and has not been seen recently.
+    pub unreachable: bool,
+
+    /// Whether another address at this IP was contacted recently.
+    pub ip_busy: bool,
+}
+
+impl DialCandidateEntry {
+    /// Returns `true` if the crawler could dial this address right now.
+    pub fn is_ready(&self) -> bool {
+        !self.is_inbound
+            && !self.invalid_for_outbound
+            && !self.recently_updated
+            && !self.unreachable
+            && !self.ip_busy
+    }
+}
+
 /// Metrics about the states of the addresses in an [`AddressBook`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AddressMetrics {
@@ -891,6 +971,62 @@ impl AddressBook {
             return true;
         }
         !same_ip_peer.has_connection_recently_responded(chrono_now)
+    }
+
+    /// Returns why each address in the book can or cannot be dialed right now.
+    ///
+    /// The crawler asks for a candidate and gets one address or nothing, so an empty
+    /// candidate set is indistinguishable from a healthy one that happens to be busy.
+    /// This reports each check in [`MetaAddr::is_ready_for_connection_attempt`] and
+    /// [`AddressBook::is_ready_for_connection_attempt_with_ip`] separately, over the
+    /// whole book, so a node that has stopped dialing can be told apart from a node
+    /// that has nothing left to dial, and the reason can be named.
+    ///
+    /// The checks are evaluated independently rather than short-circuited, so an
+    /// address blocked several ways is counted under each of them. `entry_limit`
+    /// bounds how many individual addresses are reported, taken in reconnection
+    /// order, which are the ones the crawler would reach first.
+    pub fn dial_candidate_report(
+        &self,
+        instant_now: Instant,
+        chrono_now: chrono::DateTime<Utc>,
+        entry_limit: usize,
+    ) -> DialCandidateReport {
+        let _guard = self.span.enter();
+
+        let mut report = DialCandidateReport::default();
+
+        for peer in self.peers.ordered_values() {
+            let entry = DialCandidateEntry {
+                addr: peer.addr,
+                state: peer.last_connection_state,
+                is_inbound: peer.is_inbound(),
+                invalid_for_outbound: !peer.last_known_info_is_valid_for_outbound(&self.network),
+                recently_updated: peer.was_recently_updated(instant_now, chrono_now),
+                unreachable: !peer.is_probably_reachable(chrono_now),
+                ip_busy: !self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now),
+            };
+
+            report.total += 1;
+            match entry.state {
+                PeerAddrState::Responded => report.responded += 1,
+                PeerAddrState::NeverAttemptedGossiped => report.never_attempted_gossiped += 1,
+                PeerAddrState::Failed => report.failed += 1,
+                PeerAddrState::AttemptPending => report.attempt_pending += 1,
+            }
+            report.inbound += usize::from(entry.is_inbound);
+            report.invalid_for_outbound += usize::from(entry.invalid_for_outbound);
+            report.recently_updated += usize::from(entry.recently_updated);
+            report.unreachable += usize::from(entry.unreachable);
+            report.ip_busy += usize::from(entry.ip_busy);
+            report.ready += usize::from(entry.is_ready());
+
+            if report.entries.len() < entry_limit {
+                report.entries.push(entry);
+            }
+        }
+
+        report
     }
 
     /// Return an iterator over peers that are due for a reconnection attempt,

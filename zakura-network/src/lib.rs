@@ -157,6 +157,7 @@ pub mod config;
 pub mod constants;
 
 mod address_book;
+mod address_book_trace;
 mod address_book_updater;
 mod isolated;
 mod meta_addr;
