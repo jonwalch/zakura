@@ -79,6 +79,13 @@ pub struct AuditHistoricalTreestatesCmd {
     #[clap(long, help = "path to a frontier artifact to anchor derivations on")]
     frontier_artifact: Option<PathBuf>,
 
+    /// Print the derived roots at each sampled height, for comparison against another node.
+    ///
+    /// Output is one `ROOT <height> <sapling> <orchard> <ironwood>` line per height, hex-encoded
+    /// in the same display order `z_gettreestate` uses.
+    #[clap(long, help = "print derived roots for cross-node comparison")]
+    print_roots: bool,
+
     /// Check replay-derived subtree roots against the ones stored above the handoff.
     ///
     /// Subtree roots are interior nodes, so the per-height root check does not test them. Above
@@ -228,6 +235,28 @@ impl AuditHistoricalTreestatesCmd {
             .map(Height)
             .collect();
         let total = heights.len();
+
+        if self.print_roots {
+            let cache = Mutex::new(match &artifact {
+                Some(artifact) => HistoricalTreeCache::with_artifact(artifact.clone()),
+                None => HistoricalTreeCache::default(),
+            });
+            let roots = zakura_state::derived_roots_in_display_order(
+                db,
+                &cache,
+                heights,
+                DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+            )
+            .map_err(|(height, error)| {
+                eyre!("derivation failed at height {}: {error}", height.0)
+            })?;
+
+            for (height, sapling, orchard, ironwood) in roots {
+                println!("ROOT {} {sapling} {orchard} {ironwood}", height.0);
+            }
+
+            return Ok(());
+        }
 
         let mut samples: Vec<DerivationSample> = Vec::with_capacity(total);
         let mut report = |sample: &DerivationSample| {

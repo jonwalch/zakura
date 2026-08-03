@@ -82,6 +82,10 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
+    derived_roots_in_display_order, inventory as vct_treestate_inventory, measure_derivations,
+    verify_subtrees_against_stored, DerivationSample, SubtreeVerification, VctTreestateInventory,
+};
+pub use service::finalized_state::{
     export_treestate_artifacts, FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord,
     TreestateArtifactError, TreestateExport, TreestateExportError,
 };
@@ -91,10 +95,6 @@ pub use service::finalized_state::{
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
     FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
     HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
-};
-pub use service::finalized_state::{
-    inventory as vct_treestate_inventory, measure_derivations, verify_subtrees_against_stored,
-    DerivationSample, SubtreeVerification, VctTreestateInventory,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,

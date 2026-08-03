@@ -267,3 +267,39 @@ pub fn verify_subtrees_against_stored(
 
     Ok(outcome)
 }
+
+/// Returns the per-pool note commitment roots derived at each of `heights`, hex-encoded in the
+/// display order `z_gettreestate` uses.
+///
+/// Exists so a derived treestate can be compared against another node's `z_gettreestate` output.
+/// That is the strongest check available for this design: the other node built its trees the
+/// legacy way, block by block, so agreement is independent evidence that replay reconstructs the
+/// same history rather than merely being self-consistent.
+pub fn derived_roots_in_display_order(
+    db: &ZakuraDb,
+    cache: &std::sync::Mutex<HistoricalTreeCache>,
+    heights: impl IntoIterator<Item = Height>,
+    max_replay_blocks: u64,
+) -> Result<Vec<(Height, String, String, String)>, (Height, HistoricalTreeDerivationError)> {
+    let mut roots = Vec::new();
+
+    for height in heights {
+        let derivation = derive_historical_frontiers_measured(db, cache, height, max_replay_blocks)
+            .map_err(|error| (height, error))?;
+
+        roots.push((
+            height,
+            hex::encode(derivation.frontiers.sapling.root().bytes_in_display_order()),
+            hex::encode(derivation.frontiers.orchard.root().bytes_in_display_order()),
+            hex::encode(
+                derivation
+                    .frontiers
+                    .ironwood
+                    .root()
+                    .bytes_in_display_order(),
+            ),
+        ));
+    }
+
+    Ok(roots)
+}
