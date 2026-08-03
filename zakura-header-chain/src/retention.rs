@@ -27,7 +27,7 @@ pub(crate) fn enforce_retention(
     protect_path(store, header_best.hash, &mut protected)?;
     protect_path(store, verified_best.hash, &mut protected)?;
     for reference in validation_context_references {
-        if store.node(reference).is_some() {
+        if !protected.contains(&reference) && store.node(reference).is_some() {
             protect_path(store, reference, &mut protected)?;
         }
     }
@@ -80,13 +80,18 @@ fn protect_path(
     store: &MemHeaderStore,
     tip: block::Hash,
     protected: &mut HashSet<block::Hash>,
-) -> Result<(), GraphError> {
+) -> Result<usize, GraphError> {
     let mut hash = tip;
+    let mut visited = 0usize;
     loop {
+        visited = visited.saturating_add(1);
+        if protected.contains(&hash) {
+            return Ok(visited);
+        }
         let node = store.node(hash).ok_or(GraphError::UnknownNode(hash))?;
         protected.insert(hash);
         if hash == store.finalized().hash {
-            return Ok(());
+            return Ok(visited);
         }
         hash = node.parent_hash;
     }
@@ -399,6 +404,36 @@ mod tests {
         assert!(plan.admission_refused);
         assert!(plan.resource_stalled);
         assert!(store.node(selected.hash).is_some());
+    }
+
+    #[test]
+    fn overlapping_protected_paths_stop_at_their_first_protected_ancestor() {
+        let mut store = store();
+        let anchor = store.finalized();
+        let first = insert(&mut store, anchor.hash, 1, []);
+        let selected = insert(&mut store, first.hash, 2, []);
+        let branch = insert(&mut store, first.hash, 3, []);
+        let mut protected = HashSet::new();
+
+        assert_eq!(
+            protect_path(&store, selected.hash, &mut protected)
+                .expect("the selected path is coherent"),
+            3
+        );
+        assert_eq!(
+            protect_path(&store, branch.hash, &mut protected)
+                .expect("the branch joins the selected path"),
+            2
+        );
+        assert_eq!(
+            protect_path(&store, first.hash, &mut protected)
+                .expect("the context reference is already protected"),
+            1
+        );
+        assert!(protected.contains(&anchor.hash));
+        assert!(protected.contains(&first.hash));
+        assert!(protected.contains(&selected.hash));
+        assert!(protected.contains(&branch.hash));
     }
 
     #[test]
