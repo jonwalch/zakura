@@ -467,3 +467,76 @@ fn peers_we_have_never_connected_to_are_not_cached() {
         .collect();
     assert_eq!(cacheable_addrs, vec![connected_addr]);
 }
+
+/// The dial candidate report names why each address cannot be dialed.
+///
+/// The crawler asks for one candidate and gets an address or nothing, so an empty
+/// candidate set cannot be told apart from a healthy one. Each check is reported
+/// separately, and an address blocked several ways is counted under each of them.
+#[test]
+fn dial_candidate_report_attributes_each_check() {
+    let inbound_addr = "127.0.0.1:54321".parse().unwrap();
+    let dialable_addr = "127.0.0.2:8233".parse().unwrap();
+    let no_services_addr = "127.0.0.3:8233".parse().unwrap();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let inbound_peer = MetaAddr::new_connected(inbound_addr, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(instant_now, local_now);
+    let gossiped = |addr| {
+        MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, local_now)
+            .new_gossiped_change()
+            .expect("recently gossiped peer creates an address book change")
+            .into_new_meta_addr(instant_now, local_now)
+    };
+
+    let mut address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        vec![inbound_peer, gossiped(dialable_addr)],
+    );
+    // A peer that stops serving blocks is kept in the address book so we know not to
+    // reconnect to it, but it is no longer a valid outbound candidate. The book only
+    // keeps such an entry once we have connected to it ourselves.
+    address_book.update(gossiped_change(
+        no_services_addr,
+        PeerServices::NODE_NETWORK,
+        local_now,
+    ));
+    address_book.update(MetaAddr::new_reconnect(no_services_addr));
+    address_book.update(MetaAddr::new_connected(
+        no_services_addr,
+        &PeerServices::empty(),
+        false,
+    ));
+
+    let report = address_book.dial_candidate_report(instant_now, chrono_now, usize::MAX);
+
+    assert_eq!(report.total, 3);
+    assert_eq!(report.ready, 1, "only the gossiped listener is dialable");
+    assert_eq!(report.inbound, 1);
+    assert_eq!(
+        report.invalid_for_outbound, 1,
+        "a peer that does not serve blocks is not an outbound candidate"
+    );
+    assert_eq!(report.responded, 2);
+    assert_eq!(report.never_attempted_gossiped, 1);
+
+    let ready: Vec<_> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.is_ready())
+        .map(|entry| entry.addr)
+        .collect();
+    assert_eq!(ready, vec![dialable_addr]);
+
+    // Reporting every address is optional, but the summary always covers the whole book.
+    let capped = address_book.dial_candidate_report(instant_now, chrono_now, 1);
+    assert_eq!(capped.total, 3);
+    assert_eq!(capped.entries.len(), 1);
+}
