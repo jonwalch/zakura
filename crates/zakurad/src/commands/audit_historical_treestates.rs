@@ -7,11 +7,15 @@
 //!
 //! Read-only: it opens the database as a secondary instance and never writes.
 
-use std::{path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Result, WrapErr};
 
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_state::{
@@ -67,6 +71,13 @@ pub struct AuditHistoricalTreestatesCmd {
     /// nearby frontier is memoized.
     #[clap(long, help = "clear the memo before each derivation")]
     cold: bool,
+
+    /// Anchor derivations on a published frontier artifact.
+    ///
+    /// Without this, a cold derivation replays from genesis. With it, the walk measures what a
+    /// node configured with the artifact actually pays, which is the number the grid is sized by.
+    #[clap(long, help = "path to a frontier artifact to anchor derivations on")]
+    frontier_artifact: Option<PathBuf>,
 
     /// Check replay-derived subtree roots against the ones stored above the handoff.
     ///
@@ -182,12 +193,36 @@ impl AuditHistoricalTreestatesCmd {
             if self.cold { "cold" } else { "sequential" }
         );
 
-        self.walk_band(&db, from, to)
+        // Loading here, rather than inside the walk, keeps a bad path a startup error instead of
+        // something discovered part-way through a multi-hour run.
+        let artifact = match &self.frontier_artifact {
+            Some(path) => {
+                let bytes =
+                    std::fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
+                let artifact = zakura_state::FrontierArtifact::decode(&bytes, &self.network)
+                    .map_err(|error| eyre!("{error}"))?;
+                println!(
+                    "anchoring on {} entries at spacing {}",
+                    artifact.entries.len(),
+                    artifact.spacing
+                );
+                Some(Arc::new(artifact))
+            }
+            None => None,
+        };
+
+        self.walk_band(&db, from, to, artifact)
     }
 
     /// Derives every sampled height in `[from, to]`, printing progress and a summary.
     #[allow(clippy::print_stdout)]
-    fn walk_band(&self, db: &zakura_state::ZakuraDb, from: Height, to: Height) -> Result<()> {
+    fn walk_band(
+        &self,
+        db: &zakura_state::ZakuraDb,
+        from: Height,
+        to: Height,
+        artifact: Option<Arc<zakura_state::FrontierArtifact>>,
+    ) -> Result<()> {
         let heights: Vec<Height> = (from.0..=to.0)
             .step_by(self.step as usize)
             .map(Height)
@@ -209,12 +244,17 @@ impl AuditHistoricalTreestatesCmd {
             samples.push(*sample);
         };
 
+        let new_cache = || match &artifact {
+            Some(artifact) => HistoricalTreeCache::with_artifact(artifact.clone()),
+            None => HistoricalTreeCache::default(),
+        };
+
         let result = if self.cold {
             // A fresh memo per height forces every derivation to replay from the bottom of the
             // band, which is the cost a client pays with no nearby frontier.
             let mut collected = Ok(Vec::new());
             for height in heights {
-                let cache = Mutex::new(HistoricalTreeCache::default());
+                let cache = Mutex::new(new_cache());
                 match zakura_state::measure_derivations(
                     db,
                     &cache,
@@ -231,7 +271,7 @@ impl AuditHistoricalTreestatesCmd {
             }
             collected.map(|_: Vec<DerivationSample>| ())
         } else {
-            let cache = Mutex::new(HistoricalTreeCache::default());
+            let cache = Mutex::new(new_cache());
             zakura_state::measure_derivations(
                 db,
                 &cache,
