@@ -12,10 +12,11 @@ use zakura_network::zakura::{
 ///
 /// Two sync engines submitting bulk commits concurrently race in the applying
 /// queue. A fresh state therefore stays legacy-owned until checkpoint semantic
-/// handoff, and fallback is a later commit barrier: once yielded back to legacy
+/// handoff, and fallback is a later commit barrier: while yielded back to legacy
 /// sync, the block-sync driver starts no new applies and the watchdog waits for
-/// in-flight applies to finish. The Zakura reactors stay alive throughout; only
-/// bulk body applies are gated.
+/// in-flight applies to finish. After one bounded legacy recovery round, ownership
+/// returns to Zakura. The Zakura reactors stay alive throughout; only bulk body
+/// applies are gated.
 #[derive(Debug)]
 pub(crate) struct BlockSyncHandoff {
     owner: std::sync::atomic::AtomicU8,
@@ -128,6 +129,22 @@ impl BlockSyncHandoff {
     pub(crate) async fn yield_to_legacy(&self, timeout: Duration) {
         self.stop_new_applies();
         self.wait_for_applies(timeout).await;
+    }
+
+    /// Returns block-apply ownership to Zakura after a completed legacy fallback round.
+    pub(crate) fn resume_zakura_after_fallback(&self) {
+        if self
+            .owner
+            .compare_exchange(
+                LEGACY_FALLBACK_OWNER,
+                ZAKURA_OWNER,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.owner_changed.notify_waiters();
+        }
     }
 
     fn stop_new_applies(&self) {

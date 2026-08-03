@@ -42,6 +42,30 @@ fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
     );
 }
 
+#[test]
+fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
+    let bootstrap_handoff =
+        crate::commands::start::zakura::BlockSyncHandoff::new_legacy_bootstrap();
+    bootstrap_handoff.resume_zakura_after_fallback();
+    assert!(
+        bootstrap_handoff.begin_apply().is_none(),
+        "fallback recovery must not bypass initial checkpoint bootstrap ownership"
+    );
+
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
+    assert!(handoff.is_yielded_to_legacy());
+    assert!(handoff.clone().begin_apply().is_none());
+
+    handoff.resume_zakura_after_fallback();
+    assert!(!handoff.is_yielded_to_legacy());
+    assert!(
+        handoff.begin_apply().is_some(),
+        "a drained legacy recovery round must return apply ownership to Zakura"
+    );
+}
+
 fn height_hash(height: u32) -> block::Hash {
     let mut bytes = [0; 32];
     bytes[..4].copy_from_slice(&height.to_le_bytes());

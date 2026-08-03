@@ -557,8 +557,6 @@ async fn engage_legacy_fallback_alongside_zakura(
     block_sync_handoff: &crate::commands::start::zakura::BlockSyncHandoff,
 ) {
     metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
-    // Sticky by design: once legacy fallback owns body sync, the node stays in
-    // bridge mode until restart.
     metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
 
     // Commit barrier: two engines driving bulk commits concurrently race in
@@ -1065,9 +1063,9 @@ where
     /// Zakura body-sync peers, and parking forever there leaves it stuck at genesis.
     ///
     /// `legacy_fallback` (set when the node runs both stacks, `v2_p2p && legacy_p2p`)
-    /// controls the recovery path. When `true`, a Zakura stall resumes the legacy
-    /// [`ChainSync::sync`] loop as the body-sync driver while Zakura keeps serving
-    /// peers and following local commits through the chain-tip mirror. When `false`
+    /// controls the recovery path. When `true`, a Zakura stall runs one legacy
+    /// body-sync recovery round while Zakura keeps serving peers and following local
+    /// commits through the chain-tip mirror, then returns apply ownership to Zakura. When `false`
     /// (a Zakura-only node, where falling back to absent legacy peers is pointless),
     /// the watchdog never switches: it parks and warns (once per stall window) so a
     /// stalled, eclipsed, or peerless node is visible in the logs.
@@ -1182,8 +1180,10 @@ where
                          legacy ChainSync as the body-sync driver while Zakura keeps serving \
                          peers and following local commits"
                     );
-                    engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
-                    return self.sync().await;
+                    self.run_legacy_fallback_round(&block_sync_handoff).await;
+                    let resumed_tip = self.latest_chain_tip.best_tip_height();
+                    tracker = ZakuraStallTracker::new(resumed_tip);
+                    legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
                     let blocks_ahead = self.legacy_peers_blocks_ahead().await;
@@ -1201,12 +1201,32 @@ where
                              higher tip; resuming legacy ChainSync as the body-sync driver \
                              while Zakura keeps serving peers and following local commits"
                         );
-                        engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
-                        return self.sync().await;
+                        self.run_legacy_fallback_round(&block_sync_handoff).await;
+                        let resumed_tip = self.latest_chain_tip.best_tip_height();
+                        tracker = ZakuraStallTracker::new(resumed_tip);
+                        legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
                     }
                 }
             }
         }
+    }
+
+    /// Runs one fully drained legacy recovery round, then returns apply ownership to Zakura.
+    async fn run_legacy_fallback_round(
+        &mut self,
+        block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
+    ) {
+        engage_legacy_fallback_alongside_zakura(block_sync_handoff).await;
+        if self.try_to_sync(None).await.is_err() {
+            self.downloads.cancel_all();
+        }
+        self.update_metrics();
+        block_sync_handoff.resume_zakura_after_fallback();
+        metrics::gauge!("sync.zakura.legacy_fallback.active").set(0.0);
+        info!(
+            verified_tip = ?self.latest_chain_tip.best_tip_height(),
+            "legacy fallback recovery round finished; returned body-sync ownership to Zakura"
+        );
     }
 
     /// Probes the legacy peer set for how far ahead the network is on **our**
