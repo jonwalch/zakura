@@ -538,17 +538,13 @@ impl MemHeaderStore {
         if node.height != finalized.height {
             return Err(GraphError::UnknownNode(finalized.hash));
         }
-        let retained: HashSet<_> = self
-            .nodes
-            .keys()
-            .copied()
-            .filter(|hash| {
-                self.ancestor(*hash, finalized.height)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|ancestor| ancestor == finalized)
-            })
-            .collect();
+        let mut retained = HashSet::new();
+        let mut pending = vec![finalized.hash];
+        while let Some(hash) = pending.pop() {
+            if retained.insert(hash) {
+                pending.extend(self.children(hash));
+            }
+        }
         let mut deleted: Vec<_> = self
             .nodes
             .keys()
@@ -757,6 +753,38 @@ mod tests {
             Err(GraphError::NodeHasChildren(parent.hash))
         );
         assert!(store.node(parent.hash).is_some());
+    }
+
+    #[test]
+    fn advancing_finality_retains_exactly_the_new_finalized_subtree() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let selected_parent = insert_child(&mut store, anchor.hash, 1);
+        let selected_child = insert_child(&mut store, selected_parent.hash, 2);
+        let selected_tip = insert_child(&mut store, selected_child.hash, 3);
+        let rejected_sibling = insert_child(&mut store, selected_parent.hash, 4);
+        let rejected_descendant = insert_child(&mut store, rejected_sibling.hash, 5);
+
+        let deleted = store
+            .advance_finalized(selected_child)
+            .expect("the retained selected node can become finalized");
+
+        assert_eq!(store.finalized(), selected_child);
+        assert!(store.node(selected_child.hash).is_some());
+        assert!(store.node(selected_tip.hash).is_some());
+        assert!(store.node(anchor.hash).is_none());
+        assert!(store.node(selected_parent.hash).is_none());
+        assert!(store.node(rejected_sibling.hash).is_none());
+        assert!(store.node(rejected_descendant.hash).is_none());
+        assert_eq!(
+            deleted.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                anchor.hash,
+                selected_parent.hash,
+                rejected_sibling.hash,
+                rejected_descendant.hash,
+            ])
+        );
     }
 
     fn uncached_eligible_tips(store: &MemHeaderStore) -> Vec<Frontier> {
