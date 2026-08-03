@@ -408,6 +408,116 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
 }
 
 #[test]
+fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the header schema initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the coherent store starts");
+    let initial = runtime.publisher().snapshot();
+    let anchor_frontier = initial.frontiers.finalized;
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the initialized anchor is retained");
+    let rules = HeaderRules::for_validation_lease(engine_config.network.clone(), &lease)
+        .expect("the authenticated regtest policy is valid");
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time += chrono::Duration::seconds(1);
+    let child_header = Arc::new(child_header);
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&child_header)),
+        &lease,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the exact next child prepares through production validation");
+    let child = Frontier::new(
+        anchor_frontier
+            .height
+            .next()
+            .expect("the genesis anchor has a next height"),
+        child_header.hash(),
+    );
+    let evidence = EvidenceId::from_digest([0x68; 32]);
+    let authority = Authority(evidence);
+    let context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    assert_eq!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: initial.state_version,
+                    event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                        TransientBodyFailure {
+                            hash: anchor.hash,
+                            evidence,
+                            kind: TransientBodyFailureKind::Storage,
+                            availability: BodyUnavailableSummary {
+                                attempts: 1,
+                                suppliers: 1,
+                                ..Default::default()
+                            },
+                        },
+                    )),
+                },
+                &context,
+            )
+            .expect("the unrelated body transition commits"),
+        ApplyResult::Committed
+    );
+    let after_body = runtime.publisher().snapshot();
+    assert_ne!(after_body.state_version, initial.state_version);
+    assert_eq!(after_body.header_generation, initial.header_generation);
+
+    let result = runtime
+        .apply(
+            TransitionRequest {
+                expected_version: initial.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: WorkOwner {
+                        state_version: initial.state_version,
+                        header_generation: initial.header_generation,
+                        verified_generation: None,
+                        branch: BranchId::new(anchor_frontier.hash, child.hash),
+                        session_id: 1,
+                        request_id: NonZeroU64::new(1).expect("one is nonzero"),
+                    },
+                    source: SourceId::from_digest([0x69; 32]),
+                    parent_hash: anchor_frontier.hash,
+                    target_tip_hash: child.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: anchor_frontier,
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            },
+            &context,
+        )
+        .expect("generation-current header work reaches the transition planner");
+
+    assert_eq!(result, ApplyResult::Committed);
+    assert_eq!(runtime.publisher().snapshot().frontiers.header_best, child);
+}
+
+#[test]
 fn stale_prepared_full_state_transition_is_a_hard_error() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

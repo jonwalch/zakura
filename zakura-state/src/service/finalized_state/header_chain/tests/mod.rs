@@ -35,7 +35,7 @@ use zakura_header_chain::{
     OperatorReconsider, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
     TransientBodyFailure, TransientBodyFailureKind, TransitionEvent, TrustedAnchor,
     VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration,
-    WorkCoordinate,
+    WorkCoordinate, WorkOwner,
 };
 
 struct Authority(EvidenceId);

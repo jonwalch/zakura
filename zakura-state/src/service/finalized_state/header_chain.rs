@@ -1120,7 +1120,7 @@ impl HeaderChainRuntime {
 
     fn apply_combined_inner<M>(
         &self,
-        request: TransitionRequest,
+        mut request: TransitionRequest,
         context: &TransitionContext<'_>,
         full_state_batch: DiskWriteBatch,
         memory_swap: M,
@@ -1162,11 +1162,22 @@ impl HeaderChainRuntime {
         let branch = request.event.work_owner().map(|owner| owner.branch);
         let is_idempotent_replay =
             event.is_some_and(|event| transition_engine.metadata().last_transition_id == event);
-        if !is_idempotent_replay && request.expected_version != before.state_version {
+        // Header insertions carry exact generation and branch ownership, which the transition
+        // planner validates below. Unrelated body commits can advance only the global version
+        // while a header batch is being prepared, so applying the ordinary version CAS here
+        // would incorrectly reject still-current header work.
+        let has_generation_authority = matches!(&request.event, TransitionEvent::InsertHeaders(_));
+        if !is_idempotent_replay
+            && !has_generation_authority
+            && request.expected_version != before.state_version
+        {
             return Ok(ApplyResult::Stale(StaleReceipt {
                 current_version: before.state_version,
                 branch,
             }));
+        }
+        if has_generation_authority {
+            request.expected_version = before.state_version;
         }
         let durable = if is_idempotent_replay {
             DurableTransitionFacts::None
