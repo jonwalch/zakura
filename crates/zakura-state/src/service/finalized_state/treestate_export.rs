@@ -40,6 +40,42 @@ use crate::service::{
     },
 };
 
+/// Estimated replay cost of reading and applying one block, in microseconds.
+///
+/// Fitted to the phase A2 walk over Mainnet: pre-Sapling blocks carry no commitments, so their
+/// cost is almost entirely reading and deserialising the block body, which this represents.
+const COST_PER_BLOCK_US: u64 = 120;
+
+/// Estimated replay cost of appending one note commitment, in microseconds.
+///
+/// Fitted the same way, from the difference between quiet and dense regions. Appending dominates
+/// wherever there is shielded activity.
+const COST_PER_COMMITMENT_US: u64 = 49;
+
+/// How the grid's height spacing is chosen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GridSpacing {
+    /// One entry every `blocks` heights.
+    Uniform {
+        /// The height spacing.
+        blocks: u32,
+    },
+
+    /// One entry per `budget_us` of estimated replay cost.
+    ///
+    /// Replay cost varies by more than an order of magnitude across Mainnet, so a uniform grid
+    /// either wastes entries where blocks are cheap or leaves a long tail where they are not.
+    /// Spacing by estimated cost instead bounds the worst cold request rather than the average.
+    ///
+    /// The estimate is a deterministic function of the chain — block and commitment counts, not
+    /// wall-clock timing — so two generator runs on different hardware still produce byte-identical
+    /// artifacts, which the determinism gate requires.
+    Adaptive {
+        /// The per-entry cost budget, in microseconds.
+        budget_us: u64,
+    },
+}
+
 /// Why artifact generation could not complete.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TreestateExportError {
@@ -47,8 +83,8 @@ pub enum TreestateExportError {
     #[error("this database stores per-height trees at every height, so no artifact is needed")]
     NoAbsentBand,
 
-    /// The grid spacing was zero, which would produce an entry at every height forever.
-    #[error("grid spacing must be at least 1")]
+    /// The grid spacing or cost budget was zero, which would produce an entry at every height.
+    #[error("grid spacing and cost budget must be at least 1")]
     ZeroSpacing,
 
     /// A replay or its root check failed.
@@ -88,11 +124,14 @@ pub struct TreestateExport {
 /// `on_progress` is called with each emitted entry's height, for long runs.
 pub fn export(
     db: &ZakuraDb,
-    spacing: u32,
+    spacing: GridSpacing,
     mut on_progress: impl FnMut(Height, u64),
 ) -> Result<TreestateExport, TreestateExportError> {
-    if spacing == 0 {
-        return Err(TreestateExportError::ZeroSpacing);
+    match spacing {
+        GridSpacing::Uniform { blocks: 0 } | GridSpacing::Adaptive { budget_us: 0 } => {
+            return Err(TreestateExportError::ZeroSpacing)
+        }
+        _ => {}
     }
 
     let handoff = db
@@ -119,9 +158,41 @@ pub fn export(
     let mut frontiers = DerivedFrontiers::empty();
     let mut next_replay_from = 0u32;
 
-    let mut height = upgrade;
+    let mut next = upgrade;
+    let mut accrued_cost: u64 = 0;
+
     loop {
-        let target = height.min(last);
+        // Under a uniform grid the next entry is a fixed number of blocks ahead. Under an adaptive
+        // one it is wherever the estimated cost budget runs out, which needs a block-by-block scan
+        // of the commitment counts to find.
+        let target = match spacing {
+            GridSpacing::Uniform { blocks } => Height(next.0.saturating_add(blocks).min(last.0)),
+            GridSpacing::Adaptive { budget_us } => {
+                let mut candidate = next;
+                while candidate < last {
+                    let counts = db
+                        .block(candidate.into())
+                        .map(|block| {
+                            block.sapling_note_commitments().count()
+                                + block.orchard_note_commitments().count()
+                                + block.ironwood_note_commitments().count()
+                        })
+                        .unwrap_or(0);
+
+                    accrued_cost = accrued_cost
+                        .saturating_add(COST_PER_BLOCK_US)
+                        .saturating_add(COST_PER_COMMITMENT_US.saturating_mul(counts as u64));
+
+                    if accrued_cost >= budget_us {
+                        accrued_cost = 0;
+                        break;
+                    }
+
+                    candidate = Height(candidate.0 + 1);
+                }
+                candidate
+            }
+        };
 
         let mut collected = Vec::new();
         frontiers = replay_with_subtrees(
@@ -173,12 +244,16 @@ pub fn export(
             break;
         }
 
-        height = Height(height.0.saturating_add(spacing));
+        next = Height(target.0 + 1);
     }
 
     Ok(TreestateExport {
         frontiers: FrontierArtifact {
-            spacing,
+            spacing: match spacing {
+                GridSpacing::Uniform { blocks } => blocks,
+                // Recorded as provenance only; consumers locate entries by searching.
+                GridSpacing::Adaptive { .. } => 0,
+            },
             handoff,
             entries,
         },

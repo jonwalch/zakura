@@ -43,16 +43,20 @@ pub struct ExportHistoricalTreestatesCmd {
     )]
     subtree_output: PathBuf,
 
-    /// Height spacing of the frontier grid.
+    /// Uniform height spacing of the frontier grid, in blocks.
     ///
-    /// Coarser grids make a smaller artifact and a longer worst-case cold replay. Because a
-    /// serving node memoizes what it derives, spacing only costs the first request of a sweep.
-    #[clap(
-        long,
-        default_value = "50000",
-        help = "frontier grid spacing in blocks"
-    )]
+    /// Ignored when `--target-cost-ms` is given. A uniform grid leaves a long tail, because replay
+    /// cost varies by more than an order of magnitude across the chain.
+    #[clap(long, default_value = "50000", help = "uniform grid spacing in blocks")]
     spacing: u32,
+
+    /// Per-entry replay budget in milliseconds, producing a cost-weighted grid.
+    ///
+    /// Places entries densely where blocks are expensive to replay and sparsely where they are
+    /// cheap, so it bounds the *worst* cold request rather than the average. The estimate is a
+    /// deterministic function of the chain, so generator runs stay byte-identical.
+    #[clap(long, help = "per-entry replay budget in ms (cost-weighted grid)")]
+    target_cost_ms: Option<u64>,
 }
 
 impl Runnable for ExportHistoricalTreestatesCmd {
@@ -82,28 +86,40 @@ impl ExportHistoricalTreestatesCmd {
         let (_read_state, db, _non_finalized_sender) =
             zakura_state::init_read_only(state_config, &self.network)?;
 
-        println!("generating with grid spacing {}", self.spacing);
+        let spacing = match self.target_cost_ms {
+            Some(budget_ms) => {
+                println!("generating with a cost-weighted grid, {budget_ms} ms per entry");
+                zakura_state::GridSpacing::Adaptive {
+                    budget_us: budget_ms.saturating_mul(1000),
+                }
+            }
+            None => {
+                println!("generating with uniform grid spacing {}", self.spacing);
+                zakura_state::GridSpacing::Uniform {
+                    blocks: self.spacing,
+                }
+            }
+        };
 
         // Time each grid step. One step is exactly the replay a serving node performs for a cold
         // request at this spacing, so the run doubles as the measurement that sizes the grid.
         let mut entries = 0u64;
         let mut previous = Instant::now();
-        let export =
-            zakura_state::export_treestate_artifacts(&db, self.spacing, |height, blocks| {
-                let step = previous.elapsed();
-                previous = Instant::now();
-                entries += 1;
+        let export = zakura_state::export_treestate_artifacts(&db, spacing, |height, blocks| {
+            let step = previous.elapsed();
+            previous = Instant::now();
+            entries += 1;
 
-                if entries.is_multiple_of(100) {
-                    println!(
-                        "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
+            if entries.is_multiple_of(100) {
+                println!(
+                    "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
                          last step {:>8.1}ms",
-                        height.0,
-                        step.as_secs_f64() * 1e3,
-                    );
-                }
-            })
-            .map_err(|error| eyre!("{error}"))?;
+                    height.0,
+                    step.as_secs_f64() * 1e3,
+                );
+            }
+        })
+        .map_err(|error| eyre!("{error}"))?;
 
         println!();
         println!("frontier entries:  {}", export.frontiers.entries.len());

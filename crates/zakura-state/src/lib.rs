@@ -86,8 +86,8 @@ pub use service::finalized_state::{
     verify_subtrees_against_stored, DerivationSample, SubtreeVerification, VctTreestateInventory,
 };
 pub use service::finalized_state::{
-    export_treestate_artifacts, FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord,
-    TreestateArtifactError, TreestateExport, TreestateExportError,
+    export_treestate_artifacts, FrontierArtifact, FrontierEntry, GridSpacing, SubtreeArtifact,
+    SubtreeRecord, TreestateArtifactError, TreestateExport, TreestateExportError,
 };
 pub use service::finalized_state::{
     generate_mainnet_from_archive, produce_final_frontiers_bytes,

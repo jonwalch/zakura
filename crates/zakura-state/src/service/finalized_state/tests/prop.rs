@@ -1739,7 +1739,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // Artifact generation (design §4.1, §5) is the same replay, stopping at a grid. Its
             // entries must agree with the legacy node's own per-height trees, and the artifact
             // must survive a byte round trip, since consumers only ever see the encoded form.
-            let export = super::super::export_treestate_artifacts(&fast.db, 4, |_, _| {})
+            let export = super::super::export_treestate_artifacts(&fast.db, super::super::GridSpacing::Uniform { blocks: 4 }, |_, _| {})
                 .expect("the fast-synced fixture exports");
 
             prop_assert_eq!(export.frontiers.handoff, handoff);
@@ -1775,7 +1775,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
 
             // Two runs must agree byte for byte: that reproducibility is the determinism gate
             // phase C relies on, and for the subtree artifact it carries the whole trust argument.
-            let second = super::super::export_treestate_artifacts(&fast.db, 4, |_, _| {})
+            let second = super::super::export_treestate_artifacts(&fast.db, super::super::GridSpacing::Uniform { blocks: 4 }, |_, _| {})
                 .expect("a second export succeeds");
             prop_assert_eq!(
                 second.frontiers.encode(&network),

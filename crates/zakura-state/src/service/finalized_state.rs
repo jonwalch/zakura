@@ -118,7 +118,7 @@ pub use treestate_artifact::{
     FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
 };
 pub use treestate_export::{
-    export as export_treestate_artifacts, TreestateExport, TreestateExportError,
+    export as export_treestate_artifacts, GridSpacing, TreestateExport, TreestateExportError,
 };
 pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
