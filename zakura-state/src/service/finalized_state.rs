@@ -515,7 +515,7 @@ impl FinalizedState {
     /// This is the single place the raw-transaction retention decision is made:
     /// whether to write this block's raw transactions, which aged-out or backlog
     /// range to delete, and how to advance the pruning marker.
-    /// [`ZakuraDb::write_block`] applies the returned plan without re-deriving it.
+    /// [`ZakuraDb::write_block_with`] applies the returned plan without re-deriving it.
     ///
     /// `is_checkpoint` selects the checkpoint-sync policy (a retention start
     /// before which raw transactions are skipped, plus bounded archive-backlog

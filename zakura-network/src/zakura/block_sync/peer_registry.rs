@@ -492,6 +492,8 @@ impl PeerRegistry {
             return SessionAdmission::Parked;
         }
 
+        // `try_update` replaces this API in Rust 1.97, but Zakura's MSRV is 1.91.
+        #[allow(deprecated)]
         let generation = self
             .next_generation
             .fetch_update(

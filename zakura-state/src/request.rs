@@ -1268,7 +1268,7 @@ pub enum ReadRequest {
     /// with the current disk space usage in bytes.
     UsageInfo,
 
-    /// Returns [`ReadResponse::PruningInfo`](ReadResponse::PruningInfo) with
+    /// Returns [`ReadResponse::PruningInfo`] with
     /// whether this node's block data is subject to pruning, and the lowest
     /// height at and above which every block body is retained.
     PruningInfo,

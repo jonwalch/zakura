@@ -3573,7 +3573,7 @@ const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
 
 /// Response to a `getdeprecationinfo` RPC request.
 ///
-/// See the notes for [`Rpc::get_deprecation_info`].
+/// See the notes for [`RpcServer::get_deprecation_info`].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetDeprecationInfoResponse {
     /// End-of-service information, only present on Mainnet.

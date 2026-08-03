@@ -864,7 +864,7 @@ impl ZakuraDb {
     ///
     /// `retention` is always at least
     /// [`MIN_PRUNING_RETENTION`](crate::constants::MIN_PRUNING_RETENTION), which is strictly
-    /// greater than [`MAX_BLOCK_REORG_HEIGHT`].
+    /// greater than [`MAX_BLOCK_REORG_HEIGHT`](crate::MAX_BLOCK_REORG_HEIGHT).
     /// Since the returned range only ever covers heights at or below
     /// `new_tip - retention`, pruning can never delete data that a reorg or
     /// rollback could read.
@@ -1265,7 +1265,7 @@ fn should_log_prune_progress(
 ///
 /// Computed once per block by
 /// [`FinalizedState::retention_plan`](super::super::FinalizedState::retention_plan)
-/// and applied by [`ZakuraDb::write_block`] without re-derivation.
+/// and applied by [`ZakuraDb::write_block_with`] without re-derivation.
 ///
 /// Only [`RetentionPlan::Store`] occurs in archive mode; the other variants are
 /// only produced in pruned storage mode.
