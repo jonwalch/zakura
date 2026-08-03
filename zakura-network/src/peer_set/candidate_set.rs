@@ -11,8 +11,8 @@ use tracing::Span;
 use zakura_chain::{diagnostic::task::WaitForPanics, serialization::DateTime32};
 
 use crate::{
-    constants, meta_addr::MetaAddrChange, peer_set::set::MorePeers, types::MetaAddr, AddressBook,
-    BoxError, Request, Response,
+    address_book_trace::AddressBookTrace, constants, meta_addr::MetaAddrChange,
+    peer_set::set::MorePeers, types::MetaAddr, AddressBook, BoxError, Request, Response,
 };
 
 #[cfg(test)]
@@ -142,6 +142,9 @@ where
 
     /// A timer that enforces a rate-limit on peer set requests for more peers.
     min_next_crawl: Instant,
+
+    /// Structured diagnostics for peer discovery.
+    trace: AddressBookTrace,
 }
 
 impl<S> std::fmt::Debug for CandidateSet<S>
@@ -174,7 +177,15 @@ where
             peer_service,
             min_next_handshake: Instant::now(),
             min_next_crawl: Instant::now(),
+            trace: AddressBookTrace::disabled(),
         }
+    }
+
+    /// Sets the structured diagnostics writer for peer discovery.
+    #[must_use]
+    pub fn with_trace(mut self, trace: AddressBookTrace) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// Update the peer set from the network, using the default fanout limit.
@@ -293,6 +304,12 @@ where
 
         let mut responses = FuturesUnordered::new();
         let mut more_peers = None;
+        // Counted so a crawl that reaches its peers but learns nothing can be told
+        // apart from one whose addresses are all rejected by the address book.
+        let mut response_ok = 0usize;
+        let mut response_err = 0usize;
+        let mut addrs_received = 0usize;
+        let mut addrs_sent = 0usize;
 
         // Launch requests
         for attempt in 0..fanout_limit {
@@ -318,11 +335,15 @@ where
                         ?addrs,
                         "got response to GetPeers"
                     );
-                    let addrs = validate_addrs(addrs, DateTime32::now());
+                    response_ok += 1;
+                    addrs_received += addrs.len();
+                    let addrs: Vec<_> = validate_addrs(addrs, DateTime32::now()).collect();
+                    addrs_sent += addrs.len();
                     address_book_updates.push(self.send_addrs(addrs));
                     more_peers = Some(MorePeers);
                 }
                 Err(e) => {
+                    response_err += 1;
                     // since we do a fanout, and new updates are triggered by
                     // each demand, we can ignore errors in individual responses
                     trace!(?e, "got error in GetPeers request");
@@ -333,6 +354,14 @@ where
 
         // Wait until all the address book updates have finished
         while let Some(()) = address_book_updates.next().await {}
+
+        self.trace.crawl(
+            fanout_limit,
+            response_ok,
+            response_err,
+            addrs_received,
+            addrs_sent,
+        );
 
         Ok(more_peers)
     }
