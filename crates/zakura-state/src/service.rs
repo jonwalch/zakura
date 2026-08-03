@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -60,8 +60,8 @@ use crate::{
         watch_receiver::WatchReceiver,
     },
     BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError,
+    Config, HashOrHeight, KnownBlock, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -252,6 +252,13 @@ pub struct ReadStateService {
     /// Keeps the completed-checkpoint watch open in read-only services.
     _highest_completed_checkpoint_sender:
         Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+
+    /// Note commitment frontiers this service has derived and root-checked for heights in a
+    /// verified-commitment-trees fast-synced database's absent band.
+    ///
+    /// Shared across clones so a wallet's sequential scan anchors each request on the previous
+    /// one. Empty, and never written, unless `derive_historical_trees` is configured.
+    historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
@@ -1130,6 +1137,7 @@ impl ReadStateService {
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            historical_trees: Arc::default(),
             highest_completed_checkpoint_receiver,
             _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
@@ -1667,6 +1675,40 @@ where
         .collect()
 }
 
+/// Returns the note commitment frontiers for `hash_or_height` when the stored per-height trees are
+/// absent because this is a verified-commitment-trees fast-synced database.
+///
+/// Returns `Ok(None)` when the height is outside the absent band, where a missing tree is an
+/// ordinary miss and every node behaves the same way. Inside the band, derivation either succeeds
+/// or the request fails: an absent tree there must never reach a client as an empty treestate
+/// (see [`crate::HistoricalTreeUnavailable`]).
+fn historical_frontiers(
+    state: &ReadStateService,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<Arc<read::DerivedFrontiers>>, BoxError> {
+    let Err(unavailable) = read::check_historical_tree_available(&state.db, hash_or_height) else {
+        return Ok(None);
+    };
+
+    let config = state.db.config();
+    if !config.derive_historical_trees {
+        return Err(unavailable.into());
+    }
+
+    let height = hash_or_height
+        .height_or_else(|hash| state.db.height(hash))
+        .expect("the absent-band guard already resolved this block to a height");
+
+    read::derive_historical_frontiers(
+        &state.db,
+        &state.historical_trees,
+        height,
+        config.max_historical_tree_replay_blocks,
+    )
+    .map(Some)
+    .map_err(BoxError::from)
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2062,17 +2104,38 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
-            ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
-                read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::SaplingTree(hash_or_height) => {
+                let mut tree =
+                    read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height);
+                if tree.is_none() {
+                    tree = historical_frontiers(&state, hash_or_height)?
+                        .map(|frontiers| frontiers.sapling.clone());
+                }
 
-            ReadRequest::OrchardTree(hash_or_height) => Ok(ReadResponse::OrchardTree(
-                read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+                Ok(ReadResponse::SaplingTree(tree))
+            }
 
-            ReadRequest::IronwoodTree(hash_or_height) => Ok(ReadResponse::IronwoodTree(
-                read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::OrchardTree(hash_or_height) => {
+                let mut tree =
+                    read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height);
+                if tree.is_none() {
+                    tree = historical_frontiers(&state, hash_or_height)?
+                        .map(|frontiers| frontiers.orchard.clone());
+                }
+
+                Ok(ReadResponse::OrchardTree(tree))
+            }
+
+            ReadRequest::IronwoodTree(hash_or_height) => {
+                let mut tree =
+                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height);
+                if tree.is_none() {
+                    tree = historical_frontiers(&state, hash_or_height)?
+                        .map(|frontiers| frontiers.ironwood.clone());
+                }
+
+                Ok(ReadResponse::IronwoodTree(tree))
+            }
 
             ReadRequest::SaplingSubtrees { start_index, limit } => {
                 let end_index = limit
@@ -2089,6 +2152,12 @@ impl Service<ReadRequest> for ReadStateService {
                     // the trees run out.)
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
                 };
+
+                read::check_historical_sapling_subtrees_available(
+                    &state.db,
+                    start_index,
+                    &sapling_subtrees,
+                )?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2109,6 +2178,12 @@ impl Service<ReadRequest> for ReadStateService {
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
                 };
 
+                read::check_historical_orchard_subtrees_available(
+                    &state.db,
+                    start_index,
+                    &orchard_subtrees,
+                )?;
+
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
 
@@ -2123,6 +2198,12 @@ impl Service<ReadRequest> for ReadStateService {
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
                 };
+
+                read::check_historical_ironwood_subtrees_available(
+                    &state.db,
+                    start_index,
+                    &ironwood_subtrees,
+                )?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }

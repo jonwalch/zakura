@@ -8,7 +8,10 @@ use zakura_chain::{
     ironwood, orchard,
     parameters::Network::*,
     serialization::ZcashDeserializeInto,
-    subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    subtree::{
+        NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
+        TRACKED_SUBTREE_HEIGHT,
+    },
     transaction,
 };
 
@@ -24,7 +27,10 @@ use crate::{
     service::{
         finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::Chain,
-        read::{ironwood_subtrees, orchard_subtrees, sapling_subtrees},
+        read::{
+            ironwood_subtrees, orchard_subtrees, sapling_subtrees,
+            tree::subtree_completed_by_handoff,
+        },
     },
     Config, ReadRequest, ReadResponse,
 };
@@ -636,4 +642,48 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     assert_eq!(found.unwrap().hash(), best_hash);
 
     Ok(())
+}
+
+/// The absent-band subtree bound must cover exactly the subtrees the fast path skipped.
+///
+/// The bound is what keeps [`crate::HistoricalSubtreeUnavailable`] from firing on an ordinary
+/// "you asked past the tip" query: only indices that completed at or below the handoff were
+/// skipped, everything at or above that is genuinely absent on any node.
+#[test]
+fn subtree_absent_band_bound_is_exact() {
+    const LEAVES_PER_SUBTREE: u64 = 1 << TRACKED_SUBTREE_HEIGHT;
+
+    // No subtree has completed yet, so no index is in the band, whatever the client asks for.
+    for leaves in [0, 1, LEAVES_PER_SUBTREE - 1] {
+        assert!(
+            !subtree_completed_by_handoff(0.into(), leaves),
+            "no subtree completes before {LEAVES_PER_SUBTREE} leaves, but {leaves} claimed one"
+        );
+    }
+
+    // Exactly one subtree (index 0) completed. Index 1 has not, so it stays an empty list.
+    assert!(subtree_completed_by_handoff(0.into(), LEAVES_PER_SUBTREE));
+    assert!(!subtree_completed_by_handoff(1.into(), LEAVES_PER_SUBTREE));
+
+    // A partly-filled second subtree does not count as completed.
+    assert!(subtree_completed_by_handoff(
+        0.into(),
+        LEAVES_PER_SUBTREE + 1
+    ));
+    assert!(!subtree_completed_by_handoff(
+        1.into(),
+        LEAVES_PER_SUBTREE + 1
+    ));
+
+    // Mainnet-scale: 73,934,658 Sapling commitments at the handoff is 1,128 completed subtrees,
+    // indexes 0..=1127. Index 1128 is the one still filling.
+    let sapling_leaves_at_handoff = 73_934_658;
+    assert!(subtree_completed_by_handoff(
+        1127.into(),
+        sapling_leaves_at_handoff
+    ));
+    assert!(!subtree_completed_by_handoff(
+        1128.into(),
+        sapling_leaves_at_handoff
+    ));
 }

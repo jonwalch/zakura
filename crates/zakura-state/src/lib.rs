@@ -43,11 +43,15 @@ pub use config::{
     database_format_version_on_disk, state_database_format_version_on_disk, Config, PruningConfig,
     StorageMode,
 };
-pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
+pub use constants::{
+    state_database_format_version_in_code, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    MAX_BLOCK_REORG_HEIGHT,
+};
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
-    StoreIncoherentError, ValidateContextError,
+    CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
+    HistoricalTreeUnavailable, MissingSproutTipTree, StateInitError, StoreIncoherentError,
+    ValidateContextError,
 };
 pub use request::{
     AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,
@@ -85,6 +89,10 @@ pub use service::finalized_state::{
     HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
 };
 pub use service::finalized_state::{
+    inventory as vct_treestate_inventory, measure_derivations, DerivationSample,
+    VctTreestateInventory,
+};
+pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
     PruneFinalizedStateOptions, PruneFinalizedStateSummary,
 };
@@ -95,6 +103,7 @@ pub use service::finalized_state::{
 pub use service::finalized_state::{
     VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
 };
+pub use service::read::{HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS};
 pub use service::{
     finalized_state::{
         DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,

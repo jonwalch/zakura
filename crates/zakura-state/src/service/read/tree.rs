@@ -14,11 +14,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use zakura_chain::{
-    ironwood, orchard, sapling,
-    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    block, ironwood, orchard, sapling,
+    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
 
 use crate::{
+    error::{HistoricalSubtreeUnavailable, HistoricalTreeUnavailable},
     service::{finalized_state::ZakuraDb, non_finalized_state::Chain},
     HashOrHeight,
 };
@@ -26,6 +27,142 @@ use crate::{
 // Doc-only items
 #[allow(unused_imports)]
 use zakura_chain::subtree::NoteCommitmentSubtree;
+
+/// Returns an error if the per-height note commitment tree for `hash_or_height` was never
+/// written, because `db` was built by the verified-commitment-trees fast-sync path and
+/// `hash_or_height` falls in the absent band `[U, H)`.
+///
+/// Read handlers call this only after a tree read came back empty, so a tree that is present
+/// (below `U`, or at or above the handoff) is never rejected. Distinguishing the absent band
+/// from an ordinary miss is what stops a client from reading the miss as the empty tree; see
+/// [`HistoricalTreeUnavailable`].
+pub fn check_historical_tree_available(
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Result<(), HistoricalTreeUnavailable> {
+    match db.vct_synced_below() {
+        Some(handoff) if db.vct_historical_tree_unavailable(hash_or_height) => {
+            Err(HistoricalTreeUnavailable {
+                hash_or_height,
+                handoff,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Returns `true` if the subtree at `start_index` completed at or below the checkpoint handoff,
+/// given `handoff_leaves`, the pool's note commitment count at the handoff height.
+///
+/// Subtrees complete at every multiple of `1 << TRACKED_SUBTREE_HEIGHT` leaves, so the leaf
+/// count floor-divides to the number of subtrees completed by then, and index `i` is one of
+/// them exactly when `i` is below that count.
+pub(crate) fn subtree_completed_by_handoff(
+    start_index: NoteCommitmentSubtreeIndex,
+    handoff_leaves: u64,
+) -> bool {
+    u64::from(start_index) < (handoff_leaves >> TRACKED_SUBTREE_HEIGHT)
+}
+
+/// Returns an error if the subtree at `start_index` is missing because it completed inside the
+/// verified-commitment-trees absent band, where no subtree roots were recorded.
+///
+/// Callers pass `found = false` only when a subtree list came back without `start_index`, so a
+/// subtree that is present is never rejected. `handoff_leaves` reads the pool's commitment count
+/// at the handoff, which bounds the indices the fast path could have skipped: anything at or
+/// above that bound completed after the handoff and is genuinely absent, not skipped, so a
+/// client asking past the tip still gets today's empty list.
+fn check_historical_subtree_available(
+    db: &ZakuraDb,
+    pool: &'static str,
+    start_index: NoteCommitmentSubtreeIndex,
+    found: bool,
+    handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> u64,
+) -> Result<(), HistoricalSubtreeUnavailable> {
+    if found {
+        return Ok(());
+    }
+
+    let Some(handoff) = db.vct_synced_below() else {
+        return Ok(());
+    };
+
+    if subtree_completed_by_handoff(start_index, handoff_leaves(db, handoff)) {
+        Err(HistoricalSubtreeUnavailable {
+            pool,
+            index: start_index,
+            handoff,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Returns an error if the Sapling subtree list `subtrees` is missing `start_index` because it
+/// completed inside the verified-commitment-trees absent band.
+///
+/// See [`check_historical_subtree_available`].
+pub fn check_historical_sapling_subtrees_available(
+    db: &ZakuraDb,
+    start_index: NoteCommitmentSubtreeIndex,
+    subtrees: &BTreeMap<
+        NoteCommitmentSubtreeIndex,
+        NoteCommitmentSubtreeData<sapling_crypto::Node>,
+    >,
+) -> Result<(), HistoricalSubtreeUnavailable> {
+    check_historical_subtree_available(
+        db,
+        "sapling",
+        start_index,
+        subtrees.contains_key(&start_index),
+        |db, handoff| {
+            db.sapling_tree_by_height(&handoff)
+                .map_or(0, |tree| tree.count())
+        },
+    )
+}
+
+/// Returns an error if the Orchard subtree list `subtrees` is missing `start_index` because it
+/// completed inside the verified-commitment-trees absent band.
+///
+/// See [`check_historical_subtree_available`].
+pub fn check_historical_orchard_subtrees_available(
+    db: &ZakuraDb,
+    start_index: NoteCommitmentSubtreeIndex,
+    subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+) -> Result<(), HistoricalSubtreeUnavailable> {
+    check_historical_subtree_available(
+        db,
+        "orchard",
+        start_index,
+        subtrees.contains_key(&start_index),
+        |db, handoff| {
+            db.orchard_tree_by_height(&handoff)
+                .map_or(0, |tree| tree.count())
+        },
+    )
+}
+
+/// Returns an error if the Ironwood subtree list `subtrees` is missing `start_index` because it
+/// completed inside the verified-commitment-trees absent band.
+///
+/// See [`check_historical_subtree_available`].
+pub fn check_historical_ironwood_subtrees_available(
+    db: &ZakuraDb,
+    start_index: NoteCommitmentSubtreeIndex,
+    subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+) -> Result<(), HistoricalSubtreeUnavailable> {
+    check_historical_subtree_available(
+        db,
+        "ironwood",
+        start_index,
+        subtrees.contains_key(&start_index),
+        |db, handoff| {
+            db.ironwood_tree_by_height(&handoff)
+                .map_or(0, |tree| tree.count())
+        },
+    )
+}
 
 /// Returns the Sapling
 /// [`NoteCommitmentTree`](sapling::tree::NoteCommitmentTree) specified by a
