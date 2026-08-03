@@ -44,7 +44,7 @@ use crate::{
         },
     },
     tests::FakeChainHelper,
-    HashOrHeight,
+    HashOrHeight, ReadRequest, ReadResponse,
 };
 
 use super::super::{
@@ -2910,6 +2910,162 @@ fn vct_peer_source_handoff_without_db_root_at_c() -> Result<()> {
                 golden_tip.sprout.root(),
                 "tip sprout frontier must match legacy"
             );
+    });
+
+    Ok(())
+}
+
+/// Builds a [`ReadStateService`] over `finalized_state`, so tests can exercise the real read
+/// handlers rather than the helpers underneath them.
+///
+/// The config gating, the artifact load and the typed-error fallback all live in the handler, so
+/// testing only the helpers would leave the seam that actually serves clients unproven.
+#[cfg(test)]
+fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateService {
+    use crate::service::{watch_receiver::WatchReceiver, VctRootRepairStatus};
+
+    let (_non_finalized_sender, non_finalized_receiver) = tokio::sync::watch::channel(
+        crate::service::non_finalized_state::NonFinalizedState::new(&finalized_state.network()),
+    );
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (completed, completed_receiver) =
+        super::super::HighestCompletedCheckpointTracker::open(&finalized_state.db);
+    let (_auth_sender, auth_receiver) = tokio::sync::watch::channel(None);
+
+    crate::ReadStateService::new(
+        finalized_state,
+        None,
+        WatchReceiver::new(non_finalized_receiver),
+        completed_receiver,
+        Some(completed.keepalive_sender()),
+        repair_receiver,
+        auth_receiver,
+    )
+}
+
+/// The read service must serve absent-band treestates when derivation is enabled, and report the
+/// typed archive-mode error when it is not.
+///
+/// This exercises the handler itself — config gating, derivation, and the fallback to
+/// `HistoricalTreeUnavailable` — rather than the helpers underneath it, because that handler is
+/// what a wallet's `z_gettreestate` actually reaches.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i + 1] for the successor witness
+fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
+    use tower::ServiceExt;
+
+    let _init_guard = zakura_test::init();
+
+    let network = spaced_upgrade_network();
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 4).expect("test activation height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, network) in super::valid_commitment_chain(ledger_strategy, tested_block_count).no_shrink())| {
+
+        let blocks: Vec<_> = chain.iter().collect();
+        let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+        let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+        let last = (nu5 + 3) as usize;
+        prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+        let handoff = Height(last as u32);
+        let seed = (heartwood - 1) as usize;
+
+        // Legacy pass: the per-block fixture, and the golden trees to compare against.
+        let mut legacy = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("opening an ephemeral database should succeed");
+        let mut fixture = TestRootMap::new();
+        let mut handoff_trees = None;
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let (_h, trees) = legacy
+                .commit_finalized_direct(cv.into(), None, None, "vct legacy")
+                .unwrap();
+            if i > seed {
+                fixture.insert(
+                    i as u32,
+                    (trees.sapling.root(), trees.orchard.root(), trees.ironwood.root()),
+                );
+            }
+            if i == last {
+                handoff_trees = Some(trees);
+            }
+        }
+        let handoff_trees = handoff_trees.expect("the handoff produced trees");
+
+        // Fast pass with derivation turned on, so the handler takes the serving path.
+        let deriving = Config { derive_historical_trees: true, ..Config::ephemeral() };
+        let mut fast = FinalizedState::new(&deriving, &network)
+            .expect("opening an ephemeral database should succeed");
+        enable_vct_test_fixture_source_with_handoff(
+            &mut fast,
+            fixture.clone(),
+            handoff,
+            handoff_trees.sapling.clone(),
+            handoff_trees.orchard.clone(),
+            handoff_trees.sprout.clone(),
+            handoff_trees.ironwood.clone(),
+        );
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let successor = blocks.get(i + 1).and_then(|b| next_vct_block(b.block.clone()));
+            fast.commit_finalized_direct(cv.into(), None, successor, "vct fast")
+                .unwrap();
+        }
+
+        let probe = Height(last as u32 - 1);
+        prop_assert!(fast.db.vct_tree_absent(probe), "the probe height is in the absent band");
+
+        let runtime = tokio::runtime::Runtime::new().expect("a test runtime starts");
+
+        // Derivation enabled: the handler serves a tree matching the legacy node's.
+        let read_state = read_service_over(&fast);
+        let response = runtime
+            .block_on(read_state.oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect("the read service answers");
+        let ReadResponse::SaplingTree(Some(tree)) = response else {
+            panic!("derivation is enabled, so the absent band must be served, got {response:?}")
+        };
+        prop_assert_eq!(
+            tree.root(),
+            legacy.db.sapling_tree_by_height(&probe).expect("legacy stores every tree").root(),
+            "the served treestate matches the legacy node"
+        );
+
+        // Derivation disabled: the handler reports the typed archive-mode error rather than a
+        // `None` tree, which a lightwalletd-style client would read as the empty tree.
+        let mut plain = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("opening an ephemeral database should succeed");
+        enable_vct_test_fixture_source_with_handoff(
+            &mut plain,
+            fixture,
+            handoff,
+            handoff_trees.sapling.clone(),
+            handoff_trees.orchard.clone(),
+            handoff_trees.sprout.clone(),
+            handoff_trees.ironwood.clone(),
+        );
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let successor = blocks.get(i + 1).and_then(|b| next_vct_block(b.block.clone()));
+            plain.commit_finalized_direct(cv.into(), None, successor, "vct fast")
+                .unwrap();
+        }
+
+        let read_state = read_service_over(&plain);
+        let error = runtime
+            .block_on(read_state.oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect_err("without derivation the absent band must be an error");
+        prop_assert!(
+            error.to_string().contains("fast-synced"),
+            "the error names the cause, got: {}", error
+        );
     });
 
     Ok(())
