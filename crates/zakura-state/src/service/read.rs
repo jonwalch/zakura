@@ -49,8 +49,8 @@ pub use historical_tree::{
 pub use tree::{
     check_historical_ironwood_subtrees_available, check_historical_orchard_subtrees_available,
     check_historical_sapling_subtrees_available, check_historical_tree_available,
-    ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree, sapling_subtrees,
-    sapling_tree,
+    contiguous_subtrees_from, ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree,
+    sapling_subtrees, sapling_tree,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]

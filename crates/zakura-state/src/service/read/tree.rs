@@ -51,6 +51,39 @@ pub fn check_historical_tree_available(
     }
 }
 
+/// Trims `subtrees` to the contiguous run beginning at `start_index`.
+///
+/// `z_getsubtreesbyindex` serves a continuous list: a client builds witnesses by walking indexes in
+/// order, so anything past a gap is unusable and a missing `start_index` means there is nothing to
+/// serve at all. Callers that merge two sources — the node's own rows and a published artifact —
+/// use this to re-establish that contract over the union.
+pub fn contiguous_subtrees_from<Node>(
+    mut subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    start_index: NoteCommitmentSubtreeIndex,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>> {
+    if !subtrees.contains_key(&start_index) {
+        return BTreeMap::new();
+    }
+
+    subtrees.retain(|index, _| *index >= start_index);
+
+    let mut expected = start_index.0;
+    let mut contiguous = BTreeMap::new();
+    for (index, data) in subtrees {
+        if index.0 != expected {
+            break;
+        }
+
+        contiguous.insert(index, data);
+        let Some(next) = expected.checked_add(1) else {
+            break;
+        };
+        expected = next;
+    }
+
+    contiguous
+}
+
 /// Returns `true` if the subtree at `start_index` completed at or below the checkpoint handoff,
 /// given `handoff_leaves`, the pool's note commitment count at the handoff height.
 ///

@@ -28,7 +28,7 @@ use crate::{
         finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::Chain,
         read::{
-            ironwood_subtrees, orchard_subtrees, sapling_subtrees,
+            contiguous_subtrees_from, ironwood_subtrees, orchard_subtrees, sapling_subtrees,
             tree::subtree_completed_by_handoff,
         },
     },
@@ -686,4 +686,54 @@ fn subtree_absent_band_bound_is_exact() {
         1128.into(),
         sapling_leaves_at_handoff
     ));
+}
+
+/// Merging the node's own subtree rows with published ones must still serve a continuous list.
+///
+/// The gated read drops everything when it has no row at the requested start, so a node holding
+/// rows only *above* the handoff contributes nothing until the published records below it are
+/// merged in. A client doing spend-before-sync asks from index 0 and needs one list spanning both
+/// halves; serving only the published half would silently truncate its witness data.
+#[test]
+fn contiguous_subtrees_spans_published_and_stored_rows() {
+    let data = |height: u32| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+
+    let merged: std::collections::BTreeMap<_, _> = [0u16, 1, 2, 3]
+        .into_iter()
+        .map(|index| (NoteCommitmentSubtreeIndex(index), data(index as u32 + 1)))
+        .collect();
+
+    let served = contiguous_subtrees_from(merged.clone(), NoteCommitmentSubtreeIndex(0));
+    assert_eq!(served.len(), 4, "a gapless union is served whole");
+
+    // A gap makes everything past it unusable, so it is dropped rather than served.
+    let mut holed = merged.clone();
+    holed.remove(&NoteCommitmentSubtreeIndex(2));
+    let served = contiguous_subtrees_from(holed, NoteCommitmentSubtreeIndex(0));
+    assert_eq!(
+        served.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0), NoteCommitmentSubtreeIndex(1)],
+        "the run stops at the first gap"
+    );
+
+    // A missing start index means there is nothing to serve, not a list starting later.
+    let mut no_start = merged.clone();
+    no_start.remove(&NoteCommitmentSubtreeIndex(0));
+    assert!(
+        contiguous_subtrees_from(no_start, NoteCommitmentSubtreeIndex(0)).is_empty(),
+        "a missing start index serves nothing"
+    );
+
+    // Indexes below the request are not served.
+    let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(2));
+    assert_eq!(
+        served.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(2), NoteCommitmentSubtreeIndex(3)],
+        "the run starts at the requested index"
+    );
 }

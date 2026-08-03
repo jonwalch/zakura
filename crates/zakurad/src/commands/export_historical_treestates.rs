@@ -94,7 +94,7 @@ impl ExportHistoricalTreestatesCmd {
                 previous = Instant::now();
                 entries += 1;
 
-                if entries % 100 == 0 {
+                if entries.is_multiple_of(100) {
                     println!(
                         "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
                          last step {:>8.1}ms",

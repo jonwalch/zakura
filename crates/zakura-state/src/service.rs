@@ -2255,20 +2255,19 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let sapling_subtrees = if sapling_subtrees.contains_key(&start_index) {
                     sapling_subtrees
-                } else {
-                    // The stored range does not cover `start_index`. Published records fill the
-                    // absent band; outside it there are none, and the check below decides whether
-                    // an empty list is an honest answer or the archive-mode error.
-                    let published = state
-                        .historical_subtrees
-                        .as_ref()
-                        .map_or_else(Default::default, |artifact| {
-                            artifact.sapling_range(range_for(start_index, end_index))
-                        });
+                } else if let Some(artifact) = state.historical_subtrees.as_ref() {
+                    // The gated read drops everything when it has no row at `start_index`, so the
+                    // node's own rows above the handoff are missing from it here. Rebuild the
+                    // union from the raw range plus the published records — a client asking from
+                    // index 0 must get one continuous list spanning both, not just the published
+                    // half — then re-apply the continuity contract over the whole thing.
+                    let range = range_for(start_index, end_index);
+                    let mut merged = state.db.sapling_subtree_list_by_index_range(range);
+                    merged.extend(artifact.sapling_range(range));
 
-                    let mut merged = sapling_subtrees;
-                    merged.extend(published);
-                    merged
+                    read::contiguous_subtrees_from(merged, start_index)
+                } else {
+                    sapling_subtrees
                 };
 
                 read::check_historical_sapling_subtrees_available(
@@ -2298,20 +2297,19 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let orchard_subtrees = if orchard_subtrees.contains_key(&start_index) {
                     orchard_subtrees
-                } else {
-                    // The stored range does not cover `start_index`. Published records fill the
-                    // absent band; outside it there are none, and the check below decides whether
-                    // an empty list is an honest answer or the archive-mode error.
-                    let published = state
-                        .historical_subtrees
-                        .as_ref()
-                        .map_or_else(Default::default, |artifact| {
-                            artifact.orchard_range(range_for(start_index, end_index))
-                        });
+                } else if let Some(artifact) = state.historical_subtrees.as_ref() {
+                    // The gated read drops everything when it has no row at `start_index`, so the
+                    // node's own rows above the handoff are missing from it here. Rebuild the
+                    // union from the raw range plus the published records — a client asking from
+                    // index 0 must get one continuous list spanning both, not just the published
+                    // half — then re-apply the continuity contract over the whole thing.
+                    let range = range_for(start_index, end_index);
+                    let mut merged = state.db.orchard_subtree_list_by_index_range(range);
+                    merged.extend(artifact.orchard_range(range));
 
-                    let mut merged = orchard_subtrees;
-                    merged.extend(published);
-                    merged
+                    read::contiguous_subtrees_from(merged, start_index)
+                } else {
+                    orchard_subtrees
                 };
 
                 read::check_historical_orchard_subtrees_available(
@@ -2337,20 +2335,19 @@ impl Service<ReadRequest> for ReadStateService {
 
                 let ironwood_subtrees = if ironwood_subtrees.contains_key(&start_index) {
                     ironwood_subtrees
-                } else {
-                    // The stored range does not cover `start_index`. Published records fill the
-                    // absent band; outside it there are none, and the check below decides whether
-                    // an empty list is an honest answer or the archive-mode error.
-                    let published = state
-                        .historical_subtrees
-                        .as_ref()
-                        .map_or_else(Default::default, |artifact| {
-                            artifact.ironwood_range(range_for(start_index, end_index))
-                        });
+                } else if let Some(artifact) = state.historical_subtrees.as_ref() {
+                    // The gated read drops everything when it has no row at `start_index`, so the
+                    // node's own rows above the handoff are missing from it here. Rebuild the
+                    // union from the raw range plus the published records — a client asking from
+                    // index 0 must get one continuous list spanning both, not just the published
+                    // half — then re-apply the continuity contract over the whole thing.
+                    let range = range_for(start_index, end_index);
+                    let mut merged = state.db.ironwood_subtree_list_by_index_range(range);
+                    merged.extend(artifact.ironwood_range(range));
 
-                    let mut merged = ironwood_subtrees;
-                    merged.extend(published);
-                    merged
+                    read::contiguous_subtrees_from(merged, start_index)
+                } else {
+                    ironwood_subtrees
                 };
 
                 read::check_historical_ironwood_subtrees_available(
