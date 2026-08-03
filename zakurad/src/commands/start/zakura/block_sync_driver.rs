@@ -1301,7 +1301,7 @@ pub(crate) async fn commit_block_sync_body<BlockVerifier>(
     owner: zakura_header_chain::WorkOwner,
     source: zakura_header_chain::SourceId,
     block: Arc<block::Block>,
-    class: BlockApplyClass,
+    _class: BlockApplyClass,
 ) -> BlockApplyOutcome
 where
     BlockVerifier:
@@ -1314,17 +1314,7 @@ where
     let commit = block_verifier
         .clone()
         .oneshot(zakura_consensus::Request::Commit(block));
-    match class {
-        BlockApplyClass::Checkpoint => {
-            block_commit_outcome(owner, source, height, expected_hash, commit.await)
-        }
-        BlockApplyClass::Full => {
-            match tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await {
-                Ok(outcome) => block_commit_outcome(owner, source, height, expected_hash, outcome),
-                Err(_elapsed) => block_commit_timed_out(owner, source, height, expected_hash),
-            }
-        }
-    }
+    block_commit_outcome(owner, source, height, expected_hash, commit.await)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1349,39 +1339,27 @@ where
         .clone()
         .oneshot(zakura_consensus::Request::Commit(block));
 
-    match class {
-        BlockApplyClass::Checkpoint => {
-            tokio::pin!(commit);
-            tokio::select! {
-                outcome = &mut commit => block_commit_outcome(owner, source, Some(height), expected_hash, outcome),
-                _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
-                    emit_commit_state(
-                        trace,
-                        cs_trace::COMMIT_STALLED,
-                        "block_sync_driver",
-                        |row| {
-                            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-                            insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-                            insert_cs_height(row, cs_trace::HEIGHT, height);
-                            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-                            insert_cs_u64(
-                                row,
-                                cs_trace::ELAPSED_MS,
-                                ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT.as_millis().try_into().unwrap_or(u64::MAX),
-                            );
-                        },
+    tokio::pin!(commit);
+    tokio::select! {
+        outcome = &mut commit => block_commit_outcome(owner, source, Some(height), expected_hash, outcome),
+        _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
+            emit_commit_state(
+                trace,
+                cs_trace::COMMIT_STALLED,
+                "block_sync_driver",
+                |row| {
+                    insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+                    insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
+                    insert_cs_height(row, cs_trace::HEIGHT, height);
+                    insert_cs_hash(row, cs_trace::HASH, expected_hash);
+                    insert_cs_u64(
+                        row,
+                        cs_trace::ELAPSED_MS,
+                        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT.as_millis().try_into().unwrap_or(u64::MAX),
                     );
-                    block_commit_outcome(owner, source, Some(height), expected_hash, commit.await)
-                }
-            }
-        }
-        BlockApplyClass::Full => {
-            match tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await {
-                Ok(outcome) => {
-                    block_commit_outcome(owner, source, Some(height), expected_hash, outcome)
-                }
-                Err(_elapsed) => block_commit_timed_out(owner, source, Some(height), expected_hash),
-            }
+                },
+            );
+            block_commit_outcome(owner, source, Some(height), expected_hash, commit.await)
         }
     }
 }
@@ -1483,25 +1461,6 @@ where
             }
         }
     }
-}
-
-fn block_commit_timed_out(
-    owner: zakura_header_chain::WorkOwner,
-    source: zakura_header_chain::SourceId,
-    height: Option<block::Height>,
-    expected_hash: block::Hash,
-) -> BlockApplyOutcome {
-    warn!(
-        ?height,
-        ?expected_hash,
-        "timed out committing Zakura block-sync body"
-    );
-    retryable_body_outcome(
-        owner,
-        source,
-        expected_hash,
-        zakura_header_chain::TransientBodyFailureKind::Timeout,
-    )
 }
 
 fn retryable_body_outcome(

@@ -3941,9 +3941,8 @@ mod zakura_header_sync_driver_tests {
         ));
     }
 
-    /// A checkpoint-class commit must wait for the checkpoint verifier to
-    /// assemble a full contiguous range and must never be torn down by the
-    /// driver timeout, while a full (post-checkpoint) commit still times out.
+    /// A block commit must wait for the verifier and must never release its
+    /// concurrency slot while the buffered request is still running.
     ///
     /// Regression test for the from-scratch mainnet stall: the checkpoint
     /// verifier buffers every body below the first checkpoint (height 400) until
@@ -3951,7 +3950,7 @@ mod zakura_header_sync_driver_tests {
     /// height 400 was reached and rolled the partial range back, freezing sync
     /// at genesis.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn checkpoint_commit_waits_past_driver_timeout_unlike_full_commit() {
+    async fn block_commits_wait_past_driver_timeout_for_every_apply_class() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
 
         // A verifier that never answers a commit, mimicking the checkpoint
@@ -3965,42 +3964,23 @@ mod zakura_header_sync_driver_tests {
             }
         });
 
-        // A full-class commit gives up after the driver timeout. (`verifier` is
-        // a capture-free `service_fn`, so it is `Copy` and reused below as-is.)
-        assert_eq!(
-            commit_block_sync_body(
-                verifier,
-                test_block_work_owner(),
-                test_block_source(),
-                block.clone(),
-                BlockApplyClass::Full,
+        for class in [BlockApplyClass::Full, BlockApplyClass::Checkpoint] {
+            let waited = tokio::time::timeout(
+                ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT * 4,
+                commit_block_sync_body(
+                    verifier,
+                    test_block_work_owner(),
+                    test_block_source(),
+                    block.clone(),
+                    class,
+                ),
             )
-            .await
-            .result(),
-            BlockApplyResult::TimedOut,
-            "full commit should time out when the verifier never answers"
-        );
-
-        // A checkpoint-class commit keeps waiting: an outer timeout several times
-        // longer than the driver timeout must elapse with the commit still
-        // unresolved. If the driver timeout still applied to checkpoint commits,
-        // this would instead resolve to Ok(TimedOut) long before the outer
-        // timeout fired.
-        let waited = tokio::time::timeout(
-            ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT * 4,
-            commit_block_sync_body(
-                verifier,
-                test_block_work_owner(),
-                test_block_source(),
-                block,
-                BlockApplyClass::Checkpoint,
-            ),
-        )
-        .await;
-        assert!(
-            waited.is_err(),
-            "checkpoint commit must keep waiting past the driver timeout, got {waited:?}"
-        );
+            .await;
+            assert!(
+                waited.is_err(),
+                "{class:?} commit must keep waiting past the driver timeout, got {waited:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4168,12 +4148,12 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn block_sync_pending_checkpoint_apply_emits_stalled_trace_without_finishing() {
+    async fn block_sync_pending_full_apply_emits_stalled_trace_without_finishing() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block_hash = block.hash();
         let block_height = block.coinbase_height().expect("test block has height");
         let mut capture = TraceCapture::for_test(
-            "block_sync_pending_checkpoint_apply_emits_stalled_trace_without_finishing",
+            "block_sync_pending_full_apply_emits_stalled_trace_without_finishing",
         )
         .unwrap();
         let trace = zakura_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
@@ -4212,7 +4192,7 @@ mod zakura_header_sync_driver_tests {
             test_block_source(),
             88,
             block,
-            BlockApplyClass::Checkpoint,
+            BlockApplyClass::Full,
             trace,
             None,
         ));
@@ -4235,7 +4215,7 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(
             commit_state.count(cs_trace::COMMIT_FINISH),
             0,
-            "pending checkpoint verifier must not produce a finish row before it resolves"
+            "pending full verifier must not produce a finish row before it resolves"
         );
 
         apply_task.abort();
