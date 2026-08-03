@@ -26,6 +26,17 @@ on:
         type: boolean
         required: false
         default: false
+      p2p_stack:
+        description: "P2P stack for the selected node"
+        type: choice
+        required: false
+        options: [dual, zakura, legacy]
+        default: dual
+      header_sync_trace:
+        description: "Write structured header/block-sync traces to the data volume"
+        type: boolean
+        required: false
+        default: false
       node:
         description: "Optional single deployer node name; blank deploys the whole fleet"
         required: false
@@ -115,6 +126,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          if { [ "${{ inputs.p2p_stack }}" != "dual" ] || [ "${{ inputs.header_sync_trace }}" = "true" ]; } \
+            && [ -z "${{ inputs.node }}" ]; then
+            echo "p2p_stack overrides and header_sync_trace require one explicit node" >&2
+            exit 1
+          fi
+
+          zakura_trace_line=""
+          if [ "${{ inputs.header_sync_trace }}" = "true" ]; then
+            zakura_trace_line='trace_dir = "/mnt/data/traces/header-chain-canary"'
+          fi
+
           cat > nodes.ci.toml <<EOF
           [defaults]
           service_name    = "zakurad"
@@ -125,7 +147,7 @@ jobs:
           rpc_listen_addr = "0.0.0.0:18232"
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
-          p2p_stack       = "dual"
+          p2p_stack       = "${{ inputs.p2p_stack }}"
           metrics_endpoint = "127.0.0.1:9999"
           tracing_filter  = "info,zakura_network::zakura=info"
           checkpoint_sync = false
@@ -133,6 +155,7 @@ jobs:
 
           [defaults.zakura]
           listen_addr = "0.0.0.0:8234"
+          ${zakura_trace_line}
           bootstrap_peers = [
               "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
               "4faac8f988a7820690d63b57a385cd6f833638b068e774550712c05e4b692426@167.99.110.145:8234",

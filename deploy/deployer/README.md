@@ -92,11 +92,19 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `ref` — branch, tag, or SHA to build and deploy, default `main`.
 - `force_rebuild` — pass `--force` to rebuild the cached binary.
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
+- `p2p_stack` — select `dual`, `zakura`, or `legacy` for the dispatched node;
+  defaults to `dual`.
+- `header_sync_trace` — write structured canary traces under
+  `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
+
+Non-default `p2p_stack` values and `header_sync_trace = true` require an
+explicit `node`, preventing canary settings from being applied fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
-while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`;
+while forcing the legacy non-VCT path. Fleet nodes default to
+`p2p_stack = "dual"`, with a per-run override for staged canaries;
 `zakura-compat` uses `p2p_stack = "legacy"` (legacy TCP only). It also writes
 `/etc/zakura/zakura.toml` and uses each node's existing
 `/mnt/data/zakura-cache` snapshot directory, so CI restarts the current
