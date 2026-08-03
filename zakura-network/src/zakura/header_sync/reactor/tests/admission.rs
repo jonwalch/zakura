@@ -1,6 +1,68 @@
 use super::*;
 
 #[test]
+fn committed_header_generation_reconsiders_the_cached_peer_target() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let initial = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the cached-target fixture builds");
+    let peer = peer();
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_event(HeaderSyncEvent::PeerConnected(
+        HeaderSyncPeerSession::from_parts_with_session_id(
+            peer.clone(),
+            7,
+            send,
+            CancellationToken::new(),
+        ),
+    ));
+    let (_source, _owner, _branch) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+    let advertised = reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("the fixture has an active advertised target")
+        .target
+        .status
+        .clone();
+    reactor
+        .peer_state
+        .get_mut(&peer)
+        .expect("the peer is connected")
+        .last_status = Some(advertised.clone());
+
+    let mut committed = initial;
+    committed.state_version = committed
+        .state_version
+        .checked_next()
+        .expect("the fixture state version advances");
+    committed.header_generation = committed
+        .header_generation
+        .checked_next()
+        .expect("the fixture header generation advances");
+    reactor.observe_latest_committed_snapshot(committed.clone());
+
+    let HeaderPortOperation::QueryHeaderLocator {
+        peer: scheduled_peer,
+        session_id,
+        target_tip_hash,
+        scope,
+    } = actions
+        .try_recv()
+        .expect("the new generation immediately reconsiders the cached target")
+    else {
+        panic!("the cached target must schedule fresh locator work");
+    };
+    assert_eq!(scheduled_peer, peer);
+    assert_eq!(session_id, 7);
+    assert_eq!(target_tip_hash, advertised.selected_tip_hash);
+    assert_eq!(scope.header_generation, committed.header_generation);
+    assert_eq!(scope.state_version, committed.state_version);
+}
+
+#[test]
 // AUD-06/AUD-07: committing a newer snapshot is the production retirement
 // boundary; both held successes and failures must be inert after it.
 fn committed_snapshot_retires_in_flight_state_results() {

@@ -25,6 +25,20 @@ pub struct AdvertisedHeaderTarget {
 }
 
 impl AdvertisedHeaderTarget {
+    /// Whether this target still has header-generation and branch authority.
+    ///
+    /// Header work deliberately ignores the global state version because unrelated body commits
+    /// can advance it without changing the selected header graph or finality anchor.
+    pub fn is_current(&self, local: &EngineSnapshot) -> bool {
+        self.scope.header_generation == local.header_generation
+            && self
+                .scope
+                .verified_generation
+                .is_none_or(|generation| generation == local.verified_generation)
+            && self.scope.branch.anchor_hash == local.frontiers.finalized.hash
+            && self.scope.branch.target_tip_hash == self.status.selected_tip_hash
+    }
+
     /// Compare claimed suffix work only when both snapshots use the same anchor.
     pub fn claimed_work_order(&self, local: &EngineSnapshot) -> Option<Ordering> {
         let local_anchor = local.frontiers.finalized;
@@ -229,10 +243,7 @@ impl PeerWorkQueue {
     ) -> usize {
         let before = self.work_by_peer.len();
         self.work_by_peer.retain(|_, work| match work {
-            PeerWorkState::AwaitingLocator { target, .. } => {
-                target.scope
-                    == WorkScope::for_header_target(current, target.status.selected_tip_hash)
-            }
+            PeerWorkState::AwaitingLocator { target, .. } => target.is_current(current),
             PeerWorkState::Active(_) => true,
         });
         before.saturating_sub(self.work_by_peer.len())
@@ -712,6 +723,33 @@ mod tests {
         assert!(
             queue.active(&peer(2)).is_some(),
             "active requests remain owned by the pending-owner retirement path"
+        );
+    }
+
+    #[test]
+    fn body_only_state_version_change_keeps_header_locator_work_current() {
+        let local = snapshot();
+        let mut queue = PeerWorkQueue::default();
+        let awaiting = advertisement(1);
+        let original_scope = awaiting.scope;
+        let target_hash = awaiting.status.selected_tip_hash;
+        assert_eq!(
+            queue.stage(peer(1), awaiting, PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+
+        let mut current = local;
+        current.state_version = current
+            .state_version
+            .checked_next()
+            .expect("the fixture state version advances");
+
+        assert_eq!(queue.retire_obsolete_unstarted(&current), 0);
+        assert!(
+            queue
+                .awaiting(&peer(1), 7, target_hash, original_scope)
+                .is_some(),
+            "an unrelated body commit preserves header-generation locator authority"
         );
     }
 

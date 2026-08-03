@@ -222,27 +222,13 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
         .send(Some(advanced))
         .expect("the snapshot receiver remains live");
 
-    let fresh_scope = loop {
-        handle
-            .send(HeaderSyncEvent::SessionWireMessage {
-                peer: peer.clone(),
-                session_id: 0,
-                msg: HeaderSyncMessage::Status(remote_status.clone()),
-            })
-            .await
-            .expect("a refreshed target status reaches the reactor");
-        let observed_scope = match next_action(&mut actions).await {
-            HeaderPortOperation::QueryHeaderLocator {
-                target_tip_hash,
-                scope,
-                ..
-            } if target_tip_hash == target => scope,
-            other => panic!("expected refreshed locator query for target, got {other:?}"),
-        };
-        if observed_scope != stale_scope {
-            break observed_scope;
-        }
-        tokio::task::yield_now().await;
+    let fresh_scope = match next_action(&mut actions).await {
+        HeaderPortOperation::QueryHeaderLocator {
+            target_tip_hash,
+            scope,
+            ..
+        } if target_tip_hash == target => scope,
+        other => panic!("expected refreshed locator query for target, got {other:?}"),
     };
 
     handle

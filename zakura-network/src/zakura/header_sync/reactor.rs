@@ -756,16 +756,24 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
+        self.consider_advertised_header_target(peer, session_id, status);
+    }
 
+    fn consider_advertised_header_target(
+        &mut self,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        status: Status,
+    ) {
         let Some(local) = self.committed_snapshot.as_ref() else {
             return;
         };
-        let scope =
-            zakura_header_chain::WorkScope::for_header_target(local, status.selected_tip_hash);
+        let target_tip_hash = status.selected_tip_hash;
+        let scope = zakura_header_chain::WorkScope::for_header_target(local, target_tip_hash);
         let target = AdvertisedHeaderTarget {
             scope,
             session_id,
-            status: status.clone(),
+            status,
         };
         let work_order = target.claimed_work_order(local);
         let eligible = target.is_discovery_eligible(local);
@@ -773,10 +781,8 @@ impl HeaderSyncReactor {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
         }
-        let branch = zakura_header_chain::BranchId::new(
-            local.frontiers.finalized.hash,
-            status.selected_tip_hash,
-        );
+        let branch =
+            zakura_header_chain::BranchId::new(local.frontiers.finalized.hash, target_tip_hash);
         if self
             .completed_targets
             .contains(local.header_generation, branch)
@@ -794,7 +800,7 @@ impl HeaderSyncReactor {
                 if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                     peer: peer.clone(),
                     session_id,
-                    target_tip_hash: status.selected_tip_hash,
+                    target_tip_hash,
                     scope,
                 }) {
                     self.peer_work_queue.remove_unstarted(&peer);
@@ -806,6 +812,22 @@ impl HeaderSyncReactor {
             QueueWorkResult::AtCapacity => {
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
             }
+        }
+    }
+
+    fn reconsider_advertised_header_targets(&mut self) {
+        let targets: Vec<_> = self
+            .peer_state
+            .iter()
+            .filter_map(|(peer, state)| {
+                state
+                    .last_status
+                    .clone()
+                    .map(|status| (peer.clone(), state.session.session_id(), status))
+            })
+            .collect();
+        for (peer, session_id, status) in targets {
+            self.consider_advertised_header_target(peer, session_id, status);
         }
     }
 
@@ -1855,9 +1877,7 @@ impl HeaderSyncReactor {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
         };
-        if target.scope
-            != zakura_header_chain::WorkScope::for_header_target(&local, target_tip_hash)
-        {
+        if !target.is_current(&local) {
             self.peer_work_queue.remove_unstarted(&peer);
             metrics::counter!("sync.header.target.stale_locator").increment(1);
             return;
@@ -1971,6 +1991,10 @@ impl HeaderSyncReactor {
             return;
         }
 
+        let header_authority_changed = self.committed_snapshot.as_ref().is_some_and(|old| {
+            old.header_generation != snapshot.header_generation
+                || old.frontiers.finalized != snapshot.frontiers.finalized
+        });
         self.emit_snapshot_observed(self.committed_snapshot.as_ref(), &snapshot);
         self.retire_obsolete_work(&snapshot);
         let old_tip = self
@@ -2004,6 +2028,9 @@ impl HeaderSyncReactor {
             self.publish_peer_state();
         }
         self.refresh_statuses();
+        if header_authority_changed {
+            self.reconsider_advertised_header_targets();
+        }
     }
 
     fn emit_snapshot_observed(
