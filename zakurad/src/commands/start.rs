@@ -1697,10 +1697,12 @@ mod zakura_header_sync_driver_tests {
             std::env::var_os(STATE_DIR_ENV)
                 .expect("the parent test supplies the durable state path"),
         );
-        let mut state_config = zakura_state::Config::default();
-        state_config.cache_dir = state_dir;
-        state_config.ephemeral = false;
-        state_config.debug_skip_non_finalized_state_backup_task = true;
+        let state_config = zakura_state::Config {
+            cache_dir: state_dir,
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Default::default()
+        };
         let network = zakura_chain::parameters::Network::Mainnet;
         let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
         let blocks = [
@@ -1785,8 +1787,6 @@ mod zakura_header_sync_driver_tests {
             let committed = wait_for_header_snapshot(&mut snapshots, block::Height(4)).await;
             assert_eq!(committed.frontiers.header_best.hash, blocks[3].hash());
 
-            drop(committed);
-            drop(genesis_snapshot);
             drop(suffix);
             drop(snapshots);
             drop(startup);
