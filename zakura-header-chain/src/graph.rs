@@ -48,6 +48,9 @@ pub enum GraphError {
     /// A requested retained node does not exist.
     #[error("unknown retained header {0:?}")]
     UnknownNode(block::Hash),
+    /// Finality attempted to root the graph at an ineligible header.
+    #[error("cannot finalize ineligible retained header {0:?}")]
+    IneligibleFinalized(block::Hash),
     /// Retention attempted to remove a node that still has retained children.
     #[error("cannot remove non-leaf header {0:?}")]
     NodeHasChildren(block::Hash),
@@ -538,6 +541,9 @@ impl MemHeaderStore {
         if node.height != finalized.height {
             return Err(GraphError::UnknownNode(finalized.hash));
         }
+        if !node.is_eligible() {
+            return Err(GraphError::IneligibleFinalized(finalized.hash));
+        }
         let mut retained = HashSet::new();
         let mut pending = vec![finalized.hash];
         while let Some(hash) = pending.pop() {
@@ -552,14 +558,27 @@ impl MemHeaderStore {
             .filter(|hash| !retained.contains(hash))
             .collect();
         deleted.sort_unstable_by_key(|hash| hash.0);
-        let nodes: Vec<_> = self
-            .nodes
-            .values()
-            .filter(|node| retained.contains(&node.hash))
-            .cloned()
-            .collect();
-        *self = Self::from_nodes(finalized, nodes)?;
-        self.recompute_all_eligibility()?;
+        for hash in &deleted {
+            let node = self
+                .nodes
+                .remove(hash)
+                .expect("the deletion set came from retained graph nodes");
+            self.children.remove(hash);
+            self.eligible_tips.remove(hash);
+            if let Some(hashes) = self.heights.get_mut(&node.height) {
+                hashes.remove(hash);
+                if hashes.is_empty() {
+                    self.heights.remove(&node.height);
+                }
+            }
+        }
+        self.finalized = finalized;
+        self.nodes
+            .get_mut(&finalized.hash)
+            .expect("the new finalized root is retained")
+            .eligibility
+            .inherited_from = None;
+        self.refresh_eligible_tip(finalized.hash);
         Ok(deleted)
     }
 
@@ -710,6 +729,44 @@ mod tests {
         }
     }
 
+    fn rebuild_finalized_reference(
+        store: &mut MemHeaderStore,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError> {
+        let node = store
+            .node(finalized.hash)
+            .ok_or(GraphError::UnknownNode(finalized.hash))?;
+        if node.height != finalized.height {
+            return Err(GraphError::UnknownNode(finalized.hash));
+        }
+        if !node.is_eligible() {
+            return Err(GraphError::IneligibleFinalized(finalized.hash));
+        }
+        let mut retained = HashSet::new();
+        let mut pending = vec![finalized.hash];
+        while let Some(hash) = pending.pop() {
+            if retained.insert(hash) {
+                pending.extend(store.children(hash));
+            }
+        }
+        let mut deleted: Vec<_> = store
+            .nodes
+            .keys()
+            .copied()
+            .filter(|hash| !retained.contains(hash))
+            .collect();
+        deleted.sort_unstable_by_key(|hash| hash.0);
+        let nodes: Vec<_> = store
+            .nodes
+            .values()
+            .filter(|node| retained.contains(&node.hash))
+            .cloned()
+            .collect();
+        *store = MemHeaderStore::from_nodes(finalized, nodes)?;
+        store.recompute_all_eligibility()?;
+        Ok(deleted)
+    }
+
     #[test]
     fn conflicting_duplicate_reports_the_duplicate_hash() {
         let mut store = anchor_store();
@@ -765,11 +822,20 @@ mod tests {
         let rejected_sibling = insert_child(&mut store, selected_parent.hash, 4);
         let rejected_descendant = insert_child(&mut store, rejected_sibling.hash, 5);
 
+        let mut rebuilt = store.clone();
+        let rebuilt_deleted = rebuild_finalized_reference(&mut rebuilt, selected_child)
+            .expect("the rebuild oracle accepts the same finalized node");
+
         let deleted = store
             .advance_finalized(selected_child)
             .expect("the retained selected node can become finalized");
 
         assert_eq!(store.finalized(), selected_child);
+        assert_eq!(deleted, rebuilt_deleted);
+        assert_eq!(store.nodes, rebuilt.nodes);
+        assert_eq!(store.children, rebuilt.children);
+        assert_eq!(store.heights, rebuilt.heights);
+        assert_eq!(store.eligible_tips, rebuilt.eligible_tips);
         assert!(store.node(selected_child.hash).is_some());
         assert!(store.node(selected_tip.hash).is_some());
         assert!(store.node(anchor.hash).is_none());
@@ -785,6 +851,33 @@ mod tests {
                 rejected_descendant.hash,
             ])
         );
+    }
+
+    #[test]
+    fn advancing_finality_rejects_an_ineligible_root_without_mutation() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let candidate = insert_child(&mut store, anchor.hash, 1);
+        store
+            .add_reason(
+                candidate.hash,
+                EligibilityReason::CheckpointConflict {
+                    height: candidate.height,
+                    expected: block::Hash([0xee; 32]),
+                },
+            )
+            .expect("the fixture marks the candidate ineligible");
+        let before = store.clone();
+
+        assert_eq!(
+            store.advance_finalized(candidate),
+            Err(GraphError::IneligibleFinalized(candidate.hash))
+        );
+        assert_eq!(store.nodes, before.nodes);
+        assert_eq!(store.children, before.children);
+        assert_eq!(store.heights, before.heights);
+        assert_eq!(store.eligible_tips, before.eligible_tips);
+        assert_eq!(store.finalized, before.finalized);
     }
 
     fn uncached_eligible_tips(store: &MemHeaderStore) -> Vec<Frontier> {
