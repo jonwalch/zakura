@@ -15,6 +15,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import sys
 import threading
 import time
 import tomllib
@@ -43,6 +44,15 @@ DEFAULT_MAX_INFLIGHT_TOTAL = 64
 DEFAULT_MAX_INFLIGHT_PER_CLIENT = 8
 
 LOGGER = logging.getLogger("zakura-broadcast-gateway")
+
+
+class RedactingThreadingHTTPServer(ThreadingHTTPServer):
+    """Suppress client addresses and tracebacks from handler error logs."""
+
+    def handle_error(self, _request: Any, _client_address: Any) -> None:
+        error_type = sys.exc_info()[0]
+        error_name = error_type.__name__ if error_type is not None else "unknown"
+        LOGGER.debug("request handler failed error=%s", error_name)
 
 
 @dataclass(frozen=True)
@@ -637,7 +647,7 @@ def main() -> None:
     )
     GATEWAY.start()
 
-    server = ThreadingHTTPServer((args.host, args.port), SubmitHandler)
+    server = RedactingThreadingHTTPServer((args.host, args.port), SubmitHandler)
     LOGGER.info(
         "listening on http://%s:%s backends=%s rate=%s/%ss inflight=%s/%s body_timeout=%ss",
         args.host,

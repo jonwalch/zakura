@@ -195,6 +195,27 @@ class BackendPoolTest(unittest.TestCase):
             server.server_close()
 
 
+class ServerLoggingTest(unittest.TestCase):
+    def test_handler_errors_redact_client_details_and_tracebacks(self) -> None:
+        server = gateway.RedactingThreadingHTTPServer(
+            ("127.0.0.1", 0), gateway.SubmitHandler
+        )
+        try:
+            with self.assertLogs(gateway.LOGGER, level="DEBUG") as captured:
+                try:
+                    raise ConnectionResetError("attacker-controlled detail")
+                except ConnectionResetError:
+                    server.handle_error(object(), ("203.0.113.9", 12345))
+        finally:
+            server.server_close()
+
+        output = "\n".join(captured.output)
+        self.assertIn("ConnectionResetError", output)
+        self.assertNotIn("203.0.113.9", output)
+        self.assertNotIn("12345", output)
+        self.assertNotIn("attacker-controlled detail", output)
+
+
 class HandlerTest(unittest.TestCase):
     def setUp(self) -> None:
         submit_ok = {
@@ -216,7 +237,9 @@ class HandlerTest(unittest.TestCase):
         gateway.INFLIGHT_LIMITER = gateway.InflightLimiter()
         gateway.BODY_READ_TIMEOUT = gateway.DEFAULT_BODY_READ_TIMEOUT
         gateway.MAX_BODY_BYTES = 1024
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.SubmitHandler)
+        self.server = gateway.RedactingThreadingHTTPServer(
+            ("127.0.0.1", 0), gateway.SubmitHandler
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
@@ -351,7 +374,9 @@ class SlowBodyTest(unittest.TestCase):
         gateway.INFLIGHT_LIMITER = gateway.InflightLimiter(total_limit=8, client_limit=2)
         gateway.BODY_READ_TIMEOUT = 30.0
         gateway.MAX_BODY_BYTES = 1024
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.SubmitHandler)
+        self.server = gateway.RedactingThreadingHTTPServer(
+            ("127.0.0.1", 0), gateway.SubmitHandler
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.host, self.port = self.server.server_address
