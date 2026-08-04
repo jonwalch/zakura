@@ -29,7 +29,6 @@ pub(crate) async fn zakura_header_sync_driver_startup<State>(
     state: State,
     read_state: zakura_state::ReadStateService,
     network: &zakura_chain::parameters::Network,
-    max_checkpoint_height: block::Height,
 ) -> Result<ZakuraHeaderSyncDriverStartup, Report>
 where
     State: Service<
@@ -86,11 +85,13 @@ where
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let mut committed_snapshots = read_state.subscribe_header_chain_snapshots();
-    if should_wait_for_durable_snapshot(finalized_tip, max_checkpoint_height)
-        && committed_snapshots.borrow().is_none()
-    {
-        wait_for_durable_snapshot(&mut committed_snapshots).await?;
+    let committed_snapshots = read_state.subscribe_header_chain_snapshots();
+    let mut header_runtime_status = read_state.subscribe_header_runtime_status();
+    wait_for_header_runtime(&mut header_runtime_status).await?;
+    if header_runtime_status.borrow().is_ready() && committed_snapshots.borrow().is_none() {
+        return Err(eyre!(
+            "header runtime reported ready before publishing its committed snapshot"
+        ));
     }
     let vct_root_repairs = read_state.subscribe_vct_root_repairs();
     let best_header_tip = committed_snapshots
@@ -114,33 +115,57 @@ where
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
         committed_snapshots,
+        header_runtime_status,
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(state, read_state)),
     })
 }
 
-async fn wait_for_durable_snapshot(
-    snapshots: &mut tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+async fn wait_for_header_runtime(
+    status: &mut tokio::sync::watch::Receiver<
+        zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+    >,
 ) -> Result<(), Report> {
-    tokio::time::timeout(ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT, async {
-        while snapshots.borrow().is_none() {
-            snapshots
-                .changed()
-                .await
-                .map_err(|_| eyre!("header-chain snapshot publisher closed during startup"))?;
-        }
-        Ok::<_, Report>(())
-    })
-    .await
-    .map_err(|_| eyre!("timed out waiting for the durable header-chain snapshot"))??;
-    Ok(())
-}
+    use zakura_node_services::sync_lifecycle::HeaderRuntimeStatus;
 
-fn should_wait_for_durable_snapshot(
-    finalized_tip: Option<(block::Height, block::Hash)>,
-    max_checkpoint_height: block::Height,
-) -> bool {
-    finalized_tip.is_some_and(|(height, _)| height >= max_checkpoint_height)
+    loop {
+        let current = status.borrow().clone();
+        match current {
+            HeaderRuntimeStatus::Detached {
+                reason:
+                    zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+                ..
+            }
+            | HeaderRuntimeStatus::Ready { .. } => return Ok(()),
+            HeaderRuntimeStatus::Detached {
+                reason:
+                    zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
+                ..
+            } => status.changed().await.map_err(|_| {
+                eyre!("header-runtime lifecycle publisher closed before attachment started")
+            })?,
+            HeaderRuntimeStatus::Failed { error, .. } => {
+                return Err(eyre!("header runtime attachment failed: {error}"))
+            }
+            HeaderRuntimeStatus::Reconstructing { epoch, progress } => {
+                match tokio::time::timeout(ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT, status.changed())
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err(eyre!(
+                            "header-runtime lifecycle publisher closed during startup"
+                        ))
+                    }
+                    Err(_) => tracing::warn!(
+                        header_runtime_epoch = epoch.get(),
+                        ?progress,
+                        "header runtime reconstruction is still active"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -967,40 +992,70 @@ mod tests {
         .boxed_clone()
     }
 
-    #[test]
-    fn durable_snapshot_wait_starts_only_at_checkpoint_handoff() {
-        let finalized_hash = block::Hash([5; 32]);
-        let max_checkpoint_height = block::Height(40);
+    #[tokio::test]
+    async fn runtime_wait_uses_explicit_attachment_state_without_height_inference() {
+        use zakura_node_services::sync_lifecycle::{
+            HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+        };
 
-        assert!(!should_wait_for_durable_snapshot(
-            None,
-            max_checkpoint_height
-        ));
-        assert!(!should_wait_for_durable_snapshot(
-            Some((block::Height(0), finalized_hash)),
-            max_checkpoint_height,
-        ));
-        assert!(!should_wait_for_durable_snapshot(
-            Some((block::Height(39), finalized_hash)),
-            max_checkpoint_height,
-        ));
-        assert!(should_wait_for_durable_snapshot(
-            Some((block::Height(40), finalized_hash)),
-            max_checkpoint_height,
-        ));
-        assert!(should_wait_for_durable_snapshot(
-            Some((block::Height(41), finalized_hash)),
-            max_checkpoint_height,
-        ));
+        let (_detached_tx, mut detached) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+                epoch: LifecycleEpoch::INITIAL,
+                reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+            });
+        wait_for_header_runtime(&mut detached)
+            .await
+            .expect("detached checkpoint bootstrap starts without waiting");
+
+        let (pending_tx, mut pending) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+                epoch: LifecycleEpoch::INITIAL,
+                reason: HeaderRuntimeDetachedReason::AttachmentPending,
+            });
+        let pending_wait = wait_for_header_runtime(&mut pending);
+        tokio::pin!(pending_wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending_wait)
+                .await
+                .is_err(),
+            "a durable restart must not pass startup while attachment remains pending",
+        );
+        pending_tx
+            .send(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the pending runtime status receiver remains live");
+        pending_wait
+            .await
+            .expect("the durable restart proceeds after explicit readiness");
+
+        let (_failed_tx, mut failed) = tokio::sync::watch::channel(HeaderRuntimeStatus::Failed {
+            epoch: LifecycleEpoch::new(1),
+            error: "fixture reconstruction failed".into(),
+        });
+        assert!(wait_for_header_runtime(&mut failed).await.is_err());
+
+        let (_ready_tx, mut ready) = tokio::sync::watch::channel(HeaderRuntimeStatus::Ready {
+            epoch: LifecycleEpoch::new(1),
+        });
+        wait_for_header_runtime(&mut ready)
+            .await
+            .expect("an already-ready restart never waits");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn durable_snapshot_startup_wait_outlives_driver_request_deadline() {
-        let (_snapshot_sender, mut snapshots) = tokio::sync::watch::channel(None);
+        let (_status_sender, mut status) = tokio::sync::watch::channel(
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Reconstructing {
+                epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::new(1),
+                progress:
+                    zakura_node_services::sync_lifecycle::HeaderReconstructionProgress::STARTING,
+            },
+        );
 
         let early_result = tokio::time::timeout(
             ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT + std::time::Duration::from_secs(1),
-            wait_for_durable_snapshot(&mut snapshots),
+            wait_for_header_runtime(&mut status),
         )
         .await;
 

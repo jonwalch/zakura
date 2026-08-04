@@ -1,6 +1,7 @@
 //! Process-local sync lifecycle values shared across state, network, and node orchestration.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Checked monotonic identity for one lifecycle generation.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -198,6 +199,178 @@ impl fmt::Display for LifecycleTransitionError {
 
 impl std::error::Error for LifecycleTransitionError {}
 
+/// Coarse startup stage reported while attaching the durable header runtime.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderReconstructionStage {
+    /// Audit authoritative rows and derive any reconstructible repairs.
+    StartupAudit,
+    /// Reconcile the durable header runtime with authenticated full-state frontiers.
+    FullStateReconciliation,
+}
+
+/// Bounded progress facts for one header-runtime attachment attempt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReconstructionProgress {
+    /// Current reconstruction stage.
+    pub stage: HeaderReconstructionStage,
+    /// Completed work units within the stage.
+    pub completed: u64,
+    /// Known total work units, or `None` before the audit determines it.
+    pub total: Option<u64>,
+}
+
+/// Why the durable header runtime is not attached yet.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRuntimeDetachedReason {
+    /// Fresh state must first receive checkpoint-verified blocks through semantic sync.
+    AwaitingSemanticHandoff,
+    /// Durable header state exists and the state worker still owes runtime attachment.
+    AttachmentPending,
+}
+
+impl HeaderReconstructionProgress {
+    /// Initial progress before the startup audit has enumerated work.
+    pub const STARTING: Self = Self {
+        stage: HeaderReconstructionStage::StartupAudit,
+        completed: 0,
+        total: None,
+    };
+}
+
+/// Authoritative attachment/readiness state of the durable header runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRuntimeStatus {
+    /// Checkpoint semantic handoff has not started runtime attachment.
+    Detached {
+        /// Last attachment generation.
+        epoch: LifecycleEpoch,
+        /// Explicit startup condition that determines whether callers may bootstrap.
+        reason: HeaderRuntimeDetachedReason,
+    },
+    /// One attachment generation is auditing or reconciling durable state.
+    Reconstructing {
+        /// Exact attachment generation.
+        epoch: LifecycleEpoch,
+        /// Latest bounded progress report.
+        progress: HeaderReconstructionProgress,
+    },
+    /// The coherent reader and committed snapshot publisher are both live.
+    Ready {
+        /// Ready attachment generation.
+        epoch: LifecycleEpoch,
+    },
+    /// Attachment failed closed with its root-cause message.
+    Failed {
+        /// Failed attachment generation.
+        epoch: LifecycleEpoch,
+        /// Stable root-cause text propagated from state startup.
+        error: Arc<str>,
+    },
+}
+
+impl HeaderRuntimeStatus {
+    /// Return this status's monotonic attachment generation.
+    pub const fn epoch(&self) -> LifecycleEpoch {
+        match self {
+            Self::Detached { epoch, .. }
+            | Self::Reconstructing { epoch, .. }
+            | Self::Ready { epoch }
+            | Self::Failed { epoch, .. } => *epoch,
+        }
+    }
+
+    /// Whether the coherent runtime is ready for header service use.
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Apply one checked runtime transition without changing the caller on failure.
+    pub fn transition(
+        self,
+        transition: HeaderRuntimeTransition,
+    ) -> Result<Self, LifecycleTransitionError> {
+        match transition {
+            HeaderRuntimeTransition::BeginReconstruction => match self {
+                Self::Detached { epoch, .. } => Ok(Self::Reconstructing {
+                    epoch: epoch
+                        .checked_next()
+                        .ok_or(LifecycleTransitionError::EpochExhausted)?,
+                    progress: HeaderReconstructionProgress::STARTING,
+                }),
+                _ => Err(LifecycleTransitionError::IllegalPhase),
+            },
+            HeaderRuntimeTransition::ReportProgress {
+                expected_epoch,
+                progress,
+            } => {
+                check_header_epoch(&self, expected_epoch)?;
+                match self {
+                    Self::Reconstructing { epoch, .. } => {
+                        Ok(Self::Reconstructing { epoch, progress })
+                    }
+                    _ => Err(LifecycleTransitionError::IllegalPhase),
+                }
+            }
+            HeaderRuntimeTransition::Ready { expected_epoch } => {
+                check_header_epoch(&self, expected_epoch)?;
+                match self {
+                    Self::Reconstructing { epoch, .. } => Ok(Self::Ready { epoch }),
+                    _ => Err(LifecycleTransitionError::IllegalPhase),
+                }
+            }
+            HeaderRuntimeTransition::Fail {
+                expected_epoch,
+                error,
+            } => {
+                check_header_epoch(&self, expected_epoch)?;
+                match self {
+                    Self::Detached { epoch, .. } | Self::Reconstructing { epoch, .. } => {
+                        Ok(Self::Failed { epoch, error })
+                    }
+                    _ => Err(LifecycleTransitionError::IllegalPhase),
+                }
+            }
+        }
+    }
+}
+
+fn check_header_epoch(
+    status: &HeaderRuntimeStatus,
+    expected: LifecycleEpoch,
+) -> Result<(), LifecycleTransitionError> {
+    let current = status.epoch();
+    if current != expected {
+        return Err(LifecycleTransitionError::StaleEpoch { expected, current });
+    }
+    Ok(())
+}
+
+/// Requested header-runtime lifecycle edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRuntimeTransition {
+    /// Start one checked attachment/reconstruction generation.
+    BeginReconstruction,
+    /// Replace progress only for the exact active generation.
+    ReportProgress {
+        /// Active attachment generation.
+        expected_epoch: LifecycleEpoch,
+        /// New bounded progress facts.
+        progress: HeaderReconstructionProgress,
+    },
+    /// Publish coherent readiness for the exact reconstructed generation.
+    Ready {
+        /// Active attachment generation.
+        expected_epoch: LifecycleEpoch,
+    },
+    /// Fail the exact detached or reconstructing generation closed.
+    Fail {
+        /// Generation that encountered the failure.
+        expected_epoch: LifecycleEpoch,
+        /// Root-cause text from state attachment.
+        error: Arc<str>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +452,41 @@ mod tests {
             }),
             Err(LifecycleTransitionError::EpochExhausted)
         );
+    }
+
+    #[test]
+    fn header_runtime_requires_one_explicit_reconstruction_epoch() {
+        let detached = HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AttachmentPending,
+        };
+        let reconstructing = detached
+            .clone()
+            .transition(HeaderRuntimeTransition::BeginReconstruction)
+            .expect("detached runtime can begin reconstruction");
+        let epoch = reconstructing.epoch();
+        assert!(matches!(
+            reconstructing,
+            HeaderRuntimeStatus::Reconstructing { .. }
+        ));
+        let ready = reconstructing
+            .clone()
+            .transition(HeaderRuntimeTransition::Ready {
+                expected_epoch: epoch,
+            })
+            .expect("the active reconstruction can become ready");
+        assert_eq!(ready, HeaderRuntimeStatus::Ready { epoch });
+        assert_eq!(
+            detached.transition(HeaderRuntimeTransition::Ready {
+                expected_epoch: LifecycleEpoch::INITIAL,
+            }),
+            Err(LifecycleTransitionError::IllegalPhase)
+        );
+        assert!(matches!(
+            reconstructing.transition(HeaderRuntimeTransition::Ready {
+                expected_epoch: LifecycleEpoch::INITIAL,
+            }),
+            Err(LifecycleTransitionError::StaleEpoch { .. })
+        ));
     }
 }

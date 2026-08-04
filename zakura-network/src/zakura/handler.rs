@@ -557,6 +557,9 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub verified_block_tip_hash: block::Hash,
     /// Durable header snapshots, whose value is absent until semantic handoff succeeds.
     pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    /// Explicit state-owned attachment/readiness lifecycle for capability epochs.
+    pub header_runtime_status:
+        watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
     /// VCT metadata repair needs published by the finalized writer.
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed header-chain operations used directly by the reactor.
@@ -3246,6 +3249,38 @@ fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId
         .len()
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct HeaderCapabilityEpochs {
+    applied_ready: Option<zakura_node_services::sync_lifecycle::LifecycleEpoch>,
+}
+
+impl HeaderCapabilityEpochs {
+    fn from_initial(status: &zakura_node_services::sync_lifecycle::HeaderRuntimeStatus) -> Self {
+        let applied_ready = match status {
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Ready { epoch } => {
+                Some(*epoch)
+            }
+            _ => None,
+        };
+        Self { applied_ready }
+    }
+
+    fn observe(
+        &mut self,
+        status: &zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+    ) -> Option<zakura_node_services::sync_lifecycle::LifecycleEpoch> {
+        let zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Ready { epoch } = status
+        else {
+            return None;
+        };
+        if self.applied_ready.is_some_and(|applied| *epoch <= applied) {
+            return None;
+        }
+        self.applied_ready = Some(*epoch);
+        Some(*epoch)
+    }
+}
+
 /// Enable header sync for new handshakes and disconnect connections that were
 /// negotiated before the capability became available.
 ///
@@ -3256,6 +3291,7 @@ fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId
 async fn enable_header_sync_and_renegotiate(
     handler: &ZakuraProtocolHandler,
     supervisor: &ZakuraSupervisorHandle,
+    capability_epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch,
 ) -> usize {
     handler.set_header_sync_enabled(true);
 
@@ -3270,6 +3306,7 @@ async fn enable_header_sync_and_renegotiate(
             .increment(u64::try_from(disconnected).expect("peer count always fits in u64"));
         info!(
             disconnected,
+            capability_epoch = capability_epoch.get(),
             "reconnecting peers to negotiate header sync after checkpoint bootstrap"
         );
     }
@@ -3422,12 +3459,12 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         shutdown: header_sync_shutdown,
         tasks: Mutex::new(tasks),
     });
-    let committed_snapshots = header_sync_driver_startup
+    let header_runtime_status = header_sync_driver_startup
         .as_ref()
-        .map(|startup| startup.committed_snapshots.clone());
-    let header_sync_ready = committed_snapshots
+        .map(|startup| startup.header_runtime_status.clone());
+    let header_sync_ready = header_runtime_status
         .as_ref()
-        .is_some_and(|snapshots| snapshots.borrow().is_some());
+        .is_some_and(|status| status.borrow().is_ready());
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
         supervisor.clone(),
         config.network.clone(),
@@ -3456,21 +3493,26 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
 
-    if let Some(mut snapshots) = committed_snapshots {
+    if let Some(mut runtime_status) = header_runtime_status {
         let capability_handler = endpoint.handler.clone();
         let capability_supervisor = endpoint.supervisor.clone();
         let shutdown = endpoint.background_shutdown_token();
         let task = tokio::spawn(async move {
+            let mut epochs = HeaderCapabilityEpochs::from_initial(&runtime_status.borrow());
             loop {
-                if snapshots.borrow().is_some() {
-                    enable_header_sync_and_renegotiate(&capability_handler, &capability_supervisor)
-                        .await;
-                    break;
+                let ready_epoch = epochs.observe(&runtime_status.borrow());
+                if let Some(epoch) = ready_epoch {
+                    enable_header_sync_and_renegotiate(
+                        &capability_handler,
+                        &capability_supervisor,
+                        epoch,
+                    )
+                    .await;
                 }
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    changed = snapshots.changed() => {
+                    changed = runtime_status.changed() => {
                         if changed.is_err() {
                             break;
                         }
@@ -5272,7 +5314,7 @@ mod tests {
     }
 
     #[test]
-    fn header_capability_tracks_committed_snapshot_readiness() {
+    fn header_capability_mask_tracks_explicit_runtime_enablement() {
         let handler = ZakuraProtocolHandler::new(
             ZakuraSupervisorHandle::new(1),
             Network::Mainnet,
@@ -5297,6 +5339,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn header_capability_epoch_is_applied_once_and_rejects_stale_status() {
+        use zakura_node_services::sync_lifecycle::{
+            HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+        };
+
+        let mut epochs = HeaderCapabilityEpochs::from_initial(&HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AttachmentPending,
+        });
+        let ready = HeaderRuntimeStatus::Ready {
+            epoch: LifecycleEpoch::new(2),
+        };
+        assert_eq!(epochs.observe(&ready), Some(LifecycleEpoch::new(2)));
+        assert_eq!(epochs.observe(&ready), None);
+        assert_eq!(
+            epochs.observe(&HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            }),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn enabling_header_sync_reconnects_peers_negotiated_without_it() {
         let supervisor = ZakuraSupervisorHandle::new(4);
@@ -5314,7 +5379,12 @@ mod tests {
         register_test_peer(&supervisor, test_peer(32), second_token.clone()).await;
 
         assert_eq!(
-            enable_header_sync_and_renegotiate(&handler, &supervisor).await,
+            enable_header_sync_and_renegotiate(
+                &handler,
+                &supervisor,
+                zakura_node_services::sync_lifecycle::LifecycleEpoch::new(1),
+            )
+            .await,
             2
         );
         assert_ne!(

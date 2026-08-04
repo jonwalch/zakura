@@ -52,7 +52,10 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        finalized_state::{header_chain::HeaderChainStoreError, FinalizedState, ZakuraDb},
+        finalized_state::{
+            header_chain::{HeaderChainStore, HeaderChainStoreError},
+            FinalizedState, ZakuraDb,
+        },
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
         queued_blocks::QueuedBlocks,
@@ -253,9 +256,21 @@ pub struct ReadStateService {
     header_chain_snapshot_receiver:
         tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
 
+    /// Explicit durable header-runtime attachment and readiness lifecycle.
+    header_runtime_status_receiver:
+        tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+
     /// Coherent durable header-engine reader, absent until semantic handoff.
     header_chain_reader_receiver:
         tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderChainSubscriptions {
+    snapshots: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    runtime_status:
+        tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+    reader: tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
 }
 
 impl Drop for StateService {
@@ -412,6 +427,21 @@ impl StateService {
         let sync_backup_dir_path = backup_dir_path.filter(|_| skip_backup_task);
         let (header_chain_snapshot_sender, header_chain_snapshot_receiver) =
             tokio::sync::watch::channel(None);
+        let durable_header_runtime_exists =
+            HeaderChainStore::new(finalized_state.db.header_chain_disk_db())
+                .is_initialized()
+                .expect("the opened state database can classify its durable header runtime");
+        let (header_runtime_status_sender, header_runtime_status_receiver) =
+            tokio::sync::watch::channel(
+                zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
+                    epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+                    reason: if durable_header_runtime_exists {
+                        zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending
+                    } else {
+                        zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AwaitingSemanticHandoff
+                    },
+                },
+            );
         let (header_chain_reader_sender, header_chain_reader_receiver) =
             tokio::sync::watch::channel(None);
         let (
@@ -431,6 +461,7 @@ impl StateService {
             write::HeaderChainObservers::new(
                 header_chain_snapshot_sender,
                 header_chain_reader_sender,
+                header_runtime_status_sender,
             ),
         );
 
@@ -440,8 +471,11 @@ impl StateService {
             block_write_failure,
             non_finalized_state_receiver,
             vct_root_repair_receiver,
-            header_chain_snapshot_receiver,
-            header_chain_reader_receiver,
+            HeaderChainSubscriptions {
+                snapshots: header_chain_snapshot_receiver,
+                runtime_status: header_runtime_status_receiver,
+                reader: header_chain_reader_receiver,
+            },
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -1166,18 +1200,13 @@ impl ReadStateService {
     ///
     /// Returns the newly created service,
     /// and a watch channel for updating the shared recent non-finalized chain.
-    pub(crate) fn new(
+    fn new(
         finalized_state: &FinalizedState,
         block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
         block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
-        header_chain_snapshot_receiver: tokio::sync::watch::Receiver<
-            Option<zakura_header_chain::EngineSnapshot>,
-        >,
-        header_chain_reader_receiver: tokio::sync::watch::Receiver<
-            Option<finalized_state::header_chain::HeaderChainReader>,
-        >,
+        header_chain: HeaderChainSubscriptions,
     ) -> Self {
         let read_service = Self {
             network: finalized_state.network(),
@@ -1186,8 +1215,9 @@ impl ReadStateService {
             block_write_task,
             block_write_failure,
             vct_root_repair_receiver,
-            header_chain_snapshot_receiver,
-            header_chain_reader_receiver,
+            header_chain_snapshot_receiver: header_chain.snapshots,
+            header_runtime_status_receiver: header_chain.runtime_status,
+            header_chain_reader_receiver: header_chain.reader,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1210,6 +1240,14 @@ impl ReadStateService {
         &self,
     ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
         self.header_chain_snapshot_receiver.clone()
+    }
+
+    /// Subscribe to explicit durable header-runtime attachment and readiness state.
+    pub fn subscribe_header_runtime_status(
+        &self,
+    ) -> tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>
+    {
+        self.header_runtime_status_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -2526,6 +2564,13 @@ pub fn init_read_only(
         tokio::sync::watch::channel(VctRootRepairStatus::default());
     let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
         tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
+                epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+                reason: zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+            },
+        );
     let (_header_chain_reader_sender, header_chain_reader_receiver) =
         tokio::sync::watch::channel(None);
 
@@ -2536,8 +2581,11 @@ pub fn init_read_only(
             Arc::new(OnceLock::new()),
             WatchReceiver::new(non_finalized_state_receiver),
             vct_root_repair_receiver,
-            header_chain_snapshot_receiver,
-            header_chain_reader_receiver,
+            HeaderChainSubscriptions {
+                snapshots: header_chain_snapshot_receiver,
+                runtime_status: header_runtime_status_receiver,
+                reader: header_chain_reader_receiver,
+            },
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,

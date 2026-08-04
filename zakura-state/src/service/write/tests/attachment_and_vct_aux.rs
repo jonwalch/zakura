@@ -11,6 +11,13 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
     let (non_finalized_state_sender, _non_finalized_state_receiver) = watch::channel(live.clone());
     let (snapshot_sender, snapshot_receiver) = watch::channel(None);
     let (reader_sender, reader_receiver) = watch::channel(None);
+    let (runtime_status_sender, runtime_status_receiver) = watch::channel(
+        zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
+            epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+            reason:
+                zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
+        },
+    );
     let (
         mut senders,
         _invalid_reset_receiver,
@@ -27,7 +34,7 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
         None,
         None,
         true,
-        HeaderChainObservers::new(snapshot_sender, reader_sender),
+        HeaderChainObservers::new(snapshot_sender, reader_sender, runtime_status_sender),
     );
 
     drop(senders.finalized.take());
@@ -48,6 +55,11 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
     );
     assert!(snapshot_receiver.borrow().is_none());
     assert!(reader_receiver.borrow().is_none());
+    assert!(matches!(
+        &*runtime_status_receiver.borrow(),
+        zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed { error, .. }
+            if error.contains("finalized state has no authenticated genesis header")
+    ));
 }
 
 #[test]

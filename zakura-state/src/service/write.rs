@@ -208,6 +208,8 @@ pub(crate) enum HeaderChainAttachmentError {
     Read(#[from] StoreError),
     #[error(transparent)]
     Initialization(#[from] HeaderChainInitializationError),
+    #[error(transparent)]
+    Lifecycle(#[from] zakura_node_services::sync_lifecycle::LifecycleTransitionError),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -986,17 +988,94 @@ struct WriteBlockWorkerTask {
 pub(in crate::service) struct HeaderChainObservers {
     snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
     reader_sender: watch::Sender<Option<HeaderChainReader>>,
+    runtime_status_sender: watch::Sender<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
 }
 
 impl HeaderChainObservers {
     pub(in crate::service) fn new(
         snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
         reader_sender: watch::Sender<Option<HeaderChainReader>>,
+        runtime_status_sender: watch::Sender<
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+        >,
     ) -> Self {
         Self {
             snapshot_sender,
             reader_sender,
+            runtime_status_sender,
         }
+    }
+
+    fn begin_reconstruction(
+        &self,
+    ) -> Result<zakura_node_services::sync_lifecycle::LifecycleEpoch, HeaderChainAttachmentError>
+    {
+        use zakura_node_services::sync_lifecycle::HeaderRuntimeTransition;
+
+        let next = self
+            .runtime_status_sender
+            .borrow()
+            .clone()
+            .transition(HeaderRuntimeTransition::BeginReconstruction)?;
+        let epoch = next.epoch();
+        self.publish_runtime_status(next);
+        Ok(epoch)
+    }
+
+    fn ready(
+        &self,
+        epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch,
+    ) -> Result<(), HeaderChainAttachmentError> {
+        use zakura_node_services::sync_lifecycle::HeaderRuntimeTransition;
+
+        let next = self.runtime_status_sender.borrow().clone().transition(
+            HeaderRuntimeTransition::Ready {
+                expected_epoch: epoch,
+            },
+        )?;
+        self.publish_runtime_status(next);
+        Ok(())
+    }
+
+    fn failed(
+        &self,
+        epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch,
+        error: &HeaderChainAttachmentError,
+    ) {
+        use zakura_node_services::sync_lifecycle::HeaderRuntimeTransition;
+
+        let current = self.runtime_status_sender.borrow().clone();
+        match current.transition(HeaderRuntimeTransition::Fail {
+            expected_epoch: epoch,
+            error: error.to_string().into(),
+        }) {
+            Ok(next) => self.publish_runtime_status(next),
+            Err(lifecycle_error) => tracing::error!(
+                ?lifecycle_error,
+                attachment_error = %error,
+                "could not publish failed header-runtime lifecycle"
+            ),
+        }
+    }
+
+    fn publish_runtime_status(
+        &self,
+        status: zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+    ) {
+        let epoch = status.epoch();
+        let phase = match &status {
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached { .. } => 0.0,
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Reconstructing {
+                ..
+            } => 1.0,
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Ready { .. } => 2.0,
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed { .. } => 3.0,
+        };
+        self.runtime_status_sender.send_replace(status.clone());
+        // This diagnostic gauge may round very large epochs; authority retains the checked u64.
+        metrics::gauge!("state.header.runtime.epoch").set(epoch.get() as f64);
+        metrics::gauge!("state.header.runtime.phase").set(phase);
+        tracing::info!(?status, "header runtime lifecycle changed");
     }
 }
 
@@ -1589,13 +1668,25 @@ impl WriteBlockWorkerTask {
             return BlockWriteTaskExit::Completed;
         }
 
+        let runtime_epoch = if header_chain.is_some() || *attach_header_chain_at_handoff {
+            match header_chain_observers.begin_reconstruction() {
+                Ok(epoch) => Some(epoch),
+                Err(error) => return BlockWriteTaskExit::HeaderChainAttachmentFailed(error),
+            }
+        } else {
+            None
+        };
         if *attach_header_chain_at_handoff && header_chain.is_none() {
+            let epoch = runtime_epoch.expect("runtime attachment has an explicit lifecycle epoch");
             let writer = match HeaderChainWriter::attach_at_semantic_handoff(
                 finalized_state,
                 non_finalized_state,
             ) {
                 Ok(writer) => writer,
-                Err(error) => return BlockWriteTaskExit::HeaderChainAttachmentFailed(error),
+                Err(error) => {
+                    header_chain_observers.failed(epoch, &error);
+                    return BlockWriteTaskExit::HeaderChainAttachmentFailed(error);
+                }
             };
             *header_chain = Some(writer);
         }
@@ -1609,6 +1700,11 @@ impl WriteBlockWorkerTask {
                 .runtime
                 .publisher()
                 .mirror_to(header_chain_observers.snapshot_sender.clone());
+            if let Err(error) = header_chain_observers
+                .ready(runtime_epoch.expect("an attached runtime has an explicit lifecycle epoch"))
+            {
+                return BlockWriteTaskExit::HeaderChainAttachmentFailed(error);
+            }
         }
 
         // Save any errors to propagate down to queued child blocks

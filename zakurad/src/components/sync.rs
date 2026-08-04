@@ -1074,11 +1074,20 @@ where
     /// for the legacy-informed cross-check, which only probes legacy peers when
     /// the verified tip is frozen and the node looks caught up to its own header
     /// frontier.
-    #[instrument(skip(self, read_state, committed_snapshots, block_sync_handoff))]
+    #[instrument(skip(
+        self,
+        read_state,
+        committed_snapshots,
+        header_runtime_status,
+        block_sync_handoff
+    ))]
     pub(crate) async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
-        mut committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        mut header_runtime_status: watch::Receiver<
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+        >,
         legacy_fallback: bool,
         block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
     ) -> Result<(), Report>
@@ -1090,9 +1099,15 @@ where
     {
         self.request_genesis().await?;
 
-        while committed_snapshots.borrow().is_none() {
+        while !header_runtime_status.borrow().is_ready() {
+            if let zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed {
+                error, ..
+            } = &*header_runtime_status.borrow()
+            {
+                return Err(eyre!("header runtime attachment failed: {error}"));
+            }
             if self
-                .try_to_sync(Some(&mut committed_snapshots))
+                .try_to_sync(Some(&mut header_runtime_status))
                 .await
                 .is_err()
             {
@@ -1100,7 +1115,7 @@ where
             }
             self.update_metrics();
 
-            if committed_snapshots.borrow().is_none() {
+            if !header_runtime_status.borrow().is_ready() {
                 let restart_delay = if self.is_regtest {
                     REGTEST_SYNC_RESTART_DELAY
                 } else {
@@ -1119,7 +1134,7 @@ where
         let handoff_state_tip = committed_snapshots
             .borrow()
             .as_ref()
-            .expect("checkpoint bootstrap stops only after a committed snapshot is published")
+            .expect("runtime readiness is published only after its committed snapshot")
             .frontiers
             .verified_best
             .height;
@@ -1349,8 +1364,8 @@ where
     #[instrument(skip(self))]
     async fn try_to_sync(
         &mut self,
-        committed_snapshots: Option<
-            &mut watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        header_runtime_status: Option<
+            &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
         >,
     ) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
@@ -1360,15 +1375,15 @@ where
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
-        if committed_snapshots
+        if header_runtime_status
             .as_ref()
-            .is_some_and(|snapshots| snapshots.borrow().is_some())
+            .is_some_and(|status| status.borrow().is_ready())
         {
             return Ok(());
         }
 
         info!(?state_tip, "starting sync, obtaining new tips");
-        let checkpoint_bootstrap = committed_snapshots.is_some();
+        let checkpoint_bootstrap = header_runtime_status.is_some();
         let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
             .await
             .map_err(Into::into)
@@ -1390,7 +1405,7 @@ where
         self.trace
             .tips_obtained(extra_hashes.len(), self.prospective_tips.len());
 
-        if let Err(error) = self.sync_round(extra_hashes, committed_snapshots).await {
+        if let Err(error) = self.sync_round(extra_hashes, header_runtime_status).await {
             self.trace_sync_snapshot("round_error_snapshot", 0);
             self.trace.round_finish(
                 "sync_error",
@@ -1420,11 +1435,11 @@ where
     async fn sync_round(
         &mut self,
         mut reserve: IndexSet<block::Hash>,
-        committed_snapshots: Option<
-            &mut watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        header_runtime_status: Option<
+            &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
         >,
     ) -> Result<(), Report> {
-        let checkpoint_bootstrap = committed_snapshots.is_some();
+        let checkpoint_bootstrap = header_runtime_status.is_some();
 
         // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
@@ -1444,9 +1459,9 @@ where
         let mut last_progress = Instant::now();
 
         'sync_round: loop {
-            if committed_snapshots
+            if header_runtime_status
                 .as_ref()
-                .is_some_and(|snapshots| snapshots.borrow().is_some())
+                .is_some_and(|status| status.borrow().is_ready())
             {
                 reserve.clear();
                 self.prospective_tips.clear();
@@ -1470,9 +1485,9 @@ where
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
                 let result = self.handle_block_response_with_missing_retry(rsp).await;
-                if committed_snapshots
+                if header_runtime_status
                     .as_ref()
-                    .is_some_and(|snapshots| snapshots.borrow().is_some())
+                    .is_some_and(|status| status.borrow().is_ready())
                 {
                     if let Err(error) = result {
                         debug!(
@@ -1567,9 +1582,9 @@ where
                 match completed {
                     Ok(Some(rsp)) => {
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
-                        if committed_snapshots
+                        if header_runtime_status
                             .as_ref()
-                            .is_some_and(|snapshots| snapshots.borrow().is_some())
+                            .is_some_and(|status| status.borrow().is_ready())
                         {
                             if let Err(error) = result {
                                 debug!(
@@ -1681,9 +1696,9 @@ where
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
                         let result = self.handle_block_response_with_missing_retry(rsp).await;
-                        if committed_snapshots
+                        if header_runtime_status
                             .as_ref()
-                            .is_some_and(|snapshots| snapshots.borrow().is_some())
+                            .is_some_and(|status| status.borrow().is_ready())
                         {
                             if let Err(error) = result {
                                 debug!(
