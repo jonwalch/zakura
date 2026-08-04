@@ -17,6 +17,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    ops::Bound,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -252,6 +253,12 @@ pub struct ReadStateService {
     /// Keeps the completed-checkpoint watch open in read-only services.
     _highest_completed_checkpoint_sender:
         Option<tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>>,
+
+    /// Published completed subtree roots for heights below the checkpoint handoff.
+    ///
+    /// `None` when no artifact is configured or it failed to validate, in which case
+    /// `z_getsubtreesbyindex` keeps reporting the absent band rather than serving unchecked data.
+    historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
@@ -1125,11 +1132,17 @@ impl ReadStateService {
             Option<finalized_state::HeaderRootAuthState>,
         >,
     ) -> Self {
+        let historical_subtrees = load_historical_subtree_artifact(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+        );
+
         let read_service = Self {
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            historical_subtrees,
             highest_completed_checkpoint_receiver,
             _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
@@ -1667,6 +1680,61 @@ where
         .collect()
 }
 
+/// Returns the index range a subtree request covers, as a concrete range type.
+///
+/// Mirrors the read path's handling of an absent or overflowing end bound, where the request is
+/// served to the end of what exists.
+fn range_for(
+    start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
+) -> (
+    Bound<NoteCommitmentSubtreeIndex>,
+    Bound<NoteCommitmentSubtreeIndex>,
+) {
+    (
+        Bound::Included(start_index),
+        end_index.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+/// Loads the subtree-root artifact named in `config`, if any.
+///
+/// A missing or invalid artifact is logged and skipped rather than fatal: the node still works, it
+/// just keeps reporting the absent band for `z_getsubtreesbyindex`. Refusing to start over a
+/// serving-only input would be a worse trade.
+fn load_historical_subtree_artifact(
+    network: &Network,
+    config: &Config,
+) -> Option<Arc<finalized_state::SubtreeArtifact>> {
+    let subtrees = config
+        .historical_subtree_artifact
+        .as_ref()
+        .and_then(|path| match std::fs::read(path) {
+            Ok(bytes) => match finalized_state::SubtreeArtifact::decode(&bytes, network) {
+                Ok(artifact) => {
+                    tracing::info!(
+                        ?path,
+                        sapling = artifact.sapling.len(),
+                        orchard = artifact.orchard.len(),
+                        ironwood = artifact.ironwood.len(),
+                        "loaded historical subtree-root artifact"
+                    );
+                    Some(Arc::new(artifact))
+                }
+                Err(error) => {
+                    tracing::warn!(?path, %error, "ignoring invalid historical subtree-root artifact");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(?path, %error, "cannot read historical subtree-root artifact");
+                None
+            }
+        });
+
+    subtrees
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2106,6 +2174,23 @@ impl Service<ReadRequest> for ReadStateService {
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
                 };
 
+                let sapling_subtrees = if sapling_subtrees.contains_key(&start_index) {
+                    sapling_subtrees
+                } else if let Some(artifact) = state.historical_subtrees.as_ref() {
+                    // The gated read drops everything when it has no row at `start_index`, so the
+                    // node's own rows above the handoff are missing from it here. Rebuild the
+                    // union from the raw range plus the published records — a client asking from
+                    // index 0 must get one continuous list spanning both, not just the published
+                    // half — then re-apply the continuity contract over the whole thing.
+                    let range = range_for(start_index, end_index);
+                    let mut merged = state.db.sapling_subtree_list_by_index_range(range);
+                    read::merge_published_subtrees(&mut merged, artifact.sapling_range(range));
+
+                    read::contiguous_subtrees_from(merged, start_index)
+                } else {
+                    sapling_subtrees
+                };
+
                 read::check_historical_sapling_subtrees_available(
                     &state.db,
                     start_index,
@@ -2132,6 +2217,23 @@ impl Service<ReadRequest> for ReadStateService {
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
                 };
 
+                let orchard_subtrees = if orchard_subtrees.contains_key(&start_index) {
+                    orchard_subtrees
+                } else if let Some(artifact) = state.historical_subtrees.as_ref() {
+                    // The gated read drops everything when it has no row at `start_index`, so the
+                    // node's own rows above the handoff are missing from it here. Rebuild the
+                    // union from the raw range plus the published records — a client asking from
+                    // index 0 must get one continuous list spanning both, not just the published
+                    // half — then re-apply the continuity contract over the whole thing.
+                    let range = range_for(start_index, end_index);
+                    let mut merged = state.db.orchard_subtree_list_by_index_range(range);
+                    read::merge_published_subtrees(&mut merged, artifact.orchard_range(range));
+
+                    read::contiguous_subtrees_from(merged, start_index)
+                } else {
+                    orchard_subtrees
+                };
+
                 read::check_historical_orchard_subtrees_available(
                     &state.db,
                     start_index,
@@ -2152,6 +2254,23 @@ impl Service<ReadRequest> for ReadStateService {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
+                };
+
+                let ironwood_subtrees = if ironwood_subtrees.contains_key(&start_index) {
+                    ironwood_subtrees
+                } else if let Some(artifact) = state.historical_subtrees.as_ref() {
+                    // The gated read drops everything when it has no row at `start_index`, so the
+                    // node's own rows above the handoff are missing from it here. Rebuild the
+                    // union from the raw range plus the published records — a client asking from
+                    // index 0 must get one continuous list spanning both, not just the published
+                    // half — then re-apply the continuity contract over the whole thing.
+                    let range = range_for(start_index, end_index);
+                    let mut merged = state.db.ironwood_subtree_list_by_index_range(range);
+                    read::merge_published_subtrees(&mut merged, artifact.ironwood_range(range));
+
+                    read::contiguous_subtrees_from(merged, start_index)
+                } else {
+                    ironwood_subtrees
                 };
 
                 read::check_historical_ironwood_subtrees_available(
