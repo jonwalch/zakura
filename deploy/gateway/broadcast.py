@@ -461,12 +461,22 @@ class SubmitHandler(BaseHTTPRequestHandler):
 
         if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Encoding"):
             body = jsonrpc_error(None, -32600, "Encoded request bodies are not supported")
-            return self.send_bytes(400, body, "application/json; charset=utf-8")
+            return self.send_bytes(
+                400,
+                body,
+                "application/json; charset=utf-8",
+                {"Connection": "close"},
+            )
 
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             body = jsonrpc_error(None, -32600, "Content-Type must be application/json")
-            return self.send_bytes(415, body, "application/json; charset=utf-8")
+            return self.send_bytes(
+                415,
+                body,
+                "application/json; charset=utf-8",
+                {"Connection": "close"},
+            )
 
         client = self.rate_limit_client()
         exhausted = INFLIGHT_LIMITER.acquire(client)

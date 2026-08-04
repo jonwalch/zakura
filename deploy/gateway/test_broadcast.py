@@ -220,6 +220,8 @@ class HandlerTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
+        self.host = host
+        self.port = port
         self.base = f"http://{host}:{port}"
 
     def tearDown(self) -> None:
@@ -242,6 +244,15 @@ class HandlerTest(unittest.TestCase):
                 return int(resp.status), json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             return int(exc.code), json.loads(exc.read().decode())
+
+    def _raw_request(self, request: bytes) -> bytes:
+        with socket.create_connection((self.host, self.port), timeout=3) as sock:
+            sock.settimeout(3)
+            sock.sendall(request)
+            response = b""
+            while chunk := sock.recv(4096):
+                response += chunk
+            return response
 
     def test_allowlists_sendrawtransaction(self) -> None:
         status, body = self._post(
@@ -271,6 +282,33 @@ class HandlerTest(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/healthz", timeout=3) as resp:
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.read(), b"ok\n")
+
+    def test_rejections_with_unread_bodies_close_the_connection(self) -> None:
+        for headers, expected_status in (
+            ("Content-Type: text/plain\r\nContent-Length: 4", 415),
+            (
+                "Content-Type: application/json\r\n"
+                "Content-Encoding: gzip\r\nContent-Length: 4",
+                400,
+            ),
+        ):
+            with self.subTest(expected_status=expected_status):
+                response = self._raw_request(
+                    (
+                        "POST / HTTP/1.1\r\n"
+                        f"Host: {self.host}\r\n"
+                        f"{headers}\r\n\r\n"
+                        "junk"
+                        "GET /healthz HTTP/1.1\r\n"
+                        f"Host: {self.host}\r\n\r\n"
+                    ).encode()
+                )
+
+                self.assertTrue(
+                    response.startswith(f"HTTP/1.1 {expected_status} ".encode())
+                )
+                self.assertIn(b"Connection: close\r\n", response)
+                self.assertEqual(response.count(b"HTTP/1.1 "), 1)
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
