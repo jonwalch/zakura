@@ -1181,6 +1181,7 @@ async fn caches_getaddr_response() {
         let inbound_service = ServiceBuilder::new().load_shed().service(Inbound::new(
             MAX_INBOUND_CONCURRENCY,
             false,
+            crate::components::block_verify_trace::BlockVerifyTrace::noop(),
             None,
             Vec::new(),
             setup_rx,
@@ -1469,6 +1470,7 @@ async fn setup_with_misbehavior_receiver(
     let inbound_service = ServiceBuilder::new().load_shed().service(Inbound::new(
         MAX_INBOUND_CONCURRENCY,
         false,
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
         None,
         Vec::new(),
         setup_rx,

@@ -34,7 +34,7 @@ use zakura_consensus::{router::RouterError, VerifyBlockError};
 use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
 
-use crate::BoxError;
+use crate::{components::block_verify_trace::BlockVerifyTrace, BoxError};
 
 // Re-use the syncer timeouts for consistency.
 use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};
@@ -336,6 +336,9 @@ pub struct Inbound {
     /// Whether legacy peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
 
+    /// Per-block download and verification timing for gossiped blocks.
+    block_verify_trace: BlockVerifyTrace,
+
     /// Diagnostics for zcashd-compat requests that need pruned block bodies.
     pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
 }
@@ -347,6 +350,7 @@ impl Inbound {
     pub fn new(
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,
+        block_verify_trace: BlockVerifyTrace,
         zcashd_compat_pruning_retention: Option<u32>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
@@ -357,6 +361,7 @@ impl Inbound {
                 setup,
             },
             expose_peer_addresses,
+            block_verify_trace,
             pruned_block_not_found_logger: Arc::new(PrunedBlockNotFoundLogger::new(
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
@@ -413,6 +418,7 @@ impl Service<zn::Request> for Inbound {
                         Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                         state.clone(),
                         latest_chain_tip,
+                        self.block_verify_trace.clone(),
                     ));
 
                     result = Ok(());
