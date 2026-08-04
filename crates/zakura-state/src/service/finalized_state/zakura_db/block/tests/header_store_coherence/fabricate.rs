@@ -25,7 +25,7 @@ use super::super::common::{
     state_with_genesis_config,
 };
 use crate::{
-    service::check::difficulty::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN},
+    service::check::difficulty::{pow_adjustment_block_span, AdjustedDifficulty},
     Config,
 };
 
@@ -121,7 +121,7 @@ pub(crate) fn fabricate_headers(
             previous_hash = hash;
             previous_height = candidate_height;
             context.insert(0, (header.difficulty_threshold, header.time));
-            context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
+            context.truncate(pow_adjustment_block_span(network));
 
             FabHeader {
                 height: candidate_height,
@@ -139,13 +139,14 @@ pub(crate) fn fabricate_headers(
 
 /// Extends a difficulty context with fabricated headers (oldest to newest).
 pub(crate) fn extend_context(
+    network: &Network,
     mut context: DifficultyContext,
     headers: &[FabHeader],
 ) -> DifficultyContext {
     for fab in headers {
         context.insert(0, (fab.header.difficulty_threshold, fab.header.time));
     }
-    context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
+    context.truncate(pow_adjustment_block_span(network));
     context
 }
 
@@ -243,7 +244,7 @@ impl Universe {
 
         let fork_index = FORK_HEIGHT as usize - 1;
         let fork_parent = (trunk[fork_index].height, trunk[fork_index].hash);
-        let fork_context = extend_context(genesis_context, &trunk[..=fork_index]);
+        let fork_context = extend_context(&network, genesis_context, &trunk[..=fork_index]);
 
         // The DAA must be live at the fork point, or fast/slow spacing cannot
         // produce work divergence between the branches.
@@ -284,7 +285,7 @@ impl Universe {
         // whole branch carries strictly more work than A, plus margin.
         let b_prefix = branch_b.headers[..4].to_vec();
         let b_prefix_tip = (b_prefix[3].height, b_prefix[3].hash);
-        let b_prefix_context = extend_context(fork_context.clone(), &b_prefix);
+        let b_prefix_context = extend_context(&network, fork_context.clone(), &b_prefix);
         let a_work = total_work(&branch_a.headers);
         let mut continuation_len = 1;
         let branch_b_ext = loop {
@@ -321,7 +322,7 @@ impl Universe {
         };
 
         let c_parent = (branch_a.headers[1].height, branch_a.headers[1].hash);
-        let c_context = extend_context(fork_context, &branch_a.headers[..2]);
+        let c_context = extend_context(&network, fork_context, &branch_a.headers[..2]);
         let branch_c = BranchDef {
             fork_parent: c_parent,
             headers: fabricate_headers(&network, c_parent, c_context, &[Spacing::Fast; 5], 0xE0),

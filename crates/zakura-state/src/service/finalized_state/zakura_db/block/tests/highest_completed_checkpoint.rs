@@ -18,7 +18,7 @@ use super::common::{
 };
 use crate::{
     service::{
-        check::difficulty::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN},
+        check::difficulty::{pow_adjustment_block_span, AdjustedDifficulty},
         finalized_state::{
             DiskWriteBatch, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
             HighestCompletedCheckpointTracker, WriteDisk, ZakuraDb,
@@ -524,7 +524,7 @@ fn synthetic_headers(state: &ZakuraDb, count: u32) -> Vec<Arc<block::Header>> {
             previous_hash = block::Hash::from(header.as_ref());
             previous_height = candidate_height;
             context.insert(0, (header.difficulty_threshold, header.time));
-            context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
+            context.truncate(pow_adjustment_block_span(&network));
             header
         })
         .collect()

@@ -1444,7 +1444,8 @@ fn synthetic_headers_from_state(
             previous_hash = block::Hash::from(&*header);
             previous_height = candidate_height;
             context.insert(0, (header.difficulty_threshold, header.time));
-            context.truncate(crate::service::check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
+            context
+                .truncate(crate::service::check::difficulty::pow_adjustment_block_span(&network));
             header
         })
         .collect()

@@ -600,7 +600,8 @@ impl ZakuraDb {
         )>,
         StoreIncoherentError,
     > {
-        let mut context = Vec::with_capacity(check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
+        let adjustment_block_span = check::difficulty::pow_adjustment_block_span(&self.network());
+        let mut context = Vec::with_capacity(adjustment_block_span);
 
         let Some((mut hash, mut header)) = self.header_by_height(height) else {
             return Ok(context);
@@ -619,7 +620,7 @@ impl ZakuraDb {
 
             context.push((header.difficulty_threshold, header.time));
 
-            if context.len() == check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN {
+            if context.len() == adjustment_block_span {
                 return Ok(context);
             }
             let Ok(below) = height.previous() else {
@@ -2148,6 +2149,8 @@ impl DiskWriteBatch {
         let finalized_height = zakura_db.finalized_tip_height();
         let best_header_tip = zakura_db.best_header_tip().map(|(height, _)| height);
         let checkpoints = zakura_db.network().checkpoint_list();
+        let adjustment_block_span =
+            check::difficulty::pow_adjustment_block_span(&zakura_db.network());
 
         let mut recent_headers = zakura_db.recent_header_context(anchor_height)?;
         if recent_headers.is_empty() {
@@ -2228,7 +2231,7 @@ impl DiskWriteBatch {
             )?;
 
             recent_headers.insert(0, (header.difficulty_threshold, header.time));
-            recent_headers.truncate(check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
+            recent_headers.truncate(adjustment_block_span);
 
             validated_headers.push((height, hash, header, body_size));
         }

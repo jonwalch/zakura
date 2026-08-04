@@ -911,3 +911,120 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
         "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
     );
 }
+
+#[test]
+fn pow_parameters_are_configurable_from_the_config_file() {
+    let _init_guard = zakura_test::init();
+
+    // The spacing sweep the propagation experiments run: one key per network,
+    // with the difficulty adjustment left at its consensus values.
+    let config: Config = toml::from_str(
+        r#"
+            network = "Testnet"
+            # A retuned network is not the public Testnet, so it must not keep
+            # the default public peers.
+            initial_testnet_peers = []
+
+            [testnet_parameters]
+            network_name = "FastSpacing"
+            checkpoints = true
+            post_blossom_pow_target_spacing = 25
+        "#,
+    )
+    .expect("a configured spacing is accepted");
+
+    assert_eq!(config.network.post_blossom_pow_target_spacing(), 25);
+    assert_eq!(config.network.pow_averaging_window(), 17);
+    assert_eq!(config.network.pow_median_block_span(), 11);
+
+    // The full difficulty adjustment quintet.
+    let config: Config = toml::from_str(
+        r#"
+            network = "Testnet"
+            # A retuned network is not the public Testnet, so it must not keep
+            # the default public peers.
+            initial_testnet_peers = []
+
+            [testnet_parameters]
+            network_name = "TunedDaa"
+            checkpoints = true
+            post_blossom_pow_target_spacing = 20
+            pow_averaging_window = 20
+            pow_median_block_span = 13
+            pow_damping_factor = 2
+            pow_max_adjust_up_percent = 8
+            pow_max_adjust_down_percent = 64
+        "#,
+    )
+    .expect("configured difficulty adjustment parameters are accepted");
+
+    assert_eq!(config.network.post_blossom_pow_target_spacing(), 20);
+    assert_eq!(config.network.pow_averaging_window(), 20);
+    assert_eq!(config.network.pow_median_block_span(), 13);
+    assert_eq!(config.network.pow_damping_factor(), 2);
+    assert_eq!(config.network.pow_max_adjust_up_percent(), 8);
+    assert_eq!(config.network.pow_max_adjust_down_percent(), 64);
+
+    // A configured Testnet that sets none of them keeps the consensus values,
+    // which is what makes this change invisible to existing config files.
+    let config: Config = toml::from_str(
+        r#"
+            network = "Testnet"
+            # A retuned network is not the public Testnet, so it must not keep
+            # the default public peers.
+            initial_testnet_peers = []
+
+            [testnet_parameters]
+            network_name = "NoPowKeys"
+            checkpoints = true
+        "#,
+    )
+    .expect("a testnet without proof-of-work keys is accepted");
+
+    assert_eq!(config.network.post_blossom_pow_target_spacing(), 75);
+    assert_eq!(config.network.pow_averaging_window(), 17);
+    assert_eq!(config.network.pow_median_block_span(), 11);
+    assert_eq!(config.network.pow_damping_factor(), 4);
+    assert_eq!(config.network.pow_max_adjust_up_percent(), 16);
+    assert_eq!(config.network.pow_max_adjust_down_percent(), 32);
+}
+
+#[test]
+fn unusable_pow_parameters_fail_at_config_load() {
+    let _init_guard = zakura_test::init();
+
+    // A node that cannot evaluate its own difficulty rule must refuse to start,
+    // rather than panicking on the first contextually validated block.
+    for (keys, expected) in [
+        ("pow_averaging_window = 0", "averaging window"),
+        ("pow_median_block_span = 0", "median block span"),
+        (
+            "post_blossom_pow_target_spacing = 0",
+            "target block spacing",
+        ),
+        (
+            "pow_averaging_window = 60\npow_median_block_span = 20",
+            "maximum",
+        ),
+    ] {
+        let error = toml::from_str::<Config>(&format!(
+            r#"
+                network = "Testnet"
+            # A retuned network is not the public Testnet, so it must not keep
+            # the default public peers.
+            initial_testnet_peers = []
+
+            [testnet_parameters]
+                network_name = "BadPow"
+                checkpoints = true
+                {keys}
+            "#,
+        ))
+        .expect_err("unusable proof-of-work parameters are rejected");
+
+        assert!(
+            error.to_string().contains(expected),
+            "error for `{keys}` should mention {expected:?}, got: {error}",
+        );
+    }
+}
