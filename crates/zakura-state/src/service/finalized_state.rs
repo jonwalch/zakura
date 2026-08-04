@@ -83,6 +83,7 @@ pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 mod vct;
+pub mod vct_treestate_audit;
 mod zakura_db;
 
 use vct::{VctCommitState, VctState, VctWriteData};
@@ -114,6 +115,11 @@ pub use disk_format::{
 pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
+};
+pub use vct_treestate_audit::{
+    derived_roots_in_display_order, inventory, measure_derivations, replay_inputs,
+    verify_subtrees_against_stored, DerivationSample, ReplayInputs, SubtreeVerification,
+    VctTreestateInventory,
 };
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
