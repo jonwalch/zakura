@@ -71,7 +71,7 @@ pub use service::{
     finalized_state::FinalizedState,
     init, init_read_only,
     non_finalized_state::NonFinalizedState,
-    spawn_init_read_only, validate_vct_sprout_history,
+    spawn_init_read_only,
     watch_receiver::WatchReceiver,
     OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
@@ -81,11 +81,6 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
-    generate_mainnet_from_archive, produce_final_frontiers_bytes,
-    produce_settled_final_frontiers_bytes, validate_final_frontiers_bytes,
-    FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
-};
-pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
     PruneFinalizedStateOptions, PruneFinalizedStateSummary,
 };
@@ -94,7 +89,10 @@ pub use service::finalized_state::{
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
 };
 pub use service::finalized_state::{
-    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
+    produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
+    validate_final_frontiers_bytes, AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome,
+    AuthenticatedHeaderRoots, FinalFrontiersGenerationError, FinalFrontiersValidationError,
+    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

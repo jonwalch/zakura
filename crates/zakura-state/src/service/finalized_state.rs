@@ -102,10 +102,6 @@ pub use commitment_aux::{
 };
 #[allow(unused_imports)]
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
-pub(crate) use disk_format::upgrade::repair_vct_sprout_history::validate_completed_repair;
-pub use disk_format::upgrade::repair_vct_sprout_history::{
-    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
-};
 #[allow(unused_imports)]
 pub use disk_format::{
     FallibleDiskValue, FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex,
@@ -113,10 +109,7 @@ pub use disk_format::{
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
-pub use vct::{
-    generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
-    GeneratorError, NextVctBlock,
-};
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
 pub(crate) use vct::{VctAuxRejection, VctAuxWindow};
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
