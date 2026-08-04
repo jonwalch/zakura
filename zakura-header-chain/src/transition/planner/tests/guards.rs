@@ -219,6 +219,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let mut corrupt = plan.clone();
     corrupt.change_set.delete_nodes.push(tip.hash);
     corrupt.change_set.index_changes.deleted.push(tip.hash);
+    corrupt.graph_delta.delete_nodes.push(tip.hash);
     assert_eq!(
         verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Protected(tip.hash))
