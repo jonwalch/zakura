@@ -15,14 +15,14 @@ use tokio::{sync::watch, time::Instant};
 use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 use zakura_header_chain::{
     audit_store, ApplyResult, AuxDelivery, AuxDelta, BodyWorkAuthority, BodyWorkOwner, ChangeSet,
-    CounterExhausted, DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata,
-    EngineMode, EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderLocator, HeaderNode,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
-    RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
-    SystemClock, TransitionCause, TransitionContext, TransitionEvent, TransitionFailure,
-    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    CommittedStallReceipt, CounterExhausted, DurableTransitionFacts, EligibilityReason,
+    EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityRecord,
+    FinalitySource, Frontier, FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine,
+    HeaderLocator, HeaderNode, HeaderSyncWorkOwner, HeaderWorkAuthority, MemHeaderStore,
+    NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt,
+    StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionCause, TransitionContext,
+    TransitionEvent, TransitionFailure, TransitionRequest, ValidationContextRecord,
+    ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -1336,6 +1336,12 @@ impl HeaderChainRuntime {
         }
         let transition_cause = transition.cause();
         let resource_stalled = transition_cause == TransitionCause::ResourceStalled;
+        let stall_receipt = resource_stalled.then(|| CommittedStallReceipt {
+            state_version: transition.change_set().metadata.state_version,
+            alarm_changed: transition.before().alarms.resource_stalled
+                != transition.change_set().metadata.alarms.resource_stalled,
+            attempted_branch: branch,
+        });
         match transition_cause {
             TransitionCause::HeaderWorkRebased => {
                 metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
@@ -1360,7 +1366,9 @@ impl HeaderChainRuntime {
             #[cfg(test)]
             fault(FaultPoint::AfterMemorySwap)?;
             if resource_stalled {
-                return Err(TransitionFailure::ResourceStalled.into());
+                return Ok(ApplyResult::ResourceStalled(
+                    stall_receipt.expect("resource-stalled transitions construct a receipt"),
+                ));
             }
             return Ok(ApplyResult::NoChange(NoChangeReceipt {
                 state_version: transition.before().state_version,
@@ -1389,7 +1397,9 @@ impl HeaderChainRuntime {
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         if resource_stalled {
-            return Err(TransitionFailure::ResourceStalled.into());
+            return Ok(ApplyResult::ResourceStalled(
+                stall_receipt.expect("resource-stalled transitions construct a receipt"),
+            ));
         }
         Ok(ApplyResult::Committed)
     }

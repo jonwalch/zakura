@@ -554,33 +554,46 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     )
     .expect("the two-child batch prepares through production validation");
     let target = Frontier::new(block::Height(2), second_header.hash());
-    let result = runtime.apply(
-        TransitionRequest {
-            expected_version: initial.state_version,
-            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                owner: header_owner(&initial, target.hash, 1, 1),
-                source: SourceId::from_digest([0x70; 32]),
-                parent_hash: anchor.hash,
-                target_tip_hash: target.hash,
-                completion: TargetCompletion::TargetComplete {
-                    common_ancestor: anchor_frontier,
-                },
-                batch,
-                aux: Vec::new(),
-            })),
-        },
-        &TransitionContext {
-            config: &engine_config,
-            clock: &SystemClock,
-            full_state_authority: None,
-            retention_references: &[],
-        },
-    );
+    let owner = header_owner(&initial, target.hash, 1, 1);
+    let attempted_branch = owner.header_authority().branch;
+    let request = TransitionRequest {
+        expected_version: initial.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner,
+            source: SourceId::from_digest([0x70; 32]),
+            parent_hash: anchor.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: anchor_frontier,
+            },
+            batch,
+            aux: Vec::new(),
+        })),
+    };
+    let context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    let result = runtime.apply(request.clone(), &context);
     assert!(matches!(
         result,
-        Err(HeaderChainStoreError::Transition(
-            TransitionFailure::ResourceStalled
-        ))
+        Ok(ApplyResult::ResourceStalled(CommittedStallReceipt {
+            state_version,
+            alarm_changed: true,
+            attempted_branch: Some(branch),
+        })) if state_version == StateVersion::new(2) && branch == attempted_branch
+    ));
+
+    let repeated = runtime.apply(request, &context);
+    assert!(matches!(
+        repeated,
+        Ok(ApplyResult::ResourceStalled(CommittedStallReceipt {
+            state_version,
+            alarm_changed: false,
+            attempted_branch: Some(branch),
+        })) if state_version == StateVersion::new(2) && branch == attempted_branch
     ));
 
     let published = runtime.publisher().snapshot();

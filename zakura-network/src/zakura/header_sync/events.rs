@@ -394,6 +394,8 @@ pub struct HeaderPathPage {
 pub enum HeaderTargetAdmissionResult {
     /// State committed the insertion or recognized its idempotent replay.
     Applied,
+    /// State committed a local resource-stall outcome without admitting the target.
+    ResourceStalled(zakura_header_chain::CommittedStallReceipt),
     /// Exact typed failure preserved from the state/driver boundary.
     Failed(Arc<zakura_header_chain::HeaderChainError>),
 }

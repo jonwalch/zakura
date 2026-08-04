@@ -983,6 +983,17 @@ pub struct StaleReceipt {
     pub branch: Option<BranchId>,
 }
 
+/// A resource refusal whose alarm state has already been durably committed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CommittedStallReceipt {
+    /// Durable version after recording or retaining the resource-stall alarm.
+    pub state_version: StateVersion,
+    /// True when this refusal changed and published the alarm state.
+    pub alarm_changed: bool,
+    /// Exact attempted branch when the refused event was branch-sensitive.
+    pub attempted_branch: Option<BranchId>,
+}
+
 /// Serialized transition outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplyResult {
@@ -992,6 +1003,8 @@ pub enum ApplyResult {
     NoChange(NoChangeReceipt),
     /// Ownership/version was stale before effects.
     Stale(StaleReceipt),
+    /// Admission was refused after durably recording or retaining its resource alarm.
+    ResourceStalled(CommittedStallReceipt),
 }
 
 /// Invalid construction at the transition type boundary.

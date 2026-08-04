@@ -674,7 +674,10 @@ where
         Ok(Ok(zakura_state::Response::HeaderChainInsertApplied(
             zakura_header_chain::ApplyResult::Committed
             | zakura_header_chain::ApplyResult::NoChange(_),
-        ))) => Ok(()),
+        ))) => Ok(port::ApplyHeaderTargetOutcome::Applied),
+        Ok(Ok(zakura_state::Response::HeaderChainInsertApplied(
+            zakura_header_chain::ApplyResult::ResourceStalled(receipt),
+        ))) => Ok(port::ApplyHeaderTargetOutcome::ResourceStalled(receipt)),
         Ok(Ok(zakura_state::Response::HeaderChainInsertApplied(
             zakura_header_chain::ApplyResult::Stale(_),
         ))) => Err(Arc::new(

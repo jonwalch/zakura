@@ -4,8 +4,9 @@ use std::{error::Error, future::Future, pin::Pin, sync::Arc};
 
 use zakura_chain::{block, parameters::Network};
 use zakura_header_chain::{
-    AuxDelivery, BodyWorkOwner, Frontier, HeaderChainError, HeaderLocator, HeaderSyncWorkOwner,
-    HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion, VctRepairContext,
+    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, Frontier, HeaderChainError, HeaderLocator,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion,
+    VctRepairContext,
 };
 
 /// A boxed operation returned by [`HeaderChainPort`].
@@ -209,7 +210,16 @@ impl PreparedHeaderTarget {
 pub type PrepareHeaderTargetReply = Result<PreparedHeaderTarget, Arc<HeaderChainError>>;
 
 /// Result of atomically applying a prepared target.
-pub type ApplyHeaderTargetReply = Result<(), Arc<HeaderChainError>>;
+pub type ApplyHeaderTargetReply = Result<ApplyHeaderTargetOutcome, Arc<HeaderChainError>>;
+
+/// Successful state-side outcome of applying one prepared header target.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ApplyHeaderTargetOutcome {
+    /// State committed the target or recognized its idempotent replay.
+    Applied,
+    /// State committed the resource-stall outcome without admitting the target.
+    ResourceStalled(CommittedStallReceipt),
+}
 
 /// Header-chain operations needed by header-sync policy.
 ///

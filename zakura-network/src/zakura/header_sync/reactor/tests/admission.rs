@@ -62,6 +62,41 @@ fn committed_header_generation_reconsiders_the_cached_peer_target() {
 }
 
 #[test]
+fn committed_resource_stall_is_terminal_without_retry_or_peer_fault() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let initial = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the resource-stall fixture builds");
+    let peer = peer();
+    let (source, owner, branch) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+
+    reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        peer: peer.clone(),
+        source,
+        owner,
+        result: HeaderTargetAdmissionResult::ResourceStalled(
+            zakura_header_chain::CommittedStallReceipt {
+                state_version: initial.state_version,
+                alarm_changed: true,
+                attempted_branch: Some(branch),
+            },
+        ),
+    });
+
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    assert!(!reactor
+        .completed_targets
+        .contains(owner.header_authority().header_generation, branch));
+    assert!(
+        actions.try_recv().is_err(),
+        "a committed local resource outcome is not retried as a transport failure"
+    );
+}
+
+#[test]
 // AUD-06/AUD-07: committing a newer snapshot is the production retirement
 // boundary; both held successes and failures must be inert after it.
 fn committed_snapshot_retires_in_flight_state_results() {

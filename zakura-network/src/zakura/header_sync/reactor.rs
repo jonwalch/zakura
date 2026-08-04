@@ -1391,12 +1391,26 @@ impl HeaderSyncReactor {
                     Some(error),
                 );
             }
+            HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
+                tracing::warn!(
+                    ?receipt,
+                    "header target admission stopped by a committed local resource alarm"
+                );
+                metrics::counter!(
+                    "sync.header.target.resource_stalled.total",
+                    "alarm_changed" => receipt.alarm_changed.to_string()
+                )
+                .increment(1);
+            }
         }
         self.retire_peer_work(
             &peer,
             match &result {
                 HeaderTargetAdmissionResult::Applied => HeaderRequestTerminal::TargetAdmitted,
-                HeaderTargetAdmissionResult::Failed(_) => HeaderRequestTerminal::TargetRejected,
+                HeaderTargetAdmissionResult::Failed(_)
+                | HeaderTargetAdmissionResult::ResourceStalled(_) => {
+                    HeaderRequestTerminal::TargetRejected
+                }
             },
         );
         if let Some(repair_generation) = repair_generation {
@@ -1422,6 +1436,10 @@ impl HeaderSyncReactor {
                         self.schedule_current_vct_repair();
                     }
                 }
+                HeaderTargetAdmissionResult::ResourceStalled(_) => {
+                    self.vct_repair.remove(repair_owner);
+                    metrics::counter!("sync.header.vct.repair.resource_stalled.total").increment(1);
+                }
             }
             return;
         }
@@ -1435,6 +1453,7 @@ impl HeaderSyncReactor {
             HeaderTargetAdmissionResult::Failed(error) => {
                 self.handle_typed_failure(peer, source, &error);
             }
+            HeaderTargetAdmissionResult::ResourceStalled(_) => {}
         }
     }
 
@@ -3330,7 +3349,14 @@ impl HeaderSyncReactor {
                     let result = header_chain
                         .apply_header_target(port::PreparedHeaderTarget::from_insert(insert))
                         .await
-                        .map(|()| HeaderTargetAdmissionResult::Applied)
+                        .map(|outcome| match outcome {
+                            port::ApplyHeaderTargetOutcome::Applied => {
+                                HeaderTargetAdmissionResult::Applied
+                            }
+                            port::ApplyHeaderTargetOutcome::ResourceStalled(receipt) => {
+                                HeaderTargetAdmissionResult::ResourceStalled(receipt)
+                            }
+                        })
                         .unwrap_or_else(HeaderTargetAdmissionResult::Failed);
                     Box::new(move |reactor: &mut HeaderSyncReactor| {
                         reactor.handle_header_target_admission_ready(peer, source, owner, result);

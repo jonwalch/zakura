@@ -1521,7 +1521,11 @@ impl WriteBlockWorkerTask {
                         .runtime
                         .apply_combined(request, &context, batch, || {})
                     {
-                        Ok(ApplyResult::Committed | ApplyResult::NoChange(_)) => Ok(()),
+                        Ok(
+                            ApplyResult::Committed
+                            | ApplyResult::NoChange(_)
+                            | ApplyResult::ResourceStalled(_),
+                        ) => Ok(()),
                         Ok(ApplyResult::Stale(receipt)) => {
                             tracing::debug!(
                                 ?receipt,
@@ -1597,6 +1601,12 @@ impl WriteBlockWorkerTask {
                                     tracing::debug!(
                                         ?receipt,
                                         "VCT: ignored stale auxiliary rejection"
+                                    );
+                                }
+                                Ok(Some(ApplyResult::ResourceStalled(receipt))) => {
+                                    tracing::warn!(
+                                        ?receipt,
+                                        "VCT: auxiliary rejection stopped by a committed resource alarm"
                                     );
                                 }
                                 Ok(None) => {}
