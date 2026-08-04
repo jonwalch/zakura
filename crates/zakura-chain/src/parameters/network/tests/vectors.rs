@@ -14,8 +14,11 @@ use crate::{
             MAX_NETWORK_NAME_LENGTH, RESERVED_NETWORK_NAMES,
         },
         ConsensusBranchId, Network, NetworkKind, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS,
-        TESTNET_ACTIVATION_HEIGHTS,
+        MAX_POW_ADJUSTMENT_BLOCK_SPAN, POST_BLOSSOM_POW_TARGET_SPACING, POW_AVERAGING_WINDOW,
+        POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT, POW_MAX_ADJUST_UP_PERCENT,
+        POW_MEDIAN_BLOCK_SPAN, PRE_BLOSSOM_POW_TARGET_SPACING, TESTNET_ACTIVATION_HEIGHTS,
     },
+    work::difficulty::U256,
 };
 
 /// Checks that every method in the `Parameters` impl for `zakura_chain::Network` has the same output
@@ -166,10 +169,15 @@ fn nu6_3_public_consensus_boundary_matches_librustzcash() {
 /// NU6.3 does not change the post-Blossom timing rules used by difficulty validation.
 #[test]
 fn nu6_3_keeps_post_blossom_timing_rules() {
-    assert_eq!(NetworkUpgrade::Nu6_3.target_spacing().num_seconds(), 75);
     assert_eq!(
         NetworkUpgrade::Nu6_3
-            .averaging_window_timespan()
+            .target_spacing(&Network::Mainnet)
+            .num_seconds(),
+        75
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu6_3
+            .averaging_window_timespan(&Network::Mainnet)
             .num_seconds(),
         75 * 17,
     );
@@ -978,4 +986,183 @@ fn temporary_orchard_disabling_soft_fork_heights() {
         None,
     );
     assert!(!disabled.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
+}
+
+/// Leaving every proof-of-work parameter unset keeps the consensus values, on
+/// Mainnet and on a configured Testnet alike.
+///
+/// This is the regression guard for the whole feature: the knobs exist for
+/// private experiment networks, and an unconfigured network must not be able to
+/// tell they were added.
+#[test]
+fn unset_pow_parameters_keep_the_consensus_values() {
+    let unconfigured = testnet::Parameters::build()
+        .to_network()
+        .expect("default parameters are valid");
+
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(RegtestParameters::default()),
+        unconfigured,
+    ] {
+        assert_eq!(
+            network.post_blossom_pow_target_spacing(),
+            POST_BLOSSOM_POW_TARGET_SPACING,
+            "{network} post-Blossom target spacing",
+        );
+        assert_eq!(
+            network.pow_averaging_window(),
+            POW_AVERAGING_WINDOW,
+            "{network} averaging window",
+        );
+        assert_eq!(
+            network.pow_median_block_span(),
+            POW_MEDIAN_BLOCK_SPAN,
+            "{network} median block span",
+        );
+        assert_eq!(
+            network.pow_damping_factor(),
+            POW_DAMPING_FACTOR,
+            "{network} damping factor",
+        );
+        assert_eq!(
+            network.pow_max_adjust_up_percent(),
+            POW_MAX_ADJUST_UP_PERCENT,
+            "{network} max adjust up",
+        );
+        assert_eq!(
+            network.pow_max_adjust_down_percent(),
+            POW_MAX_ADJUST_DOWN_PERCENT,
+            "{network} max adjust down",
+        );
+
+        // The two derived quantities the difficulty adjustment actually reads.
+        assert_eq!(
+            NetworkUpgrade::target_spacing_for_height(&network, Height(2_000_000)).num_seconds(),
+            75,
+        );
+        assert_eq!(
+            NetworkUpgrade::averaging_window_timespan_for_height(&network, Height(2_000_000))
+                .num_seconds(),
+            75 * 17,
+        );
+    }
+}
+
+/// A configured spacing flows through to the derived timing values the
+/// difficulty adjustment reads.
+#[test]
+fn configured_pow_parameters_reach_the_difficulty_timing() {
+    let network = testnet::Parameters::build()
+        .with_network_name("FastSpacing")
+        .expect("network name is valid")
+        .with_post_blossom_pow_target_spacing(25)
+        .with_pow_averaging_window(20)
+        .with_pow_median_block_span(13)
+        .with_pow_damping_factor(2)
+        .with_pow_max_adjust_up_percent(8)
+        .with_pow_max_adjust_down_percent(64)
+        .to_network()
+        .expect("configured proof-of-work parameters are valid");
+
+    assert_eq!(network.post_blossom_pow_target_spacing(), 25);
+    assert_eq!(network.pow_averaging_window(), 20);
+    assert_eq!(network.pow_median_block_span(), 13);
+    assert_eq!(network.pow_damping_factor(), 2);
+    assert_eq!(network.pow_max_adjust_up_percent(), 8);
+    assert_eq!(network.pow_max_adjust_down_percent(), 64);
+
+    let height = Height(2_000_000);
+    assert_eq!(
+        NetworkUpgrade::target_spacing_for_height(&network, height).num_seconds(),
+        25,
+    );
+    assert_eq!(
+        NetworkUpgrade::averaging_window_timespan_for_height(&network, height).num_seconds(),
+        25 * 20,
+    );
+
+    // The pre-Blossom spacing is not configurable, so heights below Blossom keep
+    // the consensus value.
+    assert_eq!(
+        NetworkUpgrade::target_spacing_for_height(&network, Height(0)).num_seconds(),
+        PRE_BLOSSOM_POW_TARGET_SPACING,
+    );
+}
+
+/// Proof-of-work parameters that the state could not evaluate are rejected when
+/// the network is built, rather than panicking or silently clamping later.
+#[test]
+fn invalid_pow_parameters_are_rejected() {
+    let build = testnet::Parameters::build()
+        .with_network_name("BadPow")
+        .expect("network name is valid");
+
+    assert_eq!(
+        build
+            .clone()
+            .with_pow_averaging_window(0)
+            .to_network()
+            .expect_err("a zero averaging window divides by zero in MeanTarget"),
+        ParametersBuilderError::InvalidPowAveragingWindow,
+    );
+
+    assert_eq!(
+        build
+            .clone()
+            .with_pow_median_block_span(0)
+            .to_network()
+            .expect_err("a zero median block span has no median to take"),
+        ParametersBuilderError::InvalidPowMedianBlockSpan,
+    );
+
+    assert_eq!(
+        build
+            .clone()
+            .with_post_blossom_pow_target_spacing(0)
+            .to_network()
+            .expect_err("a zero spacing divides by zero in ThresholdBits"),
+        ParametersBuilderError::InvalidPowTargetSpacing,
+    );
+
+    // The adjustment context is held in fixed-capacity buffers, so the sum of
+    // the two spans is capped.
+    assert_eq!(
+        build
+            .clone()
+            .with_pow_averaging_window(MAX_POW_ADJUSTMENT_BLOCK_SPAN)
+            .with_pow_median_block_span(1)
+            .to_network()
+            .expect_err("the adjustment span must fit the context buffers"),
+        ParametersBuilderError::PowAdjustmentBlockSpanTooLarge {
+            configured: MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1,
+            maximum: MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+        },
+    );
+
+    // The largest span that does fit is accepted, as long as the `PoWLimit` is
+    // small enough that `MeanTarget` cannot overflow its `U256` sum.
+    let widest = build
+        .clone()
+        .with_target_difficulty_limit(U256::MAX / U256::from(MAX_POW_ADJUSTMENT_BLOCK_SPAN))
+        .expect("difficulty limit is a valid expanded value")
+        .with_pow_averaging_window(MAX_POW_ADJUSTMENT_BLOCK_SPAN - 1)
+        .with_pow_median_block_span(1)
+        .to_network()
+        .expect("the maximum adjustment span is valid");
+    assert_eq!(
+        widest.pow_averaging_window() + widest.pow_median_block_span(),
+        MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+    );
+
+    // Widening the window without lowering the `PoWLimit` would let
+    // `MeanTarget`'s sum wrap, which would silently produce a wrong difficulty.
+    assert_eq!(
+        build
+            .with_pow_averaging_window(40)
+            .to_network()
+            .expect_err("the default Testnet PoWLimit cannot be summed 40 times"),
+        ParametersBuilderError::TargetDifficultyLimitOverflowRisk,
+    );
 }

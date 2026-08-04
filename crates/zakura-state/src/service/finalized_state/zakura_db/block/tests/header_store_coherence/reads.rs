@@ -83,7 +83,7 @@ fn coherent_walks_return_ok_contexts() {
         .expect("coherent store walks cleanly");
     assert_eq!(
         full.len(),
-        crate::service::check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN
+        crate::service::check::difficulty::pow_adjustment_block_span(&state.network())
     );
 
     // Heights 5..=0 inclusive: six rows, then the walk stops at genesis.

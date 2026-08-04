@@ -5,10 +5,10 @@ use chrono::{DateTime, Duration};
 use zakura_chain::{
     block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
+    parameters::{testnet, Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
     sapling,
     serialization::ZcashDeserializeInto,
-    work::difficulty::ParameterDifficulty,
+    work::difficulty::{ParameterDifficulty, U256},
 };
 
 use super::super::*;
@@ -300,10 +300,117 @@ fn daa_context(
     let target_spacing = NetworkUpgrade::target_spacing_for_height(network, candidate_height);
     let difficulty = network.target_difficulty_limit().to_compact();
 
-    (0..difficulty::POW_ADJUSTMENT_BLOCK_SPAN)
+    (0..difficulty::pow_adjustment_block_span(network))
         .map(|offset| {
             let offset = i32::try_from(offset + 1).expect("test offset fits in i32");
             (difficulty, candidate_time - target_spacing * offset)
         })
         .collect()
+}
+
+/// A configured network's difficulty adjustment reads its own spans, not the
+/// Mainnet constants.
+///
+/// The context is deliberately longer than either network needs, so the assertion
+/// is about how much of it each network consumes.
+#[test]
+fn configured_pow_spans_size_the_difficulty_context() {
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_network_name("WideDaaContext")
+        .expect("network name is valid")
+        .with_target_difficulty_limit(U256::MAX / U256::from(52u64))
+        .expect("difficulty limit is a valid expanded value")
+        .with_pow_averaging_window(51)
+        .with_pow_median_block_span(9)
+        .to_network()
+        .expect("configured proof-of-work parameters are valid");
+
+    assert_eq!(difficulty::pow_adjustment_block_span(&network), 60);
+    assert_eq!(difficulty::pow_adjustment_block_span(&Network::Mainnet), 28);
+
+    let candidate_time =
+        DateTime::from_timestamp(1_000_000, 0).expect("test timestamp is in-range");
+    let long_context: Vec<_> = (0..100)
+        .map(|offset| {
+            (
+                network.target_difficulty_limit().to_compact(),
+                candidate_time - Duration::seconds(i64::from(offset) + 1),
+            )
+        })
+        .collect();
+
+    // `AdjustedDifficulty` truncates the context to the network's own span, and
+    // `median_time_past` then takes the median of the first `PoWMedianBlockSpan`
+    // times. With 9 times at one-second spacing ending one second before the
+    // candidate, the median is the fifth: five seconds back.
+    let adjusted = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        block::Height(100),
+        &network,
+        long_context.iter().copied(),
+    );
+    assert_eq!(
+        adjusted.median_time_past(),
+        candidate_time - Duration::seconds(5),
+    );
+
+    // The same context on Mainnet uses the 11-block span, so the median is the
+    // sixth time instead.
+    let mainnet_adjusted = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        block::Height(100),
+        &Network::Mainnet,
+        long_context.iter().copied(),
+    );
+    assert_eq!(
+        mainnet_adjusted.median_time_past(),
+        candidate_time - Duration::seconds(6),
+    );
+}
+
+/// A network configured with the default proof-of-work parameters computes the
+/// same difficulty threshold as Mainnet for the same context.
+///
+/// This is the "no behavior change" guard on the state side: making the spans
+/// configurable must not move the value any existing network computes.
+#[test]
+fn default_pow_parameters_compute_the_mainnet_threshold() {
+    let _init_guard = zakura_test::init();
+
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000, 0).expect("test timestamp is in-range");
+    let previous_block_height = block::Height(500_000);
+
+    let mainnet = Network::Mainnet;
+    let mainnet_context = daa_context(&mainnet, previous_block_height, candidate_time);
+
+    // Same difficulty limit as Mainnet, so the only difference between the two
+    // networks would be the proof-of-work spans — which are left unset.
+    let configured = testnet::Parameters::build()
+        .with_network_name("DefaultPowParams")
+        .expect("network name is valid")
+        .with_target_difficulty_limit(mainnet.target_difficulty_limit())
+        .expect("difficulty limit is a valid expanded value")
+        .to_network()
+        .expect("default proof-of-work parameters are valid");
+
+    let expected = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_block_height,
+        &mainnet,
+        mainnet_context.iter().copied(),
+    )
+    .expected_difficulty_threshold();
+
+    let actual = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_block_height,
+        &configured,
+        mainnet_context.iter().copied(),
+    )
+    .expected_difficulty_threshold();
+
+    assert_eq!(actual, expected);
 }
