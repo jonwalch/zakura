@@ -1767,12 +1767,18 @@ fn load_historical_treestate_artifacts(
             }
         });
 
-    let cache = frontiers.map_or_else(
-        || Mutex::new(read::HistoricalTreeCache::default()),
-        |artifact| Mutex::new(read::HistoricalTreeCache::with_artifact(artifact)),
-    );
+    let mut cache = match frontiers {
+        Some(artifact) => read::HistoricalTreeCache::with_artifact(artifact),
+        None => read::HistoricalTreeCache::default(),
+    };
 
-    (Arc::new(cache), subtrees)
+    // The serving path checks published subtree roots as derivations cross completion positions,
+    // so the cache needs them even though they never anchor a derivation.
+    if let Some(subtrees) = subtrees.clone() {
+        cache = cache.with_subtrees(subtrees);
+    }
+
+    (Arc::new(Mutex::new(cache)), subtrees)
 }
 
 /// Returns the note commitment frontiers for `hash_or_height` when the stored per-height trees are

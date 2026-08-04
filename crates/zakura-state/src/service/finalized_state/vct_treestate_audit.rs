@@ -303,3 +303,42 @@ pub fn derived_roots_in_display_order(
 
     Ok(roots)
 }
+
+/// What a height range contains, for fitting the grid's replay cost model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplayInputs {
+    /// Blocks in the range.
+    pub blocks: u64,
+
+    /// Total serialized size of those blocks, in bytes.
+    ///
+    /// The cost model prices a block at a flat constant plus its note commitments, which misses
+    /// the cost of reading and deserialising a large body that carries few or no commitments.
+    /// Reporting bytes separately is what lets that be tested rather than assumed.
+    pub bytes: u64,
+
+    /// Total Sapling, Orchard and Ironwood note commitments in the range.
+    pub commitments: u64,
+}
+
+/// Returns what the blocks in `[from, to]` contain, for cost-model fitting.
+pub fn replay_inputs(db: &ZakuraDb, from: Height, to: Height) -> ReplayInputs {
+    let mut inputs = ReplayInputs::default();
+
+    for height in from.0..=to.0 {
+        let height = Height(height);
+        inputs.blocks += 1;
+        inputs.bytes += db
+            .block_info(height.into())
+            .map_or(0, |info| u64::from(info.size()));
+
+        if let Some(block) = db.block(height.into()) {
+            inputs.commitments += (block.sapling_note_commitments().count()
+                + block.orchard_note_commitments().count()
+                + block.ironwood_note_commitments().count())
+                as u64;
+        }
+    }
+
+    inputs
+}

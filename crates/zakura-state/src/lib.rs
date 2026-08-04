@@ -83,7 +83,8 @@ pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch}
 
 pub use service::finalized_state::{
     derived_roots_in_display_order, inventory as vct_treestate_inventory, measure_derivations,
-    verify_subtrees_against_stored, DerivationSample, SubtreeVerification, VctTreestateInventory,
+    replay_inputs, verify_subtrees_against_stored, DerivationSample, ReplayInputs,
+    SubtreeVerification, VctTreestateInventory,
 };
 pub use service::finalized_state::{
     export_treestate_artifacts, FrontierArtifact, FrontierEntry, GridSpacing, SubtreeArtifact,

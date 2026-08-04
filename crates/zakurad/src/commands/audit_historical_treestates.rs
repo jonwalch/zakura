@@ -79,6 +79,13 @@ pub struct AuditHistoricalTreestatesCmd {
     #[clap(long, help = "path to a frontier artifact to anchor derivations on")]
     frontier_artifact: Option<PathBuf>,
 
+    /// Print one line per derivation with its measured cost and its replay inputs.
+    ///
+    /// Emits `SAMPLE <height> <blocks> <bytes> <commitments> <micros>`, which is what the grid's
+    /// cost model is fitted against.
+    #[clap(long, help = "print per-derivation cost and replay inputs")]
+    print_samples: bool,
+
     /// Print the derived roots at each sampled height, for comparison against another node.
     ///
     /// Output is one `ROOT <height> <sapling> <orchard> <ironwood>` line per height, hex-encoded
@@ -258,8 +265,25 @@ impl AuditHistoricalTreestatesCmd {
             return Ok(());
         }
 
+        let print_samples = self.print_samples;
         let mut samples: Vec<DerivationSample> = Vec::with_capacity(total);
         let mut report = |sample: &DerivationSample| {
+            if print_samples {
+                // The replayed range ends at this height and covers `replayed_blocks` blocks.
+                let from = Height(
+                    sample.height.0 + 1
+                        - sample.replayed_blocks.min(u64::from(sample.height.0) + 1) as u32,
+                );
+                let inputs = zakura_state::replay_inputs(db, from, sample.height);
+                println!(
+                    "SAMPLE {} {} {} {} {}",
+                    sample.height.0,
+                    inputs.blocks,
+                    inputs.bytes,
+                    inputs.commitments,
+                    sample.elapsed.as_micros()
+                );
+            }
             // One line per 1000 samples keeps a multi-million-height walk readable.
             if samples.len().is_multiple_of(1000) {
                 println!(

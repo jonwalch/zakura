@@ -39,7 +39,11 @@ branch). The result is a half-open band `[U, H)` where those column families are
   synced from scratch it is effectively genesis.
 - `H` is `vct_synced_below`, the checkpoint handoff. The currently embedded Mainnet
   frontier puts it at 3,418,406, which is also the last entry in
-  `main-checkpoints.txt`.
+  `main-checkpoints.txt`. Shipped snapshots can carry an older marker: the
+  2026-08-02 Mainnet archive snapshot records `H = 3,358,006`, because it was built
+  by a binary whose handoff was earlier. `H` is read from the database, never
+  assumed, so this only matters when reasoning about a particular snapshot — as it
+  does for the §4.6 table below.
 
 Heights at or above `H` get trees again from semantic sync, so the gap is exactly the
 checkpointed band.
@@ -126,9 +130,27 @@ Sprout, which this artifact omits):
 | 10,000 blocks | ~342 | ~500 KB | ≤10,000 blocks |
 | 50,000 blocks | ~68 | ~100 KB | ≤50,000 blocks |
 
-The recommended starting point is the coarse end, for the reason in §4.3. Entries below a
-pool's activation height are empty and cost nothing. Adjacent entries share nearly all
-their ommers, so delta encoding would shrink this further if it ever mattered.
+Entries below a pool's activation height are empty and cost nothing. Adjacent entries
+share nearly all their ommers, so delta encoding would shrink this further if it ever
+mattered.
+
+**Measured, 2026-08-03 (supersedes the recommendation this section originally made).**
+The table above assumed a coarse grid, on the §4.3 argument that spacing only costs the
+first request of a sweep. That argument holds; its magnitude does not. Replay costs
+~1.9 ms/block on average across Mainnet and varies ~50x by height, so a 50,000-block
+cold replay runs into minutes — far outside any RPC budget. Measured entry size is also
+715 B, not the 1,489 B used above as a conservative bound, because that figure includes
+Sprout.
+
+A *uniform* grid cannot bound the worst case at a sane size: 2 s worst-case needs
+~110-block spacing, 30,527 entries, ~21.8 MB. Spacing entries by estimated replay cost
+instead concentrates them where blocks are expensive. At a 2 s per-entry budget that is
+3,380 entries and 3.25 MB, measuring median 1.07 s, p90 2.50 s, max 4.71 s per cold
+request.
+
+The residual tail is variance rather than a missing model term — it does not correlate
+with block bytes (r = -0.10) or replay length — so tightening it costs entries, not
+modelling: ~7.7 MB would be needed to hold max under 2 s.
 
 Format should follow the conventions already established by the Sprout history artifact
 (§17 of the VCT design): magic, version, network byte, explicit record count, a SHA-256
@@ -215,7 +237,16 @@ in the protocol commits to subtree roots. They exist only as a local by-product 
 tree maintenance the fast path deliberately skips, which is why they cannot be recorded
 during fast sync at all.
 
-The set is small and static. Decoding the embedded final frontier at the current handoff
+**Qualified (2026-08-03).** The first sentence holds for a *serving* node, which is why the
+artifact still ships at review-level trust. It does not hold for the **publisher**, which
+replays the band regardless: subtree roots fall out of that replay as interior nodes, pinned
+between two root-checked grid entries. Verified against ground truth — above a fast-synced
+node's handoff the database does store subtree rows, and replaying `(3,358,006, 3,432,538]`
+reproduces all 5 of them exactly. So the generator can verify what it publishes, which is
+stronger than the reproducibility gate below; what is unchanged is that a *consumer* still
+cannot check a record cheaply, except opportunistically as §4.6's second bullet describes.
+
+The set is small and static. Decoding the embedded final frontier at the handoff
 (3,418,406) gives the pool positions directly:
 
 | Pool | Commitments at handoff | Completed subtrees |
@@ -225,7 +256,9 @@ The set is small and static. Decoding the embedded final frontier at the current
 | Ironwood | 0 (activates at/after handoff) | 0 |
 
 At a 32-byte root plus a completion height per record, ~1,895 records is roughly 70 KB
-framed, an order of magnitude smaller than even the coarse frontier grid. It grows
+framed, an order of magnitude smaller than even the coarse frontier grid. Measured against
+the 2026-08-02 snapshot, whose handoff is the earlier 3,358,006: 1,127 Sapling and 763
+Orchard records, 71,879 bytes framed — close enough to confirm the estimate. It grows
 append-only by a handful of subtrees per month at current usage.
 
 Because it cannot be self-verified, this artifact ships in the **reviewed, committed
@@ -253,9 +286,16 @@ database tip and errors with `RequestedHeightIsNotTip` otherwise, and
 scan. Because this artifact excludes Sprout, it needs a new and simpler below-tip producer
 that reads the three per-pool trees at a height and skips the Sprout pairing entirely.
 
-The publisher host must run an **archive, legacy-synced** node, since the exporter reads
-per-height trees from the finalized database. This is the design's central trade: the
-ordered pass happens once, on one host, and is verified independently by every consumer.
+~~The publisher host must run an **archive, legacy-synced** node, since the exporter reads
+per-height trees from the finalized database.~~ **Superseded (2026-08-03):** the exporter
+replays block bodies and checks each grid entry against the authenticated roots in
+`commitment_roots_by_height`, rather than reading stored per-height trees. Any **archive**
+node can therefore generate the artifact, fast-synced included — which is how the current
+Mainnet artifacts were produced. A pruned node still cannot, because replay needs retained
+bodies.
+
+This remains the design's central trade: the ordered pass happens once, on one host, and is
+verified independently by every consumer.
 
 Artifact entries should follow the same append-only grid contract as the checkpoint list,
 so successive bundles remain byte-for-byte prefix-compatible and the import workflow can
@@ -284,13 +324,10 @@ backend, but dropping it should be a deliberate decision rather than a silent si
 
 ## 7. Open questions
 
-**Replay cost is unmeasured.** No absolute figure exists in the repository. The only
-related number is that `update_trees_parallel` is roughly 70% of per-block commit time
-(VCT design §3), and there is no frontier caching in `zakura-state` today to extrapolate
-from. This single benchmark should choose the grid spacing: fast replay means the ~100 KB
-end of the §4.1 table, slow replay means tightening toward 10,000-block spacing and
-leaning harder on memoization. Measuring it is the correct next step, before any of this
-is committed to.
+~~**Replay cost is unmeasured.**~~ **Answered (2026-08-03).** Measured on a Mainnet
+fast-synced archive snapshot: ~1.9 ms/block mean across the band, varying ~50x by height
+(0.28 ms median below 400k, 3.6 ms median through 1.6M-2.0M). Slow enough that the §4.1
+recommendation inverts — see the measured note there.
 
 **Subtree boundary alignment** is resolved by §4.6: subtree roots are published, not
 derived on demand, so no replay ever needs to stop at a mid-block position. The only
