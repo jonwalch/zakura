@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -674,43 +675,71 @@ where
 {
     let insert = target.into_insert();
     let owner = insert.owner;
-    match tokio::time::timeout(
-        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+    match wait_for_header_target_apply(
+        owner,
         state.oneshot(zakura_state::Request::ApplyHeaderChainInsert { insert }),
     )
     .await
     {
-        Ok(Ok(zakura_state::Response::HeaderChainInsertApplied(
+        Ok(zakura_state::Response::HeaderChainInsertApplied(
             zakura_header_chain::ApplyResult::Committed
             | zakura_header_chain::ApplyResult::NoChange(_),
-        ))) => Ok(port::ApplyHeaderTargetOutcome::Applied),
-        Ok(Ok(zakura_state::Response::HeaderChainInsertApplied(
+        )) => Ok(port::ApplyHeaderTargetOutcome::Applied),
+        Ok(zakura_state::Response::HeaderChainInsertApplied(
             zakura_header_chain::ApplyResult::ResourceStalled(receipt),
-        ))) => Ok(port::ApplyHeaderTargetOutcome::ResourceStalled(receipt)),
-        Ok(Ok(zakura_state::Response::HeaderChainInsertApplied(
+        )) => Ok(port::ApplyHeaderTargetOutcome::ResourceStalled(receipt)),
+        Ok(zakura_state::Response::HeaderChainInsertApplied(
             zakura_header_chain::ApplyResult::Stale(_),
-        ))) => Err(Arc::new(
+        )) => Err(Arc::new(
             zakura_header_chain::HeaderChainError::stale_target(
                 zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
             ),
         )),
-        Ok(Ok(response)) => Err(header_target_apply_failure(
+        Ok(response) => Err(header_target_apply_failure(
             owner,
             "unexpected_response",
             Some(Box::new(std::io::Error::other(format!(
                 "unexpected state response: {response:?}"
             )))),
         )),
-        Ok(Err(error)) => Err(header_target_apply_failure(
+        Err(error) => Err(header_target_apply_failure(
             owner,
             "state_error",
             Some(error),
         )),
-        Err(error) => Err(header_target_apply_failure(
-            owner,
-            "timeout",
-            Some(Box::new(error)),
-        )),
+    }
+}
+
+async fn wait_for_header_target_apply<F>(
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    apply: F,
+) -> Result<zakura_state::Response, zakura_state::BoxError>
+where
+    F: Future<Output = Result<zakura_state::Response, zakura_state::BoxError>>,
+{
+    let started = tokio::time::Instant::now();
+    tokio::pin!(apply);
+    loop {
+        match tokio::time::timeout(ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT, &mut apply).await {
+            Ok(result) => return result,
+            Err(_) => {
+                let header_owner = owner.header_authority();
+                metrics::counter!(
+                    "sync.header.port.stall.total",
+                    "operation" => "apply_target",
+                )
+                .increment(1);
+                tracing::warn!(
+                    operation = "apply_target",
+                    session_id = owner.session_id(),
+                    request_id = owner.request_id().get(),
+                    header_generation = header_owner.header_generation.get(),
+                    branch = ?header_owner.branch,
+                    elapsed = ?started.elapsed(),
+                    "header target apply remains pending after a diagnostic interval"
+                );
+            }
+        }
     }
 }
 
@@ -1297,29 +1326,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn header_target_apply_failure_preserves_the_timeout_source() {
+    async fn header_target_apply_waits_past_diagnostic_intervals_for_terminal_result() {
         let started = tokio::time::Instant::now();
-        let elapsed = tokio::time::timeout(std::time::Duration::from_secs(1), pending::<()>())
-            .await
-            .expect_err("the fixture future reaches its deadline");
+        let response = wait_for_header_target_apply(owner(), async {
+            tokio::time::sleep(
+                ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT * 2 + std::time::Duration::from_secs(1),
+            )
+            .await;
+            Ok(zakura_state::Response::HeaderChainInsertApplied(
+                zakura_header_chain::ApplyResult::Committed,
+            ))
+        })
+        .await
+        .expect("the accepted apply returns its terminal result after two stall intervals");
 
-        let error = header_target_apply_failure(owner(), "timeout", Some(Box::new(elapsed)));
-
-        assert_eq!(
-            error.category,
-            zakura_header_chain::ErrorCategory::LocalResourceOrStorage
-        );
-        assert_eq!(
-            error
-                .source
-                .as_ref()
-                .expect("the timeout source is retained")
-                .to_string(),
-            "deadline has elapsed"
-        );
+        assert!(matches!(
+            response,
+            zakura_state::Response::HeaderChainInsertApplied(
+                zakura_header_chain::ApplyResult::Committed
+            )
+        ));
         assert_eq!(
             tokio::time::Instant::now().duration_since(started),
-            std::time::Duration::from_secs(1)
+            ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT * 2 + std::time::Duration::from_secs(1)
         );
     }
 
