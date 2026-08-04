@@ -104,13 +104,13 @@ pub struct TransactionSubmissionConfig {
     /// `[::]:18237` on Testnet or Regtest.
     pub listen_addr: Option<SocketAddr>,
 
-    /// Maximum accepted requests per second across all clients.
+    /// Maximum HTTP requests per second across all clients.
     pub requests_per_second: u32,
 
     /// Maximum global rate limit burst.
     pub request_burst: u32,
 
-    /// Maximum accepted requests per minute from one client IP address.
+    /// Maximum HTTP requests per minute from one IPv4 address or IPv6 /64.
     pub requests_per_minute_per_ip: u32,
 
     /// Maximum per-IP rate limit burst.
@@ -119,13 +119,13 @@ pub struct TransactionSubmissionConfig {
     /// Maximum number of transaction submissions being verified at once.
     pub max_in_flight: usize,
 
-    /// Maximum number of transaction submissions being verified at once for one client IP.
+    /// Maximum transaction submissions being verified for one IPv4 address or IPv6 /64.
     pub max_in_flight_per_ip: usize,
 
     /// Maximum number of open TCP connections.
     pub max_connections: usize,
 
-    /// Maximum number of open TCP connections from one directly connected IP address.
+    /// Maximum open TCP connections from one directly connected IPv4 address or IPv6 /64.
     pub max_connections_per_ip: usize,
 
     /// Proxy networks whose `X-Forwarded-For` headers are trusted.
@@ -172,6 +172,18 @@ impl TransactionSubmissionConfig {
         if self.request_burst_per_ip == 0 {
             return Err(
                 "rpc.transaction_submission.request_burst_per_ip must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if u64::from(self.requests_per_minute_per_ip) > u64::from(self.requests_per_second) * 60 {
+            return Err(
+                "rpc.transaction_submission.requests_per_minute_per_ip must not exceed the global request rate"
+                    .to_string(),
+            );
+        }
+        if self.request_burst_per_ip > self.request_burst {
+            return Err(
+                "rpc.transaction_submission.request_burst_per_ip must not exceed request_burst"
                     .to_string(),
             );
         }
@@ -245,8 +257,8 @@ impl Default for TransactionSubmissionConfig {
             listen_addr: None,
             requests_per_second: 10,
             request_burst: 20,
-            requests_per_minute_per_ip: 600,
-            request_burst_per_ip: 20,
+            requests_per_minute_per_ip: 60,
+            request_burst_per_ip: 4,
             max_in_flight: 16,
             max_in_flight_per_ip: 4,
             max_connections: 100,
@@ -336,6 +348,13 @@ mod tests {
         let config = TransactionSubmissionConfig::default();
 
         assert!(config.enabled);
+        assert_eq!(config.requests_per_minute_per_ip, 60);
+        assert_eq!(config.request_burst_per_ip, 4);
+        assert!(
+            u64::from(config.requests_per_minute_per_ip)
+                < u64::from(config.requests_per_second) * 60
+        );
+        assert!(config.request_burst_per_ip < config.request_burst);
         assert_eq!(
             config.resolved_listen_addr(NetworkKind::Mainnet),
             SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8237)
@@ -351,6 +370,20 @@ mod tests {
     fn transaction_submission_rejects_unsafe_limits() {
         let config = TransactionSubmissionConfig {
             requests_per_second: 0,
+            ..TransactionSubmissionConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+
+        let config = TransactionSubmissionConfig {
+            requests_per_minute_per_ip: 601,
+            ..TransactionSubmissionConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+
+        let config = TransactionSubmissionConfig {
+            request_burst_per_ip: 21,
             ..TransactionSubmissionConfig::default()
         };
 

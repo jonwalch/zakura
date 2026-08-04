@@ -29,8 +29,8 @@ enabled = true
 listen_addr = "[::]:8237"
 requests_per_second = 10
 request_burst = 20
-requests_per_minute_per_ip = 600
-request_burst_per_ip = 20
+requests_per_minute_per_ip = 60
+request_burst_per_ip = 4
 max_in_flight = 16
 max_in_flight_per_ip = 4
 max_connections = 100
@@ -76,8 +76,10 @@ key_file = "/etc/zakura/tls/private-key.pem"
 
 ## Resource and retry behavior
 
-Global and per-IP token buckets reject excess requests with HTTP 429. Separate
-global and per-IP in-flight limits bound transaction verification, while a
+Global and per-client token buckets reject excess HTTP requests with HTTP 429
+before routing, including liveness and unsupported requests. IPv4 addresses are
+limited individually and IPv6 addresses share one identity per /64. Separate
+global and per-client in-flight limits bound transaction verification, while a
 connection limit and header/body deadlines bound slow clients. Client IPs and
 raw request bodies are not written to normal logs, and metric labels use only
 fixed result categories.

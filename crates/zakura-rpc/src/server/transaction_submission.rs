@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
@@ -30,7 +30,7 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use tower::{Service, ServiceBuilder};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use zakura_chain::parameters::NetworkKind;
 use zakura_node_services::mempool::MempoolService;
@@ -151,6 +151,10 @@ struct SubmissionPermits {
     _client: OwnedSemaphorePermit,
 }
 
+struct RequestRateAdmission {
+    client_in_flight: Arc<Semaphore>,
+}
+
 #[derive(Clone)]
 struct RequestAdmission(Arc<Mutex<Option<SubmissionPermits>>>);
 
@@ -179,7 +183,7 @@ impl ConnectionController {
     }
 
     fn admit(&self, ip: IpAddr) -> Option<ConnectionPermit> {
-        let ip = normalize_ip(ip);
+        let ip = client_identity(ip);
         let mut counts = lock_unpoisoned(&self.counts);
         let count = counts.entry(ip).or_default();
         if *count >= self.max_per_ip {
@@ -278,7 +282,8 @@ impl AdmissionController {
         }
     }
 
-    fn admit(&self, client_ip: IpAddr) -> Result<RequestAdmission, AdmissionRejection> {
+    fn admit_rate(&self, client_ip: IpAddr) -> Result<RequestRateAdmission, AdmissionRejection> {
+        let client_ip = client_identity(client_ip);
         let now = Instant::now();
         let client_in_flight = {
             let mut rate_state = lock_unpoisoned(&self.inner.rate_state);
@@ -328,13 +333,21 @@ impl AdmissionController {
             client_in_flight
         };
 
+        Ok(RequestRateAdmission { client_in_flight })
+    }
+
+    fn admit_in_flight(
+        &self,
+        rate_admission: RequestRateAdmission,
+    ) -> Result<RequestAdmission, AdmissionRejection> {
         let global = self
             .inner
             .global_in_flight
             .clone()
             .try_acquire_owned()
             .map_err(|_| AdmissionRejection::GlobalInFlight)?;
-        let client = client_in_flight
+        let client = rate_admission
+            .client_in_flight
             .try_acquire_owned()
             .map_err(|_| AdmissionRejection::ClientInFlight)?;
 
@@ -342,6 +355,12 @@ impl AdmissionController {
             _global: global,
             _client: client,
         }))
+    }
+
+    #[cfg(test)]
+    fn admit(&self, client_ip: IpAddr) -> Result<RequestAdmission, AdmissionRejection> {
+        let rate_admission = self.admit_rate(client_ip)?;
+        self.admit_in_flight(rate_admission)
     }
 }
 
@@ -433,6 +452,35 @@ where
         let max_request_body_size_u64 = u64::try_from(self.max_request_body_size)
             .expect("usize fits in u64 on supported platforms");
 
+        let (client_ip, forwarded_for_valid) = resolve_client_ip(
+            self.remote_ip,
+            request.headers(),
+            self.trusted_proxies.as_ref(),
+        );
+        let rate_admission = match self.admission.admit_rate(client_ip) {
+            Ok(admission) => admission,
+            Err(rejection) => {
+                metrics::counter!(
+                    "rpc.transaction_submission.rejections.total",
+                    "reason" => rejection.metric_label()
+                )
+                .increment(1);
+                return ready_response(http_error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    RATE_LIMIT_ERROR_CODE,
+                    "request limit exceeded",
+                    true,
+                ));
+            }
+        };
+        if !forwarded_for_valid {
+            metrics::counter!(
+                "rpc.transaction_submission.rejections.total",
+                "reason" => "invalid_forwarded_for"
+            )
+            .increment(1);
+        }
+
         if request.method() == Method::GET
             && request.uri().path() == "/healthz"
             && request.uri().query().is_none()
@@ -490,20 +538,7 @@ where
             );
         }
 
-        let (client_ip, forwarded_for_valid) = resolve_client_ip(
-            self.remote_ip,
-            request.headers(),
-            self.trusted_proxies.as_ref(),
-        );
-        if !forwarded_for_valid {
-            metrics::counter!(
-                "rpc.transaction_submission.rejections.total",
-                "reason" => "invalid_forwarded_for"
-            )
-            .increment(1);
-        }
-
-        let admission = match self.admission.admit(client_ip) {
+        let admission = match self.admission.admit_in_flight(rate_admission) {
             Ok(admission) => admission,
             Err(rejection) => {
                 metrics::counter!(
@@ -645,6 +680,18 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
             .to_ipv4_mapped()
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(ipv6)),
+        ip => ip,
+    }
+}
+
+fn client_identity(ip: IpAddr) -> IpAddr {
+    match normalize_ip(ip) {
+        // Treat one IPv6 /64 like one IPv4 address so privacy address rotation cannot bypass
+        // per-client admission limits.
+        IpAddr::V6(ipv6) => {
+            const IPV6_CLIENT_MASK: u128 = u128::MAX << 64;
+            IpAddr::V6(Ipv6Addr::from(u128::from(ipv6) & IPV6_CLIENT_MASK))
+        }
         ip => ip,
     }
 }
@@ -807,11 +854,21 @@ impl RpcServer {
                         {
                             Ok(Ok(stream)) => serve_http1(stream, service, stopped).await,
                             Ok(Err(tls_error)) => {
-                                warn!(?tls_error, "transaction submission TLS handshake failed");
+                                metrics::counter!(
+                                    "rpc.transaction_submission.rejections.total",
+                                    "reason" => "tls_handshake"
+                                )
+                                .increment(1);
+                                trace!(?tls_error, "transaction submission TLS handshake failed");
                                 return;
                             }
                             Err(_) => {
-                                warn!("transaction submission TLS handshake timed out");
+                                metrics::counter!(
+                                    "rpc.transaction_submission.rejections.total",
+                                    "reason" => "tls_handshake_timeout"
+                                )
+                                .increment(1);
+                                trace!("transaction submission TLS handshake timed out");
                                 return;
                             }
                         }
@@ -820,7 +877,12 @@ impl RpcServer {
                     };
 
                     if let Err(connection_error) = result {
-                        warn!(
+                        metrics::counter!(
+                            "rpc.transaction_submission.rejections.total",
+                            "reason" => "connection_error"
+                        )
+                        .increment(1);
+                        trace!(
                             ?connection_error,
                             "transaction submission connection failed"
                         );
@@ -890,6 +952,22 @@ mod tests {
 
     use super::*;
 
+    async fn raw_http_response(listen_addr: SocketAddr, request: &[u8]) -> Vec<u8> {
+        let mut connection = TcpStream::connect(listen_addr)
+            .await
+            .expect("HTTP connection should open");
+        connection
+            .write_all(request)
+            .await
+            .expect("HTTP request should write");
+        let mut response = Vec::new();
+        connection
+            .read_to_end(&mut response)
+            .await
+            .expect("HTTP response should read");
+        response
+    }
+
     #[tokio::test]
     async fn public_server_exposes_one_strict_rate_limited_method() {
         let _init_guard = zakura_test::init();
@@ -900,7 +978,7 @@ mod tests {
             requests_per_second: 100,
             request_burst: 100,
             requests_per_minute_per_ip: 1,
-            request_burst_per_ip: 2,
+            request_burst_per_ip: 5,
             ..TransactionSubmissionConfig::default()
         };
         let (server_task, listen_addr) = RpcServer::start_transaction_submission(
@@ -913,18 +991,11 @@ mod tests {
         .expect("public server should start");
         let client = RpcRequestClient::new(listen_addr);
 
-        let mut health_connection = TcpStream::connect(listen_addr)
-            .await
-            .expect("health connection should open");
-        health_connection
-            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("health request should write");
-        let mut health_response = Vec::new();
-        health_connection
-            .read_to_end(&mut health_response)
-            .await
-            .expect("health response should read");
+        let health_response = raw_http_response(
+            listen_addr,
+            b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(health_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
 
         let unknown_response = client
@@ -982,6 +1053,51 @@ mod tests {
         );
 
         mempool.expect_no_requests().await;
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn health_and_unsupported_requests_are_rate_limited() {
+        let _init_guard = zakura_test::init();
+        let mempool: MockService<_, _, _, NodeBoxError> = MockService::build().for_unit_tests();
+        let config = TransactionSubmissionConfig {
+            listen_addr: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()),
+            requests_per_second: 100,
+            request_burst: 100,
+            requests_per_minute_per_ip: 1,
+            request_burst_per_ip: 2,
+            ..TransactionSubmissionConfig::default()
+        };
+        let (server_task, listen_addr) = RpcServer::start_transaction_submission(
+            Buffer::new(mempool, 1),
+            config,
+            NetworkKind::Mainnet,
+            1,
+        )
+        .await
+        .expect("public server should start");
+
+        let health_response = raw_http_response(
+            listen_addr,
+            b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(health_response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+        let unsupported_response = raw_http_response(
+            listen_addr,
+            b"GET /unsupported HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(unsupported_response.starts_with(b"HTTP/1.1 405 Method Not Allowed\r\n"));
+
+        let limited_response = raw_http_response(
+            listen_addr,
+            b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(limited_response.starts_with(b"HTTP/1.1 429 Too Many Requests\r\n"));
 
         server_task.abort();
     }
@@ -1155,26 +1271,34 @@ mod tests {
     #[test]
     fn rate_limits_are_enforced() {
         let config = TransactionSubmissionConfig {
-            requests_per_second: 1,
-            request_burst: 1,
+            requests_per_second: 2,
+            request_burst: 2,
             requests_per_minute_per_ip: 60,
             request_burst_per_ip: 1,
-            max_in_flight: 1,
+            max_in_flight: 2,
             max_in_flight_per_ip: 1,
             ..TransactionSubmissionConfig::default()
         };
         let admission = AdmissionController::new(&config);
-        let ip = "192.0.2.1".parse().expect("valid IP");
+        let first_ip = "192.0.2.1".parse().expect("valid IP");
+        let second_ip = "192.0.2.2".parse().expect("valid IP");
 
         let first = admission
-            .admit(ip)
+            .admit(first_ip)
             .expect("first request should be admitted");
-        match admission.admit(ip) {
-            Err(rejection) => assert_eq!(rejection, AdmissionRejection::GlobalRate),
-            Ok(_) => panic!("burst should be exhausted"),
-        }
+        assert!(matches!(
+            admission.admit(first_ip),
+            Err(AdmissionRejection::ClientRate)
+        ));
+        let second = admission
+            .admit(second_ip)
+            .expect("another client should retain access to the global budget");
+        assert!(matches!(
+            admission.admit("192.0.2.3".parse().expect("valid IP")),
+            Err(AdmissionRejection::GlobalRate)
+        ));
 
-        drop(first);
+        drop((first, second));
     }
 
     #[test]
@@ -1211,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn connections_are_limited_per_direct_ip() {
+    fn connections_are_limited_per_direct_client_identity() {
         let controller = ConnectionController::new(1);
         let ip = "192.0.2.1".parse().expect("valid IP");
 
@@ -1248,12 +1372,26 @@ mod tests {
     #[test]
     fn ipv4_mapped_ipv6_addresses_share_one_rate_limit_identity() {
         assert_eq!(
-            normalize_ip(IpAddr::V6(
+            client_identity(IpAddr::V6(
                 "::ffff:192.0.2.1"
                     .parse::<Ipv6Addr>()
                     .expect("valid mapped IPv6 address"),
             )),
             IpAddr::V4("192.0.2.1".parse().expect("valid IPv4 address"))
         );
+    }
+
+    #[test]
+    fn ipv6_addresses_share_one_identity_per_64_bit_prefix() {
+        let first = client_identity("2001:db8:1234:5678::1".parse().expect("valid IPv6 address"));
+        let rotated = client_identity(
+            "2001:db8:1234:5678::ffff"
+                .parse()
+                .expect("valid IPv6 address"),
+        );
+        let other = client_identity("2001:db8:1234:5679::1".parse().expect("valid IPv6 address"));
+
+        assert_eq!(first, rotated);
+        assert_ne!(first, other);
     }
 }
