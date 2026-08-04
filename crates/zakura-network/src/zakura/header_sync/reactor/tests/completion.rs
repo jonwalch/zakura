@@ -168,6 +168,270 @@ fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
     );
 }
 
+#[test]
+fn requester_admits_prefix_at_durable_graph_headroom_before_chunk_budget_is_full() {
+    let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+    let durable_prefix_count = 2usize;
+    let max_nodes = u32::try_from(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1)
+        .expect("the v1 retained-node limit fits a block height");
+    reactor
+        .committed_snapshot
+        .as_mut()
+        .expect("the fixture has a committed snapshot")
+        .frontiers
+        .header_best
+        .height = block::Height(
+        snapshot
+            .frontiers
+            .finalized
+            .height
+            .0
+            .checked_add(max_nodes)
+            .and_then(|height| {
+                height.checked_sub(
+                    u32::try_from(durable_prefix_count)
+                        .expect("the fixture prefix count fits a block height"),
+                )
+            })
+            .expect("the fixture divergence fits a block height"),
+    );
+
+    let active = reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the fixture has active work");
+    let entry = active.entries[0].clone();
+    active.phase = HeaderTargetPhase::Receiving;
+    active.common_ancestor = Some(snapshot.frontiers.finalized);
+    active.entries = vec![entry];
+    active.max_header_count = MAX_HS_RANGE;
+    let staged_tip = active
+        .staged_tip()
+        .expect("the staged fixture has an inferred tip");
+    let mut next_header = *regtest_genesis_block().header;
+    next_header.previous_block_hash = staged_tip.hash;
+    let next_entry = HeaderEntry {
+        header: Arc::new(next_header),
+        body_size: 0,
+        tree_aux: None,
+    };
+    let _ = active;
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
+
+    reactor.handle_headers(
+        peer.clone(),
+        owner.session_id(),
+        owner.header_authority(),
+        Headers {
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            common_ancestor_height: staged_tip.height,
+            common_ancestor_hash: staged_tip.hash,
+            complete: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![next_entry],
+        },
+    );
+
+    let HeaderPortOperation::PrepareHeaderTarget {
+        completion,
+        entries,
+        ..
+    } = actions
+        .try_recv()
+        .expect("durable graph headroom seals the admissible prefix")
+    else {
+        panic!("durable graph headroom must prepare a header target");
+    };
+    assert_eq!(entries.len(), durable_prefix_count);
+    assert!(matches!(
+        completion,
+        zakura_header_chain::TargetCompletion::TargetPrefix { .. }
+    ));
+    assert_eq!(
+        reactor.peer_work_queue.chunk_budget_usage(),
+        (0, durable_prefix_count),
+        "the prefix seals before exhausting the independent in-memory chunk budget"
+    );
+    assert!(actions.try_recv().is_err());
+}
+
+#[test]
+fn durable_prefix_headroom_accounts_for_staged_headers_at_exact_limits() {
+    let anchor =
+        zakura_header_chain::Frontier::new(block::Height(10), regtest_genesis_block().hash());
+    let mut snapshot = committed_snapshot(anchor);
+    let max_nodes = u32::try_from(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1)
+        .expect("the v1 retained-node limit fits a block height");
+
+    assert_eq!(
+        HeaderSyncReactor::durable_header_prefix_remaining(&snapshot, 0),
+        max_nodes
+    );
+    snapshot.frontiers.header_best.height = block::Height(
+        anchor
+            .height
+            .0
+            .checked_add(max_nodes)
+            .and_then(|height| height.checked_sub(2))
+            .expect("the exact-bound fixture fits a block height"),
+    );
+    assert_eq!(
+        HeaderSyncReactor::durable_header_prefix_remaining(&snapshot, 0),
+        2
+    );
+    assert_eq!(
+        HeaderSyncReactor::durable_header_prefix_remaining(&snapshot, 1),
+        1
+    );
+    assert_eq!(
+        HeaderSyncReactor::durable_header_prefix_remaining(&snapshot, 2),
+        0
+    );
+    assert_eq!(
+        HeaderSyncReactor::durable_header_prefix_remaining(&snapshot, 3),
+        0,
+        "overfull fixtures fail closed instead of wrapping headroom"
+    );
+}
+
+#[tokio::test]
+async fn requester_caps_the_initial_wire_request_at_durable_graph_headroom() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut snapshot = committed_snapshot(anchor);
+    let durable_prefix_count = 2_u32;
+    let max_nodes = u32::try_from(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1)
+        .expect("the v1 retained-node limit fits a block height");
+    snapshot.frontiers.header_best = zakura_header_chain::Frontier::new(
+        block::Height(
+            anchor
+                .height
+                .0
+                .checked_add(max_nodes)
+                .and_then(|height| height.checked_sub(durable_prefix_count))
+                .expect("the wire fixture divergence fits a block height"),
+        ),
+        block::Hash([0x51; 32]),
+    );
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, mut actions, task) =
+        spawn_header_sync_reactor(startup).expect("the requester fixture starts");
+
+    let (send, mut outbound) = framed_channel(8);
+    let peer = peer();
+    handle
+        .send(HeaderSyncEvent::PeerConnected(
+            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
+        ))
+        .await
+        .expect("the peer connects");
+    let _initial_status = outbound.recv().await.expect("initial status is sent");
+
+    let target = block::Hash([0x52; 32]);
+    let remote_status = Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: block::Height(
+            snapshot
+                .frontiers
+                .header_best
+                .height
+                .0
+                .checked_add(100)
+                .expect("the remote target height fits a block height"),
+        ),
+        selected_tip_hash: target,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: u32::MAX,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: 0,
+    };
+    handle
+        .send(HeaderSyncEvent::SessionWireMessage {
+            peer: peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessage::Status(remote_status),
+        })
+        .await
+        .expect("the target status reaches the reactor");
+    let scope = match next_action(&mut actions).await {
+        HeaderPortOperation::QueryHeaderLocator {
+            target_tip_hash,
+            scope,
+            ..
+        } if target_tip_hash == target => scope,
+        other => panic!("expected locator query for target, got {other:?}"),
+    };
+    handle
+        .send(HeaderSyncEvent::HeaderLocatorReady {
+            peer: peer.clone(),
+            session_id: 0,
+            target_tip_hash: target,
+            scope,
+            locator: Some(zakura_header_chain::HeaderLocator::for_continuation(
+                snapshot.frontiers.header_best,
+            )),
+        })
+        .await
+        .expect("the locator reaches the reactor");
+    let request = match handle
+        .codec()
+        .decode_frame(outbound.recv().await.expect("GetHeaders is sent"), None)
+        .expect("GetHeaders decodes")
+    {
+        HeaderSyncMessage::GetHeaders(request) => request,
+        other => panic!("expected GetHeaders, got {other:?}"),
+    };
+    assert_eq!(request.max_header_count, durable_prefix_count);
+
+    let mut first_header = *regtest_genesis_block().header;
+    first_header.previous_block_hash = snapshot.frontiers.header_best.hash;
+    first_header.time += chrono::Duration::seconds(1);
+    let first_header = Arc::new(first_header);
+    handle
+        .send(HeaderSyncEvent::SessionResponse {
+            peer,
+            session_id: 0,
+            scope,
+            msg: HeaderSyncMessage::Headers(Headers {
+                request_id: request.request_id,
+                target_tip_hash: target,
+                common_ancestor_height: snapshot.frontiers.header_best.height,
+                common_ancestor_hash: snapshot.frontiers.header_best.hash,
+                complete: false,
+                tree_aux_schema: AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: first_header.clone(),
+                    body_size: 0,
+                    tree_aux: None,
+                }],
+            }),
+        })
+        .await
+        .expect("the partial response reaches the reactor");
+    let continuation = match handle
+        .codec()
+        .decode_frame(
+            outbound.recv().await.expect("the continuation is sent"),
+            None,
+        )
+        .expect("the continuation decodes")
+    {
+        HeaderSyncMessage::GetHeaders(request) => request,
+        other => panic!("expected continuation GetHeaders, got {other:?}"),
+    };
+    assert_eq!(continuation.max_header_count, 1);
+    assert_eq!(continuation.locator_hashes, vec![first_header.hash()]);
+
+    shutdown.cancel();
+    task.await.expect("the reactor exits cleanly");
+}
+
 #[tokio::test]
 async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
     let shutdown = CancellationToken::new();

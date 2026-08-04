@@ -1128,7 +1128,11 @@ impl HeaderSyncReactor {
         // Admit a validated prefix when the aggregate cap is full. Continuations below are
         // reduced to the remaining capacity, so one peer cannot force tiny prefix commits by
         // returning pages much smaller than requested.
-        let bounded_prefix = !complete && self.peer_work_queue.budget_is_full();
+        let durable_prefix_full = self.committed_snapshot.as_ref().is_some_and(|snapshot| {
+            Self::durable_header_prefix_remaining(snapshot, staged_entry_count) == 0
+        });
+        let bounded_prefix =
+            !complete && (self.peer_work_queue.budget_is_full() || durable_prefix_full);
         let active = self
             .peer_work_queue
             .active_mut(&peer)
@@ -1225,10 +1229,13 @@ impl HeaderSyncReactor {
         let _ = active;
         let max_header_count = self
             .peer_work_queue
-            .reservable_header_count(negotiated_header_count);
+            .reservable_header_count(negotiated_header_count)
+            .min(self.committed_snapshot.as_ref().map_or(0, |snapshot| {
+                Self::durable_header_prefix_remaining(snapshot, staged_entry_count)
+            }));
         debug_assert!(
             max_header_count > 0,
-            "a full owned budget prepared a prefix"
+            "a full owned or durable prefix returned before continuation"
         );
         if max_header_count == 0
             || !self
@@ -2020,6 +2027,8 @@ impl HeaderSyncReactor {
             .min(self.serving_limits.max_headers_per_response())
             .min(byte_limited_count)
             .min(MAX_HS_RANGE);
+        let max_header_count =
+            max_header_count.min(Self::durable_header_prefix_remaining(&local, 0));
         let max_header_count = self
             .peer_work_queue
             .reservable_header_count(max_header_count);
@@ -2094,6 +2103,30 @@ impl HeaderSyncReactor {
                 .increment(1);
             }
         }
+    }
+
+    /// Bound one ordinary target prefix by the selected-path space that can fit in the durable DAG.
+    ///
+    /// Retention must protect the complete selected path, so downloading more entries than this
+    /// lower-bound headroom can only produce a committed resource refusal. Side forks are normally
+    /// evictable; an independently protected side path can still make state return the authoritative
+    /// refusal at apply time.
+    fn durable_header_prefix_remaining(
+        snapshot: &zakura_header_chain::EngineSnapshot,
+        staged: usize,
+    ) -> u32 {
+        let selected_non_finalized = snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.finalized.height.0);
+        let selected_non_finalized = usize::try_from(selected_non_finalized)
+            .expect("u32 header divergence fits usize on supported targets");
+        let remaining = zakura_header_chain::MAX_NON_FINALIZED_NODES_V1
+            .saturating_sub(selected_non_finalized)
+            .saturating_sub(staged);
+        u32::try_from(remaining).unwrap_or(u32::MAX)
     }
 
     fn observe_latest_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
