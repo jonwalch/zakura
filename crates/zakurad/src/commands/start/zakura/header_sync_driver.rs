@@ -694,25 +694,48 @@ where
                 zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
             ),
         )),
-        Ok(Ok(_)) => Err(Arc::new(
-            zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
-                None,
-            ),
+        Ok(Ok(response)) => Err(header_target_apply_failure(
+            owner,
+            "unexpected_response",
+            Some(Box::new(std::io::Error::other(format!(
+                "unexpected state response: {response:?}"
+            )))),
         )),
-        Ok(Err(error)) => Err(Arc::new(
-            zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
-                Some(error),
-            ),
+        Ok(Err(error)) => Err(header_target_apply_failure(
+            owner,
+            "state_error",
+            Some(error),
         )),
-        Err(_) => Err(Arc::new(
-            zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
-                None,
-            ),
+        Err(error) => Err(header_target_apply_failure(
+            owner,
+            "timeout",
+            Some(Box::new(error)),
         )),
     }
+}
+
+fn header_target_apply_failure(
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    reason: &'static str,
+    source: Option<zakura_state::BoxError>,
+) -> Arc<zakura_header_chain::HeaderChainError> {
+    let branch = owner.header_authority().branch;
+    metrics::counter!(
+        "sync.header.port.failure.total",
+        "operation" => "apply_target",
+        "reason" => reason,
+    )
+    .increment(1);
+    tracing::warn!(
+        reason,
+        ?branch,
+        error = ?source.as_deref(),
+        "failed to apply a prepared header target through state"
+    );
+    Arc::new(zakura_header_chain::HeaderChainError::local_resource(
+        zakura_header_chain::ErrorSubject::Branch(branch),
+        source,
+    ))
 }
 
 async fn acquire_header_path<ReadState>(
@@ -1270,6 +1293,55 @@ mod tests {
         assert_eq!(
             tokio::time::Instant::now().duration_since(started),
             ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn header_target_apply_failure_preserves_the_timeout_source() {
+        let started = tokio::time::Instant::now();
+        let elapsed = tokio::time::timeout(std::time::Duration::from_secs(1), pending::<()>())
+            .await
+            .expect_err("the fixture future reaches its deadline");
+
+        let error = header_target_apply_failure(owner(), "timeout", Some(Box::new(elapsed)));
+
+        assert_eq!(
+            error.category,
+            zakura_header_chain::ErrorCategory::LocalResourceOrStorage
+        );
+        assert_eq!(
+            error
+                .source
+                .as_ref()
+                .expect("the timeout source is retained")
+                .to_string(),
+            "deadline has elapsed"
+        );
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn header_target_apply_failure_preserves_a_state_service_error() {
+        let error = header_target_apply_failure(
+            owner(),
+            "state_error",
+            Some("fixture state apply failure".into()),
+        );
+
+        assert_eq!(
+            error.category,
+            zakura_header_chain::ErrorCategory::LocalResourceOrStorage
+        );
+        assert_eq!(
+            error
+                .source
+                .as_ref()
+                .expect("the state source is retained")
+                .to_string(),
+            "fixture state apply failure"
         );
     }
 
