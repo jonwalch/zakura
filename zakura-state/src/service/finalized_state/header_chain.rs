@@ -1376,7 +1376,7 @@ impl HeaderChainRuntime {
         #[cfg(test)]
         fault(FaultPoint::BeforeCommit)?;
         self.store.db.write(batch)?;
-        *transition_engine = transition.into_projected_engine();
+        transition_engine.apply_committed(transition);
         #[cfg(test)]
         fault(FaultPoint::AfterCommit)?;
         if let Some(pin) = migrated_pin_refuted {

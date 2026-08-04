@@ -122,12 +122,17 @@ impl HeaderChainEngine {
         durable: DurableTransitionFacts,
     ) -> Result<EngineTransition, TransitionFailure> {
         let plan = apply_transition_engine(self, &durable, request, context)?;
+        #[cfg(any(test, feature = "fuzz-impl"))]
         let projected = {
             let mut projected = self.clone();
             projected.apply_verified_plan(&plan)?;
             projected
         };
-        Ok(EngineTransition { plan, projected })
+        Ok(EngineTransition {
+            plan,
+            #[cfg(any(test, feature = "fuzz-impl"))]
+            projected,
+        })
     }
 
     /// Apply a verified graph delta after its durable batch has committed.
@@ -181,10 +186,11 @@ impl HeaderChainEngine {
     }
 }
 
-/// A verified durable write set paired with its complete projected engine state.
+/// A verified durable write set ready for one post-commit in-memory application.
 #[derive(Clone, Debug)]
 pub struct EngineTransition {
     plan: TransitionPlan,
+    #[cfg(any(test, feature = "fuzz-impl"))]
     projected: HeaderChainEngine,
 }
 
@@ -210,6 +216,7 @@ impl EngineTransition {
     }
 
     /// Consume the verified transition and return its complete projected engine state.
+    #[cfg(any(test, feature = "fuzz-impl"))]
     pub fn into_projected_engine(self) -> HeaderChainEngine {
         self.projected
     }
