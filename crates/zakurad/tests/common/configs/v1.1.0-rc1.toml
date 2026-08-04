@@ -123,8 +123,8 @@ max_connections_per_ip = 20
 max_in_flight = 16
 max_in_flight_per_ip = 4
 request_burst = 20
-request_burst_per_ip = 20
-requests_per_minute_per_ip = 600
+request_burst_per_ip = 4
+requests_per_minute_per_ip = 60
 requests_per_second = 10
 trusted_proxies = []
 
