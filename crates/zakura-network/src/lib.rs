@@ -160,6 +160,7 @@ mod address_book;
 mod address_book_updater;
 mod isolated;
 mod meta_addr;
+mod p2p_trace;
 mod peer;
 mod peer_cache_updater;
 mod peer_set;
