@@ -377,6 +377,10 @@ mod tests {
         assert_eq!(event["state_tip"], 160);
         assert_eq!(event["checkpoint_height"], 160);
         assert_eq!(event["node"], "test-node");
+        assert_eq!(
+            event["process_trace_id"],
+            zakura_jsonl_trace::process_trace_id()
+        );
     }
 
     #[test]
