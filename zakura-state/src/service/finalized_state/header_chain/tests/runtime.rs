@@ -189,8 +189,6 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         lease.common_ancestor,
         Frontier::new(genesis.height, genesis.hash)
     );
-    assert_eq!(lease.finalized_path_end, Some(finalized));
-    assert_eq!(lease.path.as_ref(), &[target.hash]);
 
     let owner = SourceId::from_digest([0x71; 32]);
     let mut after = genesis.hash;
@@ -209,6 +207,111 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         assert_eq!(page.complete, complete);
         after = expected.hash;
     }
+    assert!(reader
+        .release_retained_path(owner, 9, lease.lease_id, scope)
+        .expect("the one-header-page cursor releases"));
+
+    for (marker, page_count) in [(0x72, 2), (0x73, 3)] {
+        let page_owner = SourceId::from_digest([marker; 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(page_owner, 9, target.hash, &[genesis.hash], scope)
+            .expect("the tier-boundary page cursor acquires")
+        else {
+            panic!("the tier-boundary cursor should be retained");
+        };
+        let mut after = genesis.hash;
+        let mut served = Vec::new();
+        loop {
+            let RetainedPathReadOutcome::Page(page) = reader
+                .read_retained_path(page_owner, 9, lease.lease_id, scope, after, page_count)
+                .expect("the page spanning the storage-tier boundary is coherent")
+            else {
+                panic!("the tier-boundary cursor should remain available");
+            };
+            served.extend(page.headers.iter().map(|header| header.hash()));
+            if page.complete {
+                break;
+            }
+            after = page
+                .headers
+                .last()
+                .expect("an incomplete page contains at least one header")
+                .hash();
+        }
+        assert_eq!(
+            served,
+            path.iter().map(|header| header.hash).collect::<Vec<_>>(),
+            "page counts ending at and after the tier boundary serve one canonical sequence",
+        );
+    }
+
+    let retry_owner = SourceId::from_digest([0x74; 32]);
+    let RetainedPathLeaseOutcome::Acquired(retry_lease) = reader
+        .acquire_retained_path(retry_owner, 9, target.hash, &[genesis.hash], scope)
+        .expect("the corruption-retry cursor acquires")
+    else {
+        panic!("the corruption-retry cursor should be retained");
+    };
+    let mut corrupt = DiskWriteBatch::new();
+    corrupt.zs_delete(&hash_by_height, path[0].height);
+    db.write(corrupt)
+        .expect("the test removes one finalized path hash");
+    assert!(reader
+        .read_retained_path(retry_owner, 9, retry_lease.lease_id, scope, genesis.hash, 1,)
+        .is_err());
+    let mut restore = DiskWriteBatch::new();
+    restore.zs_insert(&hash_by_height, path[0].height, path[0].hash);
+    db.write(restore)
+        .expect("the test restores the finalized path hash");
+    let RetainedPathReadOutcome::Page(retried) = reader
+        .read_retained_path(retry_owner, 9, retry_lease.lease_id, scope, genesis.hash, 1)
+        .expect("a repaired local row can retry the same cursor position")
+    else {
+        panic!("the failed page did not advance the cursor");
+    };
+    assert_eq!(retried.headers[0].hash(), path[0].hash);
+
+    let expiry_owner = SourceId::from_digest([0x75; 32]);
+    let RetainedPathLeaseOutcome::Acquired(expiry_lease) = reader
+        .acquire_retained_path(expiry_owner, 9, target.hash, &[genesis.hash], scope)
+        .expect("the failed-read expiry cursor acquires")
+    else {
+        panic!("the failed-read expiry cursor should be retained");
+    };
+    tokio::time::advance(RETAINED_PATH_LEASE_IDLE.saturating_sub(Duration::from_secs(1))).await;
+    let mut corrupt = DiskWriteBatch::new();
+    corrupt.zs_delete(&hash_by_height, path[0].height);
+    db.write(corrupt)
+        .expect("the test removes the expiring cursor's next hash");
+    assert!(reader
+        .read_retained_path(
+            expiry_owner,
+            9,
+            expiry_lease.lease_id,
+            scope,
+            genesis.hash,
+            1,
+        )
+        .is_err());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let mut restore = DiskWriteBatch::new();
+    restore.zs_insert(&hash_by_height, path[0].height, path[0].hash);
+    db.write(restore)
+        .expect("the test restores the expiring cursor's next hash");
+    assert_eq!(
+        reader
+            .read_retained_path(
+                expiry_owner,
+                9,
+                expiry_lease.lease_id,
+                scope,
+                genesis.hash,
+                1,
+            )
+            .expect("an expired cursor is a normal unavailable outcome"),
+        RetainedPathReadOutcome::Unavailable,
+        "a failed page must not renew its cursor deadline",
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -407,8 +510,6 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         Frontier::new(grandchild.height, grandchild.hash)
     );
     assert_eq!(lease.common_ancestor, anchor_frontier);
-    assert_eq!(lease.finalized_path_end, None);
-    assert_eq!(lease.path.as_ref(), &[child.hash, grandchild.hash]);
     assert_eq!(lease.scope, lease_scope);
     let mut wrong_scope = lease_scope;
     wrong_scope.header_generation = wrong_scope
@@ -460,18 +561,13 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     assert_eq!(page.scope, lease_scope);
     assert_eq!(page.aux_deliveries, vec![vec![delivery]]);
     assert!(!page.complete);
-    let RetainedPathReadOutcome::Page(continuation) = reader
-        .read_retained_path(owner, 7, lease.lease_id, lease_scope, child.hash, 1)
-        .expect("the continuation page is readable")
-    else {
-        panic!("the current owner should read its continuation");
-    };
     assert_eq!(
-        continuation.common_ancestor,
-        Frontier::new(child.height, child.hash)
+        reader
+            .read_retained_path(owner, 7, lease.lease_id, lease_scope, anchor.hash, 1)
+            .expect("a replayed cursor position is a normal refusal"),
+        RetainedPathReadOutcome::Unavailable,
+        "the opaque cursor advances exactly once and cannot be rewound",
     );
-    assert_eq!(continuation.headers[0].hash(), grandchild.hash);
-    assert!(continuation.complete);
 
     let before = runtime.publisher().snapshot();
     runtime
@@ -499,13 +595,19 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         runtime.publisher().snapshot().frontiers.header_best,
         anchor_frontier
     );
-    let RetainedPathReadOutcome::Page(page_after_reselection) = reader
-        .read_retained_path(owner, 7, lease.lease_id, lease_scope, anchor.hash, 1)
-        .expect("the immutable lease survives reselection")
+
+    let RetainedPathReadOutcome::Page(continuation) = reader
+        .read_retained_path(owner, 7, lease.lease_id, lease_scope, child.hash, 1)
+        .expect("the immutable cursor continues after reselection")
     else {
-        panic!("the lease remains available after reselection");
+        panic!("the current owner should read its continuation");
     };
-    assert_eq!(page_after_reselection.headers[0].hash(), child.hash);
+    assert_eq!(
+        continuation.common_ancestor,
+        Frontier::new(child.height, child.hash)
+    );
+    assert_eq!(continuation.headers[0].hash(), grandchild.hash);
+    assert!(continuation.complete);
 
     assert_eq!(
         reader
@@ -553,8 +655,21 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         panic!("the target itself intersects the locator");
     };
     assert_eq!(target_intersection.common_ancestor.hash, child.hash);
-    assert_eq!(target_intersection.finalized_path_end, None);
-    assert!(target_intersection.path.is_empty());
+    let RetainedPathReadOutcome::Page(completed) = reader
+        .read_retained_path(
+            SourceId::from_digest([2; 32]),
+            7,
+            target_intersection.lease_id,
+            target_intersection.scope,
+            child.hash,
+            1,
+        )
+        .expect("a cursor acquired at its target is readable")
+    else {
+        panic!("the target-intersection cursor remains available");
+    };
+    assert!(completed.headers.is_empty());
+    assert!(completed.complete);
     assert!(reader
         .release_retained_path(
             SourceId::from_digest([2; 32]),

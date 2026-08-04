@@ -18,7 +18,7 @@ pub use zakura_header_chain::{
 /// Maximum simultaneous retained target-path leases.
 pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;
 
-/// Immutable state-owned snapshot of one exact target path.
+/// Opaque state-owned lease for one exact canonical target path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedPathLease {
     /// Monotonic process-local lease identity.
@@ -31,14 +31,6 @@ pub struct RetainedPathLease {
     pub target: Frontier,
     /// First requester-order locator intersection.
     pub common_ancestor: Frontier,
-    /// Canonical finalized endpoint when the locator predates retained header history.
-    ///
-    /// The full-state path strictly after `common_ancestor` through this frontier is
-    /// immutable and is read lazily by height rather than copied into the lease.
-    pub finalized_path_end: Option<Frontier>,
-    /// Immutable retained hashes strictly after the finalized path (or the common
-    /// ancestor when there is no finalized path) through the target.
-    pub path: Arc<[block::Hash]>,
     /// Exact generation and branch observed while the snapshot was acquired.
     pub scope: HeaderWorkAuthority,
     /// Bounded inactivity deadline.
