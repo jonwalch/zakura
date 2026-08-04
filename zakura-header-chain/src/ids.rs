@@ -364,6 +364,20 @@ impl HeaderSyncWorkOwner {
             Self::BodyRepair(owner) => owner.request_id,
         }
     }
+
+    /// Rebind ordinary header work to state-proven current authority.
+    ///
+    /// Body-affecting repair authority is deliberately non-rebasable.
+    pub(crate) const fn rebase_header(self, authority: HeaderWorkAuthority) -> Option<Self> {
+        match self {
+            Self::Header(owner) => Some(Self::Header(HeaderWorkOwner {
+                authority,
+                session_id: owner.session_id,
+                request_id: owner.request_id,
+            })),
+            Self::BodyRepair(_) => None,
+        }
+    }
 }
 
 impl From<HeaderWorkOwner> for HeaderSyncWorkOwner {

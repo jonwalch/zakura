@@ -254,6 +254,41 @@ impl PreparedHeaderBatch {
     pub const fn evidence(&self) -> EvidenceId {
         self.evidence
     }
+
+    /// Rebase this sealed batch after an exact prepared header that became finalized.
+    ///
+    /// The remaining headers retain their validated results and absolute heights; the suffix is
+    /// resealed to the now-durable parent. Returns the removed header count.
+    pub(crate) fn rebase_after(&mut self, parent: Frontier) -> Result<usize, TransitionTypeError> {
+        if self.receipt.parent == parent {
+            return Ok(0);
+        }
+        let Some(index) = self
+            .headers
+            .iter()
+            .position(|header| Frontier::new(header.height, header.hash) == parent)
+        else {
+            return Err(TransitionTypeError::InvalidPreparedRebase);
+        };
+        let removed = index.saturating_add(1);
+        self.headers.drain(..removed);
+        self.receipt.parent = parent;
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-context-free-batch-v1");
+        hasher.update(parent.height.0.to_le_bytes());
+        hasher.update(parent.hash.0);
+        hasher.update(self.receipt.trust_anchor_digest);
+        for header in &self.headers {
+            hasher.update(header.height.0.to_le_bytes());
+            hasher.update(header.hash.0);
+        }
+        self.evidence = EvidenceId::from_digest(hasher.finalize().into());
+        Ok(removed)
+    }
+
+    pub(crate) fn clear_already_applied(&mut self) {
+        self.headers.clear();
+    }
 }
 
 /// Bounded advisory body-size metadata; it cannot allocate or grant admission credit.
@@ -365,6 +400,26 @@ pub enum TargetCompletion {
         /// Exact already-selected header whose metadata was redelivered.
         selected_target: Frontier,
     },
+}
+
+impl TargetCompletion {
+    pub(crate) fn rebase_common_ancestor(
+        &mut self,
+        common_ancestor: Frontier,
+    ) -> Result<(), TransitionTypeError> {
+        match self {
+            Self::TargetComplete {
+                common_ancestor: current,
+            }
+            | Self::TargetPrefix {
+                common_ancestor: current,
+            } => {
+                *current = common_ancestor;
+                Ok(())
+            }
+            Self::SelectedAuxiliaryRepair { .. } => Err(TransitionTypeError::InvalidPreparedRebase),
+        }
+    }
 }
 
 /// Atomically insert one complete prepared header range.
@@ -887,6 +942,10 @@ pub struct ChangeSet {
 pub enum TransitionCause {
     /// One of the externally typed evidence categories.
     Event,
+    /// Ordinary header work was admitted after a durable monotone-finality rebase.
+    HeaderWorkRebased,
+    /// The complete prepared range was already consumed by monotone finality.
+    HeaderWorkAlreadyApplied,
     /// Admission was refused without applying the event because protected state filled a limit.
     ResourceStalled,
     /// Headers-only depth finality occurred in the same insertion/reselection.
@@ -941,6 +1000,9 @@ pub enum TransitionTypeError {
     /// Header insertion batches must be nonempty.
     #[error("prepared header batch must be nonempty")]
     EmptyHeaderBatch,
+    /// A new finalized parent was not an exact member of the prepared path.
+    #[error("prepared header batch cannot rebase to the requested parent")]
+    InvalidPreparedRebase,
     /// Advisory body size exceeded the canonical block limit.
     #[error("invalid advisory body size {0}")]
     InvalidBodySize(u32),

@@ -30,8 +30,13 @@ pub enum DurableTransitionFacts {
     /// This event needs no fact outside the coherent engine state.
     #[default]
     None,
-    /// Detached branch context retained until the R5 preparation-boundary decision.
-    ValidationContext(ValidationLease),
+    /// Durable context and finality provenance for one header insertion.
+    HeaderInsertion {
+        /// Exact predecessor leases available for the original and rebased parents.
+        validation_contexts: Vec<ValidationLease>,
+        /// Contiguous finality records from the work's stable anchor to current finality.
+        finality_path: Vec<crate::FinalityRecord>,
+    },
     /// The exact preserved migration pin, when the requested pin is in durable finality history.
     MigratedFinalityPin(Option<Frontier>),
 }

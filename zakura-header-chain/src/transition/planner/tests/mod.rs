@@ -195,9 +195,10 @@ fn apply_transition(
     )
     .map_err(|_| TransitionFailure::InvalidEvidence("planner fixture engine is incoherent"))?;
     let durable = match &request.event {
-        TransitionEvent::InsertHeaders(_) => {
-            DurableTransitionFacts::ValidationContext(store.lease.clone())
-        }
+        TransitionEvent::InsertHeaders(_) => DurableTransitionFacts::HeaderInsertion {
+            validation_contexts: vec![store.lease.clone()],
+            finality_path: Vec::new(),
+        },
         TransitionEvent::MigratedPinRefutation(event) => {
             DurableTransitionFacts::MigratedFinalityPin(
                 store

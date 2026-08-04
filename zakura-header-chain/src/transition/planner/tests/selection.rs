@@ -179,7 +179,10 @@ fn stateful_engine_returns_its_complete_projected_state() {
         .apply(
             request,
             &context(&config, &clock, None),
-            crate::DurableTransitionFacts::ValidationContext(store.lease.clone()),
+            crate::DurableTransitionFacts::HeaderInsertion {
+                validation_contexts: vec![store.lease.clone()],
+                finality_path: Vec::new(),
+            },
         )
         .expect("the stateful engine plans the insertion");
 

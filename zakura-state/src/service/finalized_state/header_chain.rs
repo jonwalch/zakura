@@ -1286,9 +1286,28 @@ impl HeaderChainRuntime {
             DurableTransitionFacts::None
         } else {
             match &request.event {
-                TransitionEvent::InsertHeaders(event) => DurableTransitionFacts::ValidationContext(
-                    self.store.validation_context(event.parent_hash)?,
-                ),
+                TransitionEvent::InsertHeaders(event) => {
+                    let anchor_changed = event.owner.header_authority().branch.anchor_hash
+                        != before.frontiers.finalized.hash;
+                    let mut validation_contexts = Vec::new();
+                    if self.store.node(event.parent_hash)?.is_some() {
+                        validation_contexts.push(self.store.validation_context(event.parent_hash)?);
+                    }
+                    if anchor_changed && event.parent_hash != before.frontiers.finalized.hash {
+                        validation_contexts.push(
+                            self.store
+                                .validation_context(before.frontiers.finalized.hash)?,
+                        );
+                    }
+                    validation_contexts.dedup_by_key(|lease| lease.parent());
+                    DurableTransitionFacts::HeaderInsertion {
+                        validation_contexts,
+                        finality_path: self.store.finality_rebase_path(
+                            event.owner.header_authority().branch.anchor_hash,
+                            before.frontiers.finalized,
+                        )?,
+                    }
+                }
                 TransitionEvent::MigratedPinRefutation(event) => {
                     DurableTransitionFacts::MigratedFinalityPin(
                         self.store
@@ -1315,7 +1334,22 @@ impl HeaderChainRuntime {
                 return Err(HeaderChainStoreError::VerifiedFrontierMismatch { expected, actual });
             }
         }
-        let resource_stalled = transition.cause() == TransitionCause::ResourceStalled;
+        let transition_cause = transition.cause();
+        let resource_stalled = transition_cause == TransitionCause::ResourceStalled;
+        match transition_cause {
+            TransitionCause::HeaderWorkRebased => {
+                metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
+                    .increment(1);
+            }
+            TransitionCause::HeaderWorkAlreadyApplied => {
+                metrics::counter!("state.header.work.rebase.total", "outcome" => "already_applied")
+                    .increment(1);
+            }
+            TransitionCause::Event
+            | TransitionCause::ResourceStalled
+            | TransitionCause::HeadersOnlyFinality
+            | TransitionCause::Recovery => {}
+        }
         if transition.is_no_change() {
             #[cfg(test)]
             fault(FaultPoint::BeforeCommit)?;
@@ -2287,6 +2321,34 @@ impl HeaderChainStore {
             Ok(())
         })?;
         Ok(records)
+    }
+
+    fn finality_rebase_path(
+        &self,
+        original_anchor: block::Hash,
+        current_finalized: Frontier,
+    ) -> Result<Vec<FinalityRecord>, StoreError> {
+        if original_anchor == current_finalized.hash {
+            return Ok(Vec::new());
+        }
+        let mut path = Vec::new();
+        let mut expected = original_anchor;
+        for record in self.finality_history()? {
+            if path.is_empty() && record.previous.hash != expected {
+                continue;
+            }
+            if record.previous.hash != expected {
+                return Err(StoreError::Incoherent(
+                    "finality rebase history is not contiguous",
+                ));
+            }
+            expected = record.current.hash;
+            path.push(record);
+            if record.current == current_finalized {
+                return Ok(path);
+            }
+        }
+        Ok(Vec::new())
     }
 }
 

@@ -98,7 +98,7 @@ pub enum TransitionFailure {
 pub(super) fn apply_transition_engine(
     engine: &HeaderChainEngine,
     durable: &DurableTransitionFacts,
-    request: TransitionRequest,
+    mut request: TransitionRequest,
     context: &TransitionContext<'_>,
 ) -> Result<TransitionPlan, TransitionFailure> {
     let before = engine.snapshot();
@@ -111,7 +111,14 @@ pub(super) fn apply_transition_engine(
             .unwrap_or(metadata.last_transition_id)
         && request.event.idempotency_key().is_some()
     {
-        let plan = no_change(engine, before, metadata, request.event, context)?;
+        let plan = no_change(
+            engine,
+            before,
+            metadata,
+            request.event,
+            context,
+            TransitionCause::Event,
+        )?;
         super::verify_plan(engine, &plan)?;
         return Ok(plan);
     }
@@ -121,6 +128,20 @@ pub(super) fn apply_transition_engine(
         return Err(TransitionFailure::Stale {
             current: before.state_version,
         });
+    }
+    let header_rebase =
+        rebase_header_insertion(&mut request.event, &before, engine.graph(), durable)?;
+    if header_rebase == HeaderInsertionRebase::AlreadyApplied {
+        let plan = no_change(
+            engine,
+            before,
+            metadata,
+            request.event,
+            context,
+            TransitionCause::HeaderWorkAlreadyApplied,
+        )?;
+        super::verify_plan(engine, &plan)?;
+        return Ok(plan);
     }
     if let Some(owner) = request.event.header_sync_owner() {
         validate_header_sync_owner(owner, &before)?;
@@ -200,7 +221,11 @@ pub(super) fn apply_transition_engine(
         }
     }
 
-    let mut cause = TransitionCause::Event;
+    let mut cause = if header_rebase == HeaderInsertionRebase::Rebased {
+        TransitionCause::HeaderWorkRebased
+    } else {
+        TransitionCause::Event
+    };
     let mut finality_append = None;
     if let Some((new_finalized, source)) = finality {
         if new_finalized != graph.finalized() {
@@ -274,6 +299,177 @@ pub(super) fn apply_transition_engine(
     }
     super::verify_plan(engine, &plan)?;
     Ok(plan)
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HeaderInsertionRebase {
+    Current,
+    Rebased,
+    AlreadyApplied,
+}
+
+fn rebase_header_insertion(
+    event: &mut TransitionEvent,
+    current: &EngineSnapshot,
+    graph: &MemHeaderStore,
+    durable: &DurableTransitionFacts,
+) -> Result<HeaderInsertionRebase, TransitionFailure> {
+    let TransitionEvent::InsertHeaders(insert) = event else {
+        return Ok(HeaderInsertionRebase::Current);
+    };
+    if matches!(
+        insert.completion,
+        TargetCompletion::SelectedAuxiliaryRepair { .. }
+    ) {
+        return Ok(HeaderInsertionRebase::Current);
+    }
+    let Some(original_owner) = insert.owner.header_owner() else {
+        return Ok(HeaderInsertionRebase::Current);
+    };
+    let original = original_owner.authority;
+    if original.branch.target_tip_hash != insert.target_tip_hash {
+        return Err(TransitionFailure::Stale {
+            current: current.state_version,
+        });
+    }
+    if original.header_generation == current.header_generation
+        && original.branch.anchor_hash == current.frontiers.finalized.hash
+    {
+        return Ok(HeaderInsertionRebase::Current);
+    }
+    if original.branch.anchor_hash == current.frontiers.finalized.hash {
+        return Err(TransitionFailure::Stale {
+            current: current.state_version,
+        });
+    }
+    if original.header_generation.get() >= current.header_generation.get() {
+        return Err(TransitionFailure::Stale {
+            current: current.state_version,
+        });
+    }
+    let DurableTransitionFacts::HeaderInsertion { finality_path, .. } = durable else {
+        return Err(TransitionFailure::Stale {
+            current: current.state_version,
+        });
+    };
+    if finality_path.is_empty() {
+        return Err(TransitionFailure::Stale {
+            current: current.state_version,
+        });
+    }
+    validate_finality_rebase_path(
+        original.branch.anchor_hash,
+        current.frontiers.finalized,
+        finality_path,
+    )?;
+
+    let finalized = current.frontiers.finalized;
+    let parent_is_current_descendant = match graph.node(insert.parent_hash) {
+        Some(parent) if parent.height >= finalized.height => {
+            graph.ancestor(insert.parent_hash, finalized.height)? == Some(finalized)
+        }
+        Some(_) | None => false,
+    };
+    let mut removed = 0usize;
+    if !parent_is_current_descendant {
+        if insert
+            .batch
+            .headers()
+            .iter()
+            .any(|header| Frontier::new(header.height, header.hash) == finalized)
+        {
+            removed = insert
+                .batch
+                .rebase_after(finalized)
+                .map_err(|_| TransitionFailure::StalePreparation)?;
+            insert.parent_hash = finalized.hash;
+            insert
+                .completion
+                .rebase_common_ancestor(finalized)
+                .map_err(|_| TransitionFailure::StalePreparation)?;
+        } else {
+            let prepared_tip = insert
+                .batch
+                .headers()
+                .last()
+                .map(|header| Frontier::new(header.height, header.hash))
+                .ok_or(TransitionFailure::StalePreparation)?;
+            let prepared_tip_was_finalized = finality_path
+                .iter()
+                .any(|record| record.previous == prepared_tip || record.current == prepared_tip);
+            if prepared_tip_was_finalized && prepared_tip.height <= finalized.height {
+                insert.batch.clear_already_applied();
+                removed = insert.aux.len();
+            } else {
+                return Err(TransitionFailure::Stale {
+                    current: current.state_version,
+                });
+            }
+        }
+    }
+
+    let authority = crate::HeaderWorkAuthority {
+        header_generation: current.header_generation,
+        branch: crate::BranchId::new(finalized.hash, original.branch.target_tip_hash),
+    };
+    insert.owner = insert
+        .owner
+        .rebase_header(authority)
+        .ok_or(TransitionFailure::Authority)?;
+    for delivery in &mut insert.aux {
+        delivery.owner = delivery
+            .owner
+            .rebase_header(authority)
+            .ok_or(TransitionFailure::Authority)?;
+    }
+    if removed != 0 {
+        let retained: HashSet<_> = insert
+            .batch
+            .headers()
+            .iter()
+            .map(|header| header.hash)
+            .collect();
+        insert
+            .aux
+            .retain(|delivery| retained.contains(&delivery.header_hash));
+    }
+    if insert.batch.headers().is_empty() {
+        return Ok(HeaderInsertionRebase::AlreadyApplied);
+    }
+    Ok(HeaderInsertionRebase::Rebased)
+}
+
+fn validate_finality_rebase_path(
+    original_anchor: block::Hash,
+    current_finalized: Frontier,
+    path: &[FinalityRecord],
+) -> Result<(), TransitionFailure> {
+    if original_anchor == current_finalized.hash {
+        return path
+            .is_empty()
+            .then_some(())
+            .ok_or(TransitionFailure::StalePreparation);
+    }
+    let mut expected_frontier = None;
+    let mut expected_epoch = None;
+    for record in path {
+        let predecessor_matches = expected_frontier.map_or_else(
+            || record.previous.hash == original_anchor,
+            |expected| record.previous == expected,
+        );
+        if !predecessor_matches
+            || expected_epoch.is_some_and(|epoch| record.epoch != epoch)
+            || record.current.height < record.previous.height
+        {
+            return Err(TransitionFailure::StalePreparation);
+        }
+        expected_frontier = Some(record.current);
+        expected_epoch = Some(record.epoch.checked_next()?);
+    }
+    if expected_frontier != Some(current_finalized) {
+        return Err(TransitionFailure::StalePreparation);
+    }
+    Ok(())
 }
 
 fn migrated_pin_refuted(
@@ -429,9 +625,21 @@ fn retained_header_context(
     let mut hash = parent.hash;
     while context.len() < required {
         let Some(node) = graph.node(hash) else {
-            let DurableTransitionFacts::ValidationContext(lease) = durable else {
+            let DurableTransitionFacts::HeaderInsertion {
+                validation_contexts,
+                ..
+            } = durable
+            else {
                 return Err(
                     StoreError::Unavailable("retained predecessor context is incomplete").into(),
+                );
+            };
+            let Some(lease) = validation_contexts
+                .iter()
+                .find(|lease| lease.parent() == parent)
+            else {
+                return Err(
+                    StoreError::Unavailable("durable predecessor context is incoherent").into(),
                 );
             };
             if lease.parent() != parent || lease.predecessors().len() != required {
@@ -1161,6 +1369,7 @@ fn no_change(
     metadata: EngineMetadata,
     event: TransitionEvent,
     context: &TransitionContext<'_>,
+    cause: TransitionCause,
 ) -> Result<TransitionPlan, TransitionFailure> {
     validate_authority(&event, context)?;
     let graph = engine.graph().clone();
@@ -1178,7 +1387,7 @@ fn no_change(
             metadata,
         },
         projected: graph,
-        cause: TransitionCause::Event,
+        cause,
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
     })

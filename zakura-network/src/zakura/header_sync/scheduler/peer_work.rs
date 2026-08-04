@@ -465,7 +465,10 @@ impl PeerWorkQueue {
         obsolete.len()
     }
 
-    /// Retire active targets whose structurally owned scope is no longer current.
+    /// Retire exact body-authorized repairs whose generation is no longer current.
+    ///
+    /// Ordinary header targets remain provisionally owned until the serialized state planner
+    /// proves a monotone rebase or rejects their retained ancestry.
     pub(in crate::zakura::header_sync) fn retire_obsolete_active(
         &mut self,
         current: &EngineSnapshot,
@@ -474,16 +477,21 @@ impl PeerWorkQueue {
             .work_by_peer
             .iter()
             .filter_map(|(peer, work)| match work {
-                PeerWorkState::Active(request)
-                    if request.owner.header_authority().header_generation
-                        != current.header_generation
-                        || request.owner.body_authority().is_some_and(|authority| {
-                            authority.verified_generation != current.verified_generation
-                        })
-                        || request.owner.header_authority().branch.anchor_hash
-                            != current.frontiers.finalized.hash =>
-                {
-                    Some(peer.clone())
+                PeerWorkState::Active(request) => {
+                    let header = request.owner.header_authority();
+                    let obsolete = request.owner.body_authority().map_or_else(
+                        || {
+                            header.header_generation != current.header_generation
+                                && header.branch.anchor_hash == current.frontiers.finalized.hash
+                        },
+                        |authority| {
+                            authority.header.header_generation != current.header_generation
+                                || authority.verified_generation != current.verified_generation
+                                || authority.header.branch.anchor_hash
+                                    != current.frontiers.finalized.hash
+                        },
+                    );
+                    obsolete.then(|| peer.clone())
                 }
                 _ => None,
             })

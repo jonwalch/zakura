@@ -389,9 +389,10 @@ fn apply_transition(
                 .graph
                 .node(event.parent_hash)
                 .expect("an insertion fixture names a retained parent");
-            DurableTransitionFacts::ValidationContext(
-                store.lease(Frontier::new(parent.height, parent.hash)),
-            )
+            DurableTransitionFacts::HeaderInsertion {
+                validation_contexts: vec![store.lease(Frontier::new(parent.height, parent.hash))],
+                finality_path: Vec::new(),
+            }
         }
         crate::TransitionEvent::MigratedPinRefutation(event) => {
             DurableTransitionFacts::MigratedFinalityPin(

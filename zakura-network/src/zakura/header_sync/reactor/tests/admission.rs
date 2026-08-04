@@ -152,6 +152,58 @@ fn committed_snapshot_retires_in_flight_state_results() {
     }
 }
 
+#[test]
+fn monotone_finality_keeps_ordinary_apply_owned_until_state_decides() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let initial = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the monotone-rebase fixture builds");
+    let peer = peer();
+    let (source, owner, _) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+    let staged_tip = reactor
+        .peer_work_queue
+        .active(&peer)
+        .and_then(ActiveHeaderRequest::staged_tip)
+        .expect("the fixture has one staged header");
+
+    let mut committed = initial;
+    committed.state_version = committed
+        .state_version
+        .checked_next()
+        .expect("the fixture version advances");
+    committed.header_generation = committed
+        .header_generation
+        .checked_next()
+        .expect("the fixture generation advances");
+    committed.verified_generation = committed
+        .verified_generation
+        .checked_next()
+        .expect("the fixture verified generation advances");
+    committed.frontiers.finalized = staged_tip;
+    committed.frontiers.header_best = staged_tip;
+    committed.frontiers.verified_best = staged_tip;
+    reactor.observe_latest_committed_snapshot(committed);
+
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .map(|active| active.owner),
+        Some(owner),
+        "only serialized state may accept or reject provisionally rebased header work"
+    );
+    reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        peer: peer.clone(),
+        source,
+        owner,
+        result: HeaderTargetAdmissionResult::Applied,
+    });
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+}
+
 #[tokio::test(start_paused = true)]
 async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score() {
     let mut startup = startup(CancellationToken::new());

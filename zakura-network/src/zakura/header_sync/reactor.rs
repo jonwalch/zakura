@@ -1355,10 +1355,14 @@ impl HeaderSyncReactor {
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
             return;
         };
+        let is_repair = matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        );
         if active.phase != HeaderTargetPhase::Applying
             || active.source != source
             || active.owner != owner
-            || !self.completion_is_current(&peer, source, &owner)
+            || (is_repair && !self.completion_is_current(&peer, source, &owner))
         {
             return;
         }
@@ -1444,15 +1448,15 @@ impl HeaderSyncReactor {
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
             return;
         };
+        let purpose = active.purpose;
+        let is_repair = matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. });
         if active.phase != HeaderTargetPhase::Preparing
             || active.source != source
             || active.owner != owner
-            || !self.completion_is_current(&peer, source, &owner)
+            || (is_repair && !self.completion_is_current(&peer, source, &owner))
         {
             return;
         }
-        let purpose = active.purpose;
-        let is_repair = matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. });
         match result {
             HeaderTargetPreparationResult::Prepared(insert) => {
                 if insert.owner != owner || insert.source != source {
@@ -2514,6 +2518,7 @@ impl HeaderSyncReactor {
             self.emit_request_terminal(&active, HeaderRequestTerminal::SnapshotObsolete);
             self.cancel_active_request(&active);
         }
+        self.peer_work_queue.publish_phase_metrics();
     }
 
     fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {
