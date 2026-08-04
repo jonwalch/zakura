@@ -14,10 +14,10 @@ use zakura_chain::{
 };
 
 use crate::{
-    BodyRuleId, BodyUnavailableSummary, BranchId, ChainScore, EligibilityState, EngineMode,
-    EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderGeneration, HeaderNode,
-    HeaderValidationState, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
-    WorkOwner,
+    BodyRuleId, BodyUnavailableSummary, BodyWorkOwner, BranchId, ChainScore, EligibilityState,
+    EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderGeneration, HeaderNode,
+    HeaderSyncWorkOwner, HeaderValidationState, OperatorInvalidationId, SourceId, StateVersion,
+    VerifiedGeneration,
 };
 
 /// Opaque version of the durable header-chain disk schema.
@@ -309,7 +309,7 @@ pub struct AuxDelivery {
     /// Supplying peer/session identity.
     pub source: SourceId,
     /// Complete work ownership at receipt.
-    pub owner: WorkOwner,
+    pub owner: HeaderSyncWorkOwner,
     /// Advisory bounded body size.
     pub body_size: BodySizeHint,
     /// Complete schema-1 record retained for later one-header-later authentication.
@@ -371,7 +371,7 @@ pub enum TargetCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InsertHeaders {
     /// Current asynchronous work owner.
-    pub owner: WorkOwner,
+    pub owner: HeaderSyncWorkOwner,
     /// Header supplier.
     pub source: SourceId,
     /// Exact retained parent.
@@ -632,7 +632,7 @@ pub struct MigratedPinRefutation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuxEvidence {
     /// Current work owner.
-    pub owner: WorkOwner,
+    pub owner: BodyWorkOwner,
     /// One or two exact deliveries and their immutable provenance.
     pub deliveries: Vec<PreparedAuxDelivery>,
     /// New authentication state applied atomically to every named delivery.
@@ -759,9 +759,16 @@ impl TransitionEvent {
     }
 
     /// Return explicit branch ownership for asynchronous network-originated events.
-    pub fn work_owner(&self) -> Option<WorkOwner> {
+    pub fn header_sync_owner(&self) -> Option<HeaderSyncWorkOwner> {
         match self {
             Self::InsertHeaders(event) => Some(event.owner),
+            _ => None,
+        }
+    }
+
+    /// Return body authority for asynchronous body-originated evidence.
+    pub fn body_owner(&self) -> Option<BodyWorkOwner> {
+        match self {
             Self::AuxEvidence(event) => Some(event.owner),
             _ => None,
         }
@@ -896,7 +903,7 @@ pub struct RetiredWork {
     /// Verified generation changed; all old body-forward owners are stale.
     pub verified_generation_changed: bool,
     /// Exact owners retired for narrower causes.
-    pub owners: Vec<WorkOwner>,
+    pub owners: Vec<HeaderSyncWorkOwner>,
 }
 
 /// Successful idempotent replay with no durable effects.
@@ -969,7 +976,8 @@ mod tests {
         });
         assert_eq!(reconsider.admission(), EventAdmission::AnyMode);
         assert_eq!(reconsider.idempotency_key(), Some(evidence));
-        assert_eq!(reconsider.work_owner(), None);
+        assert_eq!(reconsider.header_sync_owner(), None);
+        assert_eq!(reconsider.body_owner(), None);
 
         let refutation = TransitionEvent::MigratedPinRefutation(MigratedPinRefutation {
             full_state_transition_id: evidence,
@@ -979,7 +987,8 @@ mod tests {
         });
         assert_eq!(refutation.admission(), EventAdmission::IntegratedFullState);
         assert_eq!(refutation.idempotency_key(), Some(evidence));
-        assert_eq!(refutation.work_owner(), None);
+        assert_eq!(refutation.header_sync_owner(), None);
+        assert_eq!(refutation.body_owner(), None);
 
         assert_eq!(
             TransitionEvent::ReevaluateDeferred.admission(),

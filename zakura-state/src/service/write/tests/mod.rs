@@ -52,16 +52,29 @@ use crate::{
 };
 use zakura_header_chain::{
     AdjustedDifficulty, AlarmSet, ApplyResult, AuxAuthentication, BodyRuleId,
-    BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
-    ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId,
-    FinalityEpoch, Frontier, FrontierSet, HeaderBatchInput, HeaderChainDiskVersion,
-    HeaderContextFact, HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState,
-    InsertHeaders, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
-    TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionEvent,
-    TransitionFailure, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate, WorkOwner, WorkScope,
+    BodyUnavailableSummary, BodyValidationState, ChainScore, CheckpointSet, ConsensusBodyInvalid,
+    EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch, Frontier,
+    FrontierSet, HeaderBatchInput, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration,
+    HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId, StateVersion,
+    SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure, TransientBodyFailureKind,
+    TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest, TrustedAnchor,
+    ValidationLease, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
     POW_ADJUSTMENT_BLOCK_SPAN,
 };
+
+fn header_owner(
+    snapshot: &EngineSnapshot,
+    target: block::Hash,
+    session_id: u64,
+    request_id: u64,
+) -> zakura_header_chain::HeaderSyncWorkOwner {
+    zakura_header_chain::HeaderWorkAuthority::for_target(snapshot, target)
+        .bind(
+            session_id,
+            std::num::NonZeroU64::new(request_id).expect("fixture request IDs are nonzero"),
+        )
+        .into()
+}
 
 struct TestDeferredMaintenance {
     deadlines: Mutex<VecDeque<chrono::DateTime<chrono::Utc>>>,

@@ -58,14 +58,21 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         delivery_id: EvidenceId::from_digest([byte; 32]),
         header_hash: block::Hash([1; 32]),
         source: zakura_header_chain::SourceId::from_digest([byte; 32]),
-        owner: zakura_header_chain::WorkOwner {
-            state_version: StateVersion::new(1),
-            header_generation: HeaderGeneration::new(2),
-            verified_generation: Some(VerifiedGeneration::new(3)),
-            branch: zakura_header_chain::BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+        owner: zakura_header_chain::BodyWorkOwner {
+            authority: zakura_header_chain::BodyWorkAuthority {
+                header: zakura_header_chain::HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(2),
+                    branch: zakura_header_chain::BranchId::new(
+                        block::Hash([4; 32]),
+                        block::Hash([5; 32]),
+                    ),
+                },
+                verified_generation: VerifiedGeneration::new(3),
+            },
             session_id: 6,
             request_id: std::num::NonZeroU64::new(7).expect("seven is nonzero"),
-        },
+        }
+        .into(),
         body_size: zakura_header_chain::BodySizeHint::Unknown,
         tree_aux: has_aux.then_some(zakura_header_chain::TreeAuxRecordV1 {
             height: block::Height(1),
@@ -219,8 +226,9 @@ fn stale_vct_aux_rejection_has_zero_durable_effects() {
         delivery_id: EvidenceId::from_digest([0x73; 32]),
         header_hash: anchor.hash(),
         source: zakura_header_chain::SourceId::from_digest([0x74; 32]),
-        owner: WorkScope::for_body_work(&stale)
-            .bind(1, std::num::NonZeroU64::new(1).expect("one is nonzero")),
+        owner: zakura_header_chain::BodyWorkAuthority::for_snapshot(&stale)
+            .bind(1, std::num::NonZeroU64::new(1).expect("one is nonzero"))
+            .into(),
         body_size: zakura_header_chain::BodySizeHint::Unknown,
         tree_aux: None,
         authentication: AuxAuthentication::Unauthenticated,

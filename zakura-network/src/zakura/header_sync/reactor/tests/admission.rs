@@ -59,7 +59,6 @@ fn committed_header_generation_reconsiders_the_cached_peer_target() {
     assert_eq!(session_id, 7);
     assert_eq!(target_tip_hash, advertised.selected_tip_hash);
     assert_eq!(scope.header_generation, committed.header_generation);
-    assert_eq!(scope.state_version, committed.state_version);
 }
 
 #[test]
@@ -86,7 +85,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         assert!(
             reactor
                 .completed_targets
-                .contains(owner.header_generation, branch),
+                .contains(owner.header_authority().header_generation, branch),
             "the current-result control proves the live handler can mark completion"
         );
     }
@@ -128,7 +127,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         assert!(reactor.peer_work_queue.active(&peer).is_none());
         assert!(!reactor
             .completed_targets
-            .contains(owner.header_generation, old_branch));
+            .contains(owner.header_authority().header_generation, old_branch));
         let published_tip = handle.best_header_tip();
         let published_candidates = handle.candidate_state();
         assert_eq!(published_tip, (replacement.height, replacement.hash));
@@ -145,7 +144,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         assert_eq!(handle.candidate_state(), published_candidates);
         assert!(!reactor
             .completed_targets
-            .contains(owner.header_generation, old_branch));
+            .contains(owner.header_authority().header_generation, old_branch));
         assert!(matches!(
             actions.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -196,7 +195,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     assert!(!reactor
         .completed_targets
-        .contains(owner.header_generation, old_branch));
+        .contains(owner.header_authority().header_generation, old_branch));
     assert!(
         actions.try_recv().is_err(),
         "a stale local anchor neither retries work nor scores its peer"
@@ -319,7 +318,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
     assert!(same_reactor.peer_work_queue.active(&peer).is_none());
     assert!(!same_reactor
         .completed_targets
-        .contains(owner.header_generation, old_branch));
+        .contains(owner.header_authority().header_generation, old_branch));
     assert!(matches!(
         same_actions.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -367,7 +366,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
     assert!(committed_reactor.peer_work_queue.active(&peer).is_none());
     assert!(!committed_reactor
         .completed_targets
-        .contains(owner.header_generation, old_branch));
+        .contains(owner.header_authority().header_generation, old_branch));
     assert!(matches!(
         committed_actions.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -415,7 +414,7 @@ async fn restart_rejects_old_ordered_stream_response() {
         tree_aux_schema: AuxSchema::None,
         entries: vec![response_entry],
     };
-    let stale_scope = old_active.owner.scope();
+    let stale_scope = old_active.owner.header_authority();
     drop(old_reactor);
 
     let mut fresh_startup = startup(CancellationToken::new());

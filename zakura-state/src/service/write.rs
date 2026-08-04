@@ -21,12 +21,12 @@ use zakura_chain::{
     parallel::tree::NoteCommitmentTrees,
 };
 use zakura_header_chain::{
-    ApplyResult, AuxAuthentication, AuxEvidence, BodyEvidence, CheckpointSet, Clock, EngineConfig,
-    EngineConfigError, EngineMode, EngineSnapshot, EvidenceId, Frontier,
+    ApplyResult, AuxAuthentication, AuxEvidence, BodyEvidence, BodyWorkAuthority, CheckpointSet,
+    Clock, EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId, Frontier,
     FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate, OperatorInvalidationId,
     OperatorReconsider, StateVersion, StoreError, SystemClock, TransitionContext, TransitionEvent,
     TransitionRequest, TrustedAnchor, VerifiedBlockAccepted, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef, WorkScope,
+    VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -481,8 +481,8 @@ impl HeaderChainWriter {
         let first = deliveries
             .first()
             .expect("the empty auxiliary rejection returned above");
-        let owner = WorkScope::for_body_work(&window.snapshot)
-            .bind(first.owner.session_id, first.owner.request_id);
+        let owner = BodyWorkAuthority::for_snapshot(&window.snapshot)
+            .bind(first.owner.session_id(), first.owner.request_id());
         let authority = PreparedAuthority(evidence);
         let mut context = self.context();
         context.full_state_authority = Some(&authority);
@@ -518,9 +518,9 @@ impl HeaderChainWriter {
         hasher.update(successor.hash.0);
         hasher.update(<[u8; 32]>::from(auth_data_root));
         let evidence = EvidenceId::from_digest(hasher.finalize().into());
-        let owner = WorkScope::for_body_work(&window.snapshot).bind(
-            window.current.owner.session_id,
-            window.current.owner.request_id,
+        let owner = BodyWorkAuthority::for_snapshot(&window.snapshot).bind(
+            window.current.owner.session_id(),
+            window.current.owner.request_id(),
         );
 
         Some((
@@ -1005,7 +1005,6 @@ pub enum NonFinalizedWriteMessage {
     /// One complete peer target prepared outside the writer and admitted through the sole
     /// transition algorithm.
     ApplyHeaderChainInsert {
-        expected_version: StateVersion,
         insert: Box<zakura_header_chain::InsertHeaders>,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
@@ -1637,18 +1636,16 @@ impl WriteBlockWorkerTask {
                 break;
             };
             let queued_child_and_rsp_tx = match msg {
-                NonFinalizedWriteMessage::ApplyHeaderChainInsert {
-                    expected_version,
-                    insert,
-                    rsp_tx,
-                } => {
+                NonFinalizedWriteMessage::ApplyHeaderChainInsert { insert, rsp_tx } => {
                     let result = header_chain
                         .as_ref()
                         .ok_or(HeaderChainStoreError::Uninitialized)
                         .and_then(|writer| {
                             writer.runtime.apply(
                                 TransitionRequest {
-                                    expected_version,
+                                    // Insertions carry typed asynchronous authority; the global
+                                    // version coordinate is intentionally irrelevant.
+                                    expected_version: StateVersion::default(),
                                     event: TransitionEvent::InsertHeaders(insert),
                                 },
                                 &writer.context(),

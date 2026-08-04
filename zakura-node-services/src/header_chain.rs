@@ -4,8 +4,8 @@ use std::{error::Error, future::Future, pin::Pin, sync::Arc};
 
 use zakura_chain::{block, parameters::Network};
 use zakura_header_chain::{
-    AuxDelivery, Frontier, HeaderChainError, HeaderLocator, InsertHeaders, SourceId,
-    TargetCompletion, VctRepairContext, WorkOwner, WorkScope,
+    AuxDelivery, BodyWorkOwner, Frontier, HeaderChainError, HeaderLocator, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion, VctRepairContext,
 };
 
 /// A boxed operation returned by [`HeaderChainPort`].
@@ -40,7 +40,7 @@ pub struct AcquireHeaderPath {
     /// Ordered-stream generation.
     pub session_id: u64,
     /// Exact generation and branch to retain.
-    pub scope: WorkScope,
+    pub scope: HeaderWorkAuthority,
     /// Exact target branch.
     pub target_tip_hash: block::Hash,
     /// Requester-order locator hashes.
@@ -76,7 +76,7 @@ pub struct RetainedHeaderPath {
     /// Exact retained target.
     pub target: Frontier,
     /// Exact generation and branch fixed at acquisition.
-    pub scope: WorkScope,
+    pub scope: HeaderWorkAuthority,
 }
 
 impl RetainedHeaderPath {
@@ -88,7 +88,7 @@ impl RetainedHeaderPath {
         session_id: u64,
         common_ancestor: Frontier,
         target: Frontier,
-        scope: WorkScope,
+        scope: HeaderWorkAuthority,
     ) -> Self {
         Self {
             token,
@@ -139,7 +139,7 @@ pub struct RetainedHeaderPathPage {
     /// Exact retained target.
     pub target: Frontier,
     /// Exact generation and branch fixed at acquisition.
-    pub scope: WorkScope,
+    pub scope: HeaderWorkAuthority,
     /// Canonical headers in parent-first order.
     pub headers: Vec<Arc<block::Header>>,
     /// Parallel auxiliary deliveries for each retained header.
@@ -176,7 +176,7 @@ pub struct PrepareHeaderTarget {
     /// Authenticated network parameters.
     pub network: Network,
     /// Exact asynchronous owner.
-    pub owner: WorkOwner,
+    pub owner: HeaderSyncWorkOwner,
     /// Exact initial locator intersection.
     pub common_ancestor: Frontier,
     /// Exact advertised target.
@@ -224,7 +224,7 @@ pub trait HeaderChainPort: Send + Sync + 'static {
     /// Resolve one exact selected-header auxiliary repair.
     fn vct_repair_context(
         &self,
-        owner: WorkOwner,
+        owner: BodyWorkOwner,
         height: block::Height,
     ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>>;
 
@@ -279,7 +279,7 @@ impl HeaderChainPort for UnavailableHeaderChainPort {
 
     fn vct_repair_context(
         &self,
-        _owner: WorkOwner,
+        _owner: BodyWorkOwner,
         _height: block::Height,
     ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>> {
         Box::pin(async { Err(HeaderChainPortError::Unavailable { source: None }) })
@@ -313,7 +313,7 @@ impl HeaderChainPort for UnavailableHeaderChainPort {
     ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
         Box::pin(async move {
             Err(Arc::new(HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(request.owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(request.owner.header_authority().branch),
                 None,
             )))
         })
@@ -326,7 +326,7 @@ impl HeaderChainPort for UnavailableHeaderChainPort {
         let owner = target.0.owner;
         Box::pin(async move {
             Err(Arc::new(HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                 None,
             )))
         })
@@ -347,7 +347,7 @@ impl HeaderChainPort for InertHeaderChainPort {
 
     fn vct_repair_context(
         &self,
-        _owner: WorkOwner,
+        _owner: BodyWorkOwner,
         _height: block::Height,
     ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>> {
         Box::pin(std::future::pending())
@@ -406,7 +406,7 @@ mod tests {
 
         fn vct_repair_context(
             &self,
-            _owner: WorkOwner,
+            _owner: BodyWorkOwner,
             _height: block::Height,
         ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>> {
             Box::pin(async { Ok(VctRepairContextReply::Stale) })

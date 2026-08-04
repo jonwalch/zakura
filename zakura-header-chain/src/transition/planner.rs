@@ -7,12 +7,12 @@ use zakura_chain::block;
 
 use crate::retention::RetentionPlan;
 use crate::{
-    BodyEvidence, BodyValidationState, ChangeSet, CounterExhausted, DurableTransitionFacts,
-    EligibilityDelta, EligibilityReason, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot,
-    EventAdmission, EvidenceId, FinalityRecord, FinalitySource, Frontier, FrontierSet, GraphError,
-    HeaderChainEngine, HeaderNode, HeaderValidationState, IndexChanges, MemHeaderStore,
-    ProjectionDelta, StateVersion, StoreError, TargetCompletion, TransitionCause,
-    TransitionContext, TransitionEvent, TransitionRequest, WorkOwner,
+    BodyEvidence, BodyValidationState, BodyWorkOwner, ChangeSet, CounterExhausted,
+    DurableTransitionFacts, EligibilityDelta, EligibilityReason, EngineLimits, EngineMetadata,
+    EngineMode, EngineSnapshot, EventAdmission, EvidenceId, FinalityRecord, FinalitySource,
+    Frontier, FrontierSet, GraphError, HeaderChainEngine, HeaderNode, HeaderSyncWorkOwner,
+    HeaderValidationState, IndexChanges, MemHeaderStore, ProjectionDelta, StateVersion, StoreError,
+    TargetCompletion, TransitionCause, TransitionContext, TransitionEvent, TransitionRequest,
 };
 
 /// A complete write set plus the private projected graph it was verified against.
@@ -115,13 +115,18 @@ pub(super) fn apply_transition_engine(
         super::verify_plan(engine, &plan)?;
         return Ok(plan);
     }
-    if request.expected_version != before.state_version {
+    let has_async_authority =
+        request.event.header_sync_owner().is_some() || request.event.body_owner().is_some();
+    if !has_async_authority && request.expected_version != before.state_version {
         return Err(TransitionFailure::Stale {
             current: before.state_version,
         });
     }
-    if let Some(owner) = request.event.work_owner() {
-        validate_owner(owner, &before)?;
+    if let Some(owner) = request.event.header_sync_owner() {
+        validate_header_sync_owner(owner, &before)?;
+    }
+    if let Some(owner) = request.event.body_owner() {
+        validate_body_owner(owner, &before)?;
     }
     validate_authority(&request.event, context)?;
 
@@ -335,11 +340,30 @@ fn validate_snapshot(
     Ok(())
 }
 
-fn validate_owner(owner: WorkOwner, before: &EngineSnapshot) -> Result<(), TransitionFailure> {
-    if owner.header_generation != before.header_generation
+fn validate_header_sync_owner(
+    owner: HeaderSyncWorkOwner,
+    before: &EngineSnapshot,
+) -> Result<(), TransitionFailure> {
+    let header = owner.header_authority();
+    if header.header_generation != before.header_generation
         || owner
-            .verified_generation
-            .is_some_and(|generation| generation != before.verified_generation)
+            .body_authority()
+            .is_some_and(|authority| authority.verified_generation != before.verified_generation)
+        || header.branch.anchor_hash != before.frontiers.finalized.hash
+    {
+        return Err(TransitionFailure::Stale {
+            current: before.state_version,
+        });
+    }
+    Ok(())
+}
+
+fn validate_body_owner(
+    owner: BodyWorkOwner,
+    before: &EngineSnapshot,
+) -> Result<(), TransitionFailure> {
+    if owner.header_generation != before.header_generation
+        || owner.verified_generation != before.verified_generation
         || owner.branch.anchor_hash != before.frontiers.finalized.hash
     {
         return Err(TransitionFailure::Stale {
@@ -540,11 +564,16 @@ fn apply_event(
                 TargetCompletion::SelectedAuxiliaryRepair {
                     selected_target, ..
                 } => {
+                    if event.owner.body_owner().is_none() {
+                        return Err(TransitionFailure::InvalidEvidence(
+                            "selected auxiliary repair does not have body authority",
+                        ));
+                    }
                     if event.batch.headers().len() != 1
                         || event.aux.len() != 1
                         || event.aux[0].tree_aux.is_none()
                         || selected_target != parent
-                        || event.owner.branch.target_tip_hash
+                        || event.owner.header_authority().branch.target_tip_hash
                             != event_context.before.frontiers.header_best.hash
                         || event_context
                             .old_selected
@@ -552,9 +581,10 @@ fn apply_event(
                             .find(|frontier| frontier.height == selected_target.height)
                             .map(|frontier| frontier.hash)
                             != Some(selected_target.hash)
-                        || graph
-                            .ancestor(event.owner.branch.target_tip_hash, selected_target.height)?
-                            != Some(selected_target)
+                        || graph.ancestor(
+                            event.owner.header_authority().branch.target_tip_hash,
+                            selected_target.height,
+                        )? != Some(selected_target)
                     {
                         return Err(TransitionFailure::InvalidEvidence(
                             "auxiliary repair is not one exact selected header",
@@ -562,7 +592,14 @@ fn apply_event(
                     }
                 }
                 TargetCompletion::TargetComplete { .. } | TargetCompletion::TargetPrefix { .. } => {
-                    if event.owner.branch.target_tip_hash != event.target_tip_hash {
+                    if event.owner.header_owner().is_none() {
+                        return Err(TransitionFailure::InvalidEvidence(
+                            "ordinary header insertion does not have pure header authority",
+                        ));
+                    }
+                    if event.owner.header_authority().branch.target_tip_hash
+                        != event.target_tip_hash
+                    {
                         return Err(TransitionFailure::InvalidEvidence(
                             "target completion does not end at the pursued hash",
                         ));

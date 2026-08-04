@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::time::Instant;
 use zakura_chain::block;
-use zakura_header_chain::{AuxDelivery, Frontier, SourceId, WorkScope};
+use zakura_header_chain::{AuxDelivery, Frontier, HeaderWorkAuthority, SourceId};
 
 pub use zakura_header_chain::{
     AlarmSet as HeaderChainAlarmSet, BodyUnavailableSummary as HeaderChainBodyUnavailableSummary,
@@ -40,7 +40,7 @@ pub struct RetainedPathLease {
     /// ancestor when there is no finalized path) through the target.
     pub path: Arc<[block::Hash]>,
     /// Exact generation and branch observed while the snapshot was acquired.
-    pub scope: WorkScope,
+    pub scope: HeaderWorkAuthority,
     /// Bounded inactivity deadline.
     pub idle_deadline: Instant,
 }
@@ -70,7 +70,7 @@ pub struct RetainedPathPage {
     /// Exact target fixed when the lease was acquired.
     pub target: Frontier,
     /// Exact generation and branch fixed by the lease.
-    pub scope: WorkScope,
+    pub scope: HeaderWorkAuthority,
     /// Canonical headers in path order.
     pub headers: Vec<Arc<block::Header>>,
     /// Hash-keyed auxiliary deliveries parallel to `headers`.

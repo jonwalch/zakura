@@ -174,11 +174,9 @@ mod tests {
         ZakuraPeerId::new(vec![7; 32]).expect("test peer ID has the required length")
     }
 
-    fn scope() -> zakura_header_chain::WorkScope {
-        zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(1),
+    fn scope() -> zakura_header_chain::HeaderWorkAuthority {
+        zakura_header_chain::HeaderWorkAuthority {
             header_generation: zakura_header_chain::HeaderGeneration::new(2),
-            verified_generation: None,
             branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([3; 32])),
         }
     }

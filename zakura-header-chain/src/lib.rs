@@ -31,15 +31,18 @@ pub use frontier::{
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
 pub use graph::{GraphError, InsertResult, MemHeaderStore};
 pub use ids::{
-    BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
-    OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration, WorkOwner, WorkScope,
+    BodyWorkAuthority, BodyWorkOwner, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
+    HeaderGeneration, HeaderId, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner,
+    OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
 pub use locator::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
 pub use node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState,
 };
-pub use ownership::{CompletionDecision, CompletionGate, PendingOwners, StaleReason};
+pub use ownership::{
+    CompletionDecision, CompletionGate, CompletionOwner, PendingOwners, StaleReason,
+};
 pub use transition::*;
 pub use validation::{
     infer_height, prepare_context_free_headers, prepare_headers, validate_commitment_structure,

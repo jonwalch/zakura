@@ -17,8 +17,8 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.common_ancestor = None;
     active.entries.clear();
     let wrong_ancestor_response = Headers {
-        request_id: owner.request_id.get(),
-        target_tip_hash: owner.branch.target_tip_hash,
+        request_id: owner.request_id().get(),
+        target_tip_hash: owner.header_authority().branch.target_tip_hash,
         common_ancestor_height: wrong_ancestor.height,
         common_ancestor_hash: wrong_ancestor.hash,
         complete: false,
@@ -36,7 +36,12 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
             .is_ok(),
         "the wrong locator member is otherwise wire-valid"
     );
-    reactor.handle_headers(peer.clone(), 0, owner.scope(), wrong_ancestor_response);
+    reactor.handle_headers(
+        peer.clone(),
+        0,
+        owner.header_authority(),
+        wrong_ancestor_response,
+    );
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
 
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
@@ -53,10 +58,10 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     reactor.handle_headers(
         peer.clone(),
         0,
-        owner.scope(),
+        owner.header_authority(),
         Headers {
-            request_id: owner.request_id.get(),
-            target_tip_hash: owner.branch.target_tip_hash,
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: snapshot.frontiers.finalized.height,
             common_ancestor_hash: snapshot.frontiers.finalized.hash,
             complete: true,
@@ -88,7 +93,7 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
 #[test]
 fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
     let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
-    let subject = zakura_header_chain::ErrorSubject::Branch(owner.branch);
+    let subject = zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch);
 
     for (category, expected) in [
         (
@@ -173,7 +178,7 @@ fn response_completion_requires_the_reserved_branch_scope() {
         .active(&peer)
         .expect("the fixture has active work")
         .clone();
-    let mut wrong_scope = owner.scope();
+    let mut wrong_scope = owner.header_authority();
     wrong_scope.header_generation = wrong_scope
         .header_generation
         .checked_next()
@@ -183,8 +188,8 @@ fn response_completion_requires_the_reserved_branch_scope() {
         0,
         wrong_scope,
         Headers {
-            request_id: owner.request_id.get(),
-            target_tip_hash: owner.branch.target_tip_hash,
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: snapshot.frontiers.finalized.height,
             common_ancestor_hash: snapshot.frontiers.finalized.hash,
             complete: true,
@@ -204,16 +209,18 @@ fn response_completion_requires_the_reserved_branch_scope() {
         .active(&peer)
         .expect("the fixture has active work")
         .clone();
-    let mut wrong_scope = owner.scope();
-    wrong_scope.branch =
-        zakura_header_chain::BranchId::new(owner.branch.anchor_hash, block::Hash([0x73; 32]));
+    let mut wrong_scope = owner.header_authority();
+    wrong_scope.branch = zakura_header_chain::BranchId::new(
+        owner.header_authority().branch.anchor_hash,
+        block::Hash([0x73; 32]),
+    );
     reactor.handle_headers_outcome(
         peer.clone(),
         0,
         wrong_scope,
         HeadersOutcome {
-            request_id: owner.request_id.get(),
-            target_tip_hash: owner.branch.target_tip_hash,
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
             outcome: HeadersOutcomeCode::Busy,
         },
     );
@@ -242,8 +249,8 @@ fn aggregate_staging_overflow_retires_work_without_peer_punishment() {
     let mut next_header = *regtest_genesis_block().header;
     next_header.previous_block_hash = staged_tip.hash;
     let response = Headers {
-        request_id: owner.request_id.get(),
-        target_tip_hash: owner.branch.target_tip_hash,
+        request_id: owner.request_id().get(),
+        target_tip_hash: owner.header_authority().branch.target_tip_hash,
         common_ancestor_height: staged_tip.height,
         common_ancestor_hash: staged_tip.hash,
         complete: false,
@@ -262,7 +269,7 @@ fn aggregate_staging_overflow_retires_work_without_peer_punishment() {
         "the overflowing page is otherwise wire-valid"
     );
 
-    reactor.handle_headers(peer.clone(), 0, owner.scope(), response);
+    reactor.handle_headers(peer.clone(), 0, owner.header_authority(), response);
 
     assert!(
         reactor.peer_work_queue.active(&peer).is_none(),

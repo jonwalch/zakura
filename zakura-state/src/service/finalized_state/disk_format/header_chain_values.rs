@@ -16,11 +16,12 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     AlarmSet, AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary,
-    BodyValidationState, BranchId, ChainScore, EligibilityReason, EligibilityState, EngineMetadata,
-    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderValidationState,
-    OperatorInvalidationId, SourceId, StateVersion, SuffixWork, TreeAuxRecordV1,
-    VerifiedGeneration, WorkCoordinate, WorkOwner,
+    BodyValidationState, BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, EligibilityReason,
+    EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord,
+    FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderContextFact,
+    HeaderGeneration, HeaderNode, HeaderSyncWorkOwner, HeaderValidationState, HeaderWorkAuthority,
+    HeaderWorkOwner, OperatorInvalidationId, SourceId, StateVersion, SuffixWork, TreeAuxRecordV1,
+    VerifiedGeneration, WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -776,20 +777,28 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
     })
 }
 
-fn put_owner(encoder: &mut Encoder, owner: WorkOwner) {
-    encoder.u64(owner.state_version.get());
-    encoder.u64(owner.header_generation.get());
-    encoder.optional(owner.verified_generation, |encoder, generation| {
-        encoder.u64(generation.get());
-    });
-    encoder.fixed(&owner.branch.anchor_hash.0);
-    encoder.fixed(&owner.branch.target_tip_hash.0);
-    encoder.u64(owner.session_id);
-    encoder.u64(owner.request_id.get());
+fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
+    // Preserve the version-one byte layout. This field was never consulted when
+    // deciding whether asynchronous work was current, and is reserved as zero now.
+    encoder.u64(0);
+    let header = owner.header_authority();
+    encoder.u64(header.header_generation.get());
+    encoder.optional(
+        owner.body_authority().map(|body| body.verified_generation),
+        |encoder, generation| {
+            encoder.u64(generation.get());
+        },
+    );
+    encoder.fixed(&header.branch.anchor_hash.0);
+    encoder.fixed(&header.branch.target_tip_hash.0);
+    encoder.u64(owner.session_id());
+    encoder.u64(owner.request_id().get());
 }
 
-fn get_owner(decoder: &mut Decoder<'_>) -> Result<WorkOwner, HeaderChainValueError> {
-    let state_version = StateVersion::new(decoder.u64()?);
+fn get_owner(decoder: &mut Decoder<'_>) -> Result<HeaderSyncWorkOwner, HeaderChainValueError> {
+    // Legacy rows contain their former global state version here. It was not an
+    // authority coordinate, so decoding intentionally accepts and discards it.
+    let _reserved_state_version = decoder.u64()?;
     let header_generation = HeaderGeneration::new(decoder.u64()?);
     let verified_generation =
         decoder.optional(|decoder| decoder.u64().map(VerifiedGeneration::new))?;
@@ -797,13 +806,26 @@ fn get_owner(decoder: &mut Decoder<'_>) -> Result<WorkOwner, HeaderChainValueErr
     let session_id = decoder.u64()?;
     let request_id =
         NonZeroU64::new(decoder.u64()?).ok_or(HeaderChainValueError::Zero("request_id"))?;
-    Ok(WorkOwner {
-        state_version,
+    let header = HeaderWorkAuthority {
         header_generation,
-        verified_generation,
         branch,
-        session_id,
-        request_id,
+    };
+    Ok(match verified_generation {
+        Some(verified_generation) => BodyWorkOwner {
+            authority: BodyWorkAuthority {
+                header,
+                verified_generation,
+            },
+            session_id,
+            request_id,
+        }
+        .into(),
+        None => HeaderWorkOwner {
+            authority: header,
+            session_id,
+            request_id,
+        }
+        .into(),
     })
 }
 
@@ -1129,14 +1151,18 @@ mod tests {
 
     #[test]
     fn aux_finality_and_metadata_values_round_trip_exactly() {
-        let owner = WorkOwner {
-            state_version: StateVersion::new(1),
-            header_generation: HeaderGeneration::new(2),
-            verified_generation: Some(VerifiedGeneration::new(3)),
-            branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+        let owner = BodyWorkOwner {
+            authority: BodyWorkAuthority {
+                header: HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(2),
+                    branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+                },
+                verified_generation: VerifiedGeneration::new(3),
+            },
             session_id: 4,
             request_id: NonZeroU64::new(5).expect("five is nonzero"),
-        };
+        }
+        .into();
         let aux = AuxDelivery {
             delivery_id: EvidenceId::from_digest([6; 32]),
             header_hash: block::Hash([7; 32]),
@@ -1162,6 +1188,11 @@ mod tests {
             AuxDelivery::decode(&aux.encode().expect("aux encodes")),
             Ok(aux)
         );
+        let mut legacy_aux = aux.encode().expect("aux encodes");
+        const OWNER_STATE_VERSION_OFFSET: usize = 32 + 32 + 32;
+        legacy_aux[OWNER_STATE_VERSION_OFFSET..OWNER_STATE_VERSION_OFFSET + 8]
+            .copy_from_slice(&99_u64.to_be_bytes());
+        assert_eq!(AuxDelivery::decode(&legacy_aux), Ok(aux));
         let mut malformed_aux = aux.encode().expect("aux encodes");
         const SAPLING_ROOT_OFFSET: usize = 32 + 32 + 32 + 105 + 4 + 1 + 4;
         malformed_aux[SAPLING_ROOT_OFFSET..SAPLING_ROOT_OFFSET + 32].fill(0xff);
@@ -1243,7 +1274,7 @@ mod tests {
                 digest(&bytes),
             ],
             [
-                "186354a36e1b19a6cead350807f3bba93f1bd723114a838f1e38c8b6a2a80696",
+                "ef31b854deb19b68411aabedc15a681405065939be00a691a050a4325df3348e",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
                 "58e4aac31baa70f4a8a93bbef0ac6591b443256cdf734a4ce041f0be9139fade",
             ]

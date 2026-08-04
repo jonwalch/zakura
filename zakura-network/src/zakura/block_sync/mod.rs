@@ -83,17 +83,18 @@ pub use wire::{
 };
 
 #[cfg(test)]
-fn test_work_scope() -> zakura_header_chain::WorkScope {
-    zakura_header_chain::WorkScope {
-        state_version: zakura_header_chain::StateVersion::new(1),
-        header_generation: zakura_header_chain::HeaderGeneration::new(2),
-        verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(3)),
-        branch: zakura_header_chain::BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
+    zakura_header_chain::BodyWorkAuthority {
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            branch: zakura_header_chain::BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+        },
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
     }
 }
 
 #[cfg(test)]
-fn test_work_owner() -> zakura_header_chain::WorkOwner {
+fn test_work_owner() -> zakura_header_chain::BodyWorkOwner {
     test_work_scope().bind(6, std::num::NonZeroU64::new(7).expect("seven is nonzero"))
 }
 

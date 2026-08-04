@@ -57,7 +57,7 @@ struct RangeResponseTrace {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct PendingNeededQuery {
     query_id: NonZeroU64,
-    scope: zakura_header_chain::WorkScope,
+    scope: zakura_header_chain::BodyWorkAuthority,
     from: block::Height,
     limit: u32,
     best_header_tip: block::Height,
@@ -75,7 +75,7 @@ fn synchronize_persisted_body_alarm(
             .filter(|summary| summary.alarmed)
             .map(|summary| {
                 (
-                    zakura_header_chain::WorkScope::for_body_work(snapshot),
+                    zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot),
                     snapshot.frontiers.header_best.hash,
                     retry_deadline_instant(summary.next_probe_at),
                 )
@@ -157,7 +157,17 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
     let initial_body_scope = committed_snapshot
         .as_ref()
-        .map(zakura_header_chain::WorkScope::for_body_work);
+        .map(zakura_header_chain::BodyWorkAuthority::for_snapshot);
+    let initial_state_version = committed_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.state_version);
+    #[cfg(test)]
+    let initial_state_version = initial_state_version.or_else(|| {
+        startup
+            .committed_snapshots
+            .is_none()
+            .then_some(zakura_header_chain::StateVersion::default())
+    });
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -185,7 +195,8 @@ pub fn spawn_block_sync_reactor(
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
-    );
+    )
+    .with_initial_state_version(initial_state_version);
     tokio::spawn(sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
@@ -760,7 +771,7 @@ impl BlockSyncReactor {
                 .filter(|summary| summary.alarmed)
                 .map(|_| {
                     (
-                        zakura_header_chain::WorkScope::for_body_work(snapshot),
+                        zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot),
                         snapshot.frontiers.header_best.hash,
                     )
                 })
@@ -786,6 +797,13 @@ impl BlockSyncReactor {
         }
 
         let current_scope = self.body_work_scope();
+        if previous.as_ref().map(|old| old.state_version) != Some(snapshot.state_version) {
+            let _ = self
+                .sequencer_control
+                .send(SequencerControlInput::StateVersionChanged(
+                    snapshot.state_version,
+                ));
+        }
         if current_scope != previous_scope {
             let released = match current_scope {
                 Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
@@ -1010,7 +1028,7 @@ impl BlockSyncReactor {
 
     async fn handle_needed_blocks(
         &mut self,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
         self.pending_needed_query = None;
@@ -1090,7 +1108,7 @@ impl BlockSyncReactor {
     async fn handle_scoped_needed_blocks(
         &mut self,
         query_id: NonZeroU64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
         let completion = (query_id, scope);
@@ -1437,7 +1455,7 @@ impl BlockSyncReactor {
     #[allow(clippy::too_many_arguments)]
     async fn handle_block_apply_finished(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
@@ -1576,11 +1594,11 @@ impl BlockSyncReactor {
         dispatched
     }
 
-    fn body_work_scope(&self) -> Option<zakura_header_chain::WorkScope> {
+    fn body_work_scope(&self) -> Option<zakura_header_chain::BodyWorkAuthority> {
         let scope = self
             .committed_snapshot
             .as_ref()
-            .map(zakura_header_chain::WorkScope::for_body_work);
+            .map(zakura_header_chain::BodyWorkAuthority::for_snapshot);
         #[cfg(not(test))]
         {
             scope
@@ -1589,14 +1607,15 @@ impl BlockSyncReactor {
         {
             scope.or_else(|| {
                 self.startup.committed_snapshots.is_none().then_some(
-                    zakura_header_chain::WorkScope {
-                        state_version: zakura_header_chain::StateVersion::new(0),
-                        header_generation: zakura_header_chain::HeaderGeneration::new(0),
-                        verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(0)),
-                        branch: zakura_header_chain::BranchId::new(
-                            self.startup.frontiers.verified_block_hash,
-                            self.state.best_header_hash,
-                        ),
+                    zakura_header_chain::BodyWorkAuthority {
+                        header: zakura_header_chain::HeaderWorkAuthority {
+                            header_generation: zakura_header_chain::HeaderGeneration::new(0),
+                            branch: zakura_header_chain::BranchId::new(
+                                self.startup.frontiers.verified_block_hash,
+                                self.state.best_header_hash,
+                            ),
+                        },
+                        verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
                     },
                 )
             })
@@ -1606,7 +1625,7 @@ impl BlockSyncReactor {
     fn body_completion_is_current(
         &self,
         source: zakura_header_chain::SourceId,
-        owner: &zakura_header_chain::WorkOwner,
+        owner: &zakura_header_chain::BodyWorkOwner,
     ) -> bool {
         let current = self
             .startup
@@ -1615,7 +1634,7 @@ impl BlockSyncReactor {
             .and_then(|snapshots| snapshots.borrow().clone());
         #[cfg(test)]
         if current.is_none() {
-            return self.body_work_scope() == Some(owner.scope());
+            return self.body_work_scope() == Some(owner.authority());
         }
         let Some(current) = current else {
             return false;

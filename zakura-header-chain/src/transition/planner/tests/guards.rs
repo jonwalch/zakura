@@ -1,25 +1,34 @@
 use super::*;
 
 #[test]
-fn stale_version_and_owner_fail_before_any_plan_effect() {
+fn typed_header_authority_ignores_global_version_but_rejects_stale_generation() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
     let mut request = insertion(&store, 1, EvidenceId::from_digest([6; 32]));
     request.expected_version = StateVersion::new(9);
-    assert!(matches!(
-        apply_transition(&store, request, &context(&config, &clock, None)),
-        Err(TransitionFailure::Stale {
-            current
-        }) if current == StateVersion::new(0)
-    ));
+    apply_transition(&store, request, &context(&config, &clock, None))
+        .expect("global state versions do not authorize header work");
 
     let mut request = insertion(&store, 1, EvidenceId::from_digest([7; 32]));
     let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
         panic!("the fixture constructs a header insertion");
     };
-    insert.owner.state_version = StateVersion::new(9);
-    apply_transition(&store, request, &context(&config, &clock, None))
-        .expect("owner authority is generation and branch scoped, not version scoped");
+    let owner = insert
+        .owner
+        .header_owner()
+        .expect("the fixture is ordinary header work");
+    insert.owner = crate::HeaderWorkOwner {
+        authority: crate::HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(9),
+            ..owner.authority
+        },
+        ..owner
+    }
+    .into();
+    assert!(matches!(
+        apply_transition(&store, request, &context(&config, &clock, None)),
+        Err(TransitionFailure::Stale { current }) if current == StateVersion::new(0)
+    ));
 }
 
 #[test]
@@ -113,7 +122,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let request = insertion(&store, 2, EvidenceId::from_digest([8; 32]));
     let owner = request
         .event
-        .work_owner()
+        .header_sync_owner()
         .expect("insertion carries an owner");
     let plan = apply_transition(&store, request, &context(&config, &clock, None))
         .expect("the baseline plan satisfies every invariant");

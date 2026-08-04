@@ -31,7 +31,7 @@ impl port::HeaderChainPort for PanickingPort {
 
     fn vct_repair_context(
         &self,
-        _owner: zakura_header_chain::WorkOwner,
+        _owner: zakura_header_chain::BodyWorkOwner,
         _height: block::Height,
     ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::HeaderChainPortError>>
     {
@@ -69,7 +69,9 @@ impl port::HeaderChainPort for PanickingPort {
         Box::pin(async move {
             Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
-                    zakura_header_chain::ErrorSubject::Branch(request.owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(
+                        request.owner.header_authority().branch,
+                    ),
                     None,
                 ),
             ))
@@ -84,7 +86,7 @@ impl port::HeaderChainPort for PanickingPort {
         Box::pin(async move {
             Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                     None,
                 ),
             ))
@@ -137,7 +139,7 @@ async fn port_future_panic_disconnects_exact_session_and_reactor_survives() {
         .clone()
         .expect("the fixture has a committed snapshot");
     let target = block::Hash([0x81; 32]);
-    let scope = zakura_header_chain::WorkScope::for_header_target(&snapshot, target);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
 
     assert!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
@@ -178,7 +180,7 @@ async fn stale_port_panic_does_not_disconnect_replacement_session() {
         .clone()
         .expect("the fixture has a committed snapshot");
     let target = block::Hash([0x83; 32]);
-    let scope = zakura_header_chain::WorkScope::for_header_target(&snapshot, target);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
     assert!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
@@ -219,7 +221,7 @@ async fn internal_vct_port_panic_is_contained_without_peer_disconnect() {
         .committed_snapshot
         .clone()
         .expect("the fixture has a committed snapshot");
-    let owner = zakura_header_chain::WorkScope::for_body_work(&snapshot).bind(
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
         INTERNAL_VCT_REPAIR_SESSION_ID,
         std::num::NonZeroU64::new(1).expect("one is nonzero"),
     );
@@ -258,7 +260,7 @@ async fn port_panic_trace_is_bounded_and_request_scope_serializes_null_generatio
     let peer = peer();
     let (connection_cancel, _) = connected_session(&mut reactor, peer.clone(), 7);
     let target = block::Hash([0x91; 32]);
-    let scope = zakura_header_chain::WorkScope::for_header_target(&snapshot, target);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
     reactor.emit_header_request(
         &peer,
         7,

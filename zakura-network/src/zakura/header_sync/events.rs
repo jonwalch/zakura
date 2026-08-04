@@ -222,7 +222,7 @@ pub enum HeaderSyncEvent {
         /// Ordered-stream generation.
         session_id: u64,
         /// Durable generation and exact branch that owns the response reservation.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Decoded `Headers` or `HeadersOutcome` response.
         msg: HeaderSyncMessage,
     },
@@ -236,7 +236,7 @@ pub enum HeaderSyncEvent {
         /// Exact advertised target hash.
         target_tip_hash: block::Hash,
         /// Durable generation and exact branch that scheduled the locator read.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Coherent locator, absent when state is unavailable.
         locator: Option<zakura_header_chain::HeaderLocator>,
     },
@@ -244,7 +244,7 @@ pub enum HeaderSyncEvent {
     #[cfg(any(test, feature = "zakura-testkit"))]
     VctRepairContextReady {
         /// Owner echoed from the exact state query.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         /// Exact state-read outcome.
         result: VctRepairContextResult,
     },
@@ -256,7 +256,7 @@ pub enum HeaderSyncEvent {
         /// Ordered-stream generation that owns the request.
         session_id: u64,
         /// Exact generation and branch that owns the request.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Exact request whose state read completed.
         request: GetHeaders,
         /// Acquired lease or explicit wire outcome.
@@ -270,7 +270,7 @@ pub enum HeaderSyncEvent {
         /// Ordered-stream generation that owns the lease.
         session_id: u64,
         /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Exact request correlation identifier.
         request_id: HeaderSyncRequestId,
         /// Exact snapshot-bound target.
@@ -286,7 +286,7 @@ pub enum HeaderSyncEvent {
         /// Stable source identity used by the pending-owner gate.
         source: zakura_header_chain::SourceId,
         /// Ownership token echoed by the driver.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         /// Sealed evidence or a typed preparation failure.
         result: HeaderTargetPreparationResult,
     },
@@ -298,7 +298,7 @@ pub enum HeaderSyncEvent {
         /// Stable source identity used by the pending-owner gate.
         source: zakura_header_chain::SourceId,
         /// Ownership token echoed by the driver.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         /// Commit, stale-work, peer-invalid, or local-failure result.
         result: HeaderTargetAdmissionResult,
     },
@@ -358,7 +358,7 @@ pub struct HeaderPathLease {
     /// Exact retained target fixed by the lease.
     pub target: zakura_header_chain::Frontier,
     /// Exact generation and branch fixed by the lease.
-    pub scope: zakura_header_chain::WorkScope,
+    pub scope: zakura_header_chain::HeaderWorkAuthority,
 }
 
 /// Network-facing state result for one retained target page.
@@ -380,7 +380,7 @@ pub struct HeaderPathPage {
     /// Exact retained target fixed by the lease.
     pub target: zakura_header_chain::Frontier,
     /// Exact generation and branch fixed by the lease.
-    pub scope: zakura_header_chain::WorkScope,
+    pub scope: zakura_header_chain::HeaderWorkAuthority,
     /// Requested schema when every parallel record was available, otherwise none.
     pub tree_aux_schema: AuxSchema,
     /// Canonical headers and parallel advisory metadata.
@@ -419,12 +419,12 @@ pub enum HeaderPortOperation {
         /// Exact advertised target hash.
         target_tip_hash: block::Hash,
         /// Durable generation and exact branch that owns the query.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
     },
     /// Ask state to resolve one current branch-owned VCT repair.
     QueryVctRepairContext {
         /// Complete owner captured with the committed repair signal.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         /// Exact unavailable selected-header height.
         height: block::Height,
     },
@@ -435,7 +435,7 @@ pub enum HeaderPortOperation {
         /// Ordered-stream generation that owns the request.
         session_id: u64,
         /// Exact generation and branch that owns the request.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Exact request to snapshot in state.
         request: GetHeaders,
     },
@@ -448,7 +448,7 @@ pub enum HeaderPortOperation {
         /// State-issued lease identity.
         lease_id: u64,
         /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Exact wire request identifier.
         request_id: HeaderSyncRequestId,
         /// Exact snapshot-bound target.
@@ -469,7 +469,7 @@ pub enum HeaderPortOperation {
         /// State-issued lease identity.
         lease_id: u64,
         /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
     },
     /// Validate all staged pages and submit exactly one complete-target insertion.
     PrepareHeaderTarget {
@@ -482,7 +482,7 @@ pub enum HeaderPortOperation {
         /// Authenticated network parameters.
         network: Network,
         /// Exact asynchronous ownership fixed by the initial request.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         /// Exact initial locator intersection.
         common_ancestor: zakura_header_chain::Frontier,
         /// Exact admitted target, which can be a bounded prefix of the advertised target.
@@ -501,7 +501,7 @@ pub enum HeaderPortOperation {
         /// Stable source identity used by the pending-owner gate.
         source: zakura_header_chain::SourceId,
         /// Exact current owner.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         /// Sealed insertion produced by `prepare_headers`.
         insert: Box<zakura_header_chain::InsertHeaders>,
     },

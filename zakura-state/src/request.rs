@@ -880,8 +880,6 @@ pub enum Request {
     /// Atomically admit one complete, already prepared header target through the serialized
     /// fork-aware header-chain writer.
     ApplyHeaderChainInsert {
-        /// Durable version observed while acquiring the validation context.
-        expected_version: zakura_header_chain::StateVersion,
         /// Sealed complete-target insertion; other transition authorities are unrepresentable.
         insert: Box<zakura_header_chain::InsertHeaders>,
     },
@@ -1473,7 +1471,7 @@ pub enum ReadRequest {
     /// Resolve one current branch-owned VCT repair to its exact selected request context.
     VctRepairContext {
         /// Complete owner captured when the repair was scheduled.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         /// Exact selected height whose auxiliary metadata is unavailable.
         height: block::Height,
     },
@@ -1487,7 +1485,7 @@ pub enum ReadRequest {
         /// Exact target named by the peer's status.
         target_tip_hash: block::Hash,
         /// Exact generation and branch captured before the state read.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Locator hashes in requester order.
         locator_hashes: Vec<block::Hash>,
     },
@@ -1501,7 +1499,7 @@ pub enum ReadRequest {
         /// Exact state-issued lease identity.
         lease_id: u64,
         /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         /// Common ancestor or prior page tip.
         after_hash: block::Hash,
         /// Maximum nodes returned.
@@ -1517,7 +1515,7 @@ pub enum ReadRequest {
         /// Exact state-issued lease identity.
         lease_id: u64,
         /// Exact generation and branch fixed by the lease.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
     },
 
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)

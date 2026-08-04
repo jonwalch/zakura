@@ -491,14 +491,7 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
             TransitionRequest {
                 expected_version: initial.state_version,
                 event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner: WorkOwner {
-                        state_version: initial.state_version,
-                        header_generation: initial.header_generation,
-                        verified_generation: None,
-                        branch: BranchId::new(anchor_frontier.hash, child.hash),
-                        session_id: 1,
-                        request_id: NonZeroU64::new(1).expect("one is nonzero"),
-                    },
+                    owner: header_owner(&initial, child.hash, 1, 1),
                     source: SourceId::from_digest([0x69; 32]),
                     parent_hash: anchor_frontier.hash,
                     target_tip_hash: child.hash,
@@ -565,14 +558,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
         TransitionRequest {
             expected_version: initial.state_version,
             event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                owner: WorkOwner {
-                    state_version: initial.state_version,
-                    header_generation: initial.header_generation,
-                    verified_generation: None,
-                    branch: BranchId::new(anchor.hash, target.hash),
-                    session_id: 1,
-                    request_id: NonZeroU64::new(1).expect("one is nonzero"),
-                },
+                owner: header_owner(&initial, target.hash, 1, 1),
                 source: SourceId::from_digest([0x70; 32]),
                 parent_hash: anchor.hash,
                 target_tip_hash: target.hash,

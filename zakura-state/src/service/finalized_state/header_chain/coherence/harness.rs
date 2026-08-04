@@ -11,13 +11,13 @@ use zakura_chain::{
     work::difficulty::{Work, U256},
 };
 use zakura_header_chain::{
-    audit_store, AlarmSet, ApplyResult, BodyValidationState, BranchId, ChainScore, CheckpointSet,
+    audit_store, AlarmSet, ApplyResult, BodyValidationState, ChainScore, CheckpointSet,
     EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
     FullStateEvidenceAuthority, FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId,
     StateVersion, StoreAuditRead, SuffixWork, SystemClock, TargetCompletion, TransitionContext,
     TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate, WorkOwner,
+    VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
 };
 
 use super::{
@@ -395,14 +395,15 @@ impl Harness {
                 TransitionRequest {
                     expected_version: snapshot.state_version,
                     event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner: WorkOwner {
-                            state_version: snapshot.state_version,
-                            header_generation: snapshot.header_generation,
-                            verified_generation: None,
-                            branch: BranchId::new(snapshot.frontiers.finalized.hash, target.hash),
+                        owner: zakura_header_chain::HeaderWorkOwner {
+                            authority: zakura_header_chain::HeaderWorkAuthority::for_target(
+                                &snapshot,
+                                target.hash,
+                            ),
                             session_id: 1,
                             request_id,
-                        },
+                        }
+                        .into(),
                         source: SourceId::from_digest([0x51; 32]),
                         parent_hash: anchor_hash,
                         target_tip_hash: target.hash,

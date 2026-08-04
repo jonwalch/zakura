@@ -1562,14 +1562,15 @@ mod zakura_header_sync_driver_tests {
             from,
             limit,
             best_header_tip,
-            scope: zakura_header_chain::WorkScope {
-                state_version: zakura_header_chain::StateVersion::new(query_id),
-                header_generation: zakura_header_chain::HeaderGeneration::new(query_id),
-                verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(query_id)),
-                branch: zakura_header_chain::BranchId::new(
-                    block::Hash([0; 32]),
-                    block::Hash([0; 32]),
-                ),
+            scope: zakura_header_chain::BodyWorkAuthority {
+                header: zakura_header_chain::HeaderWorkAuthority {
+                    header_generation: zakura_header_chain::HeaderGeneration::new(query_id),
+                    branch: zakura_header_chain::BranchId::new(
+                        block::Hash([0; 32]),
+                        block::Hash([0; 32]),
+                    ),
+                },
+                verified_generation: zakura_header_chain::VerifiedGeneration::new(query_id),
             },
         }
     }
@@ -1632,7 +1633,7 @@ mod zakura_header_sync_driver_tests {
             blocks.last().expect("the durable suffix is non-empty");
         let target = zakura_header_chain::Frontier::new(*target_height, target_block.hash());
         let scope =
-            zakura_header_chain::WorkScope::for_header_target(snapshot, target_block.hash());
+            zakura_header_chain::HeaderWorkAuthority::for_target(snapshot, target_block.hash());
         let owner = scope.bind(
             session_id,
             std::num::NonZeroU64::new(request_id).expect("the test request ID is nonzero"),
@@ -1643,7 +1644,7 @@ mod zakura_header_sync_driver_tests {
             .prepare_header_target(zakura_node_services::header_chain::PrepareHeaderTarget {
                 source,
                 network: zakura_chain::parameters::Network::Mainnet,
-                owner,
+                owner: owner.into(),
                 common_ancestor,
                 target,
                 entries: blocks
@@ -1874,12 +1875,16 @@ mod zakura_header_sync_driver_tests {
         }
     }
 
-    fn test_block_work_owner() -> zakura_header_chain::WorkOwner {
-        zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(1),
-            header_generation: zakura_header_chain::HeaderGeneration::new(1),
-            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
-            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([1; 32])),
+    fn test_block_work_owner() -> zakura_header_chain::BodyWorkOwner {
+        zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: zakura_header_chain::HeaderGeneration::new(1),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([0; 32]),
+                    block::Hash([1; 32]),
+                ),
+            },
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
         }
         .bind(
             1,

@@ -266,7 +266,7 @@ impl HeaderSyncPeerSession {
     pub(super) fn try_send_get_headers(
         &self,
         codec: &HeaderSyncCodec,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         target_tip_hash: block::Hash,
         locator: &zakura_header_chain::HeaderLocator,
         max_header_count: u32,
@@ -356,7 +356,7 @@ pub(super) enum HeaderSyncPeerCommand {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct ExpectedHeadersResponse {
     pub(super) request_id: HeaderSyncRequestId,
-    pub(super) scope: zakura_header_chain::WorkScope,
+    pub(super) scope: zakura_header_chain::HeaderWorkAuthority,
     pub(super) context: HeaderSyncDecodeContext,
 }
 

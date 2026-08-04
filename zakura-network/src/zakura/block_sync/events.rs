@@ -54,7 +54,7 @@ pub enum BlockSyncEvent {
         /// Reactor-local query identifier echoed by the driver.
         query_id: NonZeroU64,
         /// Durable generation and branch coordinates echoed from the query.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         /// Header-known bodies missing under `scope`.
         blocks: Vec<BlockSyncBlockMeta>,
     },
@@ -64,7 +64,7 @@ pub enum BlockSyncEvent {
     /// Node wiring finished applying a submitted block body.
     BlockApplyFinished {
         /// Exact network request that owned the submission.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         /// Authenticated body supplier.
         source: zakura_header_chain::SourceId,
         /// Submission token from the matching [`BlockSyncAction::SubmitBlock`].
@@ -265,7 +265,7 @@ pub enum BlockSyncAction {
         /// Current best header target, used for diagnostics and coalescing.
         best_header_tip: block::Height,
         /// Atomic durable coordinates that own this state query and its result.
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
     QueryBlocksByHeightRange {
@@ -279,7 +279,7 @@ pub enum BlockSyncAction {
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
         /// Exact network request that owns this verifier submission.
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         /// Authenticated peer source that supplied the body.
         source: zakura_header_chain::SourceId,
         /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].

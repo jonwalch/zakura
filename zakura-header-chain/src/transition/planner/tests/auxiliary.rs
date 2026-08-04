@@ -1,5 +1,12 @@
 use super::*;
 
+fn body_owner(snapshot: &EngineSnapshot, session_id: u64, request_id: u64) -> crate::BodyWorkOwner {
+    crate::BodyWorkAuthority::for_snapshot(snapshot).bind(
+        session_id,
+        NonZeroU64::new(request_id).expect("fixture request IDs are nonzero"),
+    )
+}
+
 #[test]
 fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
@@ -17,14 +24,13 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
 
     store.lease.parent = anchor;
     store.lease.context_digest = [0x67; 32];
-    let owner = crate::WorkScope::for_body_work(&store.snapshot())
-        .bind(8, NonZeroU64::new(9).expect("nine is nonzero"));
+    let owner = body_owner(&store.snapshot(), 8, 9);
     let source = SourceId::from_digest([0x68; 32]);
     let delivery = crate::AuxDelivery {
         delivery_id: EvidenceId::from_digest([0x69; 32]),
         header_hash: repaired.hash,
         source,
-        owner,
+        owner: owner.into(),
         body_size: crate::BodySizeHint::Unknown,
         tree_aux: Some(crate::TreeAuxRecordV1 {
             height: repaired.height,
@@ -41,7 +47,7 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
     let repair = TransitionRequest {
         expected_version: store.metadata.state_version,
         event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
-            owner,
+            owner: owner.into(),
             source,
             parent_hash: anchor.hash,
             target_tip_hash: repaired.hash,
@@ -65,6 +71,31 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
         Some(delivery.delivery_id),
         "repair replay identity is the new provenance record, not the old header batch"
     );
+    let mut wrongly_header_authorized = repair.clone();
+    let TransitionEvent::InsertHeaders(wrong) = &mut wrongly_header_authorized.event else {
+        panic!("the fixture constructs a header insertion");
+    };
+    let body_owner = wrong
+        .owner
+        .body_owner()
+        .expect("the fixture repair has body authority");
+    let header_owner = crate::HeaderWorkOwner {
+        authority: body_owner.authority.header,
+        session_id: body_owner.session_id,
+        request_id: body_owner.request_id,
+    };
+    wrong.owner = header_owner.into();
+    wrong.aux[0].owner = header_owner.into();
+    assert!(matches!(
+        apply_transition(
+            &store,
+            wrongly_header_authorized,
+            &context(&config, &clock, None)
+        ),
+        Err(TransitionFailure::InvalidEvidence(
+            "selected auxiliary repair does not have body authority"
+        ))
+    ));
     let repaired = apply_transition(&store, repair, &context(&config, &clock, None))
         .expect("one exact selected auxiliary repair is admitted");
     assert_eq!(repaired.change_set.put_nodes.len(), 1);
@@ -172,7 +203,18 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
         .next()
         .expect("the bounded fixture height advances");
     let mut wrong_owner = delivery;
-    wrong_owner.owner.session_id = wrong_owner.owner.session_id.saturating_add(1);
+    wrong_owner.owner = match wrong_owner.owner {
+        crate::HeaderSyncWorkOwner::Header(owner) => crate::HeaderWorkOwner {
+            session_id: owner.session_id.saturating_add(1),
+            ..owner
+        }
+        .into(),
+        crate::HeaderSyncWorkOwner::BodyRepair(owner) => crate::BodyWorkOwner {
+            session_id: owner.session_id.saturating_add(1),
+            ..owner
+        }
+        .into(),
+    };
     let mut wrong_source = delivery;
     wrong_source.source = SourceId::from_digest([0x73; 32]);
     let mut preauthenticated = delivery;
@@ -254,17 +296,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         .expect("the target and unauthenticated delivery insert atomically");
     store.commit(&inserted);
 
-    let repair_owner = WorkOwner {
-        state_version: store.metadata.state_version,
-        header_generation: store.metadata.header_generation,
-        verified_generation: Some(store.metadata.verified_generation),
-        branch: BranchId::new(
-            store.metadata.frontiers.finalized.hash,
-            store.metadata.frontiers.header_best.hash,
-        ),
-        session_id: 2,
-        request_id: NonZeroU64::new(2).expect("two is nonzero"),
-    };
+    let repair_owner = body_owner(&store.snapshot(), 2, 2);
     let authentication = crate::AuxAuthentication::Authenticated {
         evidence: EvidenceId::from_digest([0xb4; 32]),
         boundary_hash,
@@ -338,12 +370,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     let rejection = crate::AuxAuthentication::Rejected {
         evidence: EvidenceId::from_digest([0xc5; 32]),
     };
-    let rejection_owner = WorkOwner {
-        state_version: store.metadata.state_version,
-        header_generation: store.metadata.header_generation,
-        verified_generation: Some(store.metadata.verified_generation),
-        ..repair_owner
-    };
+    let rejection_owner = body_owner(&store.snapshot(), 2, 2);
     let rejected = apply_transition(
         &store,
         TransitionRequest {
@@ -386,12 +413,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         TransitionRequest {
             expected_version: store.metadata.state_version,
             event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
-                owner: WorkOwner {
-                    state_version: store.metadata.state_version,
-                    header_generation: store.metadata.header_generation,
-                    verified_generation: Some(store.metadata.verified_generation),
-                    ..repair_owner
-                },
+                owner: body_owner(&store.snapshot(), 2, 2),
                 deliveries: vec![crate::AuxDelivery {
                     authentication,
                     ..delivery

@@ -138,14 +138,7 @@ fn idle_writer_promotes_a_due_persisted_deferred_header() {
             .expect("the genesis anchor has a next height"),
         future_header.hash(),
     );
-    let owner = WorkOwner {
-        state_version: initial.state_version,
-        header_generation: initial.header_generation,
-        verified_generation: None,
-        branch: BranchId::new(anchor.hash(), future.hash),
-        session_id: 41,
-        request_id: std::num::NonZeroU64::new(42).expect("forty-two is nonzero"),
-    };
+    let owner = header_owner(&initial, future.hash, 41, 42);
     let insertion_context = TransitionContext {
         config: &writer.config,
         clock: &preparation_clock,

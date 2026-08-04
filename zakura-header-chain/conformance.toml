@@ -152,7 +152,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-GEN-03"
 name = "Branch-scoped work identity"
 status = "implemented"
-owner = "zakura_header_chain::WorkOwner"
+owner = "zakura_header_chain::HeaderSyncWorkOwner"
 tests = [
     "IN-05::response_completion_requires_the_reserved_branch_scope",
     "IN-05::stale_locator_completion_cannot_rebase_onto_a_new_generation",
@@ -168,7 +168,7 @@ id = "LC-GEN-04"
 name = "Stale-result rejection"
 status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::apply"
-tests = ["IN-02::stale_version_and_owner_fail_before_any_plan_effect"]
+tests = ["IN-02::all_owner_mismatches_have_zero_effects"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -355,7 +355,7 @@ id = "LC-VAL-11"
 name = "Validation before admission"
 status = "implemented"
 owner = "zakura_header_chain::prepare_headers + zakura_state::Request::ApplyHeaderChainInsert"
-tests = ["DG-01::requester_stages_all_pages_before_one_exact_admission", "DG-01::complete_batch_is_sealed_to_lease_and_uses_internal_context", "IN-01::stale_version_and_owner_fail_before_any_plan_effect"]
+tests = ["DG-01::requester_stages_all_pages_before_one_exact_admission", "DG-01::complete_batch_is_sealed_to_lease_and_uses_internal_context", "IN-01::all_owner_mismatches_have_zero_effects"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -610,7 +610,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-WORK-01"
 name = "Generation-scoped forward work"
 status = "implemented"
-owner = "zakura_header_chain::WorkScope"
+owner = "zakura_header_chain::HeaderWorkAuthority + zakura_header_chain::BodyWorkAuthority"
 tests = ["AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::committed_snapshot_retires_in_flight_state_results", "AUD-09::generation_change_retires_every_repair_state", "IN-05::generation_change_retires_served_path_before_late_page_completion", "IN-05::work_queue_separates_scopes_and_retires_obsolete_reservations", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -627,7 +627,7 @@ id = "LC-WORK-03"
 name = "Stale-anchor recovery"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::observe_latest_committed_snapshot"
-tests = ["IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score", "IN-07::serialized_apply_commits_before_receipt_and_reopens_exactly", "IN-05::stale_version_and_owner_fail_before_any_plan_effect", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::only_malformed_protocol_and_invalid_header_default_to_header_peer_fault"]
+tests = ["IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score", "IN-07::serialized_apply_commits_before_receipt_and_reopens_exactly", "IN-05::all_owner_mismatches_have_zero_effects", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::only_malformed_protocol_and_invalid_header_default_to_header_peer_fault"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

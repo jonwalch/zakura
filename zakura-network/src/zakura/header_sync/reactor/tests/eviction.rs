@@ -77,7 +77,7 @@ impl EvictionFixture {
     }
 
     /// Stage one request in the receiving phase, returning its owning scope.
-    fn start_receiving(&mut self, session_id: u64) -> zakura_header_chain::WorkScope {
+    fn start_receiving(&mut self, session_id: u64) -> zakura_header_chain::HeaderWorkAuthority {
         seed_applying_request(
             &mut self.reactor,
             &self.snapshot,
@@ -91,7 +91,7 @@ impl EvictionFixture {
             .expect("the seeded request is active");
         active.phase = HeaderTargetPhase::Receiving;
         active.common_ancestor = None;
-        active.owner.scope()
+        active.owner.header_authority()
     }
 
     /// Answer the active request with one usable header, completing its target.

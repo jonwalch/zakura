@@ -169,7 +169,10 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         .expect("the finalized prefix and retained suffix reconcile");
     let reader = runtime.reader();
     let target = Frontier::new(path[2].height, path[2].hash);
-    let scope = WorkScope::for_header_target(&runtime.publisher().snapshot(), target.hash);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        target.hash,
+    );
     let RetainedPathLeaseOutcome::Acquired(lease) = reader
         .acquire_retained_path(
             SourceId::from_digest([0x71; 32]),
@@ -279,8 +282,8 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         None
     );
     let snapshot = runtime.publisher().snapshot();
-    let owner =
-        WorkScope::for_body_work(&snapshot).bind(7, NonZeroU64::new(8).expect("eight is nonzero"));
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).expect("eight is nonzero"));
     let repair = reader
         .vct_repair_context(owner, child.height)
         .expect("the selected repair context is coherent")
@@ -289,9 +292,9 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     assert_eq!(repair.locator.entries(), &[anchor_frontier]);
 
     let mut stale_owner = owner;
-    stale_owner.state_version = StateVersion::new(
+    stale_owner.authority.verified_generation = VerifiedGeneration::new(
         owner
-            .state_version
+            .verified_generation
             .get()
             .checked_add(1)
             .expect("the fixture state version can advance"),
@@ -323,7 +326,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         delivery_id: EvidenceId::from_digest([0x91; 32]),
         header_hash: child.hash,
         source: SourceId::from_digest([0x92; 32]),
-        owner,
+        owner: owner.into(),
         body_size: zakura_header_chain::BodySizeHint::Unknown,
         tree_aux: Some(aux),
         authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
@@ -389,7 +392,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     ));
 
     let owner = SourceId::from_digest([1; 32]);
-    let lease_scope = zakura_header_chain::WorkScope::for_header_target(
+    let lease_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
         &runtime.publisher().snapshot(),
         grandchild.hash,
     );
@@ -511,7 +514,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 7,
                 block::Hash([0xfe; 32]),
                 &[anchor.hash],
-                zakura_header_chain::WorkScope::for_header_target(
+                zakura_header_chain::HeaderWorkAuthority::for_target(
                     &runtime.publisher().snapshot(),
                     block::Hash([0xfe; 32]),
                 ),
@@ -526,7 +529,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 7,
                 child.hash,
                 &[block::Hash([0xfd; 32])],
-                zakura_header_chain::WorkScope::for_header_target(
+                zakura_header_chain::HeaderWorkAuthority::for_target(
                     &runtime.publisher().snapshot(),
                     child.hash,
                 ),
@@ -540,7 +543,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             7,
             child.hash,
             &[child.hash, anchor.hash],
-            zakura_header_chain::WorkScope::for_header_target(
+            zakura_header_chain::HeaderWorkAuthority::for_target(
                 &runtime.publisher().snapshot(),
                 child.hash,
             ),
@@ -573,7 +576,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                     9,
                     child.hash,
                     &[anchor.hash],
-                    zakura_header_chain::WorkScope::for_header_target(
+                    zakura_header_chain::HeaderWorkAuthority::for_target(
                         &runtime.publisher().snapshot(),
                         child.hash,
                     ),
@@ -589,7 +592,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 9,
                 child.hash,
                 &[anchor.hash],
-                zakura_header_chain::WorkScope::for_header_target(
+                zakura_header_chain::HeaderWorkAuthority::for_target(
                     &runtime.publisher().snapshot(),
                     child.hash,
                 ),
@@ -619,7 +622,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 10,
                 child.hash,
                 &[anchor.hash],
-                zakura_header_chain::WorkScope::for_header_target(
+                zakura_header_chain::HeaderWorkAuthority::for_target(
                     &runtime.publisher().snapshot(),
                     child.hash,
                 ),
@@ -633,14 +636,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         delivery_id: EvidenceId::from_digest([0xa1; 32]),
         header_hash: anchor.hash,
         source: SourceId::from_digest([0xa2; 32]),
-        owner: zakura_header_chain::WorkOwner {
-            state_version: snapshot.state_version,
-            header_generation: snapshot.header_generation,
-            verified_generation: Some(snapshot.verified_generation),
-            branch: zakura_header_chain::BranchId::new(anchor.hash, anchor.hash),
-            session_id: 11,
-            request_id: std::num::NonZeroU64::new(12).expect("twelve is nonzero"),
-        },
+        owner: body_owner(&snapshot, 11, 12).into(),
         body_size: zakura_header_chain::BodySizeHint::Unknown,
         tree_aux: None,
         authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,

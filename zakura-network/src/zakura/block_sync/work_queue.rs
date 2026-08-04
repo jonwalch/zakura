@@ -35,9 +35,9 @@ pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct WorkItem {
     /// Exact durable coordinates that authorized this body download.
-    pub(super) scope: zakura_header_chain::WorkScope,
+    pub(super) scope: zakura_header_chain::BodyWorkAuthority,
     /// Exact active range request, set only while reserved in flight.
-    pub(super) owner: Option<zakura_header_chain::WorkOwner>,
+    pub(super) owner: Option<zakura_header_chain::BodyWorkOwner>,
     /// Expected hash of the block at this height (drives the response match).
     pub(super) hash: block::Hash,
     /// The block's size estimate. Used for request budget reservation and the
@@ -136,7 +136,7 @@ impl WorkQueue {
     /// Returns the number of newly-inserted heights and wakes waiters if any.
     pub(super) fn extend(
         &self,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
     ) -> usize {
         let mut inserted = 0usize;
@@ -173,7 +173,10 @@ impl WorkQueue {
     ///
     /// This is applied before scheduling from a newly committed snapshot, so a
     /// height from an obsolete branch/generation cannot suppress its replacement.
-    pub(super) fn retire_obsolete_scope(&self, current: zakura_header_chain::WorkScope) -> u64 {
+    pub(super) fn retire_obsolete_scope(
+        &self,
+        current: zakura_header_chain::BodyWorkAuthority,
+    ) -> u64 {
         let mut inner = self.lock();
         let mut released = 0u64;
         inner.pending.retain(|_, item| {
@@ -377,7 +380,7 @@ impl WorkQueue {
 
     pub(super) fn mark_reserved_for_owner(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         self.mark_reserved_matching(Some(owner), heights)
@@ -385,7 +388,7 @@ impl WorkQueue {
 
     fn mark_reserved_matching(
         &self,
-        owner: Option<zakura_header_chain::WorkOwner>,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         let mut marked = 0u64;
@@ -394,7 +397,7 @@ impl WorkQueue {
             let Some(item) = inner.in_flight.get_mut(&height) else {
                 continue;
             };
-            if owner.is_some_and(|owner| item.scope != owner.scope()) {
+            if owner.is_some_and(|owner| item.scope != owner.authority()) {
                 continue;
             }
             if item.budget.is_reserved() {
@@ -418,7 +421,7 @@ impl WorkQueue {
 
     pub(super) fn release_active_reserved_height_for_owner(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Option<u64> {
         self.release_active_reserved_height_matching(Some(owner), height)
@@ -426,7 +429,7 @@ impl WorkQueue {
 
     fn release_active_reserved_height_matching(
         &self,
-        owner: Option<zakura_header_chain::WorkOwner>,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
     ) -> Option<u64> {
         let mut inner = self.lock();
@@ -452,7 +455,7 @@ impl WorkQueue {
 
     pub(super) fn claim_received_for_owner(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> u64 {
         self.claim_received_matching(Some(owner), height)
@@ -460,7 +463,7 @@ impl WorkQueue {
 
     fn claim_received_matching(
         &self,
-        owner: Option<zakura_header_chain::WorkOwner>,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
     ) -> u64 {
         let mut inner = self.lock();
@@ -496,7 +499,7 @@ impl WorkQueue {
 
     pub(super) fn release_reserved_heights_for_owner(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         self.release_reserved_heights_matching(Some(owner), heights)
@@ -504,7 +507,7 @@ impl WorkQueue {
 
     fn release_reserved_heights_matching(
         &self,
-        owner: Option<zakura_header_chain::WorkOwner>,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         let mut released = 0u64;
@@ -574,7 +577,7 @@ impl WorkQueue {
 
     pub(super) fn release_reserved_and_return_items_detailed_for_owner(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> WorkReturnOutcome {
         self.release_reserved_and_return_items_detailed_matching(Some(owner), heights)
@@ -582,7 +585,7 @@ impl WorkQueue {
 
     fn release_reserved_and_return_items_detailed_matching(
         &self,
-        owner: Option<zakura_header_chain::WorkOwner>,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> WorkReturnOutcome {
         let mut moved = false;
@@ -896,7 +899,7 @@ impl WorkQueue {
     pub(super) fn owner_for_height(
         &self,
         height: block::Height,
-    ) -> Option<zakura_header_chain::WorkOwner> {
+    ) -> Option<zakura_header_chain::BodyWorkOwner> {
         let inner = self.lock();
         inner
             .pending

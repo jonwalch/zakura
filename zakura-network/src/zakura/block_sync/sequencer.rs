@@ -28,7 +28,7 @@ use super::{events::BlockApplyToken, reorder::*, state::*, *};
 /// of thousands of decoded bodies resident at once).
 #[derive(Clone, Debug)]
 pub(super) struct ApplyingBlock {
-    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
     pub(super) source: zakura_header_chain::SourceId,
     pub(super) token: BlockApplyToken,
     pub(super) hash: block::Hash,
@@ -60,7 +60,7 @@ pub(super) enum AcceptOutcome {
 /// dispatches the matching `SubmitBlock` action.
 #[derive(Clone, Debug)]
 pub(super) struct SubmitItem {
-    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
     pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
@@ -74,7 +74,7 @@ pub(super) struct SubmitItem {
 /// from `applying`, so this record lives until the exact completion arrives.
 #[derive(Copy, Clone, Debug)]
 struct InFlightSubmission {
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     height: block::Height,
     hash: block::Hash,
@@ -353,7 +353,7 @@ impl Sequencer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn accept_buffered_body(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
@@ -616,7 +616,7 @@ impl Sequencer {
     /// exactly matches the token identity assigned at dispatch.
     pub(super) fn finish_submission(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
@@ -655,7 +655,7 @@ impl Sequencer {
     /// Keep the applying entry marked submitted so it is not dispatched again.
     pub(super) fn finish_attached_submission(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
@@ -740,7 +740,7 @@ impl Sequencer {
         &self,
         height: block::Height,
     ) -> Option<(
-        zakura_header_chain::WorkOwner,
+        zakura_header_chain::BodyWorkOwner,
         zakura_header_chain::SourceId,
         BlockApplyToken,
         block::Hash,

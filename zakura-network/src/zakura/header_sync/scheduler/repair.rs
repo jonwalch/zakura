@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use tokio::time::Instant;
 use zakura_chain::block;
-use zakura_header_chain::{EngineSnapshot, SourceId, VctRepairContext, WorkOwner};
+use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
 
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,7 +58,7 @@ pub(in crate::zakura::header_sync) enum RepairPolicyError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) struct RepairRequirement {
     /// Exact asynchronous owner fixed when work was scheduled.
-    pub owner: WorkOwner,
+    pub owner: BodyWorkOwner,
     /// Exact selected height whose auxiliary metadata must be replaced.
     pub height: block::Height,
     /// Durable repair-signal generation that owns this task.
@@ -73,7 +73,7 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
 
 impl RepairRequirement {
     /// Construct one scheduled exact-height repair.
-    pub fn new(owner: WorkOwner, height: block::Height, repair_generation: u64) -> Self {
+    pub fn new(owner: BodyWorkOwner, height: block::Height, repair_generation: u64) -> Self {
         Self {
             owner,
             height,
@@ -115,8 +115,8 @@ impl RepairRequirement {
     }
 
     /// Bind a resolved task to the actual canonical stream request.
-    pub fn assign(&mut self, owner: WorkOwner) -> Result<(), RepairPolicyError> {
-        if owner.scope() != self.owner.scope() {
+    pub fn assign(&mut self, owner: BodyWorkOwner) -> Result<(), RepairPolicyError> {
+        if owner.header_authority() != self.owner.header_authority() {
             return Err(RepairPolicyError::ScopeMismatch);
         }
         let RepairPolicyState::Ready { context } = &self.state else {
@@ -196,11 +196,6 @@ impl RepairRequirement {
             _ => None,
         }
     }
-
-    /// Whether durable state admitted this repair but has not cleared its signal yet.
-    pub fn is_completed(&self) -> bool {
-        self.state == RepairPolicyState::Completed
-    }
 }
 
 /// The sole optional VCT repair, when state requires one.
@@ -224,12 +219,12 @@ impl RepairRequirementSlot {
     }
 
     /// Return one exact task for phase handling.
-    pub fn get_mut(&mut self, owner: WorkOwner) -> Option<&mut RepairRequirement> {
+    pub fn get_mut(&mut self, owner: BodyWorkOwner) -> Option<&mut RepairRequirement> {
         self.0.as_mut().filter(|task| task.owner == owner)
     }
 
     /// Return one exact task without permitting mutation.
-    pub fn get(&self, owner: WorkOwner) -> Option<&RepairRequirement> {
+    pub fn get(&self, owner: BodyWorkOwner) -> Option<&RepairRequirement> {
         self.0.as_ref().filter(|task| task.owner == owner)
     }
 
@@ -250,8 +245,8 @@ impl RepairRequirementSlot {
     /// Rekey a resolved task from its scheduling owner to its actual wire owner.
     pub fn assign(
         &mut self,
-        scheduled_owner: WorkOwner,
-        wire_owner: WorkOwner,
+        scheduled_owner: BodyWorkOwner,
+        wire_owner: BodyWorkOwner,
     ) -> Result<(), RepairPolicyError> {
         self.get_mut(scheduled_owner)
             .ok_or(RepairPolicyError::IllegalState)?
@@ -259,7 +254,7 @@ impl RepairRequirementSlot {
     }
 
     /// Retire one completed, stale, or canceled task.
-    pub fn remove(&mut self, owner: WorkOwner) -> Option<RepairRequirement> {
+    pub fn remove(&mut self, owner: BodyWorkOwner) -> Option<RepairRequirement> {
         if self.0.as_ref().is_some_and(|task| task.owner == owner) {
             self.0.take()
         } else {
@@ -276,11 +271,9 @@ impl RepairRequirementSlot {
     pub fn retain_current(&mut self, current: &EngineSnapshot) -> Option<RepairRequirement> {
         let obsolete = self.0.as_ref().is_some_and(|task| {
             task.owner.header_generation != current.header_generation
-                || task
-                    .owner
-                    .verified_generation
-                    .is_some_and(|generation| generation != current.verified_generation)
-                || task.owner.branch.anchor_hash != current.frontiers.finalized.hash
+                || task.owner.verified_generation != current.verified_generation
+                || task.owner.header_authority().branch.anchor_hash
+                    != current.frontiers.finalized.hash
         });
         if obsolete {
             self.0.take()
@@ -302,8 +295,8 @@ mod tests {
 
     use zakura_chain::{block, work::difficulty::U256};
     use zakura_header_chain::{
-        AlarmSet, BranchId, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration,
-        StateVersion, SuffixWork, VerifiedGeneration,
+        AlarmSet, ChainScore, EngineMode, Frontier, FrontierSet, HeaderGeneration, StateVersion,
+        SuffixWork, VerifiedGeneration,
     };
 
     use super::*;
@@ -331,18 +324,9 @@ mod tests {
         }
     }
 
-    fn owner(snapshot: &EngineSnapshot) -> WorkOwner {
-        WorkOwner {
-            state_version: snapshot.state_version,
-            header_generation: snapshot.header_generation,
-            verified_generation: Some(snapshot.verified_generation),
-            branch: BranchId::new(
-                snapshot.frontiers.finalized.hash,
-                snapshot.frontiers.header_best.hash,
-            ),
-            session_id: 6,
-            request_id: NonZeroU64::new(7).expect("seven is nonzero"),
-        }
+    fn owner(snapshot: &EngineSnapshot) -> BodyWorkOwner {
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot)
+            .bind(6, NonZeroU64::new(7).expect("seven is nonzero"))
     }
 
     fn task(snapshot: &EngineSnapshot) -> RepairRequirement {

@@ -274,14 +274,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
                 .expect("the genesis anchor has a next height"),
             child_header.hash(),
         );
-        let owner = WorkOwner {
-            state_version: metadata.state_version,
-            header_generation: metadata.header_generation,
-            verified_generation: None,
-            branch: BranchId::new(anchor.hash, child.hash),
-            session_id: 1,
-            request_id: NonZeroU64::new(1).expect("one is nonzero"),
-        };
+        let owner = header_owner(&metadata.snapshot(), child.hash, 1, 1);
         let request = TransitionRequest {
             expected_version: metadata.state_version,
             event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {

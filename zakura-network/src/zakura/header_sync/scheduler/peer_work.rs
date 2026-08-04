@@ -1,7 +1,8 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use zakura_header_chain::{
-    EngineSnapshot, Frontier, HeaderLocator, SourceId, WorkOwner, WorkScope, MAX_STAGED_TARGETS_V1,
+    EngineSnapshot, Frontier, HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
+    MAX_STAGED_TARGETS_V1,
 };
 
 use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
@@ -17,7 +18,7 @@ pub(in crate::zakura::header_sync) const MAX_STAGED_HEADERS_V1: usize = 128;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedHeaderTarget {
     /// Durable generation and exact branch captured before locator work is scheduled.
-    pub scope: WorkScope,
+    pub scope: HeaderWorkAuthority,
     /// Ordered-stream generation that supplied this status.
     pub session_id: u64,
     /// Exact advisory snapshot supplied by the peer.
@@ -31,10 +32,6 @@ impl AdvertisedHeaderTarget {
     /// can advance it without changing the selected header graph or finality anchor.
     pub fn is_current(&self, local: &EngineSnapshot) -> bool {
         self.scope.header_generation == local.header_generation
-            && self
-                .scope
-                .verified_generation
-                .is_none_or(|generation| generation == local.verified_generation)
             && self.scope.branch.anchor_hash == local.frontiers.finalized.hash
             && self.scope.branch.target_tip_hash == self.status.selected_tip_hash
     }
@@ -76,7 +73,7 @@ pub struct ActiveHeaderRequest {
     /// Nonzero request correlation identifier.
     pub request_id: HeaderSyncRequestId,
     /// Durable generation and exact branch ownership fixed by the first request.
-    pub owner: WorkOwner,
+    pub owner: HeaderSyncWorkOwner,
     /// Exact authenticated intersection fixed by the first response.
     pub common_ancestor: Option<Frontier>,
     /// Complete response pages staged without intermediate state mutation.
@@ -259,11 +256,13 @@ impl PeerWorkQueue {
             .iter()
             .filter_map(|(peer, work)| match work {
                 PeerWorkState::Active(request)
-                    if request.owner.header_generation != current.header_generation
-                        || request.owner.verified_generation.is_some_and(|generation| {
-                            generation != current.verified_generation
+                    if request.owner.header_authority().header_generation
+                        != current.header_generation
+                        || request.owner.body_authority().is_some_and(|authority| {
+                            authority.verified_generation != current.verified_generation
                         })
-                        || request.owner.branch.anchor_hash != current.frontiers.finalized.hash =>
+                        || request.owner.header_authority().branch.anchor_hash
+                            != current.frontiers.finalized.hash =>
                 {
                     Some(peer.clone())
                 }
@@ -280,7 +279,7 @@ impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn registered_attempt(
         &self,
         peer: &ZakuraPeerId,
-    ) -> Option<(SourceId, WorkOwner)> {
+    ) -> Option<(SourceId, HeaderSyncWorkOwner)> {
         self.active(peer)
             .map(|request| (request.source, request.owner))
     }
@@ -340,7 +339,7 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         session_id: u64,
         target_tip_hash: zakura_chain::block::Hash,
-        scope: WorkScope,
+        scope: HeaderWorkAuthority,
     ) -> Option<&AdvertisedHeaderTarget> {
         match self.work_by_peer.get(peer) {
             Some(PeerWorkState::AwaitingLocator { target, .. })
@@ -381,7 +380,7 @@ impl PeerWorkQueue {
 
     pub(in crate::zakura::header_sync) fn remove_owner(
         &mut self,
-        owner: WorkOwner,
+        owner: HeaderSyncWorkOwner,
     ) -> Option<ActiveHeaderRequest> {
         let peer = self
             .work_by_peer
@@ -396,7 +395,7 @@ impl PeerWorkQueue {
     /// Return the active target carrying one exact durable owner.
     pub(in crate::zakura::header_sync) fn active_owner(
         &self,
-        owner: WorkOwner,
+        owner: HeaderSyncWorkOwner,
     ) -> Option<&ActiveHeaderRequest> {
         self.work_by_peer.values().find_map(|work| match work {
             PeerWorkState::Active(request) if request.owner == owner => Some(request.as_ref()),
@@ -418,7 +417,7 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         session_id: u64,
         target_tip_hash: zakura_chain::block::Hash,
-        scope: WorkScope,
+        scope: HeaderWorkAuthority,
     ) {
         if self
             .awaiting(peer, session_id, target_tip_hash, scope)
@@ -506,7 +505,7 @@ mod tests {
     fn advertisement(marker: u8) -> AdvertisedHeaderTarget {
         let local = snapshot();
         AdvertisedHeaderTarget {
-            scope: WorkScope::for_header_target(&local, hash(marker)),
+            scope: HeaderWorkAuthority::for_target(&local, hash(marker)),
             session_id: 7,
             status: Status {
                 work_anchor_height: block::Height(10),
@@ -540,18 +539,13 @@ mod tests {
             peer: peer(marker),
             source: SourceId::from_digest([marker; 32]),
             sent_locator: HeaderLocator::for_continuation(local.frontiers.finalized),
-            owner: WorkOwner {
-                state_version: local.state_version,
-                header_generation: local.header_generation,
-                verified_generation: None,
-                branch: zakura_header_chain::BranchId::new(
-                    local.frontiers.finalized.hash,
-                    target.status.selected_tip_hash,
-                ),
+            owner: zakura_header_chain::HeaderWorkOwner {
+                authority: HeaderWorkAuthority::for_target(local, target.status.selected_tip_hash),
                 session_id: target.session_id,
                 request_id: std::num::NonZeroU64::new(request_id.get())
                     .expect("header-sync request IDs are nonzero"),
-            },
+            }
+            .into(),
             target,
             request_id,
             common_ancestor: Some(local.frontiers.finalized),
@@ -640,17 +634,15 @@ mod tests {
             target: replacement.clone(),
             sent_locator: locator.clone(),
             request_id: HeaderSyncRequestId::new(1).expect("one is a nonzero request ID"),
-            owner: WorkOwner {
-                state_version: local.state_version,
-                header_generation: local.header_generation,
-                verified_generation: None,
-                branch: zakura_header_chain::BranchId::new(
-                    local.frontiers.finalized.hash,
+            owner: zakura_header_chain::HeaderWorkOwner {
+                authority: HeaderWorkAuthority::for_target(
+                    &local,
                     replacement.status.selected_tip_hash,
                 ),
                 session_id: 7,
                 request_id: std::num::NonZeroU64::new(1).expect("one is nonzero"),
-            },
+            }
+            .into(),
             common_ancestor: None,
             entries: Vec::new(),
             phase: HeaderTargetPhase::Receiving,

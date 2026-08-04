@@ -38,7 +38,7 @@ const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// control events that release budget and drive the next scheduling reaction.
 #[derive(Debug)]
 pub(super) struct SequencedBody {
-    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
     pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
@@ -53,7 +53,7 @@ pub(super) struct SequencedBody {
 impl SequencedBody {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_queued(
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
@@ -147,11 +147,13 @@ impl Drop for SequencerInputAccounting {
 pub(super) enum SequencerControlInput {
     /// Retire all body work from the previous authoritative scope before accepting new work.
     WorkScopeChanged {
-        scope: Option<zakura_header_chain::WorkScope>,
+        scope: Option<zakura_header_chain::BodyWorkAuthority>,
     },
+    /// Refresh the global CAS coordinate used only by synchronous state writes.
+    StateVersionChanged(zakura_header_chain::StateVersion),
     /// A committed transition cleared the persistent alarm for this exact work.
     BodyAlarmCleared {
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         hash: block::Hash,
     },
     /// A verified-tip advance (frontier growth/commit).
@@ -175,7 +177,7 @@ pub(super) enum SequencerControlInput {
     },
     /// A verifier apply completion.
     ApplyFinished {
-        owner: Box<zakura_header_chain::WorkOwner>,
+        owner: Box<zakura_header_chain::BodyWorkOwner>,
         source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
@@ -265,7 +267,9 @@ pub(super) struct SequencerTask {
     verified_block_hash: block::Hash,
     reset_epoch: u64,
     reaction_epoch: u64,
-    current_scope: Option<zakura_header_chain::WorkScope>,
+    current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
+    /// Global CAS coordinate for synchronous alarm writes, never body-work authority.
+    current_state_version: Option<zakura_header_chain::StateVersion>,
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
     retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
     body_input_rx: mpsc::Receiver<SequencedBody>,
@@ -304,7 +308,7 @@ impl SequencerTask {
         actions: mpsc::Sender<BlockSyncAction>,
         committed_throughput: ThroughputMeter,
         frontiers: BlockSyncFrontiers,
-        current_scope: Option<zakura_header_chain::WorkScope>,
+        current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
         retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
@@ -326,6 +330,8 @@ impl SequencerTask {
             reset_epoch: 0,
             reaction_epoch: 0,
             current_scope,
+            current_state_version: current_scope
+                .map(|_| zakura_header_chain::StateVersion::default()),
             body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
             retry_jitter,
             body_input_rx,
@@ -339,6 +345,15 @@ impl SequencerTask {
             submission_retry_attempt: 0,
             trace,
         }
+    }
+
+    /// Seed the synchronous state-write coordinate from the startup snapshot.
+    pub(super) fn with_initial_state_version(
+        mut self,
+        state_version: Option<zakura_header_chain::StateVersion>,
+    ) -> Self {
+        self.current_state_version = state_version.or(self.current_state_version);
+        self
     }
 
     pub(super) async fn run(mut self) {
@@ -414,6 +429,10 @@ impl SequencerTask {
                 let _ = self.sequencer.reset_to(verified_tip, false);
                 true
             }
+            SequencerControlInput::StateVersionChanged(state_version) => {
+                self.current_state_version = Some(state_version);
+                false
+            }
             SequencerControlInput::BodyAlarmCleared { scope, hash } => {
                 self.body_retries
                     .remove(scope.header_generation, scope.branch, hash);
@@ -478,7 +497,7 @@ impl SequencerTask {
     /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
     /// ready contiguous prefix into applying.
     fn handle_accept_body(&mut self, body: SequencedBody) {
-        let scope_is_current = self.current_scope == Some(body.owner.scope());
+        let scope_is_current = self.current_scope == Some(body.owner.authority());
         #[cfg(test)]
         let scope_is_current = scope_is_current || self.current_scope.is_none();
         if !scope_is_current {
@@ -638,7 +657,7 @@ impl SequencerTask {
     #[allow(clippy::too_many_arguments)]
     async fn handle_apply_finished(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
@@ -687,7 +706,9 @@ impl SequencerTask {
                 outcome.verification()
             {
                 self.send_action(BlockSyncAction::RecordBodyInvalid {
-                    expected_version: owner.state_version,
+                    expected_version: self.current_state_version.expect(
+                        "a semantically current body completion has a committed state version",
+                    ),
                     invalid: invalid.clone(),
                 })
                 .await;
@@ -705,7 +726,9 @@ impl SequencerTask {
             outcome.verification()
         {
             self.send_action(BlockSyncAction::RecordBodyUnavailable {
-                expected_version: owner.state_version,
+                expected_version: self
+                    .current_state_version
+                    .expect("a semantically current body completion has a committed state version"),
                 failure: *failure,
             })
             .await;
@@ -779,7 +802,7 @@ impl SequencerTask {
 
     fn record_body_retry(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         header: zakura_header_chain::Frontier,
         outcome: &mut BlockApplyOutcome,
@@ -790,7 +813,7 @@ impl SequencerTask {
         let Some(failure) = outcome.retryable_mut() else {
             self.body_retries
                 .remove(owner.header_generation, owner.branch, hash);
-            self.registry.clear_body_retry(owner.scope(), hash);
+            self.registry.clear_body_retry(owner.authority(), hash);
             return;
         };
         eligible_sources.insert(source);
@@ -851,11 +874,11 @@ impl SequencerTask {
             }
         }
         if restarted {
-            self.registry.clear_body_retry(owner.scope(), hash);
+            self.registry.clear_body_retry(owner.authority(), hash);
         }
         self.registry.defer_body_retry(
             deferred_sources,
-            owner.scope(),
+            owner.authority(),
             hash,
             retry_deadline_instant(retry_at),
         );
@@ -1437,6 +1460,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_version_refresh_does_not_retire_body_authority() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let scope = super::test_work_scope();
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(scope),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        assert!(
+            !task
+                .handle_control_input(SequencerControlInput::StateVersionChanged(
+                    zakura_header_chain::StateVersion::new(9),
+                ))
+                .await,
+            "a CAS-coordinate refresh does not require a scheduling reaction"
+        );
+        assert_eq!(task.current_scope, Some(scope));
+        assert_eq!(
+            task.current_state_version,
+            Some(zakura_header_chain::StateVersion::new(9))
+        );
+    }
+
+    #[tokio::test]
     async fn stale_retry_completion_releases_only_exact_infrastructure() {
         let frontiers = BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -1513,7 +1582,7 @@ mod tests {
         );
 
         let mut current_scope = super::test_work_scope();
-        current_scope.state_version = zakura_header_chain::StateVersion::new(9);
+        current_scope.verified_generation = zakura_header_chain::VerifiedGeneration::new(9);
         assert!(
             task.handle_control_input(SequencerControlInput::WorkScopeChanged {
                 scope: Some(current_scope),
@@ -1728,7 +1797,8 @@ mod tests {
                     Some(BlockSyncAction::RecordBodyInvalid {
                         expected_version,
                         invalid: actual,
-                    }) if expected_version == owner.state_version && actual == invalid
+                    }) if expected_version == zakura_header_chain::StateVersion::default()
+                        && actual == invalid
                 ));
                 assert!(matches!(
                     actions_rx.recv().await,
@@ -1766,15 +1836,7 @@ mod tests {
                 from: block::Height(1),
                 limit: 1,
                 best_header_tip: block::Height(1),
-                scope: zakura_header_chain::WorkScope {
-                    state_version: zakura_header_chain::StateVersion::new(0),
-                    header_generation: zakura_header_chain::HeaderGeneration::new(0),
-                    verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(0)),
-                    branch: zakura_header_chain::BranchId::new(
-                        block::Hash([0; 32]),
-                        block::Hash([0; 32]),
-                    ),
-                },
+                scope: super::test_work_scope(),
             })
             .expect("test fills the action channel");
         let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));

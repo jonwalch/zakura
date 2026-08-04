@@ -21,29 +21,29 @@ fn peer() -> ZakuraPeerId {
 }
 
 fn stale_failure(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
 ) -> Arc<zakura_header_chain::HeaderChainError> {
     Arc::new(zakura_header_chain::HeaderChainError::stale_target(
-        zakura_header_chain::ErrorSubject::Branch(owner.branch),
+        zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
     ))
 }
 
 fn local_failure(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
 ) -> Arc<zakura_header_chain::HeaderChainError> {
     Arc::new(zakura_header_chain::HeaderChainError::local_resource(
-        zakura_header_chain::ErrorSubject::Branch(owner.branch),
+        zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
         None,
     ))
 }
 
 fn invalid_header_failure(
     source: zakura_header_chain::SourceId,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
 ) -> Arc<zakura_header_chain::HeaderChainError> {
     Arc::new(zakura_header_chain::HeaderChainError::invalid_header(
         zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(
-            owner.branch.target_tip_hash,
+            owner.header_authority().branch.target_tip_hash,
         )),
         zakura_header_chain::RuleId::new("LC-VAL-02"),
         zakura_header_chain::EvidenceId::from_digest([0x71; 32]),
@@ -110,7 +110,7 @@ fn seed_applying_request(
     session_id: u64,
 ) -> (
     zakura_header_chain::SourceId,
-    zakura_header_chain::WorkOwner,
+    zakura_header_chain::HeaderSyncWorkOwner,
     zakura_header_chain::BranchId,
 ) {
     let source = source_id_from_peer(&peer);
@@ -127,17 +127,15 @@ fn seed_applying_request(
         header.hash(),
     );
     let request_id = HeaderSyncRequestId::new(9).expect("nine is nonzero");
-    let owner = zakura_header_chain::WorkOwner {
-        state_version: snapshot.state_version,
-        header_generation: snapshot.header_generation,
-        verified_generation: None,
-        branch: zakura_header_chain::BranchId::new(anchor.hash, target.hash),
+    let owner: zakura_header_chain::HeaderSyncWorkOwner = zakura_header_chain::HeaderWorkOwner {
+        authority: zakura_header_chain::HeaderWorkAuthority::for_target(snapshot, target.hash),
         session_id,
         request_id: NonZeroU64::new(request_id.get()).expect("the request ID is nonzero"),
-    };
+    }
+    .into();
     let advertised = AdvertisedHeaderTarget {
-        scope: zakura_header_chain::WorkScope::for_header_target(snapshot, target.hash),
-        session_id: owner.session_id,
+        scope: zakura_header_chain::HeaderWorkAuthority::for_target(snapshot, target.hash),
+        session_id: owner.session_id(),
         status: Status {
             work_anchor_height: anchor.height,
             work_anchor_hash: anchor.hash,
@@ -175,7 +173,7 @@ fn seed_applying_request(
         max_header_count: 1,
         tree_aux_schema: AuxSchema::None,
     }));
-    (source, owner, owner.branch)
+    (source, owner, owner.header_authority().branch)
 }
 
 fn peer_violation_fixture() -> (
@@ -184,7 +182,7 @@ fn peer_violation_fixture() -> (
     zakura_header_chain::EngineSnapshot,
     ZakuraPeerId,
     zakura_header_chain::SourceId,
-    zakura_header_chain::WorkOwner,
+    zakura_header_chain::HeaderSyncWorkOwner,
 ) {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown);

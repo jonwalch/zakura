@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn ordinary_header_insertion_rejects_body_repair_authority() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let mut request = insertion(&store, 1, EvidenceId::from_digest([0x2f; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+        panic!("the fixture request inserts headers");
+    };
+    let header_owner = insert
+        .owner
+        .header_owner()
+        .expect("the fixture is ordinary header work");
+    insert.owner = crate::BodyWorkOwner {
+        authority: crate::BodyWorkAuthority {
+            header: header_owner.authority,
+            verified_generation: store.metadata.verified_generation,
+        },
+        session_id: header_owner.session_id,
+        request_id: header_owner.request_id,
+    }
+    .into();
+
+    assert!(matches!(
+        apply_transition(&store, request, &context(&config, &clock, None)),
+        Err(TransitionFailure::InvalidEvidence(
+            "ordinary header insertion does not have pure header authority"
+        ))
+    ));
+}
+
+#[test]
 fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
     config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(1).expect("one is nonzero");
@@ -71,7 +101,18 @@ fn engine_rejects_context_free_batch_with_invalid_retained_time() {
         validation: HeaderValidationState::Valid,
     };
     insert.target_tip_hash = hash;
-    insert.owner.branch = BranchId::new(insert.parent_hash, hash);
+    let owner = insert
+        .owner
+        .header_owner()
+        .expect("the fixture is ordinary header work");
+    insert.owner = crate::HeaderWorkOwner {
+        authority: crate::HeaderWorkAuthority {
+            branch: BranchId::new(insert.parent_hash, hash),
+            ..owner.authority
+        },
+        ..owner
+    }
+    .into();
     insert.batch = PreparedHeaderBatch::new(
         vec![prepared],
         store.lease.parent,

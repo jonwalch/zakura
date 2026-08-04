@@ -49,14 +49,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
                 .expect("the genesis anchor has a next height"),
             child_header.hash(),
         );
-        let insertion_owner = WorkOwner {
-            state_version: initial.state_version,
-            header_generation: initial.header_generation,
-            verified_generation: None,
-            branch: BranchId::new(anchor.hash, child.hash),
-            session_id: 51,
-            request_id: NonZeroU64::new(52).expect("fifty-two is nonzero"),
-        };
+        let insertion_owner = header_owner(&initial, child.hash, 51, 52);
         let insertion_context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
@@ -104,14 +97,14 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             &SystemClock,
         )
         .expect("the selected header redelivery passes production validation");
-        let repair_owner = WorkScope::for_body_work(&before)
+        let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&before)
             .bind(53, NonZeroU64::new(54).expect("fifty-four is nonzero"));
         let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
         let delivery = AuxDelivery {
             delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
             header_hash: child.hash,
             source,
-            owner: repair_owner,
+            owner: repair_owner.into(),
             body_size: zakura_header_chain::BodySizeHint::Unknown,
             tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
                 height: child.height,
@@ -150,7 +143,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             TransitionRequest {
                 expected_version: before.state_version,
                 event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner: repair_owner,
+                    owner: repair_owner.into(),
                     source,
                     parent_hash: anchor.hash,
                     target_tip_hash: child.hash,
@@ -345,14 +338,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .expect("the first child has a next height");
         let current = Frontier::new(current_height, current_header.hash());
         let boundary = Frontier::new(boundary_height, boundary_header.hash());
-        let insertion_owner = WorkOwner {
-            state_version: initial.state_version,
-            header_generation: initial.header_generation,
-            verified_generation: None,
-            branch: BranchId::new(anchor.hash, boundary.hash),
-            session_id: 21,
-            request_id: NonZeroU64::new(22).expect("twenty-two is nonzero"),
-        };
+        let insertion_owner = header_owner(&initial, boundary.hash, 21, 22);
         let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
         let delivery = AuxDelivery {
             delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
@@ -416,14 +402,11 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         let request = TransitionRequest {
             expected_version: before.state_version,
             event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {
-                owner: WorkOwner {
-                    state_version: before.state_version,
-                    header_generation: before.header_generation,
-                    verified_generation: Some(before.verified_generation),
-                    branch: BranchId::new(anchor.hash, boundary.hash),
-                    session_id: insertion_owner.session_id,
-                    request_id: insertion_owner.request_id,
-                },
+                owner: body_owner(
+                    &before,
+                    insertion_owner.session_id(),
+                    insertion_owner.request_id().get(),
+                ),
                 deliveries: vec![delivery],
                 authentication,
             })),
@@ -570,13 +553,14 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .initialize(metadata.clone(), anchor.clone())
             .expect("the empty schema initializes");
         let marker = u8::try_from(index + 0x80).expect("the rejection cases fit in u8");
-        let delivery_owner = WorkScope::for_body_work(&metadata.snapshot())
-            .bind(61, NonZeroU64::new(62).expect("sixty-two is nonzero"));
+        let delivery_owner =
+            zakura_header_chain::BodyWorkAuthority::for_snapshot(&metadata.snapshot())
+                .bind(61, NonZeroU64::new(62).expect("sixty-two is nonzero"));
         let first = AuxDelivery {
             delivery_id: EvidenceId::from_digest([marker.wrapping_add(1); 32]),
             header_hash: anchor.hash,
             source: SourceId::from_digest([marker.wrapping_add(2); 32]),
-            owner: delivery_owner,
+            owner: delivery_owner.into(),
             body_size: zakura_header_chain::BodySizeHint::Unknown,
             tree_aux: None,
             authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
@@ -644,7 +628,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             TransitionRequest {
                 expected_version: before.state_version,
                 event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {
-                    owner: WorkScope::for_body_work(&before)
+                    owner: zakura_header_chain::BodyWorkAuthority::for_snapshot(&before)
                         .bind(delivery_owner.session_id, delivery_owner.request_id),
                     deliveries: vec![first, second],
                     authentication,

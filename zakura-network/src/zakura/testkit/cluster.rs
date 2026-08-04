@@ -316,8 +316,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(peer, hostile_id);
-                assert_eq!(owner.session_id, session_id);
-                assert_eq!(owner.scope(), scope);
+                assert_eq!(owner.session_id(), session_id);
+                assert_eq!(owner.header_authority(), scope);
                 assert_eq!(
                     common_ancestor,
                     zakura_header_chain::Frontier::new(anchor.0, anchor.1)

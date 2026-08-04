@@ -26,7 +26,7 @@ pub enum BlockSizeEstimate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BlockRangeRequest {
     /// Exact session/request and durable coordinates that own this range.
-    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
     pub(super) start_height: block::Height,
     pub(super) count: u32,
     pub(super) anchor_hash: block::Hash,

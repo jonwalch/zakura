@@ -78,7 +78,7 @@ impl ReorderBuffer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_body(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         height: block::Height,
         hash: block::Hash,
@@ -203,7 +203,7 @@ pub(super) enum ReorderInsertResult {
 /// into `applying` never forces a decode.
 #[derive(Clone, Debug)]
 pub(super) struct DrainedBlock {
-    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
     pub(super) source: zakura_header_chain::SourceId,
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
@@ -215,7 +215,7 @@ pub(super) struct DrainedBlock {
 
 #[derive(Clone, Debug)]
 struct BufferedBlock {
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     hash: block::Hash,
     previous_block_hash: block::Hash,

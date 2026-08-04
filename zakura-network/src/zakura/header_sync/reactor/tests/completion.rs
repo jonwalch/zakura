@@ -19,13 +19,13 @@ fn empty_complete_response_at_target_is_benign() {
 
     reactor.handle_headers(
         peer.clone(),
-        owner.session_id,
-        owner.scope(),
+        owner.session_id(),
+        owner.header_authority(),
         Headers {
-            request_id: owner.request_id.get(),
-            target_tip_hash: owner.branch.target_tip_hash,
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: target_height,
-            common_ancestor_hash: owner.branch.target_tip_hash,
+            common_ancestor_hash: owner.header_authority().branch.target_tip_hash,
             complete: true,
             tree_aux_schema: AuxSchema::None,
             entries: Vec::new(),
@@ -57,13 +57,13 @@ fn empty_complete_response_requires_the_exact_height_qualified_ancestor() {
 
     reactor.handle_headers(
         peer.clone(),
-        owner.session_id,
-        owner.scope(),
+        owner.session_id(),
+        owner.header_authority(),
         Headers {
-            request_id: owner.request_id.get(),
-            target_tip_hash: owner.branch.target_tip_hash,
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: block::Height(target_height.0.saturating_add(1)),
-            common_ancestor_hash: owner.branch.target_tip_hash,
+            common_ancestor_hash: owner.header_authority().branch.target_tip_hash,
             complete: true,
             tree_aux_schema: AuxSchema::None,
             entries: Vec::new(),
@@ -105,11 +105,11 @@ fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
 
     reactor.handle_headers(
         peer.clone(),
-        owner.session_id,
-        owner.scope(),
+        owner.session_id(),
+        owner.header_authority(),
         Headers {
-            request_id: owner.request_id.get(),
-            target_tip_hash: owner.branch.target_tip_hash,
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: staged_tip.height,
             common_ancestor_hash: staged_tip.hash,
             complete: false,
@@ -139,8 +139,11 @@ fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
             u32::try_from(MAX_STAGED_HEADERS_V1).expect("the staging cap fits in a height")
         )
     );
-    assert_eq!(prefix_owner.branch.target_tip_hash, target.hash);
-    assert_ne!(target.hash, owner.branch.target_tip_hash);
+    assert_eq!(
+        prefix_owner.header_authority().branch.target_tip_hash,
+        target.hash
+    );
+    assert_ne!(target.hash, owner.header_authority().branch.target_tip_hash);
     assert_eq!(
         completion,
         zakura_header_chain::TargetCompletion::TargetPrefix { common_ancestor }
@@ -429,7 +432,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     assert_eq!(common_ancestor, anchor);
     assert_eq!(admitted_target, target);
     assert_eq!(entries.len(), 2);
-    assert_eq!(owner.request_id.get(), first_request.request_id);
+    assert_eq!(owner.request_id().get(), first_request.request_id);
     let anchor_header = regtest_genesis_block().header.clone();
     let lease = zakura_header_chain::ValidationLease::new(
         anchor,
@@ -461,8 +464,15 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         batch,
         aux: Vec::new(),
     };
-    let mut stale_owner = owner;
-    stale_owner.session_id = stale_owner.session_id.saturating_add(1);
+    let exact_owner = owner
+        .header_owner()
+        .expect("the fixture is ordinary header work");
+    let stale_owner: zakura_header_chain::HeaderSyncWorkOwner =
+        zakura_header_chain::HeaderWorkOwner {
+            session_id: exact_owner.session_id.saturating_add(1),
+            ..exact_owner
+        }
+        .into();
     let mut stale_insert = insert.clone();
     stale_insert.owner = stale_owner;
     handle

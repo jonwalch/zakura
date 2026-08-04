@@ -183,13 +183,13 @@ enum ServedPathState {
         session_id: u64,
         request_id: HeaderSyncRequestId,
         target_tip_hash: block::Hash,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
     },
     Active {
         session_id: u64,
         lease_id: u64,
         target: zakura_header_chain::Frontier,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         next_after: zakura_header_chain::Frontier,
         pending_request: Option<PendingServedRequest>,
     },
@@ -200,7 +200,7 @@ struct PendingLeaseRelease {
     peer: ZakuraPeerId,
     session_id: u64,
     lease_id: u64,
-    scope: zakura_header_chain::WorkScope,
+    scope: zakura_header_chain::HeaderWorkAuthority,
 }
 
 impl PendingLeaseRelease {
@@ -263,8 +263,8 @@ struct PortPanicContext {
     peer: Option<ZakuraPeerId>,
     session_id: Option<u64>,
     session: Option<HeaderSyncPeerSession>,
-    scope: Option<zakura_header_chain::WorkScope>,
-    owner: Option<zakura_header_chain::WorkOwner>,
+    scope: Option<zakura_header_chain::HeaderWorkAuthority>,
+    owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
     target_tip_hash: Option<block::Hash>,
     lease_id: Option<u64>,
 }
@@ -349,7 +349,7 @@ fn vct_repair_task(
         return None;
     }
     let request_id = status.generation.checked_add(1).and_then(NonZeroU64::new)?;
-    let scope = zakura_header_chain::WorkScope::for_body_work(snapshot);
+    let scope = zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot);
     let owner = scope.bind(INTERNAL_VCT_REPAIR_SESSION_ID, request_id);
     Some(RepairRequirement::new(owner, height, status.generation))
 }
@@ -665,7 +665,9 @@ impl HeaderSyncReactor {
             },
         ) {
             previous.session.cancel_token().cancel();
-            if let Some((owner, source)) = replaced_repair {
+            if let Some((owner, source)) = replaced_repair
+                .and_then(|(owner, source)| owner.body_owner().map(|owner| (owner, source)))
+            {
                 self.retry_vct_repair(owner, source, HeaderRequestTerminal::SessionReplaced);
             }
         }
@@ -701,7 +703,15 @@ impl HeaderSyncReactor {
                 active.purpose,
                 HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
             )
-            .then_some((active.owner, active.source))
+            .then(|| {
+                (
+                    active
+                        .owner
+                        .body_owner()
+                        .expect("an auxiliary repair has body authority"),
+                    active.source,
+                )
+            })
         });
         self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         self.peer_state.remove(peer);
@@ -769,7 +779,7 @@ impl HeaderSyncReactor {
             return;
         };
         let target_tip_hash = status.selected_tip_hash;
-        let scope = zakura_header_chain::WorkScope::for_header_target(local, target_tip_hash);
+        let scope = zakura_header_chain::HeaderWorkAuthority::for_target(local, target_tip_hash);
         let target = AdvertisedHeaderTarget {
             scope,
             session_id,
@@ -835,7 +845,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         message: HeaderSyncMessage,
     ) {
         let Some(state) = self.peer_state.get(&peer) else {
@@ -965,7 +975,7 @@ impl HeaderSyncReactor {
             return;
         };
         let scope =
-            zakura_header_chain::WorkScope::for_header_target(local, request.target_tip_hash);
+            zakura_header_chain::HeaderWorkAuthority::for_target(local, request.target_tip_hash);
         self.served_paths.insert(
             peer.clone(),
             ServedPathState::Acquiring {
@@ -997,7 +1007,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
-        response_scope: zakura_header_chain::WorkScope,
+        response_scope: zakura_header_chain::HeaderWorkAuthority,
         response: Headers,
     ) {
         let Some(request_id) = HeaderSyncRequestId::new(response.request_id) else {
@@ -1012,7 +1022,7 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
-        if active.owner.scope() != response_scope {
+        if active.owner.header_authority() != response_scope {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
@@ -1046,7 +1056,10 @@ impl HeaderSyncReactor {
                 && response.entries[0].header.hash() == selected_target.hash;
             if !exact_shape {
                 self.retry_vct_repair(
-                    active.owner,
+                    active
+                        .owner
+                        .body_owner()
+                        .expect("an auxiliary repair has body authority"),
                     active.source,
                     HeaderRequestTerminal::MalformedResponse,
                 );
@@ -1126,7 +1139,19 @@ impl HeaderSyncReactor {
                 .expect("a response page fixed its exact ancestor");
             let completion = match active.purpose {
                 HeaderTargetPurpose::Normal if bounded_prefix => {
-                    active.owner.branch.target_tip_hash = staged_tip.hash;
+                    let owner = active
+                        .owner
+                        .header_owner()
+                        .expect("a normal target has header authority");
+                    active.owner = zakura_header_chain::HeaderWorkAuthority {
+                        branch: zakura_header_chain::BranchId {
+                            target_tip_hash: staged_tip.hash,
+                            ..owner.authority.branch
+                        },
+                        ..owner.authority
+                    }
+                    .bind(owner.session_id, owner.request_id)
+                    .into();
                     zakura_header_chain::TargetCompletion::TargetPrefix { common_ancestor }
                 }
                 HeaderTargetPurpose::Normal => {
@@ -1143,7 +1168,15 @@ impl HeaderSyncReactor {
                 active.purpose,
                 HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
             )
-            .then_some((active.owner, active.source));
+            .then(|| {
+                (
+                    active
+                        .owner
+                        .body_owner()
+                        .expect("an auxiliary repair has body authority"),
+                    active.source,
+                )
+            });
             active.phase = HeaderTargetPhase::Preparing;
             let action = HeaderPortOperation::PrepareHeaderTarget {
                 purpose: active.purpose.clone(),
@@ -1181,7 +1214,7 @@ impl HeaderSyncReactor {
         let negotiated_header_count = active.max_header_count;
         let tree_aux_schema = active.tree_aux_schema;
         let target_tip_hash = active.target.status.selected_tip_hash;
-        let request_scope = active.owner.scope();
+        let request_scope = active.owner.header_authority();
         let _ = active;
         let max_header_count = negotiated_header_count.min(
             u32::try_from(self.peer_work_queue.staging_capacity_remaining()).unwrap_or(u32::MAX),
@@ -1236,7 +1269,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         _session_id: u64,
-        response_scope: zakura_header_chain::WorkScope,
+        response_scope: zakura_header_chain::HeaderWorkAuthority,
         response: HeadersOutcome,
     ) {
         let Some(request_id) = HeaderSyncRequestId::new(response.request_id) else {
@@ -1251,7 +1284,7 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
-        if active.owner.scope() != response_scope {
+        if active.owner.header_authority() != response_scope {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         }
@@ -1266,7 +1299,14 @@ impl HeaderSyncReactor {
             HeaderRequestTerminal::MalformedResponse
         };
         if is_repair {
-            self.retry_vct_repair(active.owner, active.source, terminal_outcome);
+            self.retry_vct_repair(
+                active
+                    .owner
+                    .body_owner()
+                    .expect("an auxiliary repair has body authority"),
+                active.source,
+                terminal_outcome,
+            );
         } else {
             self.retire_peer_work(&peer, terminal_outcome);
         }
@@ -1293,7 +1333,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         source: zakura_header_chain::SourceId,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         result: HeaderTargetAdmissionResult,
     ) {
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
@@ -1340,20 +1380,23 @@ impl HeaderSyncReactor {
             },
         );
         if let Some(repair_generation) = repair_generation {
+            let repair_owner = owner
+                .body_owner()
+                .expect("an auxiliary repair admission has body authority");
             match result {
                 HeaderTargetAdmissionResult::Applied => {
                     let _ = self
                         .vct_repair
-                        .get_mut(owner)
+                        .get_mut(repair_owner)
                         .expect("the admitted repair remains owned by its active request")
                         .complete();
-                    if let Some(task) = self.vct_repair.get(owner) {
+                    if let Some(task) = self.vct_repair.get(repair_owner) {
                         self.emit_vct_repair_state(task, "admission", Some("applied"));
                     }
                     metrics::counter!("sync.header.vct.repair.admitted.total").increment(1);
                 }
                 HeaderTargetAdmissionResult::Failed(error) => {
-                    self.vct_repair.remove(owner);
+                    self.vct_repair.remove(repair_owner);
                     self.handle_typed_failure(peer, source, &error);
                     if repair_generation == self.vct_repair_status.generation {
                         self.schedule_current_vct_repair();
@@ -1364,8 +1407,9 @@ impl HeaderSyncReactor {
         }
         match result {
             HeaderTargetAdmissionResult::Applied => {
+                let authority = owner.header_authority();
                 self.completed_targets
-                    .mark(owner.header_generation, owner.branch);
+                    .mark(authority.header_generation, authority.branch);
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::Failed(error) => {
@@ -1378,7 +1422,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         source: zakura_header_chain::SourceId,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         result: HeaderTargetPreparationResult,
     ) {
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
@@ -1399,14 +1443,21 @@ impl HeaderSyncReactor {
                     return;
                 }
                 if is_repair {
-                    let valid = self.vct_repair.get(owner).is_some_and(|task| {
+                    let repair_owner = owner
+                        .body_owner()
+                        .expect("an auxiliary repair preparation has body authority");
+                    let valid = self.vct_repair.get(repair_owner).is_some_and(|task| {
                         let RepairPolicyState::Assigned { context } = &task.state else {
                             return false;
                         };
                         insert.target_tip_hash == context.target.hash && insert.aux.len() == 1
                     });
                     if !valid {
-                        self.retry_vct_repair(owner, source, HeaderRequestTerminal::RepairObsolete);
+                        self.retry_vct_repair(
+                            repair_owner,
+                            source,
+                            HeaderRequestTerminal::RepairObsolete,
+                        );
                         return;
                     }
                 }
@@ -1424,7 +1475,13 @@ impl HeaderSyncReactor {
                     insert,
                 }) {
                 } else if is_repair {
-                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::LocalError);
+                    self.retry_vct_repair(
+                        owner
+                            .body_owner()
+                            .expect("an auxiliary repair has body authority"),
+                        source,
+                        HeaderRequestTerminal::LocalError,
+                    );
                 } else {
                     self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
                 }
@@ -1438,7 +1495,13 @@ impl HeaderSyncReactor {
                     Some(&error),
                 );
                 if is_repair {
-                    self.retry_vct_repair(owner, source, HeaderRequestTerminal::TargetRejected);
+                    self.retry_vct_repair(
+                        owner
+                            .body_owner()
+                            .expect("an auxiliary repair has body authority"),
+                        source,
+                        HeaderRequestTerminal::TargetRejected,
+                    );
                 } else {
                     self.retire_peer_work(&peer, HeaderRequestTerminal::TargetRejected);
                 }
@@ -1452,7 +1515,7 @@ impl HeaderSyncReactor {
         event: &'static str,
         stage: &'static str,
         peer: &ZakuraPeerId,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
         error: Option<&zakura_header_chain::HeaderChainError>,
     ) {
         let direction = self
@@ -1462,13 +1525,13 @@ impl HeaderSyncReactor {
         self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
             row.insert(hs_trace::EVENT.into(), event.into());
             row.insert(hs_trace::PEER.into(), trace_peer_label(peer).into());
-            row.insert(hs_trace::SESSION_ID.into(), owner.session_id.into());
+            row.insert(hs_trace::SESSION_ID.into(), owner.session_id().into());
             row.insert(
                 hs_trace::DIRECTION.into(),
                 direction.map_or(serde_json::Value::Null, Into::into),
             );
-            insert_header_scope(row, owner.scope());
-            row.insert(hs_trace::REQUEST_ID.into(), owner.request_id.get().into());
+            insert_header_scope(row, owner.header_authority());
+            row.insert(hs_trace::REQUEST_ID.into(), owner.request_id().get().into());
             row.insert(hs_trace::STAGE.into(), stage.into());
             row.insert(
                 hs_trace::CATEGORY.into(),
@@ -1487,15 +1550,15 @@ impl HeaderSyncReactor {
 
     fn retry_vct_repair(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         source: zakura_header_chain::SourceId,
         terminal_outcome: HeaderRequestTerminal,
     ) {
-        if let Some(active) = self.peer_work_queue.active_owner(owner).cloned() {
+        if let Some(active) = self.peer_work_queue.active_owner(owner.into()).cloned() {
             self.emit_request_terminal(&active, terminal_outcome);
         }
-        self.cancel_owned_request(source, owner);
-        self.peer_work_queue.remove_owner(owner);
+        self.cancel_owned_request(source, owner.into());
+        self.peer_work_queue.remove_owner(owner.into());
         let peer = self
             .peer_state
             .iter()
@@ -1530,7 +1593,7 @@ impl HeaderSyncReactor {
                 hs_trace::EVENT.into(),
                 hs_trace::HEADER_VCT_REPAIR_STATE.into(),
             );
-            insert_header_scope(row, task.owner.scope());
+            insert_header_scope(row, task.owner.header);
             row.insert(hs_trace::SESSION_ID.into(), task.owner.session_id.into());
             row.insert(
                 hs_trace::REQUEST_ID.into(),
@@ -1559,7 +1622,7 @@ impl HeaderSyncReactor {
         if let Some(task) = self.vct_repair.take() {
             if let Some(peer) = self
                 .peer_work_queue
-                .active_owner(task.owner)
+                .active_owner(task.owner.into())
                 .map(|active| active.peer.clone())
             {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
@@ -1571,7 +1634,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         request: GetHeaders,
         result: HeaderPathLeaseResult,
     ) {
@@ -1684,7 +1747,7 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         session_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         request_id: HeaderSyncRequestId,
         target_tip_hash: block::Hash,
         result: HeaderPathPageResult,
@@ -1857,7 +1920,7 @@ impl HeaderSyncReactor {
         peer: ZakuraPeerId,
         session_id: u64,
         target_tip_hash: block::Hash,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         locator: Option<zakura_header_chain::HeaderLocator>,
     ) {
         let Some(target) = self
@@ -1957,7 +2020,7 @@ impl HeaderSyncReactor {
                     target,
                     sent_locator: locator,
                     request_id,
-                    owner,
+                    owner: owner.into(),
                     common_ancestor: None,
                     entries: Vec::new(),
                     phase: HeaderTargetPhase::Receiving,
@@ -2113,18 +2176,11 @@ impl HeaderSyncReactor {
             return;
         };
         let preserves_current = self.vct_repair.current().is_some_and(|task| {
-            let state_admission_owns_repair = task.is_completed()
-                || self
-                    .peer_work_queue
-                    .active_owner(task.owner)
-                    .is_some_and(|active| active.phase == HeaderTargetPhase::Applying);
             task.repair_generation == desired.repair_generation
                 && task.height == desired.height
                 && task.owner.header_generation == desired.owner.header_generation
                 && task.owner.verified_generation == desired.owner.verified_generation
                 && task.owner.branch == desired.owner.branch
-                && (task.owner.state_version == desired.owner.state_version
-                    || state_admission_owns_repair)
         });
         if preserves_current {
             return;
@@ -2166,7 +2222,7 @@ impl HeaderSyncReactor {
 
     fn handle_vct_repair_context_ready(
         &mut self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         result: VctRepairContextResult,
     ) {
         if self
@@ -2268,7 +2324,7 @@ impl HeaderSyncReactor {
         for (peer, source, session, mut status) in candidates {
             let request_id = match session.try_send_get_headers(
                 &self.codec,
-                task.owner.scope(),
+                task.owner.header,
                 context.target.hash,
                 &context.locator,
                 1,
@@ -2286,14 +2342,14 @@ impl HeaderSyncReactor {
             self.emit_header_request(
                 &peer,
                 session.session_id(),
-                task.owner.scope(),
+                task.owner.header,
                 request_id,
                 context.target.hash,
                 &context.locator,
                 1,
                 AuxSchema::V1,
             );
-            let wire_owner = task.owner.scope().bind(
+            let wire_owner = task.owner.authority.bind(
                 session.session_id(),
                 NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
             );
@@ -2308,7 +2364,7 @@ impl HeaderSyncReactor {
             status.selected_tip_hash = context.target.hash;
             status.max_headers_per_response = 1;
             let target = AdvertisedHeaderTarget {
-                scope: wire_owner.scope(),
+                scope: wire_owner.header,
                 session_id: session.session_id(),
                 status,
             };
@@ -2327,7 +2383,7 @@ impl HeaderSyncReactor {
                     target,
                     sent_locator: context.locator.clone(),
                     request_id,
-                    owner: wire_owner,
+                    owner: wire_owner.into(),
                     common_ancestor: None,
                     entries: Vec::new(),
                     phase: HeaderTargetPhase::Receiving,
@@ -2369,7 +2425,10 @@ impl HeaderSyncReactor {
                     ServedPathState::Active { target, scope, .. } => (target.hash, *scope),
                 };
                 (scope
-                    != zakura_header_chain::WorkScope::for_header_target(snapshot, target_tip_hash))
+                    != zakura_header_chain::HeaderWorkAuthority::for_target(
+                        snapshot,
+                        target_tip_hash,
+                    ))
                 .then(|| peer.clone())
             })
             .collect();
@@ -2410,7 +2469,7 @@ impl HeaderSyncReactor {
         if let Some(task) = self.vct_repair.retain_current(snapshot) {
             if let Some(peer) = self
                 .peer_work_queue
-                .active_owner(task.owner)
+                .active_owner(task.owner.into())
                 .map(|active| active.peer.clone())
             {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
@@ -2530,7 +2589,15 @@ impl HeaderSyncReactor {
                     active.purpose,
                     HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
                 )
-                .then_some((active.owner, active.source))
+                .then(|| {
+                    (
+                        active
+                            .owner
+                            .body_owner()
+                            .expect("an auxiliary repair has body authority"),
+                        active.source,
+                    )
+                })
             });
             if let Some((owner, source)) = repair {
                 if let Some(task) = self.vct_repair.get(owner) {
@@ -2542,7 +2609,7 @@ impl HeaderSyncReactor {
                 let session_id = self
                     .peer_work_queue
                     .active(&peer)
-                    .map(|active| active.owner.session_id);
+                    .map(|active| active.owner.session_id());
                 self.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
                 metrics::counter!("sync.header.target.timed_out.total").increment(1);
                 if let Some(session_id) = session_id {
@@ -2675,7 +2742,7 @@ impl HeaderSyncReactor {
         peer: ZakuraPeerId,
         session_id: u64,
         lease_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
     ) {
         let release = PendingLeaseRelease {
             peer,
@@ -2815,7 +2882,7 @@ impl HeaderSyncReactor {
         &self,
         peer: &ZakuraPeerId,
         session_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         request_id: HeaderSyncRequestId,
         target_hash: block::Hash,
         locator: &zakura_header_chain::HeaderLocator,
@@ -2873,7 +2940,7 @@ impl HeaderSyncReactor {
         event: &'static str,
         peer: &ZakuraPeerId,
         session_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::HeaderWorkAuthority,
         request_id: u64,
         target_hash: block::Hash,
         common_ancestor_height: block::Height,
@@ -3190,7 +3257,9 @@ impl HeaderSyncReactor {
                     {
                         let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
                             zakura_header_chain::HeaderChainError::stale_target(
-                                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                                zakura_header_chain::ErrorSubject::Branch(
+                                    owner.header_authority().branch,
+                                ),
                             ),
                         ));
                         return Box::new(move |reactor: &mut HeaderSyncReactor| {
@@ -3273,8 +3342,8 @@ impl HeaderSyncReactor {
                 "vct_repair_context",
                 None,
                 None,
-                Some(owner.scope()),
-                Some(*owner),
+                Some(owner.header),
+                Some((*owner).into()),
                 None,
                 None,
             ),
@@ -3330,8 +3399,8 @@ impl HeaderSyncReactor {
             } => (
                 "prepare_header_target",
                 Some(peer.clone()),
-                Some(owner.session_id),
-                Some(owner.scope()),
+                Some(owner.session_id()),
+                Some(owner.header_authority()),
                 Some(*owner),
                 Some(target.hash),
                 None,
@@ -3339,10 +3408,10 @@ impl HeaderSyncReactor {
             HeaderPortOperation::ApplyHeaderTarget { peer, owner, .. } => (
                 "apply_header_target",
                 Some(peer.clone()),
-                Some(owner.session_id),
-                Some(owner.scope()),
+                Some(owner.session_id()),
+                Some(owner.header_authority()),
                 Some(*owner),
-                Some(owner.branch.target_tip_hash),
+                Some(owner.header_authority().branch.target_tip_hash),
                 None,
             ),
             HeaderPortOperation::Misbehavior { peer, .. } => (
@@ -3438,7 +3507,12 @@ impl HeaderSyncReactor {
 
         if context.operation == "vct_repair_context" {
             if let Some(owner) = context.owner {
-                self.handle_vct_repair_context_ready(owner, VctRepairContextResult::Unavailable);
+                if let Some(owner) = owner.body_owner() {
+                    self.handle_vct_repair_context_ready(
+                        owner,
+                        VctRepairContextResult::Unavailable,
+                    );
+                }
             }
             return;
         }
@@ -3458,7 +3532,7 @@ impl HeaderSyncReactor {
                     },
                 )
             },
-            |owner| zakura_header_chain::ErrorSubject::Branch(owner.branch),
+            |owner| zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
         );
         let failure = zakura_header_chain::HeaderChainError::local_resource(subject, None);
         self.handle_typed_failure(peer.clone(), source, &failure);
@@ -3483,7 +3557,15 @@ impl HeaderSyncReactor {
                         active.purpose,
                         HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
                     )
-                    .then_some((active.owner, active.source))
+                    .then(|| {
+                        (
+                            active
+                                .owner
+                                .body_owner()
+                                .expect("an auxiliary repair has body authority"),
+                            active.source,
+                        )
+                    })
                 });
                 if let Some((owner, source)) = repair {
                     self.retry_vct_repair(owner, source, HeaderRequestTerminal::LocalError);
@@ -3529,7 +3611,7 @@ impl HeaderSyncReactor {
         &self,
         peer: &ZakuraPeerId,
         source: zakura_header_chain::SourceId,
-        owner: &zakura_header_chain::WorkOwner,
+        owner: &zakura_header_chain::HeaderSyncWorkOwner,
     ) -> bool {
         let Some(current) = self.committed_snapshot.as_ref() else {
             return false;
@@ -3656,7 +3738,7 @@ impl HeaderSyncReactor {
             return;
         }
         let direction = self.peer_state.get(&active.peer).and_then(|state| {
-            (state.session.session_id() == active.owner.session_id)
+            (state.session.session_id() == active.owner.session_id())
                 .then(|| header_direction_label(state.session.direction()))
         });
         self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
@@ -3665,12 +3747,15 @@ impl HeaderSyncReactor {
                 hs_trace::HEADER_REQUEST_TERMINAL.into(),
             );
             row.insert(hs_trace::PEER.into(), trace_peer_label(&active.peer).into());
-            row.insert(hs_trace::SESSION_ID.into(), active.owner.session_id.into());
+            row.insert(
+                hs_trace::SESSION_ID.into(),
+                active.owner.session_id().into(),
+            );
             row.insert(
                 hs_trace::DIRECTION.into(),
                 direction.map_or(serde_json::Value::Null, Into::into),
             );
-            insert_header_scope(row, active.owner.scope());
+            insert_header_scope(row, active.owner.header_authority());
             row.insert(hs_trace::REQUEST_ID.into(), active.request_id.get().into());
             row.insert(
                 hs_trace::TARGET_HASH.into(),
@@ -3684,7 +3769,7 @@ impl HeaderSyncReactor {
         let Some(state) = self.peer_state.get(&active.peer) else {
             return;
         };
-        if state.session.session_id() == active.owner.session_id {
+        if state.session.session_id() == active.owner.session_id() {
             state.session.cancel_request(active.request_id);
         }
     }
@@ -3692,15 +3777,16 @@ impl HeaderSyncReactor {
     fn cancel_owned_request(
         &self,
         source: zakura_header_chain::SourceId,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
     ) {
         let Some(state) = self.peer_state.iter().find_map(|(peer, state)| {
-            (state.session.session_id() == owner.session_id && source_id_from_peer(peer) == source)
+            (state.session.session_id() == owner.session_id()
+                && source_id_from_peer(peer) == source)
                 .then_some(state)
         }) else {
             return;
         };
-        let Some(request_id) = HeaderSyncRequestId::new(owner.request_id.get()) else {
+        let Some(request_id) = HeaderSyncRequestId::new(owner.request_id().get()) else {
             return;
         };
         state.session.cancel_request(request_id);
@@ -3819,23 +3905,16 @@ fn headers_outcome_label(outcome: HeadersOutcomeCode) -> &'static str {
 
 fn insert_header_scope(
     row: &mut serde_json::Map<String, serde_json::Value>,
-    scope: zakura_header_chain::WorkScope,
+    scope: zakura_header_chain::HeaderWorkAuthority,
 ) {
-    row.insert(
-        hs_trace::STATE_VERSION.into(),
-        scope.state_version.get().into(),
-    );
+    row.insert(hs_trace::STATE_VERSION.into(), serde_json::Value::Null);
     row.insert(
         hs_trace::HEADER_GENERATION.into(),
         scope.header_generation.get().into(),
     );
     row.insert(
         hs_trace::VERIFIED_GENERATION.into(),
-        scope
-            .verified_generation
-            .map_or(serde_json::Value::Null, |generation| {
-                generation.get().into()
-            }),
+        serde_json::Value::Null,
     );
     row.insert(
         hs_trace::BRANCH_ANCHOR.into(),

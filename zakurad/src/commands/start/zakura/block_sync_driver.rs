@@ -42,7 +42,7 @@ pub(crate) enum BlockApplyClass {
 
 #[derive(Clone, Debug)]
 struct PendingBlockApply {
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     class: BlockApplyClass,
@@ -687,7 +687,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
 fn abandon_block_apply(
     block_sync: &BlockSyncHandle,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: &block::Block,
@@ -719,7 +719,7 @@ fn abandon_block_apply(
 }
 
 pub(crate) fn abandoned_block_apply_finished_event(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: &block::Block,
@@ -1197,7 +1197,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     _endpoint: Option<ZakuraEndpoint>,
     _read_state: ReadState,
     block_sync: BlockSyncHandle,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     block: Arc<block::Block>,
@@ -1298,7 +1298,7 @@ where
 #[cfg(test)]
 pub(crate) async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     block: Arc<block::Block>,
     _class: BlockApplyClass,
@@ -1323,7 +1323,7 @@ async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     block: Arc<block::Block>,
     class: BlockApplyClass,
     trace: &ZakuraTrace,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     height: block::Height,
@@ -1365,7 +1365,7 @@ where
 }
 
 fn block_commit_outcome<E>(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     height: Option<block::Height>,
     expected_hash: block::Hash,
@@ -1464,7 +1464,7 @@ where
 }
 
 fn retryable_body_outcome(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     hash: block::Hash,
     kind: zakura_header_chain::TransientBodyFailureKind,
@@ -1484,7 +1484,7 @@ fn retryable_body_outcome(
 }
 
 fn probe_body_outcome(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     hash: block::Hash,
     result: BlockApplyResult,
@@ -1525,7 +1525,7 @@ fn probe_body_outcome(
 
 fn body_outcome_evidence(
     kind: &[u8],
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     hash: block::Hash,
     detail: &[u8],
@@ -1533,15 +1533,8 @@ fn body_outcome_evidence(
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-body-apply-outcome-v1");
     hash_bytes(&mut hasher, kind);
-    hasher.update(owner.state_version.get().to_le_bytes());
     hasher.update(owner.header_generation.get().to_le_bytes());
-    match owner.verified_generation {
-        Some(generation) => {
-            hasher.update([1]);
-            hasher.update(generation.get().to_le_bytes());
-        }
-        None => hasher.update([0]),
-    }
+    hasher.update(owner.verified_generation.get().to_le_bytes());
     hasher.update(owner.branch.anchor_hash.0);
     hasher.update(owner.branch.target_tip_hash.0);
     hasher.update(owner.session_id.to_le_bytes());
@@ -1837,12 +1830,16 @@ mod tests {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
     }
 
-    fn test_owner() -> zakura_header_chain::WorkOwner {
-        zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(1),
-            header_generation: zakura_header_chain::HeaderGeneration::new(1),
-            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
-            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([1; 32])),
+    fn test_owner() -> zakura_header_chain::BodyWorkOwner {
+        zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: zakura_header_chain::HeaderGeneration::new(1),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([0; 32]),
+                    block::Hash([1; 32]),
+                ),
+            },
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
         }
         .bind(
             1,

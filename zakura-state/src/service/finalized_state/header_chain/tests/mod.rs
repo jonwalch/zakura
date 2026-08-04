@@ -28,15 +28,39 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     AlarmSet, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
-    BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
-    EligibilityReason, EngineConfig, EngineMode, FinalityEpoch, FrontierSet,
-    FullStateEvidenceAuthority, HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration,
-    HeaderRules, HeaderValidationState, InsertHeaders, OperatorInvalidate, OperatorInvalidationId,
-    OperatorReconsider, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
-    TransientBodyFailure, TransientBodyFailureKind, TransitionEvent, TrustedAnchor,
-    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration,
-    WorkCoordinate, WorkOwner,
+    BodyUnavailableSummary, BodyValidationState, ChainScore, CheckpointSet, EligibilityReason,
+    EngineConfig, EngineMode, FinalityEpoch, FrontierSet, FullStateEvidenceAuthority,
+    HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration, HeaderRules, HeaderValidationState,
+    InsertHeaders, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, SourceId,
+    StateVersion, SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure,
+    TransientBodyFailureKind, TransitionEvent, TrustedAnchor, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, WorkCoordinate,
 };
+
+fn header_owner(
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    target: block::Hash,
+    session_id: u64,
+    request_id: u64,
+) -> zakura_header_chain::HeaderSyncWorkOwner {
+    zakura_header_chain::HeaderWorkAuthority::for_target(snapshot, target)
+        .bind(
+            session_id,
+            NonZeroU64::new(request_id).expect("fixture request IDs are nonzero"),
+        )
+        .into()
+}
+
+fn body_owner(
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    session_id: u64,
+    request_id: u64,
+) -> zakura_header_chain::BodyWorkOwner {
+    zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot).bind(
+        session_id,
+        NonZeroU64::new(request_id).expect("fixture request IDs are nonzero"),
+    )
+}
 
 struct Authority(EvidenceId);
 

@@ -183,7 +183,7 @@ fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>
 }
 
 fn header_hash_payload_mismatch(
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     requested: block::Hash,
     delivered: block::Hash,
@@ -192,17 +192,8 @@ fn header_hash_payload_mismatch(
         .hash_length(32)
         .personal(b"ZkBodyMismatch1_")
         .to_state();
-    hasher.update(&owner.state_version.get().to_le_bytes());
     hasher.update(&owner.header_generation.get().to_le_bytes());
-    match owner.verified_generation {
-        Some(generation) => {
-            hasher.update(&[1]);
-            hasher.update(&generation.get().to_le_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
+    hasher.update(&owner.verified_generation.get().to_le_bytes());
     hasher.update(&owner.branch.anchor_hash.0);
     hasher.update(&owner.branch.target_tip_hash.0);
     hasher.update(&owner.session_id.to_le_bytes());
@@ -1622,7 +1613,7 @@ impl PeerRoutine {
     #[allow(clippy::too_many_arguments)]
     async fn forward_body_to_sequencer(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
         hash: block::Hash,
         previous_block_hash: block::Hash,

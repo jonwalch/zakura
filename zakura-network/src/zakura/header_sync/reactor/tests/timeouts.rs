@@ -33,6 +33,13 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
         build_header_sync_reactor(startup).expect("the timeout fixture builds");
     let peer = peer();
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(owner.session_id(), owner.request_id());
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the fixture has one applying request")
+        .owner = owner.into();
     let repair_status = &reactor
         .peer_work_queue
         .active(&peer)
@@ -102,7 +109,7 @@ fn full_action_queue_retries_lease_release_on_maintenance() {
             .expect("the bounded action queue has exactly 128 slots");
     }
     let scope =
-        zakura_header_chain::WorkScope::for_header_target(&snapshot, block::Hash([0x33; 32]));
+        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, block::Hash([0x33; 32]));
 
     reactor.release_lease(peer.clone(), 7, 9, scope);
 

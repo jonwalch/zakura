@@ -64,14 +64,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
                 .expect("the genesis anchor has a next height"),
             future_header.hash(),
         );
-        let owner = WorkOwner {
-            state_version: initial.state_version,
-            header_generation: initial.header_generation,
-            verified_generation: None,
-            branch: BranchId::new(anchor.hash, future.hash),
-            session_id: 31,
-            request_id: NonZeroU64::new(32).expect("thirty-two is nonzero"),
-        };
+        let owner = header_owner(&initial, future.hash, 31, 32);
         let insertion_context = TransitionContext {
             config: &engine_config,
             clock: &preparation_clock,

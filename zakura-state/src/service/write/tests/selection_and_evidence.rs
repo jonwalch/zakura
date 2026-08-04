@@ -119,14 +119,7 @@ fn header_valid_body_invalidity_reselects_after_authenticated_evidence() {
             .expect("the genesis fixture has a next height"),
         child_header.hash(),
     );
-    let owner = WorkOwner {
-        state_version: initial.state_version,
-        header_generation: initial.header_generation,
-        verified_generation: None,
-        branch: BranchId::new(anchor.hash(), child.hash),
-        session_id: 1,
-        request_id: std::num::NonZeroU64::new(2).expect("two is nonzero"),
-    };
+    let owner = header_owner(&initial, child.hash, 1, 2);
     writer
         .runtime
         .apply(

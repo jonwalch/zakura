@@ -8,8 +8,9 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     AlarmSet, BranchId, ChainScore, CompletionDecision, CompletionGate, EngineMode, EngineSnapshot,
-    Frontier, FrontierSet, HeaderGeneration, HeaderLocator, PendingOwners, RetiredWork, SourceId,
-    StateVersion, SuffixWork, VerifiedGeneration, WorkOwner, WorkScope, MAX_STAGED_TARGETS_V1,
+    Frontier, FrontierSet, HeaderGeneration, HeaderLocator, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, HeaderWorkOwner, PendingOwners, RetiredWork, SourceId, StateVersion,
+    SuffixWork, VerifiedGeneration, MAX_STAGED_TARGETS_V1,
 };
 
 use super::{
@@ -84,13 +85,13 @@ enum ModelWork {
     Awaiting {
         session_id: u64,
         target: block::Hash,
-        scope: WorkScope,
+        scope: HeaderWorkAuthority,
         priority: PeerWorkPriority,
     },
     Active {
         session_id: u64,
         target: block::Hash,
-        owner: WorkOwner,
+        owner: HeaderSyncWorkOwner,
         phase: HeaderTargetPhase,
         ancestor_bound: bool,
     },
@@ -99,7 +100,7 @@ enum ModelWork {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct HeldCompletion {
     peer_key: u8,
-    owner: WorkOwner,
+    owner: HeaderSyncWorkOwner,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -181,7 +182,7 @@ impl PursuitHarness {
         let session_id = session(flags);
         let target = target(marker);
         let priority = priority(flags);
-        let scope = WorkScope::for_header_target(&self.snapshot, target);
+        let scope = HeaderWorkAuthority::for_target(&self.snapshot, target);
         let actual = self.queue.stage(
             peer(peer_key),
             advertisement(&self.snapshot, session_id, marker),
@@ -196,7 +197,7 @@ impl PursuitHarness {
         peer_key: u8,
         session_id: u64,
         target: block::Hash,
-        scope: WorkScope,
+        scope: HeaderWorkAuthority,
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
         if let Some(work) = self.model.get_mut(&peer_key) {
@@ -252,7 +253,7 @@ impl PursuitHarness {
     fn start(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
-        let supplied_scope = WorkScope::for_header_target(&self.snapshot, supplied_target);
+        let supplied_scope = HeaderWorkAuthority::for_target(&self.snapshot, supplied_target);
         let model_match = matches!(
             self.model.get(&peer_key),
             Some(ModelWork::Awaiting {
@@ -411,7 +412,7 @@ impl PursuitHarness {
             self.summary.refused_operations += 1;
             return;
         }
-        let request_id = HeaderSyncRequestId::new(owner.request_id.get())
+        let request_id = HeaderSyncRequestId::new(owner.request_id().get())
             .expect("work owners always contain nonzero request identifiers");
         let request = self
             .queue
@@ -428,7 +429,7 @@ impl PursuitHarness {
 
     fn disconnect(&mut self, peer_key: u8) {
         if let Some(ModelWork::Active { owner, .. }) = self.model.get(&peer_key).cloned() {
-            self.pending.remove(source(peer_key), owner.request_id);
+            self.pending.remove(source(peer_key), owner.request_id());
         }
         self.queue.remove(&peer(peer_key));
         self.queue.remove_unstarted(&peer(peer_key));
@@ -743,7 +744,18 @@ impl PursuitHarness {
         template.target.status.selected_tip_height =
             block::Height(anchor.height.0.saturating_add(4));
         template.target.status.selected_tip_hash = target;
-        template.owner.branch.target_tip_hash = target;
+        let owner = template
+            .owner
+            .header_owner()
+            .expect("the modeled request is ordinary header work");
+        template.owner = HeaderWorkOwner {
+            authority: HeaderWorkAuthority {
+                branch: BranchId::new(owner.authority.branch.anchor_hash, target),
+                ..owner.authority
+            },
+            ..owner
+        }
+        .into();
 
         let mut canonical = None;
         for partition in [vec![4], vec![1, 3], vec![2, 2], vec![1, 1, 2]] {
@@ -790,9 +802,9 @@ impl PursuitHarness {
         self.summary.partition_checks += 1;
     }
 
-    fn retire(&mut self, peer_key: u8, owner: WorkOwner) {
+    fn retire(&mut self, peer_key: u8, owner: HeaderSyncWorkOwner) {
         assert_eq!(
-            self.pending.remove(source(peer_key), owner.request_id),
+            self.pending.remove(source(peer_key), owner.request_id()),
             Some(owner),
             "retirement removes the exact pending owner"
         );
@@ -811,7 +823,7 @@ impl PursuitHarness {
         assert_eq!(retired.owner, completion.owner);
         assert_eq!(
             self.pending
-                .remove(source(completion.peer_key), completion.owner.request_id),
+                .remove(source(completion.peer_key), completion.owner.request_id()),
             Some(completion.owner),
             "an exact held owner retires only its own pending entry"
         );
@@ -943,7 +955,7 @@ fn priority(flags: u8) -> PeerWorkPriority {
 
 fn advertisement(snapshot: &EngineSnapshot, session_id: u64, marker: u8) -> AdvertisedHeaderTarget {
     AdvertisedHeaderTarget {
-        scope: WorkScope::for_header_target(snapshot, target(marker)),
+        scope: HeaderWorkAuthority::for_target(snapshot, target(marker)),
         session_id,
         status: Status {
             work_anchor_height: block::Height(10),
@@ -970,17 +982,12 @@ fn request(
     let request_id =
         NonZeroU64::new(request_value).expect("logical peer request identifiers are nonzero");
     let target = advertisement(snapshot, session_id, marker);
-    let owner = WorkOwner {
-        state_version: snapshot.state_version,
-        header_generation: snapshot.header_generation,
-        verified_generation: None,
-        branch: BranchId::new(
-            snapshot.frontiers.finalized.hash,
-            target.status.selected_tip_hash,
-        ),
+    let owner: HeaderSyncWorkOwner = HeaderWorkOwner {
+        authority: HeaderWorkAuthority::for_target(snapshot, target.status.selected_tip_hash),
         session_id,
         request_id,
-    };
+    }
+    .into();
     ActiveHeaderRequest {
         purpose: HeaderTargetPurpose::Normal,
         peer: peer(peer_key),

@@ -670,8 +670,9 @@ mod tests {
     use crate::{
         AlarmSet, AuxAuthentication, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BranchId,
         ChainScore, CheckpointSet, EligibilityState, EngineMode, EvidenceId, FinalityEpoch,
-        FrontierSet, HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState, SourceId,
-        StateVersion, SuffixWork, TrustedAnchor, VerifiedGeneration, WorkCoordinate, WorkOwner,
+        FrontierSet, HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState,
+        HeaderWorkAuthority, HeaderWorkOwner, SourceId, StateVersion, SuffixWork, TrustedAnchor,
+        VerifiedGeneration, WorkCoordinate,
     };
 
     #[derive(Clone)]
@@ -1037,14 +1038,15 @@ mod tests {
             delivery_id: evidence,
             header_hash: block::Hash([6; 32]),
             source: SourceId::from_digest([7; 32]),
-            owner: WorkOwner {
-                state_version: StateVersion::new(1),
-                header_generation: HeaderGeneration::new(1),
-                verified_generation: None,
-                branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
+            owner: HeaderWorkOwner {
+                authority: HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(1),
+                    branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
+                },
                 session_id: 1,
                 request_id: NonZeroU64::new(1).expect("one is nonzero"),
-            },
+            }
+            .into(),
             body_size: BodySizeHint::Unknown,
             tree_aux: None,
             authentication: AuxAuthentication::Unauthenticated,

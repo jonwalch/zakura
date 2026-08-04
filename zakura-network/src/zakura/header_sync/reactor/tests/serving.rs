@@ -72,7 +72,8 @@ fn new_request_replaces_idle_served_path_and_releases_its_lease() {
         build_header_sync_reactor(startup).expect("the serving fixture builds");
     let peer = peer();
     let old_target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x31; 32]));
-    let old_scope = zakura_header_chain::WorkScope::for_header_target(&snapshot, old_target.hash);
+    let old_scope =
+        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, old_target.hash);
     reactor.served_paths.insert(
         peer.clone(),
         ServedPathState::Active {

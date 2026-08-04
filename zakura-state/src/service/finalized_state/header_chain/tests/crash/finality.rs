@@ -296,14 +296,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
             )
             .expect("the equal-work competitor prepares through production validation");
             let before_insert = runtime.publisher().snapshot();
-            let owner = WorkOwner {
-                state_version: before_insert.state_version,
-                header_generation: before_insert.header_generation,
-                verified_generation: None,
-                branch: BranchId::new(anchor.hash, higher.hash),
-                session_id: 1,
-                request_id: NonZeroU64::new(1).expect("one is nonzero"),
-            };
+            let owner = header_owner(&before_insert, higher.hash, 1, 1);
             let context = TransitionContext {
                 config: &engine_config,
                 clock: &SystemClock,

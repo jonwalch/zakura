@@ -23,13 +23,13 @@ use crate::{
     EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord,
     FinalitySource, Frontier, FrontierSet, FullStateEvidenceAuthority, FullStateFinalized,
     GraphError, HeaderBatchInput, HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact,
-    HeaderFailure, HeaderGeneration, HeaderRule, HeaderRules, HeaderValidationState, InsertHeaders,
-    MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
-    PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, SuffixWork, TargetCompletion,
-    TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionFailure,
-    TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkOwner,
-    MAX_CANDIDATE_TIPS_V1,
+    HeaderFailure, HeaderGeneration, HeaderRule, HeaderRules, HeaderValidationState,
+    HeaderWorkAuthority, HeaderWorkOwner, InsertHeaders, MemHeaderStore, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
+    ProjectionDelta, SourceId, StateVersion, SuffixWork, TargetCompletion, TransientBodyFailure,
+    TransientBodyFailureKind, TransitionContext, TransitionFailure, TransitionPlan,
+    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -260,11 +260,11 @@ impl FuzzStore {
         TransitionRequest {
             expected_version: self.metadata.state_version,
             event: crate::TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                owner: WorkOwner {
-                    state_version: self.metadata.state_version,
-                    header_generation: self.metadata.header_generation,
-                    verified_generation: None,
-                    branch: BranchId::new(self.metadata.frontiers.finalized.hash, target),
+                owner: HeaderWorkOwner {
+                    authority: HeaderWorkAuthority {
+                        header_generation: self.metadata.header_generation,
+                        branch: BranchId::new(self.metadata.frontiers.finalized.hash, target),
+                    },
                     session_id: u64::try_from(operation).unwrap_or(u64::MAX),
                     request_id: NonZeroU64::new(
                         u64::try_from(operation)
@@ -272,7 +272,8 @@ impl FuzzStore {
                             .saturating_add(1),
                     )
                     .expect("the request identity is nonzero"),
-                },
+                }
+                .into(),
                 source: SourceId::from_digest([branch; 32]),
                 parent_hash: parent.hash,
                 target_tip_hash: target,

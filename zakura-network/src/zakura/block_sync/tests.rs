@@ -365,7 +365,10 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     };
     assert_eq!(from, block::Height(1));
     assert_eq!(best_header_tip, first_header.height);
-    assert_eq!(scope, zakura_header_chain::WorkScope::for_body_work(&first));
+    assert_eq!(
+        scope,
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(&first)
+    );
 
     let second_header =
         zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x22; 32]));
@@ -388,7 +391,7 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     assert_eq!(best_header_tip, second_header.height);
     assert_eq!(
         scope,
-        zakura_header_chain::WorkScope::for_body_work(&second)
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(&second)
     );
 
     reactor_task.abort();
@@ -438,7 +441,7 @@ fn state_is_only_frontier_publisher() {
 async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
     let snapshot = alarmed_committed_snapshot(header);
-    let scope = zakura_header_chain::WorkScope::for_body_work(&snapshot);
+    let scope = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
     let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
     startup.frontiers = BlockSyncFrontiers {
@@ -1806,8 +1809,8 @@ fn work_queue_extend_dedups_against_pending_in_flight_and_floor() {
 #[test]
 fn work_queue_separates_scopes_and_retires_obsolete_reservations() {
     let obsolete = test_work_scope();
-    let current = zakura_header_chain::WorkScope {
-        state_version: zakura_header_chain::StateVersion::new(9),
+    let current = zakura_header_chain::BodyWorkAuthority {
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
         ..obsolete
     };
     let queue = WorkQueue::new(block::Height(0));
@@ -4852,7 +4855,7 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         seq.applying_decoded_attributed_memory_bytes(),
         decoded_attributed_memory_bytes
     );
-    let wrong_owner = zakura_header_chain::WorkOwner {
+    let wrong_owner = zakura_header_chain::BodyWorkOwner {
         request_id: std::num::NonZeroU64::new(item.owner.request_id.get().saturating_add(1))
             .expect("incremented test request ID is nonzero"),
         ..item.owner
@@ -7628,7 +7631,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
                                 expected_version,
                                 failure,
                             } => {
-                                assert_eq!(expected_version, submit_owner.state_version);
+                                assert_eq!(expected_version, zakura_header_chain::StateVersion::default());
                                 assert_eq!(failure.hash, block.hash());
                                 assert_eq!(failure.availability.attempts, 1);
                                 saw_retry_persistence = true;
@@ -7678,7 +7681,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
                         expected_version,
                         failure,
                     } => {
-                        assert_eq!(expected_version, submit_owner.state_version);
+                        assert_eq!(expected_version, zakura_header_chain::StateVersion::default());
                         assert_eq!(failure.hash, block.hash());
                         assert_eq!(
                             failure.kind,

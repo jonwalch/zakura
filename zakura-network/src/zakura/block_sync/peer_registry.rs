@@ -135,7 +135,7 @@ struct BodyRetryKey {
 }
 
 impl BodyRetryKey {
-    fn new(scope: zakura_header_chain::WorkScope, hash: block::Hash) -> Self {
+    fn new(scope: zakura_header_chain::BodyWorkAuthority, hash: block::Hash) -> Self {
         Self {
             header_generation: scope.header_generation,
             branch: scope.branch,
@@ -169,7 +169,7 @@ pub(super) struct SlotDiagnostics {
 /// Published metadata for one unreceived outstanding height.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct OutstandingMeta {
-    pub(super) owner: zakura_header_chain::WorkOwner,
+    pub(super) owner: zakura_header_chain::BodyWorkOwner,
     pub(super) hash: block::Hash,
     pub(super) estimated_bytes: u64,
     pub(super) queued_at: Instant,
@@ -231,7 +231,7 @@ impl PeerRegistry {
     pub(super) fn defer_body_retry(
         &self,
         sources: impl IntoIterator<Item = zakura_header_chain::SourceId>,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         hash: block::Hash,
         until: Instant,
     ) {
@@ -244,7 +244,7 @@ impl PeerRegistry {
 
     pub(super) fn set_persisted_body_alarm(
         &self,
-        alarm: Option<(zakura_header_chain::WorkScope, block::Hash, Instant)>,
+        alarm: Option<(zakura_header_chain::BodyWorkAuthority, block::Hash, Instant)>,
     ) {
         let mut retries = self.body_retry_all_lock();
         retries.clear();
@@ -255,7 +255,7 @@ impl PeerRegistry {
 
     pub(super) fn clear_body_retry(
         &self,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         hash: block::Hash,
     ) {
         let key = BodyRetryKey::new(scope, hash);
@@ -264,7 +264,10 @@ impl PeerRegistry {
         self.body_retry_all_lock().remove(&key);
     }
 
-    pub(super) fn retain_body_retry_scope(&self, current: Option<zakura_header_chain::WorkScope>) {
+    pub(super) fn retain_body_retry_scope(
+        &self,
+        current: Option<zakura_header_chain::BodyWorkAuthority>,
+    ) {
         self.body_retry_lock().retain(|(_, key), _| {
             current.is_some_and(|scope| {
                 key.header_generation == scope.header_generation && key.branch == scope.branch
@@ -280,7 +283,7 @@ impl PeerRegistry {
     pub(super) fn is_body_retry_avoided(
         &self,
         peer: &ZakuraPeerId,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         hash: block::Hash,
         now: Instant,
     ) -> bool {
@@ -641,7 +644,7 @@ impl PeerRegistry {
     /// Whether the current committed scope already has this exact request.
     pub(super) fn has_outstanding_request_in_scope(
         &self,
-        scope: zakura_header_chain::WorkScope,
+        scope: zakura_header_chain::BodyWorkAuthority,
         height: block::Height,
         hash: block::Hash,
     ) -> bool {
@@ -650,7 +653,7 @@ impl PeerRegistry {
             entry
                 .outstanding
                 .get(&height)
-                .is_some_and(|meta| meta.hash == hash && meta.owner.scope() == scope)
+                .is_some_and(|meta| meta.hash == hash && meta.owner.authority() == scope)
         })
     }
 
@@ -686,7 +689,10 @@ impl PeerRegistry {
     }
 
     /// Total unreceived heights owned by one committed work scope.
-    pub(super) fn total_unreceived_in_scope(&self, scope: zakura_header_chain::WorkScope) -> usize {
+    pub(super) fn total_unreceived_in_scope(
+        &self,
+        scope: zakura_header_chain::BodyWorkAuthority,
+    ) -> usize {
         let peers = self.lock();
         peers
             .values()
@@ -694,7 +700,7 @@ impl PeerRegistry {
                 entry
                     .outstanding
                     .values()
-                    .filter(|meta| meta.owner.scope() == scope)
+                    .filter(|meta| meta.owner.authority() == scope)
                     .count()
             })
             .sum()
@@ -879,7 +885,7 @@ impl PeerRegistry {
         &self,
         peer: &ZakuraPeerId,
         height: block::Height,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
     ) -> bool {
         let mut peers = self.lock();
         let Some(entry) = peers.get_mut(peer) else {
@@ -1039,12 +1045,7 @@ mod floor_bias_tests {
         let (failed, alternate) = (peer(1), peer(2));
         register(&reg, &config, &failed, 1, 1, 1);
         register(&reg, &config, &alternate, 1, 1, 1);
-        let scope = zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(3),
-            header_generation: zakura_header_chain::HeaderGeneration::new(4),
-            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(5)),
-            branch: zakura_header_chain::BranchId::new(block::Hash([6; 32]), block::Hash([7; 32])),
-        };
+        let scope = super::super::test_work_scope();
         let hash = block::Hash([8; 32]);
         let now = Instant::now();
         let until = now + std::time::Duration::from_secs(1);
@@ -1079,8 +1080,11 @@ mod floor_bias_tests {
             hash,
             until,
         );
-        reg.retain_body_retry_scope(Some(zakura_header_chain::WorkScope {
-            header_generation: zakura_header_chain::HeaderGeneration::new(10),
+        reg.retain_body_retry_scope(Some(zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: zakura_header_chain::HeaderGeneration::new(10),
+                ..scope.header
+            },
             ..scope
         }));
         assert!(!reg.is_body_retry_avoided(&failed, scope, hash, now));
@@ -1093,12 +1097,7 @@ mod floor_bias_tests {
         let (first, second) = (peer(1), peer(2));
         register(&reg, &config, &first, 1, 1, 1);
         register(&reg, &config, &second, 1, 1, 1);
-        let scope = zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(3),
-            header_generation: zakura_header_chain::HeaderGeneration::new(4),
-            verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(5)),
-            branch: zakura_header_chain::BranchId::new(block::Hash([6; 32]), block::Hash([7; 32])),
-        };
+        let scope = super::super::test_work_scope();
         let hash = block::Hash([8; 32]);
         let now = Instant::now();
         let until = now + std::time::Duration::from_secs(60);
@@ -1109,8 +1108,11 @@ mod floor_bias_tests {
         assert!(!reg.is_body_retry_avoided(&first, scope, block::Hash([9; 32]), now));
         assert!(!reg.is_body_retry_avoided(
             &first,
-            zakura_header_chain::WorkScope {
-                header_generation: zakura_header_chain::HeaderGeneration::new(10),
+            zakura_header_chain::BodyWorkAuthority {
+                header: zakura_header_chain::HeaderWorkAuthority {
+                    header_generation: zakura_header_chain::HeaderGeneration::new(10),
+                    ..scope.header
+                },
                 ..scope
             },
             hash,
@@ -1291,7 +1293,7 @@ mod floor_bias_tests {
             )
             .generation();
         let current_owner = super::super::test_work_owner();
-        let stale_owner = zakura_header_chain::WorkOwner {
+        let stale_owner = zakura_header_chain::BodyWorkOwner {
             request_id: std::num::NonZeroU64::new(current_owner.request_id.get() + 1)
                 .expect("the incremented test request ID is nonzero"),
             ..current_owner
@@ -1312,14 +1314,14 @@ mod floor_bias_tests {
             )]),
         );
 
-        let obsolete_scope = zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(
-                current_owner.state_version.get().saturating_add(1),
+        let obsolete_scope = zakura_header_chain::BodyWorkAuthority {
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(
+                current_owner.verified_generation.get().saturating_add(1),
             ),
-            ..current_owner.scope()
+            ..current_owner.authority
         };
         assert!(reg.has_outstanding_request_in_scope(
-            current_owner.scope(),
+            current_owner.authority(),
             height,
             block::Hash([1; 32]),
         ));
@@ -1328,7 +1330,7 @@ mod floor_bias_tests {
             height,
             block::Hash([1; 32]),
         ));
-        assert_eq!(reg.total_unreceived_in_scope(current_owner.scope()), 1);
+        assert_eq!(reg.total_unreceived_in_scope(current_owner.authority()), 1);
         assert_eq!(reg.total_unreceived_in_scope(obsolete_scope), 0);
         assert!(!reg.clear_outstanding_height_for_owner(&peer, height, stale_owner));
         assert!(reg.peer_has_outstanding_height(&peer, height));

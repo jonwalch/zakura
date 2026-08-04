@@ -268,14 +268,15 @@ fn insertion(store: &TestStore, count: u32, evidence: EvidenceId) -> TransitionR
     TransitionRequest {
         expected_version: store.metadata.state_version,
         event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
-            owner: WorkOwner {
-                state_version: store.metadata.state_version,
-                header_generation: store.metadata.header_generation,
-                verified_generation: None,
-                branch: BranchId::new(store.metadata.frontiers.finalized.hash, target),
+            owner: crate::HeaderWorkOwner {
+                authority: crate::HeaderWorkAuthority {
+                    header_generation: store.metadata.header_generation,
+                    branch: BranchId::new(store.metadata.frontiers.finalized.hash, target),
+                },
                 session_id: 1,
                 request_id: NonZeroU64::new(1).expect("one is nonzero"),
-            },
+            }
+            .into(),
             source: SourceId::from_digest([3; 32]),
             parent_hash: store.lease.parent.hash,
             target_tip_hash: target,

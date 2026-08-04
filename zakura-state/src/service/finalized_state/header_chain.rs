@@ -14,15 +14,15 @@ use thiserror::Error;
 use tokio::{sync::watch, time::Instant};
 use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 use zakura_header_chain::{
-    audit_store, ApplyResult, AuxDelivery, AuxDelta, ChangeSet, CounterExhausted,
-    DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
-    EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
+    audit_store, ApplyResult, AuxDelivery, AuxDelta, BodyWorkAuthority, BodyWorkOwner, ChangeSet,
+    CounterExhausted, DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata,
+    EngineMode, EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
     FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderLocator, HeaderNode,
-    MemHeaderStore, NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId,
-    StaleReceipt, StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionCause,
-    TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest,
-    ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedHeaderRef, WorkOwner, WorkScope,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
+    RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
+    SystemClock, TransitionCause, TransitionContext, TransitionEvent, TransitionFailure,
+    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -319,7 +319,7 @@ struct RetainedPathLeaseSpec {
     common_ancestor: Frontier,
     finalized_path_end: Option<Frontier>,
     path: Arc<[block::Hash]>,
-    scope: WorkScope,
+    scope: HeaderWorkAuthority,
 }
 
 impl RetainedPathLeaseRegistry {
@@ -390,7 +390,7 @@ impl RetainedPathLeaseRegistry {
         peer: SourceId,
         session_id: u64,
         lease_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: HeaderWorkAuthority,
     ) -> bool {
         let matches = self.by_peer.get(&peer).is_some_and(|lease| {
             lease.session_id == session_id && lease.lease_id == lease_id && lease.scope == scope
@@ -695,7 +695,7 @@ impl HeaderChainReader {
     /// Resolve an exact, still-current VCT repair owner to one selected header request.
     pub(crate) fn vct_repair_context(
         &self,
-        owner: WorkOwner,
+        owner: BodyWorkOwner,
         height: block::Height,
     ) -> Result<Option<zakura_header_chain::VctRepairContext>, HeaderChainStoreError> {
         let _writer = self
@@ -707,7 +707,7 @@ impl HeaderChainReader {
             .store
             .snapshot()
             .map_err(HeaderChainStoreError::Store)?;
-        if owner.scope() != WorkScope::for_body_work(&snapshot)
+        if owner.authority != BodyWorkAuthority::for_snapshot(&snapshot)
             || height <= snapshot.frontiers.finalized.height
             || height > snapshot.frontiers.header_best.height
         {
@@ -746,7 +746,7 @@ impl HeaderChainReader {
         session_id: u64,
         target_tip_hash: block::Hash,
         locator_hashes: &[block::Hash],
-        scope: zakura_header_chain::WorkScope,
+        scope: HeaderWorkAuthority,
     ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
         if locator_hashes.is_empty()
             || locator_hashes.len() > zakura_header_chain::MAX_HEADER_LOCATOR_HASHES
@@ -761,7 +761,7 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let snapshot = self.store.snapshot()?;
-        if scope != zakura_header_chain::WorkScope::for_header_target(&snapshot, target_tip_hash) {
+        if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
             return Ok(RetainedPathLeaseOutcome::Busy);
         }
         let Some(target_node) = self.store.node(target_tip_hash)? else {
@@ -836,7 +836,7 @@ impl HeaderChainReader {
         peer: SourceId,
         session_id: u64,
         lease_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: HeaderWorkAuthority,
         after_hash: block::Hash,
         max_count: u32,
     ) -> Result<RetainedPathReadOutcome, HeaderChainStoreError> {
@@ -977,7 +977,7 @@ impl HeaderChainReader {
         peer: SourceId,
         session_id: u64,
         lease_id: u64,
-        scope: zakura_header_chain::WorkScope,
+        scope: HeaderWorkAuthority,
     ) -> Result<bool, HeaderChainStoreError> {
         Ok(self
             .leases
@@ -1120,7 +1120,7 @@ impl HeaderChainRuntime {
 
     fn apply_combined_inner<M>(
         &self,
-        mut request: TransitionRequest,
+        request: TransitionRequest,
         context: &TransitionContext<'_>,
         full_state_batch: DiskWriteBatch,
         memory_swap: M,
@@ -1159,14 +1159,20 @@ impl HeaderChainRuntime {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
         let event = request.event.idempotency_key();
-        let branch = request.event.work_owner().map(|owner| owner.branch);
+        let branch = request
+            .event
+            .header_sync_owner()
+            .map(HeaderSyncWorkOwner::header_authority)
+            .map(|authority| authority.branch)
+            .or_else(|| request.event.body_owner().map(|owner| owner.branch));
         let is_idempotent_replay =
             event.is_some_and(|event| transition_engine.metadata().last_transition_id == event);
         // Header insertions carry exact generation and branch ownership, which the transition
         // planner validates below. Unrelated body commits can advance only the global version
         // while a header batch is being prepared, so applying the ordinary version CAS here
         // would incorrectly reject still-current header work.
-        let has_generation_authority = matches!(&request.event, TransitionEvent::InsertHeaders(_));
+        let has_generation_authority =
+            request.event.header_sync_owner().is_some() || request.event.body_owner().is_some();
         if !is_idempotent_replay
             && !has_generation_authority
             && request.expected_version != before.state_version
@@ -1175,9 +1181,6 @@ impl HeaderChainRuntime {
                 current_version: before.state_version,
                 branch,
             }));
-        }
-        if has_generation_authority {
-            request.expected_version = before.state_version;
         }
         let durable = if is_idempotent_replay {
             DurableTransitionFacts::None

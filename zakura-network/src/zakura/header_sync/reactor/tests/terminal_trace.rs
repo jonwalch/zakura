@@ -24,8 +24,8 @@ fn trace_active_request(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId) -> Act
         .clone();
     reactor.emit_header_request(
         peer,
-        active.owner.session_id,
-        active.owner.scope(),
+        active.owner.session_id(),
+        active.owner.header_authority(),
         active.request_id,
         active.target.status.selected_tip_hash,
         &active.sent_locator,
@@ -61,7 +61,7 @@ async fn busy_outcome_emits_exact_bounded_request_terminal() {
     reactor.handle_headers_outcome(
         peer.clone(),
         session_id,
-        active.owner.scope(),
+        active.owner.header_authority(),
         HeadersOutcome {
             request_id: active.request_id.get(),
             target_tip_hash: active.target.status.selected_tip_hash,
@@ -73,7 +73,12 @@ async fn busy_outcome_emits_exact_bounded_request_terminal() {
     let reader = capture.reader().expect("the trace reloads");
     let header_trace = reader.table(HEADER_SYNC_TABLE.table());
     let target_hash = active.target.status.selected_tip_hash.to_string();
-    let anchor_hash = active.owner.branch.anchor_hash.to_string();
+    let anchor_hash = active
+        .owner
+        .header_authority()
+        .branch
+        .anchor_hash
+        .to_string();
     header_trace.assert_row(
         hs_trace::HEADER_REQUEST_TERMINAL,
         &[

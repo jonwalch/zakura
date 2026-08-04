@@ -95,7 +95,7 @@ pub struct BenchBodyFeeder {
     body_input_bytes: Arc<AtomicU64>,
     body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     bench_peer: ZakuraPeerId,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
 }
 
@@ -116,7 +116,7 @@ pub struct BenchCommitter {
     // (the rows the zakura-trace-plots skill consumes).
     trace: ZakuraTrace,
     finalized_height: block::Height,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     // The JSONL trace writer guard (when `trace_dir` was supplied). Flushed via
     // [`BenchCommitter::flush_trace`] so the trace tables are complete for review.
@@ -149,7 +149,7 @@ pub fn spawn_bench_sequencer(
         verified_block_tip,
         verified_block_hash,
     };
-    let owner = zakura_header_chain::WorkScope {
+    let owner = zakura_header_chain::BodyWorkAuthority {
         state_version: zakura_header_chain::StateVersion::new(1),
         header_generation: zakura_header_chain::HeaderGeneration::new(1),
         verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
@@ -193,7 +193,7 @@ pub fn spawn_bench_sequencer(
         actions_tx,
         throughput,
         frontiers,
-        Some(owner.scope()),
+        Some(owner.authority()),
         crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
         body_input_rx,
         control_rx,

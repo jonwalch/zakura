@@ -17,21 +17,20 @@ fn vct_repair_signal_schedules_one_exact_current_height() {
         vct_repair_task(&snapshot, status).expect("an in-range repair need schedules exact work");
     assert_eq!(task.height, block::Height(11));
     assert_eq!(task.repair_generation, 7);
-    assert_eq!(task.owner.state_version, snapshot.state_version);
-    assert_eq!(task.owner.header_generation, snapshot.header_generation);
     assert_eq!(
-        task.owner.verified_generation,
-        Some(snapshot.verified_generation)
+        task.owner.header_authority().header_generation,
+        snapshot.header_generation
     );
+    assert_eq!(task.owner.verified_generation, snapshot.verified_generation);
     assert_eq!(
-        task.owner.branch,
+        task.owner.header_authority().branch,
         zakura_header_chain::BranchId::new(
             snapshot.frontiers.finalized.hash,
             snapshot.frontiers.header_best.hash,
         )
     );
-    assert_eq!(task.owner.session_id, INTERNAL_VCT_REPAIR_SESSION_ID);
-    assert_eq!(task.owner.request_id.get(), 8);
+    assert_eq!(task.owner.session_id(), INTERNAL_VCT_REPAIR_SESSION_ID);
+    assert_eq!(task.owner.request_id().get(), 8);
 
     assert!(vct_repair_task(
         &snapshot,
@@ -90,8 +89,8 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     };
     assert_eq!(height, repair_header.height);
     assert_eq!(
-        owner.scope(),
-        zakura_header_chain::WorkScope::for_body_work(&snapshot)
+        owner.header_authority(),
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).header
     );
 
     let (send, mut outbound) = framed_channel(8);
@@ -150,7 +149,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
         .send(HeaderSyncEvent::SessionResponse {
             peer: peer.clone(),
             session_id: 0,
-            scope: owner.scope(),
+            scope: owner.header_authority(),
             msg: HeaderSyncMessage::Headers(Headers {
                 request_id: request.request_id,
                 target_tip_hash: repair_header.hash,
@@ -187,7 +186,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     else {
         panic!("the exact repair response is prepared off-reactor");
     };
-    assert_eq!(action_owner.session_id, 0);
+    assert_eq!(action_owner.session_id(), 0);
     assert_eq!(target, repair_header);
     assert!(matches!(
         purpose,
@@ -381,10 +380,10 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         panic!("the repair uses GetHeaders");
     };
 
-    snapshot.state_version = snapshot
-        .state_version
+    snapshot.verified_generation = snapshot
+        .verified_generation
         .checked_next()
-        .expect("the fixture state version can advance");
+        .expect("the fixture verified generation can advance");
     snapshots_tx
         .send(Some(snapshot))
         .expect("the replacement snapshot is published");
@@ -396,7 +395,7 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         .send(HeaderSyncEvent::SessionResponse {
             peer,
             session_id: 0,
-            scope: owner.scope(),
+            scope: owner.header_authority(),
             msg: HeaderSyncMessage::Headers(Headers {
                 request_id: request.request_id,
                 target_tip_hash: repair_header.hash,

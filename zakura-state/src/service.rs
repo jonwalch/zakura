@@ -1019,7 +1019,6 @@ impl StateService {
 
     fn send_header_chain_insert(
         &self,
-        expected_version: zakura_header_chain::StateVersion,
         insert: Box<zakura_header_chain::InsertHeaders>,
     ) -> oneshot::Receiver<Result<zakura_header_chain::ApplyResult, HeaderChainStoreError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
@@ -1028,11 +1027,7 @@ impl StateService {
             return rsp_rx;
         };
         if let Err(tokio::sync::mpsc::error::SendError(message)) =
-            sender.send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
-                expected_version,
-                insert,
-                rsp_tx,
-            })
+            sender.send(NonFinalizedWriteMessage::ApplyHeaderChainInsert { insert, rsp_tx })
         {
             let NonFinalizedWriteMessage::ApplyHeaderChainInsert { rsp_tx, .. } = message else {
                 unreachable!("the failed send returns the same header insertion message");
@@ -1291,11 +1286,8 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
-            Request::ApplyHeaderChainInsert {
-                expected_version,
-                insert,
-            } => {
-                let rsp_rx = self.send_header_chain_insert(expected_version, insert);
+            Request::ApplyHeaderChainInsert { insert } => {
+                let rsp_rx = self.send_header_chain_insert(insert);
                 async move {
                     rsp_rx
                         .await

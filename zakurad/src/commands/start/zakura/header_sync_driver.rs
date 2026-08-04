@@ -312,7 +312,7 @@ where
 
     fn vct_repair_context(
         &self,
-        owner: zakura_header_chain::WorkOwner,
+        owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> HeaderChainFuture<'_, Result<port::VctRepairContextReply, HeaderChainPortError>> {
         let read_state = self.read_state.clone();
@@ -392,15 +392,15 @@ where
 
 fn header_failure_evidence(
     source: zakura_header_chain::SourceId,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
     hash: block::Hash,
     rule: zakura_header_chain::RuleId,
 ) -> zakura_header_chain::EvidenceId {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-header-validation-failure-v1");
     hasher.update(source.digest());
-    hasher.update(owner.session_id.to_le_bytes());
-    hasher.update(owner.request_id.get().to_le_bytes());
+    hasher.update(owner.session_id().to_le_bytes());
+    hasher.update(owner.request_id().get().to_le_bytes());
     hasher.update(hash.0);
     hasher.update(rule.as_str().as_bytes());
     zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
@@ -410,7 +410,7 @@ fn classify_header_preparation_failure(
     error: zakura_header_chain::HeaderFailure,
     entries: &[port::HeaderTargetEntry],
     source: zakura_header_chain::SourceId,
-    owner: zakura_header_chain::WorkOwner,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
 ) -> zakura_header_chain::HeaderChainError {
     match error {
         zakura_header_chain::HeaderFailure::Invalid {
@@ -443,7 +443,7 @@ fn classify_header_preparation_failure(
             zakura_header_chain::HeaderChainError::malformed_protocol(
                 zakura_header_chain::ErrorSubject::Request {
                     source,
-                    request_id: owner.request_id,
+                    request_id: owner.request_id(),
                 },
                 zakura_header_chain::RuleId::new("LC-WIRE-08"),
                 source,
@@ -452,12 +452,12 @@ fn classify_header_preparation_failure(
         }
         zakura_header_chain::HeaderFailure::InvalidLease => {
             zakura_header_chain::HeaderChainError::stale_target(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
             )
         }
         zakura_header_chain::HeaderFailure::ClockRange => {
             zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                 Some(Box::new(zakura_header_chain::HeaderFailure::ClockRange)),
             )
         }
@@ -516,14 +516,14 @@ where
         Ok(Ok(zakura_state::ReadResponse::HeaderValidationLease(_))) => {
             return Err(Arc::new(
                 zakura_header_chain::HeaderChainError::stale_target(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                 ),
             ));
         }
         Ok(Ok(_)) => {
             return Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                     None,
                 ),
             ));
@@ -531,7 +531,7 @@ where
         Ok(Err(error)) => {
             return Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                     Some(error),
                 ),
             ));
@@ -539,7 +539,7 @@ where
         Err(_) => {
             return Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                     None,
                 ),
             ));
@@ -550,7 +550,7 @@ where
         let rules = zakura_header_chain::HeaderRules::for_validation_lease(network, &lease)
             .map_err(|error| {
                 Arc::new(zakura_header_chain::HeaderChainError::unknown_anchor(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                     Some(Box::new(error)),
                 ))
             })?;
@@ -579,8 +579,8 @@ where
             let mut hasher = Sha256::new();
             hasher.update(b"zakura-header-aux-delivery-v1");
             hasher.update(source.digest());
-            hasher.update(owner.session_id.to_le_bytes());
-            hasher.update(owner.request_id.get().to_le_bytes());
+            hasher.update(owner.session_id().to_le_bytes());
+            hasher.update(owner.request_id().get().to_le_bytes());
             hasher.update(prepared.hash.0);
             aux.push(zakura_header_chain::AuxDelivery {
                 delivery_id: zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into()),
@@ -601,7 +601,7 @@ where
         Err(error) => {
             return Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
-                    zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                     Some(Box::new(error)),
                 ),
             ));
@@ -638,10 +638,7 @@ where
     let owner = insert.owner;
     match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
-        state.oneshot(zakura_state::Request::ApplyHeaderChainInsert {
-            expected_version: owner.state_version,
-            insert,
-        }),
+        state.oneshot(zakura_state::Request::ApplyHeaderChainInsert { insert }),
     )
     .await
     {
@@ -653,24 +650,24 @@ where
             zakura_header_chain::ApplyResult::Stale(_),
         ))) => Err(Arc::new(
             zakura_header_chain::HeaderChainError::stale_target(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
             ),
         )),
         Ok(Ok(_)) => Err(Arc::new(
             zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                 None,
             ),
         )),
         Ok(Err(error)) => Err(Arc::new(
             zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                 Some(error),
             ),
         )),
         Err(_) => Err(Arc::new(
             zakura_header_chain::HeaderChainError::local_resource(
-                zakura_header_chain::ErrorSubject::Branch(owner.branch),
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
                 None,
             ),
         )),
@@ -947,17 +944,16 @@ mod tests {
 
     use super::*;
 
-    fn owner() -> zakura_header_chain::WorkOwner {
-        zakura_header_chain::WorkScope {
-            state_version: zakura_header_chain::StateVersion::new(1),
+    fn owner() -> zakura_header_chain::HeaderSyncWorkOwner {
+        zakura_header_chain::HeaderWorkAuthority {
             header_generation: zakura_header_chain::HeaderGeneration::new(2),
-            verified_generation: None,
             branch: zakura_header_chain::BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
         }
         .bind(
             3,
             NonZeroU64::new(4).expect("the fixture request ID is nonzero"),
         )
+        .into()
     }
 
     fn pending_read_state() -> tower::util::BoxCloneService<
@@ -1104,7 +1100,7 @@ mod tests {
         let mut page = port::RetainedHeaderPathPage {
             common_ancestor: frontier,
             target: frontier,
-            scope: owner().scope(),
+            scope: owner().header_authority(),
             headers: vec![node.header],
             aux_deliveries: vec![Vec::new()],
             complete: true,
@@ -1156,10 +1152,10 @@ mod tests {
         let peer = ZakuraPeerId::new(vec![7; 32]).expect("the peer identity has canonical width");
         let request = port::AcquireHeaderPath {
             source: source_id(&peer),
-            session_id: owner.session_id,
-            scope: owner.scope(),
-            target_tip_hash: owner.branch.target_tip_hash,
-            locator_hashes: vec![owner.branch.anchor_hash],
+            session_id: owner.session_id(),
+            scope: owner.header_authority(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            locator_hashes: vec![owner.header_authority().branch.anchor_hash],
         };
         let started = tokio::time::Instant::now();
 

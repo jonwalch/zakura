@@ -72,9 +72,9 @@ fn exact_vct_aux_window(
 ) -> VctAuxWindow {
     use std::num::NonZeroU64;
     use zakura_header_chain::{
-        AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, BranchId, ChainScore, EngineMode,
+        AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, ChainScore, EngineMode,
         EngineSnapshot, EvidenceId, Frontier, FrontierSet, HeaderGeneration, SourceId,
-        StateVersion, SuffixWork, TreeAuxRecordV1, VerifiedGeneration, WorkOwner,
+        StateVersion, SuffixWork, TreeAuxRecordV1, VerifiedGeneration,
     };
 
     let hash = block.hash();
@@ -95,14 +95,10 @@ fn exact_vct_aux_window(
         oldest_retained_height: height,
         alarms: AlarmSet::default(),
     };
-    let owner = WorkOwner {
-        state_version: snapshot.state_version,
-        header_generation: snapshot.header_generation,
-        verified_generation: Some(snapshot.verified_generation),
-        branch: BranchId::new(hash, successor_hash),
-        session_id: 1,
-        request_id: NonZeroU64::new(1).expect("one is nonzero"),
-    };
+    let owner: zakura_header_chain::HeaderSyncWorkOwner =
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+            .bind(1, NonZeroU64::new(1).expect("one is nonzero"))
+            .into();
     let mut current_delivery_id = [0; 32];
     current_delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
     let mut successor_delivery_id = current_delivery_id;
