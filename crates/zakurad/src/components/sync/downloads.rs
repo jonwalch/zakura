@@ -31,6 +31,7 @@ use zakura_chain::{
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
+use crate::components::block_verify_trace::{BlockSource, BlockVerifyTrace};
 use crate::components::sync::{
     legacy_trace::{
         LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -306,6 +307,9 @@ where
 
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
+
+    /// Per-block download and verification timing.
+    verify_trace: BlockVerifyTrace,
 }
 
 fn take_task_state(
@@ -393,6 +397,7 @@ where
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: ZN,
         verifier: ZV,
@@ -401,6 +406,7 @@ where
         lookahead_limit: usize,
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
+        verify_trace: BlockVerifyTrace,
     ) -> Self {
         let past_lookahead_limit_receiver =
             zs::WatchReceiver::new(past_lookahead_limit_sender.subscribe());
@@ -419,6 +425,7 @@ where
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
             trace,
+            verify_trace,
         }
     }
 
@@ -536,6 +543,7 @@ where
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
         let task_states = self.task_states.clone();
         let trace = self.trace.clone();
+        let verify_trace = self.verify_trace.clone();
 
         let task = tokio::spawn(
             async move {
@@ -786,6 +794,15 @@ where
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
                     .record(verify_start.elapsed().as_secs_f64());
+
+                verify_trace.record(
+                    BlockSource::Sync,
+                    Some(block_height),
+                    hash,
+                    verify_start.duration_since(download_start),
+                    verify_start.elapsed(),
+                    verification.as_ref().err().map(|error| error as &dyn std::fmt::Display),
+                );
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);
