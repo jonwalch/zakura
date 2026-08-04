@@ -439,6 +439,7 @@ impl StartCmd {
                     state.clone(),
                     read_only_state_service.clone(),
                     &config.network.network,
+                    &zakura_block_sync_handoff,
                 )
                 .await?,
             )
@@ -1755,10 +1756,15 @@ mod zakura_header_sync_driver_tests {
                 })
             };
 
-            let startup =
-                zakura_header_sync_driver_startup(state.clone(), read_state.clone(), &network)
-                    .await
-                    .expect("the first durable header driver starts");
+            let coordinator = zakura::SyncCoordinator::new();
+            let startup = zakura_header_sync_driver_startup(
+                state.clone(),
+                read_state.clone(),
+                &network,
+                &coordinator,
+            )
+            .await
+            .expect("the first durable header driver starts");
             let mut snapshots = startup.committed_snapshots.clone();
             let genesis_snapshot = wait_for_header_snapshot(&mut snapshots, block::Height(0)).await;
             let suffix: Vec<_> = blocks[..4]
@@ -1820,10 +1826,15 @@ mod zakura_header_sync_driver_tests {
                     }
                 })
             };
-            let startup =
-                zakura_header_sync_driver_startup(state.clone(), read_state.clone(), &network)
-                    .await
-                    .expect("the restarted durable header driver starts");
+            let coordinator = zakura::SyncCoordinator::new();
+            let startup = zakura_header_sync_driver_startup(
+                state.clone(),
+                read_state.clone(),
+                &network,
+                &coordinator,
+            )
+            .await
+            .expect("the restarted durable header driver starts");
             assert_eq!(
                 startup.best_header_tip,
                 Some((block::Height(4), blocks[3].hash()))

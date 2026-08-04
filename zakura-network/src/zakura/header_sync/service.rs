@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use tokio::{sync::mpsc, task};
+use tokio::{
+    sync::{mpsc, watch},
+    task,
+};
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 
@@ -447,6 +450,8 @@ pub(crate) async fn drive_header_sync_actions(
 pub(crate) struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
     peers: Arc<StdMutex<HashMap<ZakuraPeerId, HeaderSyncPeerRecord>>>,
+    service_demand:
+        Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
 }
 
 #[derive(Debug)]
@@ -462,7 +467,35 @@ impl HeaderSyncService {
         Self {
             header_sync,
             peers: Arc::new(StdMutex::new(HashMap::new())),
+            service_demand: None,
         }
+    }
+
+    pub(crate) fn with_service_demand(
+        mut self,
+        service_demand: Option<
+            watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
+        >,
+    ) -> Self {
+        self.service_demand = service_demand;
+        self
+    }
+
+    fn coordinator_demand(&self) -> Option<OrderedSessionDemand> {
+        let mut service_demand = self.service_demand.clone()?;
+        if service_demand.borrow().header.is_enabled() {
+            return None;
+        }
+        Some(OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            loop {
+                if service_demand.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                if service_demand.borrow().header.is_enabled() {
+                    return;
+                }
+            }
+        })))
     }
 }
 
@@ -489,6 +522,9 @@ impl Service for HeaderSyncService {
         _negotiated: u64,
         direction: ServicePeerDirection,
     ) -> OrderedSessionDemand {
+        if let Some(demand) = self.coordinator_demand() {
+            return demand;
+        }
         let mut peers = self.header_sync.subscribe_peer_snapshot();
         let snapshot = *peers.borrow_and_update();
         let slots_free = match direction {
@@ -529,6 +565,13 @@ impl Service for HeaderSyncService {
         _negotiated: u64,
         direction: ServicePeerDirection,
     ) -> bool {
+        if self
+            .service_demand
+            .as_ref()
+            .is_some_and(|demand| !demand.borrow().header.is_enabled())
+        {
+            return false;
+        }
         let replaces_same_direction = self
             .peers
             .lock()

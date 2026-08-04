@@ -14018,3 +14018,68 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
     ));
     reactor_task.abort();
 }
+
+#[tokio::test]
+async fn serving_only_coordinator_demand_keeps_block_session_available_during_fallback() {
+    use zakura_node_services::sync_lifecycle::{
+        BlockServiceDemand, HeaderServiceDemand, LifecycleEpoch, SyncServiceDemand,
+    };
+
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let applying = SyncServiceDemand {
+        header: HeaderServiceDemand::Enabled {
+            capability_epoch: LifecycleEpoch::new(1),
+        },
+        block: BlockServiceDemand::ServingAndApplying {
+            apply_epoch: LifecycleEpoch::new(2),
+        },
+    };
+    let (demand_tx, demand_rx) = watch::channel(applying);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone())
+        .with_service_demand(Some(demand_rx));
+    let peer = peer(10);
+    let conn_id = 18;
+    handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
+
+    let OrderedSessionDemand::WaitForChange(changed) = service.ordered_session_demand(
+        conn_id,
+        &peer,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+    ) else {
+        panic!("native applying demand waits at tip after a local session park");
+    };
+    demand_tx
+        .send(SyncServiceDemand {
+            block: BlockServiceDemand::ServingOnly {
+                apply_epoch: LifecycleEpoch::new(2),
+            },
+            ..applying
+        })
+        .expect("the block service retains its coordinator demand receiver");
+    tokio::time::timeout(Duration::from_secs(1), changed)
+        .await
+        .expect("fallback service demand wakes the parked ordered session");
+    assert!(matches!(
+        service.ordered_session_demand(
+            conn_id,
+            &peer,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow,
+    ));
+    reactor_task.abort();
+}

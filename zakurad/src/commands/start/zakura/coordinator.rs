@@ -5,7 +5,8 @@ use std::{
 
 use tokio::sync::{watch, Notify};
 use zakura_node_services::sync_lifecycle::{
-    ApplyPhase, ApplyTransition, LifecycleEpoch, LifecycleTransitionError,
+    ApplyPhase, ApplyTransition, HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    LifecycleTransitionError, SyncServiceDemand,
 };
 
 /// Sole process-local owner of bulk block-apply lifecycle transitions.
@@ -13,6 +14,8 @@ use zakura_node_services::sync_lifecycle::{
 pub(crate) struct SyncCoordinator {
     phase: Mutex<ApplyPhase>,
     phase_tx: watch::Sender<ApplyPhase>,
+    header_status: Mutex<HeaderRuntimeStatus>,
+    service_demand_tx: watch::Sender<SyncServiceDemand>,
     in_flight: std::sync::atomic::AtomicUsize,
     drained: Notify,
     phase_changed: Notify,
@@ -45,16 +48,48 @@ impl SyncCoordinator {
     }
 
     fn new_with_phase(phase: ApplyPhase) -> Arc<Self> {
+        let header_status = HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        };
         let (phase_tx, _phase_rx) = watch::channel(phase);
+        let (service_demand_tx, _service_demand_rx) =
+            watch::channel(SyncServiceDemand::from_phases(phase, &header_status));
         let coordinator = Arc::new(Self {
             phase: Mutex::new(phase),
             phase_tx,
+            header_status: Mutex::new(header_status),
+            service_demand_tx,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             drained: Notify::new(),
             phase_changed: Notify::new(),
         });
         coordinator.publish_phase(phase);
         coordinator
+    }
+
+    /// Subscribe to the one typed capability and ordered-service demand publication.
+    pub(crate) fn subscribe_service_demand(&self) -> watch::Receiver<SyncServiceDemand> {
+        self.service_demand_tx.subscribe()
+    }
+
+    /// Observe state-owned header attachment without letting consumers infer readiness.
+    pub(crate) fn observe_header_runtime(
+        &self,
+        observed: &HeaderRuntimeStatus,
+    ) -> Result<bool, LifecycleTransitionError> {
+        let mut current = self
+            .header_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current == *observed {
+            return Ok(false);
+        }
+        validate_header_observation(&current, observed)?;
+        *current = observed.clone();
+        drop(current);
+        self.publish_service_demand();
+        Ok(true)
     }
 
     /// Return the current authoritative apply phase.
@@ -221,6 +256,7 @@ impl SyncCoordinator {
     fn publish_phase(&self, phase: ApplyPhase) {
         self.phase_tx.send_replace(phase);
         self.phase_changed.notify_waiters();
+        self.publish_service_demand();
         // This diagnostic gauge may round epochs above f64's exact integer range;
         // lifecycle authority always uses the original checked u64 value.
         metrics::gauge!("sync.zakura.apply.epoch").set(phase.epoch().get() as f64);
@@ -237,6 +273,66 @@ impl SyncCoordinator {
             "sync apply lifecycle changed"
         );
     }
+
+    fn publish_service_demand(&self) {
+        let apply = self.apply_phase();
+        let header = self
+            .header_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let demand = SyncServiceDemand::from_phases(apply, &header);
+        self.service_demand_tx.send_replace(demand);
+        metrics::gauge!("sync.zakura.service.header_enabled")
+            .set(f64::from(demand.header.is_enabled()));
+        metrics::gauge!("sync.zakura.service.block_applying")
+            .set(f64::from(demand.block.is_applying()));
+        tracing::debug!(?demand, "sync ordered-service demand changed");
+    }
+}
+
+fn validate_header_observation(
+    current: &HeaderRuntimeStatus,
+    observed: &HeaderRuntimeStatus,
+) -> Result<(), LifecycleTransitionError> {
+    if observed.epoch() < current.epoch() {
+        return Err(LifecycleTransitionError::StaleEpoch {
+            expected: observed.epoch(),
+            current: current.epoch(),
+        });
+    }
+
+    if observed.epoch() > current.epoch() {
+        if current.epoch().checked_next() != Some(observed.epoch())
+            || !matches!(current, HeaderRuntimeStatus::Detached { .. })
+            || matches!(observed, HeaderRuntimeStatus::Detached { .. })
+        {
+            return Err(LifecycleTransitionError::IllegalPhase);
+        }
+        return Ok(());
+    }
+
+    let allowed = matches!(
+        (current, observed),
+        (
+            HeaderRuntimeStatus::Reconstructing { .. },
+            HeaderRuntimeStatus::Reconstructing { .. }
+                | HeaderRuntimeStatus::Ready { .. }
+                | HeaderRuntimeStatus::Failed { .. }
+        ) | (
+            HeaderRuntimeStatus::Detached { .. },
+            HeaderRuntimeStatus::Failed { .. }
+        ) | (
+            HeaderRuntimeStatus::Ready { .. },
+            HeaderRuntimeStatus::Ready { .. }
+        ) | (
+            HeaderRuntimeStatus::Failed { .. },
+            HeaderRuntimeStatus::Failed { .. }
+        )
+    );
+    allowed
+        .then_some(())
+        .ok_or(LifecycleTransitionError::IllegalPhase)
 }
 
 impl Drop for BlockApplyPermit {
@@ -318,5 +414,88 @@ mod tests {
             *phases.borrow(),
             ApplyPhase::Native { epoch: current } if current == epoch.checked_next().expect("test epoch advances")
         ));
+    }
+
+    #[tokio::test]
+    async fn one_demand_stream_tracks_header_capability_and_apply_epochs() {
+        use zakura_node_services::sync_lifecycle::{BlockServiceDemand, HeaderServiceDemand};
+
+        let coordinator = SyncCoordinator::new_legacy_bootstrap();
+        let mut demand = coordinator.subscribe_service_demand();
+        assert!(matches!(
+            demand.borrow_and_update().header,
+            HeaderServiceDemand::Disabled { .. }
+        ));
+        assert!(matches!(
+            demand.borrow().block,
+            BlockServiceDemand::ServingOnly { .. }
+        ));
+
+        coordinator
+            .observe_header_runtime(&HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("state readiness advances the coordinator header epoch");
+        demand
+            .changed()
+            .await
+            .expect("the coordinator demand publisher remains live");
+        assert!(matches!(
+            demand.borrow_and_update().header,
+            HeaderServiceDemand::Enabled {
+                capability_epoch
+            } if capability_epoch == LifecycleEpoch::new(1)
+        ));
+        assert!(matches!(
+            demand.borrow().block,
+            BlockServiceDemand::ServingOnly { .. }
+        ));
+
+        coordinator
+            .finish_legacy_bootstrap()
+            .expect("bootstrap hands apply ownership to native sync");
+        demand.changed().await.expect("native demand is published");
+        assert!(matches!(
+            demand.borrow_and_update().block,
+            BlockServiceDemand::ServingAndApplying { .. }
+        ));
+
+        let lease = coordinator
+            .acquire_legacy_fallback(Duration::from_millis(1))
+            .await
+            .expect("the empty native apply epoch drains");
+        assert!(matches!(
+            demand.borrow().block,
+            BlockServiceDemand::ServingOnly { .. }
+        ));
+        assert!(demand.borrow().header.is_enabled());
+        drop(lease);
+        assert!(matches!(
+            demand.borrow().block,
+            BlockServiceDemand::ServingAndApplying { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_header_observation_cannot_disable_current_demand() {
+        let coordinator = SyncCoordinator::new();
+        coordinator
+            .observe_header_runtime(&HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the first readiness epoch is current");
+        let stale = HeaderRuntimeStatus::Reconstructing {
+            epoch: LifecycleEpoch::INITIAL,
+            progress: zakura_node_services::sync_lifecycle::HeaderReconstructionProgress::STARTING,
+        };
+        assert!(matches!(
+            coordinator.observe_header_runtime(&stale),
+            Err(LifecycleTransitionError::StaleEpoch { .. })
+        ));
+        assert!(coordinator
+            .subscribe_service_demand()
+            .borrow()
+            .header
+            .is_enabled());
     }
 }

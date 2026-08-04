@@ -557,9 +557,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub verified_block_tip_hash: block::Hash,
     /// Durable header snapshots, whose value is absent until semantic handoff succeeds.
     pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
-    /// Explicit state-owned attachment/readiness lifecycle for capability epochs.
-    pub header_runtime_status:
-        watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
+    /// Coordinator-owned capability and ordered-service demand epochs.
+    pub service_demand: watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
     /// VCT metadata repair needs published by the finalized writer.
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed header-chain operations used directly by the reactor.
@@ -1729,10 +1728,15 @@ pub(crate) fn service_registry(
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<super::DiscoveryService>,
+    service_demand: Option<
+        watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
+    >,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone()];
     let header_sync_service = if let Some(header_sync) = &header_sync {
-        Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>
+        Arc::new(
+            HeaderSyncService::new(header_sync.clone()).with_service_demand(service_demand.clone()),
+        ) as Arc<dyn Service>
     } else {
         Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
     };
@@ -1747,7 +1751,7 @@ pub(crate) fn service_registry(
             None => BlockSyncService::new(block_sync_config),
         },
     };
-    let block_sync = Arc::new(block_sync) as Arc<dyn Service>;
+    let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
     discovery_service.set_connection_owners(vec![
         legacy_service,
         header_sync_service,
@@ -3255,29 +3259,21 @@ struct HeaderCapabilityEpochs {
 }
 
 impl HeaderCapabilityEpochs {
-    fn from_initial(status: &zakura_node_services::sync_lifecycle::HeaderRuntimeStatus) -> Self {
-        let applied_ready = match status {
-            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Ready { epoch } => {
-                Some(*epoch)
-            }
-            _ => None,
-        };
+    fn from_initial(demand: &zakura_node_services::sync_lifecycle::SyncServiceDemand) -> Self {
+        let applied_ready = demand.header.capability_epoch();
         Self { applied_ready }
     }
 
     fn observe(
         &mut self,
-        status: &zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+        demand: &zakura_node_services::sync_lifecycle::SyncServiceDemand,
     ) -> Option<zakura_node_services::sync_lifecycle::LifecycleEpoch> {
-        let zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Ready { epoch } = status
-        else {
-            return None;
-        };
-        if self.applied_ready.is_some_and(|applied| *epoch <= applied) {
+        let epoch = demand.header.capability_epoch()?;
+        if self.applied_ready.is_some_and(|applied| epoch <= applied) {
             return None;
         }
-        self.applied_ready = Some(*epoch);
-        Some(*epoch)
+        self.applied_ready = Some(epoch);
+        Some(epoch)
     }
 }
 
@@ -3425,6 +3421,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         block_sync.clone(),
     ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
+    let service_demand = header_sync_driver_startup
+        .as_ref()
+        .map(|startup| startup.service_demand.clone());
     let registry = service_registry(
         &supervisor,
         Some(header_sync.clone()),
@@ -3432,6 +3431,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.block_sync.clone(),
         legacy_service,
         discovery_service,
+        service_demand.clone(),
     )?;
     let mut tasks = vec![header_sync_task];
     if let Some(task) = block_sync_task {
@@ -3459,12 +3459,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         shutdown: header_sync_shutdown,
         tasks: Mutex::new(tasks),
     });
-    let header_runtime_status = header_sync_driver_startup
+    let header_sync_ready = service_demand
         .as_ref()
-        .map(|startup| startup.header_runtime_status.clone());
-    let header_sync_ready = header_runtime_status
-        .as_ref()
-        .is_some_and(|status| status.borrow().is_ready());
+        .is_some_and(|demand| demand.borrow().header.is_enabled());
     let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
         supervisor.clone(),
         config.network.clone(),
@@ -3493,14 +3490,14 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
 
-    if let Some(mut runtime_status) = header_runtime_status {
+    if let Some(mut service_demand) = service_demand {
         let capability_handler = endpoint.handler.clone();
         let capability_supervisor = endpoint.supervisor.clone();
         let shutdown = endpoint.background_shutdown_token();
         let task = tokio::spawn(async move {
-            let mut epochs = HeaderCapabilityEpochs::from_initial(&runtime_status.borrow());
+            let mut epochs = HeaderCapabilityEpochs::from_initial(&service_demand.borrow());
             loop {
-                let ready_epoch = epochs.observe(&runtime_status.borrow());
+                let ready_epoch = epochs.observe(&service_demand.borrow());
                 if let Some(epoch) = ready_epoch {
                     enable_header_sync_and_renegotiate(
                         &capability_handler,
@@ -3512,7 +3509,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    changed = runtime_status.changed() => {
+                    changed = service_demand.changed() => {
                         if changed.is_err() {
                             break;
                         }
@@ -5340,26 +5337,35 @@ mod tests {
     }
 
     #[test]
-    fn header_capability_epoch_is_applied_once_and_rejects_stale_status() {
+    fn header_capability_epoch_is_applied_once_and_rejects_stale_demand() {
         use zakura_node_services::sync_lifecycle::{
-            HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+            BlockServiceDemand, HeaderServiceDemand, LifecycleEpoch, SyncServiceDemand,
         };
 
-        let mut epochs = HeaderCapabilityEpochs::from_initial(&HeaderRuntimeStatus::Detached {
-            epoch: LifecycleEpoch::INITIAL,
-            reason: HeaderRuntimeDetachedReason::AttachmentPending,
-        });
-        let ready = HeaderRuntimeStatus::Ready {
-            epoch: LifecycleEpoch::new(2),
+        let disabled = SyncServiceDemand {
+            header: HeaderServiceDemand::Disabled {
+                runtime_epoch: LifecycleEpoch::INITIAL,
+            },
+            block: BlockServiceDemand::ServingAndApplying {
+                apply_epoch: LifecycleEpoch::INITIAL,
+            },
+        };
+        let mut epochs = HeaderCapabilityEpochs::from_initial(&disabled);
+        let ready = SyncServiceDemand {
+            header: HeaderServiceDemand::Enabled {
+                capability_epoch: LifecycleEpoch::new(2),
+            },
+            ..disabled
         };
         assert_eq!(epochs.observe(&ready), Some(LifecycleEpoch::new(2)));
         assert_eq!(epochs.observe(&ready), None);
-        assert_eq!(
-            epochs.observe(&HeaderRuntimeStatus::Ready {
-                epoch: LifecycleEpoch::new(1),
-            }),
-            None
-        );
+        let stale = SyncServiceDemand {
+            header: HeaderServiceDemand::Enabled {
+                capability_epoch: LifecycleEpoch::new(1),
+            },
+            ..disabled
+        };
+        assert_eq!(epochs.observe(&stale), None);
     }
 
     #[tokio::test]
@@ -6489,6 +6495,63 @@ mod tests {
             ),
             "an outbound slot should still allow lazy header-sync escalation"
         );
+
+        shutdown.cancel();
+        reactor_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn header_ordered_session_waits_for_coordinator_capability_epoch() -> Result<(), BoxError>
+    {
+        use zakura_node_services::sync_lifecycle::{
+            BlockServiceDemand, HeaderServiceDemand, LifecycleEpoch, SyncServiceDemand,
+        };
+
+        let shutdown = CancellationToken::new();
+        let (header_sync, _actions, reactor_task) =
+            spawn_header_sync_reactor(header_sync_startup(shutdown.clone()))?;
+        let disabled = SyncServiceDemand {
+            header: HeaderServiceDemand::Disabled {
+                runtime_epoch: LifecycleEpoch::INITIAL,
+            },
+            block: BlockServiceDemand::ServingOnly {
+                apply_epoch: LifecycleEpoch::INITIAL,
+            },
+        };
+        let (demand_tx, demand_rx) = watch::channel(disabled);
+        let service = HeaderSyncService::new(header_sync).with_service_demand(Some(demand_rx));
+        let peer = test_peer(171);
+        assert!(!service.wants_peer(
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ));
+        let OrderedSessionDemand::WaitForChange(changed) = service.ordered_session_demand(
+            test_conn_id(),
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ) else {
+            panic!("disabled coordinator demand must park the ordered header session");
+        };
+
+        demand_tx
+            .send(SyncServiceDemand {
+                header: HeaderServiceDemand::Enabled {
+                    capability_epoch: LifecycleEpoch::new(1),
+                },
+                ..disabled
+            })
+            .expect("the header service retains its demand receiver");
+        tokio::time::timeout(Duration::from_secs(1), changed)
+            .await
+            .expect("the capability epoch wakes ordered-session demand");
+        assert!(service.wants_peer(
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ));
 
         shutdown.cancel();
         reactor_task.await?;

@@ -203,6 +203,8 @@ impl BlockSyncPeerSession {
 #[derive(Debug)]
 pub(crate) struct BlockSyncService {
     inner: Arc<BlockSyncServiceInner>,
+    service_demand:
+        Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
     _held_events: Option<Arc<StdMutex<mpsc::Receiver<BlockSyncEvent>>>>,
     _reactor_task: Option<JoinHandle<()>>,
 }
@@ -293,6 +295,7 @@ impl BlockSyncService {
                 session_gap_claims: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
+            service_demand: None,
             _held_events: None,
             _reactor_task: None,
         }
@@ -330,6 +333,7 @@ impl BlockSyncService {
                 session_gap_claims: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
+            service_demand: None,
             _held_events: None,
             _reactor_task: Some(reactor_task),
         }
@@ -362,6 +366,7 @@ impl BlockSyncService {
                     session_gap_claims: StdMutex::new(HashMap::new()),
                     next_session_id: AtomicU64::new(1),
                 }),
+                service_demand: None,
                 _held_events: None,
                 _reactor_task: None,
             },
@@ -375,6 +380,16 @@ impl BlockSyncService {
         handle: BlockSyncHandle,
     ) -> Self {
         Self::new_with_handle(config, handle)
+    }
+
+    pub(crate) fn with_service_demand(
+        mut self,
+        service_demand: Option<
+            watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
+        >,
+    ) -> Self {
+        self.service_demand = service_demand;
+        self
     }
 
     #[cfg(test)]
@@ -468,15 +483,33 @@ impl Service for BlockSyncService {
         // exchange status and serve the remote. This gate applies only after a
         // local park: if another peer filled the body gap during the cooldown,
         // keep this session absent until block sync publishes useful work again.
-        if self.session_needs_body_work(peer, conn_id) {
+        let native_applying = self
+            .service_demand
+            .as_ref()
+            .is_none_or(|demand| demand.borrow().block.is_applying());
+        if native_applying && self.session_needs_body_work(peer, conn_id) {
             let mut candidates = self.inner.candidates.clone();
             if candidates
                 .borrow_and_update()
                 .missing_block_bodies
                 .is_empty()
             {
+                let mut service_demand = self.service_demand.clone();
                 return OrderedSessionDemand::WaitForChange(Box::pin(async move {
-                    if candidates.changed().await.is_err() {
+                    if let Some(demand) = service_demand.as_mut() {
+                        tokio::select! {
+                            changed = candidates.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            changed = demand.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        }
+                    } else if candidates.changed().await.is_err() {
                         std::future::pending::<()>().await;
                     }
                 }));

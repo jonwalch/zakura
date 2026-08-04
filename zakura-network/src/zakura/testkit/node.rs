@@ -562,6 +562,7 @@ impl ZakuraTestNodeBuilder {
             self.block_sync_config.clone(),
             base_service,
             discovery_service,
+            None,
         )?;
         let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),

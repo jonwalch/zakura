@@ -29,6 +29,7 @@ pub(crate) async fn zakura_header_sync_driver_startup<State>(
     state: State,
     read_state: zakura_state::ReadStateService,
     network: &zakura_chain::parameters::Network,
+    coordinator: &std::sync::Arc<super::SyncCoordinator>,
 ) -> Result<ZakuraHeaderSyncDriverStartup, Report>
 where
     State: Service<
@@ -88,6 +89,9 @@ where
     let committed_snapshots = read_state.subscribe_header_chain_snapshots();
     let mut header_runtime_status = read_state.subscribe_header_runtime_status();
     wait_for_header_runtime(&mut header_runtime_status).await?;
+    coordinator
+        .observe_header_runtime(&header_runtime_status.borrow())
+        .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
     if header_runtime_status.borrow().is_ready() && committed_snapshots.borrow().is_none() {
         return Err(eyre!(
             "header runtime reported ready before publishing its committed snapshot"
@@ -115,7 +119,7 @@ where
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
         committed_snapshots,
-        header_runtime_status,
+        service_demand: coordinator.subscribe_service_demand(),
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(state, read_state)),
     })

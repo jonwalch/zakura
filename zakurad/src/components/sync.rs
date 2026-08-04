@@ -1099,10 +1099,17 @@ where
     {
         self.request_genesis().await?;
 
-        while !header_runtime_status.borrow().is_ready() {
+        loop {
+            let runtime_status = header_runtime_status.borrow().clone();
+            block_sync_handoff
+                .observe_header_runtime(&runtime_status)
+                .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
+            if runtime_status.is_ready() {
+                break;
+            }
             if let zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed {
                 error, ..
-            } = &*header_runtime_status.borrow()
+            } = runtime_status
             {
                 return Err(eyre!("header runtime attachment failed: {error}"));
             }
@@ -1115,7 +1122,11 @@ where
             }
             self.update_metrics();
 
-            if !header_runtime_status.borrow().is_ready() {
+            let runtime_status = header_runtime_status.borrow().clone();
+            block_sync_handoff
+                .observe_header_runtime(&runtime_status)
+                .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
+            if !runtime_status.is_ready() {
                 let restart_delay = if self.is_regtest {
                     REGTEST_SYNC_RESTART_DELAY
                 } else {

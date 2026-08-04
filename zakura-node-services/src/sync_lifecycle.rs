@@ -371,6 +371,99 @@ pub enum HeaderRuntimeTransition {
     },
 }
 
+/// Coordinator-owned header ordered-service demand.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderServiceDemand {
+    /// Do not advertise or open header-sync sessions before runtime readiness.
+    Disabled {
+        /// Latest observed header-runtime generation.
+        runtime_epoch: LifecycleEpoch,
+    },
+    /// Advertise and schedule header sync exactly once for this readiness generation.
+    Enabled {
+        /// Monotonic capability/readiness generation.
+        capability_epoch: LifecycleEpoch,
+    },
+}
+
+impl HeaderServiceDemand {
+    /// Whether header capability advertisement and ordered sessions are authorized.
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    /// Return the capability generation when header demand is enabled.
+    pub const fn capability_epoch(self) -> Option<LifecycleEpoch> {
+        match self {
+            Self::Disabled { .. } => None,
+            Self::Enabled { capability_epoch } => Some(capability_epoch),
+        }
+    }
+}
+
+/// Coordinator-owned block ordered-service demand.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BlockServiceDemand {
+    /// Keep body serving live while legacy/bootstrap owns bulk application.
+    ServingOnly {
+        /// Exact apply generation represented by this demand.
+        apply_epoch: LifecycleEpoch,
+    },
+    /// Keep body serving live and admit native body application.
+    ServingAndApplying {
+        /// Exact native apply generation represented by this demand.
+        apply_epoch: LifecycleEpoch,
+    },
+}
+
+impl BlockServiceDemand {
+    /// Whether native body application is authorized in this demand generation.
+    pub const fn is_applying(self) -> bool {
+        matches!(self, Self::ServingAndApplying { .. })
+    }
+
+    /// Return the exact apply generation represented by this demand.
+    pub const fn apply_epoch(self) -> LifecycleEpoch {
+        match self {
+            Self::ServingOnly { apply_epoch } | Self::ServingAndApplying { apply_epoch } => {
+                apply_epoch
+            }
+        }
+    }
+}
+
+/// One coordinator publication consumed by capability and ordered-service scheduling.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct SyncServiceDemand {
+    /// Header capability/session demand.
+    pub header: HeaderServiceDemand,
+    /// Block serving/apply demand.
+    pub block: BlockServiceDemand,
+}
+
+impl SyncServiceDemand {
+    /// Derive the complete transport demand from authoritative lifecycle phases.
+    pub fn from_phases(apply: ApplyPhase, header: &HeaderRuntimeStatus) -> Self {
+        let header = match header {
+            HeaderRuntimeStatus::Ready { epoch } => HeaderServiceDemand::Enabled {
+                capability_epoch: *epoch,
+            },
+            _ => HeaderServiceDemand::Disabled {
+                runtime_epoch: header.epoch(),
+            },
+        };
+        let block = match apply {
+            ApplyPhase::Native { epoch } => {
+                BlockServiceDemand::ServingAndApplying { apply_epoch: epoch }
+            }
+            _ => BlockServiceDemand::ServingOnly {
+                apply_epoch: apply.epoch(),
+            },
+        };
+        Self { header, block }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +581,33 @@ mod tests {
             }),
             Err(LifecycleTransitionError::StaleEpoch { .. })
         ));
+    }
+
+    #[test]
+    fn service_demand_keeps_serving_separate_from_native_applying() {
+        let ready = HeaderRuntimeStatus::Ready {
+            epoch: LifecycleEpoch::new(3),
+        };
+        let native = SyncServiceDemand::from_phases(
+            ApplyPhase::Native {
+                epoch: LifecycleEpoch::new(4),
+            },
+            &ready,
+        );
+        assert_eq!(
+            native.header.capability_epoch(),
+            Some(LifecycleEpoch::new(3))
+        );
+        assert!(native.block.is_applying());
+
+        let fallback = SyncServiceDemand::from_phases(
+            ApplyPhase::LegacyFallback {
+                epoch: LifecycleEpoch::new(4),
+            },
+            &ready,
+        );
+        assert_eq!(fallback.header, native.header);
+        assert!(!fallback.block.is_applying());
+        assert_eq!(fallback.block.apply_epoch(), LifecycleEpoch::new(4));
     }
 }
