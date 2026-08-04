@@ -1513,7 +1513,7 @@ mod zakura_header_sync_driver_tests {
         collections::VecDeque,
         future,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
@@ -3412,7 +3412,10 @@ mod zakura_header_sync_driver_tests {
         let commit_count = Arc::new(AtomicUsize::new(0));
         let verifier = counting_verifier(commit_count.clone(), None);
         let handoff = super::zakura::BlockSyncHandoff::new();
-        handoff.yield_to_legacy(Duration::from_secs(1)).await;
+        let _fallback_lease = handoff
+            .acquire_legacy_fallback(Duration::from_secs(1))
+            .await
+            .expect("idle native applies yield to fallback");
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
@@ -3564,7 +3567,9 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("second block queues behind the full apply limit");
         let drain = tokio::spawn(async move {
-            drain_handoff.yield_to_legacy(Duration::from_secs(5)).await;
+            drain_handoff
+                .acquire_legacy_fallback(Duration::from_secs(5))
+                .await
         });
         tokio::task::yield_now().await;
         assert!(
@@ -3573,7 +3578,10 @@ mod zakura_header_sync_driver_tests {
         );
 
         release_first.notify_waiters();
-        drain.await.expect("fallback drain task exits");
+        let _fallback_lease = drain
+            .await
+            .expect("fallback drain task exits")
+            .expect("fallback acquires the lease after the apply drains");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
                 peer: test_zakura_peer(78),
@@ -3627,7 +3635,10 @@ mod zakura_header_sync_driver_tests {
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
         let handoff = super::zakura::BlockSyncHandoff::new();
-        handoff.yield_to_legacy(Duration::from_secs(1)).await;
+        let _fallback_lease = handoff
+            .acquire_legacy_fallback(Duration::from_secs(1))
+            .await
+            .expect("idle native applies yield to fallback");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
@@ -3704,7 +3715,10 @@ mod zakura_header_sync_driver_tests {
         let read_state =
             read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
         let handoff = super::zakura::BlockSyncHandoff::new();
-        handoff.yield_to_legacy(Duration::from_secs(1)).await;
+        let _fallback_lease = handoff
+            .acquire_legacy_fallback(Duration::from_secs(1))
+            .await
+            .expect("idle native applies yield to fallback");
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
@@ -4220,6 +4234,108 @@ mod zakura_header_sync_driver_tests {
 
         apply_task.abort();
         let _ = capture.finish().await.unwrap();
+        reactor_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn buffered_native_commit_blocks_legacy_fallback_past_every_diagnostic_interval() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let block_height = block.coinbase_height().expect("test block has height");
+        let (release_commit_tx, release_commit_rx) = tokio::sync::watch::channel(false);
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let mut release_commit_rx = release_commit_rx.clone();
+            async move {
+                match request {
+                    zakura_consensus::Request::Commit(block) => {
+                        while !*release_commit_rx.borrow() {
+                            release_commit_rx
+                                .changed()
+                                .await
+                                .expect("test commit release sender stays open");
+                        }
+                        Ok::<_, zakura_consensus::BoxError>(block.hash())
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
+            match request {
+                zakura_state::ReadRequest::FinalizedTip => {
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::FinalizedTip(None))
+                }
+                zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
+                    block_height,
+                    block_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let handoff = super::zakura::BlockSyncHandoff::new();
+        let permit = handoff
+            .begin_apply()
+            .expect("native apply owns a permit before fallback");
+        let apply = tokio::spawn(async move {
+            let _permit = permit;
+            apply_block_sync_body(
+                verifier,
+                zakura_chain::chain_tip::NoChainTip,
+                None,
+                read_state,
+                block_sync,
+                test_block_work_owner(),
+                test_block_source(),
+                89,
+                block,
+                BlockApplyClass::Full,
+                zakura_network::zakura::ZakuraTrace::noop(),
+                None,
+            )
+            .await
+        });
+
+        let legacy_started = Arc::new(AtomicBool::new(false));
+        let fallback_handoff = handoff.clone();
+        let fallback_started = legacy_started.clone();
+        let fallback = tokio::spawn(async move {
+            let lease = fallback_handoff
+                .acquire_legacy_fallback(Duration::from_secs(60))
+                .await
+                .expect("one fallback request owns the drain");
+            fallback_started.store(true, Ordering::SeqCst);
+            lease
+        });
+
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !legacy_started.load(Ordering::SeqCst),
+                "legacy apply authorization must stay blocked while the verifier commit is alive"
+            );
+            assert!(!fallback.is_finished());
+        }
+
+        release_commit_tx
+            .send(true)
+            .expect("the buffered commit receiver remains live");
+        apply.await.expect("the native buffered commit finishes");
+        let lease = fallback
+            .await
+            .expect("the fallback acquisition task finishes after the native commit");
+        assert!(legacy_started.load(Ordering::SeqCst));
+        assert!(handoff.begin_apply().is_none());
+
+        drop(lease);
+        assert!(
+            handoff.begin_apply().is_some(),
+            "native ownership resumes after the legacy fallback lease ends"
+        );
         reactor_task.abort();
     }
 

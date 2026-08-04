@@ -28,14 +28,18 @@ fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
         "native applies must stay disabled while legacy checkpoint bootstrap owns the verifier"
     );
 
-    handoff.finish_legacy_bootstrap();
+    handoff
+        .finish_legacy_bootstrap()
+        .expect("checkpoint bootstrap transfers ownership exactly once");
     let permit = handoff
         .clone()
         .begin_apply()
         .expect("native applies start after the durable checkpoint handoff");
     drop(permit);
 
-    handoff.finish_legacy_bootstrap();
+    handoff
+        .finish_legacy_bootstrap()
+        .expect_err("a duplicate checkpoint handoff is an explicit invalid transition");
     assert!(
         handoff.clone().begin_apply().is_some(),
         "repeating the one-way bootstrap signal must leave Zakura as owner"
@@ -46,7 +50,10 @@ fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
 fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
     let bootstrap_handoff =
         crate::commands::start::zakura::BlockSyncHandoff::new_legacy_bootstrap();
-    bootstrap_handoff.resume_zakura_after_fallback();
+    futures::executor::block_on(
+        bootstrap_handoff.acquire_legacy_fallback(std::time::Duration::from_secs(1)),
+    )
+    .expect_err("fallback recovery must not bypass initial checkpoint bootstrap ownership");
     assert!(
         bootstrap_handoff.begin_apply().is_none(),
         "fallback recovery must not bypass initial checkpoint bootstrap ownership"
@@ -54,11 +61,12 @@ fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
 
     let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
 
-    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
+    let lease = futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff))
+        .expect("a drained native pipeline yields one fallback lease");
     assert!(handoff.is_yielded_to_legacy());
     assert!(handoff.clone().begin_apply().is_none());
 
-    handoff.resume_zakura_after_fallback();
+    drop(lease);
     assert!(!handoff.is_yielded_to_legacy());
     assert!(
         handoff.begin_apply().is_some(),
@@ -402,7 +410,8 @@ fn stalled_zakura_with_legacy_fallback_keeps_zakura_reactors_alive() {
         "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
     let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
-    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
+    let _lease = futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff))
+        .expect("an idle native pipeline yields one fallback lease");
     assert!(
         handoff.is_yielded_to_legacy(),
         "fallback must yield Zakura block sync to legacy sync"
@@ -478,7 +487,8 @@ fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
     );
 
     let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
-    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
+    let _lease = futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff))
+        .expect("an idle native pipeline yields one fallback lease");
     assert!(
         handoff.is_yielded_to_legacy(),
         "fallback must yield Zakura block sync to legacy sync"
@@ -588,8 +598,16 @@ async fn fallback_handoff_drains_applies_without_cancelling_zakura() {
     );
 
     drop(permit);
-    drain.await.expect("drain task completes");
+    let lease = drain
+        .await
+        .expect("drain task completes")
+        .expect("the fallback lease is acquired after the drain");
     assert!(handoff.is_yielded_to_legacy());
+    drop(lease);
+    assert!(
+        handoff.begin_apply().is_some(),
+        "dropping the fallback lease restores native ownership"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -600,15 +618,18 @@ async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
     let drain_handoff = handoff.clone();
     let drain = tokio::spawn(async move {
         drain_handoff
-            .yield_to_legacy(std::time::Duration::from_secs(30))
-            .await;
+            .acquire_legacy_fallback(std::time::Duration::from_secs(30))
+            .await
     });
 
     let dropper = tokio::task::spawn_blocking(move || drop(permit));
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    let lease = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         dropper.await.expect("dropper task completes");
-        drain.await.expect("drain task completes");
+        drain
+            .await
+            .expect("drain task completes")
+            .expect("the fallback lease is acquired after the concurrent release")
     })
     .await
     .expect("drain must observe the final apply release without waiting for its timeout");
@@ -618,4 +639,111 @@ async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
         handoff.begin_apply().is_none(),
         "no new Zakura applies may start after the concurrent drain"
     );
+    drop(lease);
+    assert!(
+        handoff.begin_apply().is_some(),
+        "dropping the concurrently acquired lease restores native ownership"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fallback_diagnostic_intervals_never_authorize_legacy_with_a_live_apply() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("native apply starts");
+    let drain_handoff = handoff.clone();
+    let fallback = tokio::spawn(async move {
+        drain_handoff
+            .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    for _ in 0..3 {
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !fallback.is_finished(),
+            "a diagnostic interval must not authorize legacy while a native permit is live"
+        );
+        assert!(
+            handoff.begin_apply().is_none(),
+            "fallback drain must continue rejecting new native applies"
+        );
+    }
+
+    drop(permit);
+    let lease = fallback
+        .await
+        .expect("fallback task stays alive")
+        .expect("fallback acquires only after the native apply finishes");
+    assert!(handoff.is_yielded_to_legacy());
+    drop(lease);
+    assert!(handoff.begin_apply().is_some());
+}
+
+#[tokio::test]
+async fn cancelling_fallback_drain_restores_native_ownership() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("native apply starts");
+    let drain_handoff = handoff.clone();
+    let fallback = tokio::spawn(async move {
+        drain_handoff
+            .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    assert!(handoff.is_yielded_to_legacy());
+    fallback.abort();
+    fallback
+        .await
+        .expect_err("the fallback acquisition is explicitly cancelled");
+
+    drop(permit);
+    assert!(
+        handoff.begin_apply().is_some(),
+        "dropping the acquisition future drops its lease and restores native ownership"
+    );
+}
+
+#[tokio::test]
+async fn panic_during_fallback_round_restores_native_ownership() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let panic_handoff = handoff.clone();
+    let fallback = tokio::spawn(async move {
+        let _lease = panic_handoff
+            .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+            .await
+            .expect("idle native pipeline drains immediately");
+        panic!("simulated legacy fallback panic");
+    });
+
+    fallback
+        .await
+        .expect_err("the simulated fallback round panics");
+    assert!(
+        handoff.begin_apply().is_some(),
+        "unwinding the fallback future drops its lease and restores native ownership"
+    );
+}
+
+#[tokio::test]
+async fn only_one_fallback_lease_can_own_an_apply_epoch() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let lease = handoff
+        .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+        .await
+        .expect("the first fallback acquires the idle pipeline");
+    handoff
+        .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+        .await
+        .expect_err("a competing fallback cannot acquire the same apply epoch");
+
+    drop(lease);
+    let next_lease = handoff
+        .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+        .await
+        .expect("a later fallback can acquire the restored native pipeline");
+    drop(next_lease);
+    assert!(handoff.begin_apply().is_some());
 }

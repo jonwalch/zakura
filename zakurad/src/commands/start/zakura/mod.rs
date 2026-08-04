@@ -14,8 +14,8 @@ use zakura_network::zakura::{
 /// queue. A fresh state therefore stays legacy-owned until checkpoint semantic
 /// handoff, and fallback is a later commit barrier: while yielded back to legacy
 /// sync, the block-sync driver starts no new applies and the watchdog waits for
-/// in-flight applies to finish. After one bounded legacy recovery round, ownership
-/// returns to Zakura. The Zakura reactors stay alive throughout; only bulk body
+/// in-flight applies to finish. A fallback lease restores ownership to Zakura on
+/// every exit path. The Zakura reactors stay alive throughout; only bulk body
 /// applies are gated.
 #[derive(Debug)]
 pub(crate) struct BlockSyncHandoff {
@@ -25,29 +25,54 @@ pub(crate) struct BlockSyncHandoff {
     owner_changed: tokio::sync::Notify,
 }
 
-const LEGACY_BOOTSTRAP_OWNER: u8 = 0;
-const ZAKURA_OWNER: u8 = 1;
-const LEGACY_FALLBACK_OWNER: u8 = 2;
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum BlockApplyOwner {
+    LegacyBootstrap = 0,
+    Zakura = 1,
+    LegacyFallback = 2,
+}
+
+/// An invalid or competing block-apply ownership transition.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum BlockSyncHandoffError {
+    /// Initial checkpoint ownership was already transferred or fallback is active.
+    #[error("legacy checkpoint bootstrap does not own block applies")]
+    BootstrapNotOwned,
+    /// Native sync is not currently available to yield to one fallback round.
+    #[error("Zakura does not currently own block applies")]
+    ZakuraNotOwned,
+}
 
 /// Tracks one in-flight Zakura block apply; dropping it releases the slot and
-/// wakes a pending [`BlockSyncHandoff::yield_to_legacy`].
+/// wakes a pending [`BlockSyncHandoff::acquire_legacy_fallback`].
 #[derive(Debug)]
 pub(crate) struct BlockApplyPermit(std::sync::Arc<BlockSyncHandoff>);
 
+/// Exclusive authorization for one fully drained legacy fallback round.
+///
+/// This guard is created before the drain starts, so cancelling or panicking
+/// while waiting restores native ownership. It is returned to the caller only
+/// after every native apply permit has been released.
+#[derive(Debug)]
+pub(crate) struct LegacyFallbackLease {
+    handoff: std::sync::Arc<BlockSyncHandoff>,
+}
+
 impl BlockSyncHandoff {
     pub(crate) fn new() -> std::sync::Arc<Self> {
-        Self::new_with_owner(ZAKURA_OWNER)
+        Self::new_with_owner(BlockApplyOwner::Zakura)
     }
 
     /// Starts with the legacy-compatible downloader owning block applies until
     /// the checkpoint verifier publishes the durable semantic-handoff snapshot.
     pub(crate) fn new_legacy_bootstrap() -> std::sync::Arc<Self> {
-        Self::new_with_owner(LEGACY_BOOTSTRAP_OWNER)
+        Self::new_with_owner(BlockApplyOwner::LegacyBootstrap)
     }
 
-    fn new_with_owner(owner: u8) -> std::sync::Arc<Self> {
+    fn new_with_owner(owner: BlockApplyOwner) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            owner: std::sync::atomic::AtomicU8::new(owner),
+            owner: std::sync::atomic::AtomicU8::new(owner as u8),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
             owner_changed: tokio::sync::Notify::new(),
@@ -56,28 +81,27 @@ impl BlockSyncHandoff {
 
     /// Whether the pipeline has been yielded to legacy sync.
     pub(crate) fn is_yielded_to_legacy(&self) -> bool {
-        self.owner.load(std::sync::atomic::Ordering::SeqCst) == LEGACY_FALLBACK_OWNER
+        self.owner.load(std::sync::atomic::Ordering::SeqCst)
+            == BlockApplyOwner::LegacyFallback as u8
     }
 
     /// Whether native Zakura sync currently owns block applies.
     pub(crate) fn zakura_owns_applies(&self) -> bool {
-        self.owner.load(std::sync::atomic::Ordering::SeqCst) == ZAKURA_OWNER
+        self.owner.load(std::sync::atomic::Ordering::SeqCst) == BlockApplyOwner::Zakura as u8
     }
 
     /// Transfers initial block-apply ownership to native Zakura sync exactly once.
-    pub(crate) fn finish_legacy_bootstrap(&self) {
-        if self
-            .owner
+    pub(crate) fn finish_legacy_bootstrap(&self) -> Result<(), BlockSyncHandoffError> {
+        self.owner
             .compare_exchange(
-                LEGACY_BOOTSTRAP_OWNER,
-                ZAKURA_OWNER,
+                BlockApplyOwner::LegacyBootstrap as u8,
+                BlockApplyOwner::Zakura as u8,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
             )
-            .is_ok()
-        {
-            self.owner_changed.notify_waiters();
-        }
+            .map_err(|_| BlockSyncHandoffError::BootstrapNotOwned)?;
+        self.owner_changed.notify_waiters();
+        Ok(())
     }
 
     /// Waits until initial legacy bootstrap transfers apply ownership to Zakura.
@@ -124,37 +148,39 @@ impl BlockSyncHandoff {
         }
     }
 
-    /// Yields the apply pipeline to legacy sync and waits until in-flight
-    /// applies drain, bounded by `timeout`.
-    pub(crate) async fn yield_to_legacy(&self, timeout: Duration) {
-        self.stop_new_applies();
-        self.wait_for_applies(timeout).await;
-    }
-
-    /// Returns block-apply ownership to Zakura after a completed legacy fallback round.
-    pub(crate) fn resume_zakura_after_fallback(&self) {
-        if self
-            .owner
+    /// Stop new native applies and acquire one legacy fallback lease after all
+    /// already-authorized applies finish.
+    ///
+    /// `diagnostic_interval` bounds each wait only for observability. A warning
+    /// never authorizes legacy work while an underlying native commit is alive.
+    pub(crate) async fn acquire_legacy_fallback(
+        self: &std::sync::Arc<Self>,
+        diagnostic_interval: Duration,
+    ) -> Result<LegacyFallbackLease, BlockSyncHandoffError> {
+        self.owner
             .compare_exchange(
-                LEGACY_FALLBACK_OWNER,
-                ZAKURA_OWNER,
+                BlockApplyOwner::Zakura as u8,
+                BlockApplyOwner::LegacyFallback as u8,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
             )
-            .is_ok()
-        {
-            self.owner_changed.notify_waiters();
-        }
-    }
-
-    fn stop_new_applies(&self) {
-        self.owner
-            .store(LEGACY_FALLBACK_OWNER, std::sync::atomic::Ordering::SeqCst);
+            .map_err(|_| BlockSyncHandoffError::ZakuraNotOwned)?;
         self.owner_changed.notify_waiters();
+        let lease = LegacyFallbackLease {
+            handoff: self.clone(),
+        };
+        self.wait_for_applies(diagnostic_interval).await;
+        metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
+        Ok(lease)
     }
 
-    async fn wait_for_applies(&self, timeout: Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
+    async fn wait_for_applies(&self, diagnostic_interval: Duration) {
+        let diagnostic_interval = if diagnostic_interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            diagnostic_interval
+        };
+        let started = tokio::time::Instant::now();
         loop {
             let drained = self.drained.notified();
             tokio::pin!(drained);
@@ -165,13 +191,16 @@ impl BlockSyncHandoff {
                 return;
             }
 
-            if tokio::time::timeout_at(deadline, drained).await.is_err() {
+            if tokio::time::timeout(diagnostic_interval, drained)
+                .await
+                .is_err()
+            {
                 tracing::warn!(
                     in_flight,
-                    "timed out draining Zakura block applies before legacy fallback; \
-                     remaining applies resolve through their own driver timeouts"
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "Zakura block applies remain active while legacy fallback waits for its \
+                     exclusive apply lease"
                 );
-                return;
             }
         }
     }
@@ -180,6 +209,29 @@ impl BlockSyncHandoff {
 impl Drop for BlockApplyPermit {
     fn drop(&mut self) {
         self.0.release();
+    }
+}
+
+impl Drop for LegacyFallbackLease {
+    fn drop(&mut self) {
+        let restored = self
+            .handoff
+            .owner
+            .compare_exchange(
+                BlockApplyOwner::LegacyFallback as u8,
+                BlockApplyOwner::Zakura as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        if restored {
+            self.handoff.owner_changed.notify_waiters();
+        } else {
+            tracing::error!(
+                "legacy fallback lease lost exclusive apply ownership before it was dropped"
+            );
+        }
+        metrics::gauge!("sync.zakura.legacy_fallback.active").set(0.0);
     }
 }
 

@@ -554,17 +554,16 @@ where
 /// the fallback node might be the only peer with working legacy ingest, so it
 /// must keep advertising frontiers and serving headers/bodies to Zakura peers.
 async fn engage_legacy_fallback_alongside_zakura(
-    block_sync_handoff: &crate::commands::start::zakura::BlockSyncHandoff,
-) {
+    block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
+) -> Result<
+    crate::commands::start::zakura::LegacyFallbackLease,
+    crate::commands::start::zakura::BlockSyncHandoffError,
+> {
+    let lease = block_sync_handoff
+        .acquire_legacy_fallback(std::time::Duration::from_secs(60))
+        .await?;
     metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
-    metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
-
-    // Commit barrier: two engines driving bulk commits concurrently race in
-    // the applying queue, so stop new Zakura applies and drain in-flight ones
-    // before legacy ChainSync takes the pipeline.
-    block_sync_handoff
-        .yield_to_legacy(std::time::Duration::from_secs(60))
-        .await;
+    Ok(lease)
 }
 
 /// Sync configuration section.
@@ -1126,7 +1125,9 @@ where
             .height;
         self.trace
             .checkpoint_handoff(Some(handoff_state_tip), self.max_checkpoint_height);
-        block_sync_handoff.finish_legacy_bootstrap();
+        block_sync_handoff
+            .finish_legacy_bootstrap()
+            .map_err(|error| eyre!("checkpoint apply handoff failed: {error}"))?;
         info!(
             checkpoint = ?self.max_checkpoint_height,
             "Zakura block sync replacement completed checkpoint bootstrap; \
@@ -1216,13 +1217,18 @@ where
         &mut self,
         block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
     ) {
-        engage_legacy_fallback_alongside_zakura(block_sync_handoff).await;
+        let lease = match engage_legacy_fallback_alongside_zakura(block_sync_handoff).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                warn!(?error, "could not acquire the legacy fallback apply lease");
+                return;
+            }
+        };
         if self.try_to_sync(None).await.is_err() {
             self.downloads.cancel_all();
         }
         self.update_metrics();
-        block_sync_handoff.resume_zakura_after_fallback();
-        metrics::gauge!("sync.zakura.legacy_fallback.active").set(0.0);
+        drop(lease);
         info!(
             verified_tip = ?self.latest_chain_tip.best_tip_height(),
             "legacy fallback recovery round finished; returned body-sync ownership to Zakura"
