@@ -11,6 +11,7 @@ mod tests;
 use std::{
     fmt::{self},
     sync::Arc,
+    time::Duration,
 };
 
 use derive_getters::Getters;
@@ -18,7 +19,10 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    OwnedSemaphorePermit, Semaphore,
+};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -543,6 +547,9 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
+/// Maximum time a request waits for block template construction capacity.
+const TEMPLATE_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -558,6 +565,9 @@ where
 
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
     sync_status: SyncStatus,
+
+    /// Limits concurrent block template and coinbase construction.
+    template_construction_semaphore: Arc<Semaphore>,
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
@@ -577,10 +587,16 @@ where
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> Self {
+        let template_construction_limit = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(2, 8);
+
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             sync_status,
+            template_construction_semaphore: Arc::new(Semaphore::new(template_construction_limit)),
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
         }
@@ -599,6 +615,23 @@ where
     /// Returns the block verifier router.
     pub fn block_verifier_router(&self) -> BlockVerifierRouter {
         self.block_verifier_router.clone()
+    }
+
+    /// Waits until another block template or coinbase construction task can start.
+    pub async fn acquire_template_construction_permit(&self) -> RpcResult<OwnedSemaphorePermit> {
+        let acquire_permit = self.template_construction_semaphore.clone().acquire_owned();
+
+        let permit = tokio::time::timeout(TEMPLATE_CONSTRUCTION_TIMEOUT, acquire_permit)
+            .await
+            .map_err(|_| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "timed out waiting for block template construction capacity",
+                    None,
+                )
+            })?;
+
+        Ok(permit.expect("template construction semaphore is never closed"))
     }
 
     /// Advertises the mined block.

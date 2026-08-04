@@ -2566,24 +2566,25 @@ where
                 // before we start waiting for a new tip since computing the coinbase tx takes a few
                 // seconds if the miner mines to a shielded address, and we want to return fast
                 // when the tip changes.
-                let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
-                    })
-                };
-
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
-                )
+                let network = self.network.clone();
+                let miner_params = miner_params.clone();
+                let permit = self.gbt.acquire_template_construction_permit().await?;
+                let precomputed_coinbase = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    TransactionTemplate::new_coinbase(
+                        &network,
+                        precomputed_height,
+                        &miner_params,
+                        Amount::zero(),
+                    )
+                    .expect("valid coinbase tx")
+                })
                 .await
                 .expect("valid coinbase tx");
 
                 let _ = wait_for_new_tip.await;
 
-                precomputed_coinbase
+                Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
             };
 
             // Wait for the maximum block time to elapse. This can change the block header
@@ -2629,6 +2630,7 @@ where
                 }
 
                 precomputed_coinbase = wait_for_new_tip => {
+                    let precomputed_coinbase = precomputed_coinbase?;
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
 
                     let server_long_poll_id = LongPollInput::new(
@@ -2655,7 +2657,9 @@ where
                     // chain.
                     let network = self.network.clone();
                     let miner_params = miner_params.clone();
+                    let permit = self.gbt.acquire_template_construction_permit().await?;
                     let response = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
                         BlockTemplateResponse::new_internal(
                             &network,
                             precomputed_coinbase,
@@ -2726,7 +2730,9 @@ where
 
         let network = self.network.clone();
         let miner_params = miner_params.clone();
+        let permit = self.gbt.acquire_template_construction_permit().await?;
         let response = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             BlockTemplateResponse::new_internal(
                 &network,
                 None,
