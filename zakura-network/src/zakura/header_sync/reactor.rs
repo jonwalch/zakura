@@ -1072,6 +1072,14 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
+        if !self
+            .peer_work_queue
+            .consume_response_capacity(&peer, response.entries.len())
+        {
+            self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+            return;
+        }
         if response.complete
             && response.entries.is_empty()
             && returned_ancestor.hash == response.target_tip_hash
@@ -1079,14 +1087,6 @@ impl HeaderSyncReactor {
         {
             self.retire_peer_work(&peer, HeaderRequestTerminal::AlreadyKnown);
             metrics::counter!("sync.header.target.already_known.total").increment(1);
-            return;
-        }
-        if !self
-            .peer_work_queue
-            .has_staging_capacity(response.entries.len())
-        {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::StagingRefused);
-            metrics::counter!("sync.header.target.staging_capacity_refused").increment(1);
             return;
         }
         // A page that stages nothing leaves the continuation locator unchanged, so a peer can
@@ -1112,17 +1112,23 @@ impl HeaderSyncReactor {
             .expect("the matching active request was just cloned");
         active.common_ancestor.get_or_insert(returned_ancestor);
         active.entries.extend(response.entries);
+        let staged_entry_count = active.entries.len();
         let Some(staged_tip) = active.staged_tip() else {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
         let _ = active;
+        debug_assert_eq!(
+            self.peer_work_queue.owned_header_count(&peer),
+            staged_entry_count,
+            "every staged header retains exactly one owned budget unit",
+        );
         // A target can be arbitrarily far ahead, but response staging is deliberately bounded.
         // Admit a validated prefix when the aggregate cap is full. Continuations below are
         // reduced to the remaining capacity, so one peer cannot force tiny prefix commits by
         // returning pages much smaller than requested.
-        let bounded_prefix = !complete && !self.peer_work_queue.has_staging_capacity(1);
+        let bounded_prefix = !complete && self.peer_work_queue.budget_is_full();
         let active = self
             .peer_work_queue
             .active_mut(&peer)
@@ -1190,6 +1196,7 @@ impl HeaderSyncReactor {
                 entries: active.entries.clone(),
             };
             let _ = active;
+            self.peer_work_queue.publish_phase_metrics();
             if let Some((owner, source)) = repair {
                 let Some(task) = self.vct_repair.get(owner) else {
                     self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
@@ -1216,13 +1223,21 @@ impl HeaderSyncReactor {
         let target_tip_hash = active.target.status.selected_tip_hash;
         let request_scope = active.owner.header_authority();
         let _ = active;
-        let max_header_count = negotiated_header_count.min(
-            u32::try_from(self.peer_work_queue.staging_capacity_remaining()).unwrap_or(u32::MAX),
-        );
+        let max_header_count = self
+            .peer_work_queue
+            .reservable_header_count(negotiated_header_count);
         debug_assert!(
             max_header_count > 0,
-            "a full staging window prepared a prefix"
+            "a full owned budget prepared a prefix"
         );
+        if max_header_count == 0
+            || !self
+                .peer_work_queue
+                .reserve_request(&peer, max_header_count)
+        {
+            self.retire_peer_work(&peer, HeaderRequestTerminal::StagingRefused);
+            return;
+        }
         let Some(session) = self
             .peer_state
             .get(&peer)
@@ -1259,6 +1274,7 @@ impl HeaderSyncReactor {
                 debug_assert!(tree_aux_schema.admits(response_schema));
             }
             Err(error) => {
+                self.peer_work_queue.cancel_request_reservation(&peer);
                 self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                 self.retire_peer_work(&peer, HeaderRequestTerminal::SendError);
             }
@@ -1467,6 +1483,7 @@ impl HeaderSyncReactor {
                     .active_mut(&peer)
                     .expect("the exact preparing request passed the completion gate")
                     .phase = HeaderTargetPhase::Applying;
+                self.peer_work_queue.publish_phase_metrics();
                 if self.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
                     purpose: purpose.clone(),
                     peer: peer.clone(),
@@ -1979,12 +1996,15 @@ impl HeaderSyncReactor {
             .max_headers_per_response
             .min(self.serving_limits.max_headers_per_response())
             .min(byte_limited_count)
-            .min(MAX_HS_RANGE)
-            .min(
-                u32::try_from(self.peer_work_queue.staging_capacity_remaining())
-                    .unwrap_or(u32::MAX),
-            );
-        if max_header_count == 0 {
+            .min(MAX_HS_RANGE);
+        let max_header_count = self
+            .peer_work_queue
+            .reservable_header_count(max_header_count);
+        if max_header_count == 0
+            || !self
+                .peer_work_queue
+                .reserve_request(&peer, max_header_count)
+        {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
         }
@@ -2034,10 +2054,14 @@ impl HeaderSyncReactor {
                 if started {
                     self.request_deadlines
                         .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
+                } else {
+                    session.cancel_request(request_id);
+                    self.peer_work_queue.remove_unstarted(&peer);
                 }
                 metrics::counter!("sync.header.target.requested").increment(1);
             }
             Err(error) => {
+                self.peer_work_queue.cancel_request_reservation(&peer);
                 self.peer_work_queue.remove_unstarted(&peer);
                 self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                 metrics::counter!(
@@ -2322,6 +2346,12 @@ impl HeaderSyncReactor {
             return;
         }
         for (peer, source, session, mut status) in candidates {
+            self.peer_work_queue.remove_unstarted(&peer);
+            if self.peer_work_queue.reservable_header_count(1) != 1
+                || !self.peer_work_queue.reserve_request(&peer, 1)
+            {
+                continue;
+            }
             let request_id = match session.try_send_get_headers(
                 &self.codec,
                 task.owner.header,
@@ -2332,6 +2362,7 @@ impl HeaderSyncReactor {
             ) {
                 Ok(request_id) => request_id,
                 Err(error) => {
+                    self.peer_work_queue.cancel_request_reservation(&peer);
                     self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                     if let Some(current) = self.vct_repair.get_mut(task.owner) {
                         let _ = current.record_failed_source(source);
@@ -2355,6 +2386,7 @@ impl HeaderSyncReactor {
             );
             if self.vct_repair.assign(task.owner, wire_owner).is_err() {
                 session.cancel_request(request_id);
+                self.peer_work_queue.cancel_request_reservation(&peer);
                 return;
             }
             if let Some(task) = self.vct_repair.get(wire_owner) {
@@ -2368,7 +2400,6 @@ impl HeaderSyncReactor {
                 session_id: session.session_id(),
                 status,
             };
-            self.peer_work_queue.remove_unstarted(&peer);
             if self
                 .peer_work_queue
                 .stage(peer.clone(), target.clone(), PeerWorkPriority::Normal)
@@ -2392,6 +2423,7 @@ impl HeaderSyncReactor {
                 })
             {
                 session.cancel_request(request_id);
+                self.peer_work_queue.cancel_request_reservation(&peer);
                 self.retry_vct_repair(wire_owner, source, HeaderRequestTerminal::LocalError);
                 return;
             }
@@ -3708,10 +3740,21 @@ impl HeaderSyncReactor {
 
     fn retire_peer_work(&mut self, peer: &ZakuraPeerId, terminal_outcome: HeaderRequestTerminal) {
         self.request_deadlines.remove(peer);
+        let reserved = self.peer_work_queue.reserved_header_count(peer);
+        let owned = self.peer_work_queue.owned_header_count(peer);
         if let Some(active) = self.peer_work_queue.remove(peer) {
             self.emit_request_terminal(&active, terminal_outcome);
             self.cancel_active_request(&active);
         }
+        let released = reserved.saturating_add(owned);
+        if released != 0 {
+            metrics::counter!(
+                "sync.header.chunk_budget.released.total",
+                "terminal" => terminal_outcome.label()
+            )
+            .increment(u64::try_from(released).unwrap_or(u64::MAX));
+        }
+        self.peer_work_queue.publish_phase_metrics();
     }
 
     #[cfg(test)]
@@ -3720,6 +3763,7 @@ impl HeaderSyncReactor {
         if let Some(active) = self.peer_work_queue.remove(peer) {
             self.cancel_active_request(&active);
         }
+        self.peer_work_queue.publish_phase_metrics();
     }
 
     fn retire_all_peer_work(&mut self, terminal_outcome: HeaderRequestTerminal) {

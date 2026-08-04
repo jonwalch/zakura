@@ -1,5 +1,7 @@
 use super::*;
-use crate::zakura::header_sync::scheduler::peer_work::MAX_STAGED_HEADERS_V1;
+use crate::zakura::header_sync::scheduler::peer_work::{
+    HEADER_CHUNK_BUDGET_CAPACITY_V1, MAX_HEADER_CHUNK_RESERVATION_V1,
+};
 
 #[test]
 fn empty_complete_response_at_target_is_benign() {
@@ -81,7 +83,7 @@ fn empty_complete_response_requires_the_exact_height_qualified_ancestor() {
 }
 
 #[test]
-fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
+fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
     let active = reactor
         .peer_work_queue
@@ -90,7 +92,7 @@ fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
     let entry = active.entries[0].clone();
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = Some(snapshot.frontiers.finalized);
-    active.entries = vec![entry; MAX_STAGED_HEADERS_V1 - 1];
+    active.entries = vec![entry; HEADER_CHUNK_BUDGET_CAPACITY_V1 - 1];
     active.max_header_count = 1;
     let staged_tip = active
         .staged_tip()
@@ -102,6 +104,10 @@ fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
         body_size: 0,
         tree_aux: None,
     };
+    let _ = active;
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&peer, HEADER_CHUNK_BUDGET_CAPACITY_V1 - 1, 1);
 
     reactor.handle_headers(
         peer.clone(),
@@ -127,16 +133,17 @@ fn requester_admits_a_bounded_prefix_when_the_staging_window_fills() {
         ..
     } = actions
         .try_recv()
-        .expect("the full staging window prepares a bounded prefix")
+        .expect("the exhausted chunk budget prepares its owned prefix")
     else {
-        panic!("the full staging window must prepare a header target");
+        panic!("the exhausted chunk budget must prepare a header target");
     };
     assert_eq!(common_ancestor, snapshot.frontiers.finalized);
-    assert_eq!(entries.len(), MAX_STAGED_HEADERS_V1);
+    assert_eq!(entries.len(), HEADER_CHUNK_BUDGET_CAPACITY_V1);
     assert_eq!(
         target.height,
         block::Height(
-            u32::try_from(MAX_STAGED_HEADERS_V1).expect("the staging cap fits in a height")
+            u32::try_from(HEADER_CHUNK_BUDGET_CAPACITY_V1)
+                .expect("the owned header budget fits in a height")
         )
     );
     assert_eq!(
@@ -364,7 +371,8 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     };
     assert_eq!(
         first_request.max_header_count,
-        u32::try_from(MAX_STAGED_HEADERS_V1).expect("the staging cap fits on the wire")
+        u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .expect("the fair reservation fits on the wire")
     );
     handle
         .send(HeaderSyncEvent::SessionResponse {

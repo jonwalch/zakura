@@ -267,6 +267,12 @@ impl PursuitHarness {
         );
         let request = request(&self.snapshot, peer_key, supplied_session, marker);
         let owner = request.owner;
+        if model_match {
+            assert!(
+                self.queue.reserve_request(&peer(peer_key), 1),
+                "matching initial work owns one response reservation"
+            );
+        }
         let started = self.queue.start(request);
         assert_eq!(started, model_match, "request admission changed its target");
         if started {
@@ -324,6 +330,14 @@ impl PursuitHarness {
             self.summary.refused_operations += 1;
             return;
         }
+        assert!(
+            self.queue.consume_response_capacity(&peer(peer_key), 1),
+            "a modeled response consumes its exact reservation"
+        );
+        assert!(
+            self.queue.reserve_request(&peer(peer_key), 1),
+            "a modeled continuation owns its response reservation"
+        );
         let request = self
             .queue
             .active_mut(&peer(peer_key))
@@ -356,6 +370,7 @@ impl PursuitHarness {
             self.summary.refused_operations += 1;
             return;
         }
+        self.queue.cancel_request_reservation(&peer(peer_key));
         self.queue
             .active_mut(&peer(peer_key))
             .expect("the production queue is active when the model is active")
@@ -854,6 +869,12 @@ impl PursuitHarness {
             self.pending.len(),
             active_count,
             "pending owners exactly match active requests"
+        );
+        let (reserved, owned) = self.queue.chunk_budget_usage();
+        assert!(
+            reserved.saturating_add(owned)
+                <= super::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1,
+            "wire reservations and staged chunks never exceed the aggregate budget"
         );
         for peer_key in 0..LOGICAL_PEERS {
             match self.model.get(&peer_key) {

@@ -55,6 +55,8 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.phase = HeaderTargetPhase::Receiving;
     active.common_ancestor = None;
     active.entries.clear();
+    let _ = active;
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     reactor.handle_headers(
         peer.clone(),
         0,
@@ -232,51 +234,36 @@ fn response_completion_requires_the_reserved_branch_scope() {
 }
 
 #[test]
-fn aggregate_staging_overflow_retires_work_without_peer_punishment() {
-    let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity() {
+    let (mut reactor, mut actions, _snapshot, peer, _source, owner) = peer_violation_fixture();
     let active = reactor
         .peer_work_queue
         .active_mut(&peer)
         .expect("the fixture has active work");
     let entry = active.entries[0].clone();
     active.phase = HeaderTargetPhase::Receiving;
-    active.common_ancestor = Some(snapshot.frontiers.finalized);
-    active.entries =
-        vec![entry; crate::zakura::header_sync::scheduler::peer_work::MAX_STAGED_HEADERS_V1];
-    let staged_tip = active
-        .staged_tip()
-        .expect("the bounded staged fixture has an inferred tip");
-    let mut next_header = *regtest_genesis_block().header;
-    next_header.previous_block_hash = staged_tip.hash;
+    active.entries.clear();
+    let returned_ancestor = active.common_ancestor.expect("the fixture has an ancestor");
+    let _ = active;
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     let response = Headers {
         request_id: owner.request_id().get(),
         target_tip_hash: owner.header_authority().branch.target_tip_hash,
-        common_ancestor_height: staged_tip.height,
-        common_ancestor_hash: staged_tip.hash,
+        common_ancestor_height: returned_ancestor.height,
+        common_ancestor_hash: returned_ancestor.hash,
         complete: false,
         tree_aux_schema: AuxSchema::None,
-        entries: vec![HeaderEntry {
-            header: Arc::new(next_header),
-            body_size: 0,
-            tree_aux: None,
-        }],
+        entries: vec![entry; 2],
     };
-    assert!(
-        reactor
-            .codec
-            .encode(&HeaderSyncMessage::Headers(response.clone()))
-            .is_ok(),
-        "the overflowing page is otherwise wire-valid"
-    );
-
     reactor.handle_headers(peer.clone(), 0, owner.header_authority(), response);
 
     assert!(
         reactor.peer_work_queue.active(&peer).is_none(),
-        "overflow retires the target and releases all staged headers"
+        "over-reservation retires the target and releases its reservation"
     );
-    assert!(
-        actions.try_recv().is_err(),
-        "local staging pressure emits no peer violation"
+    assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
+    assert_eq!(
+        reactor.peer_work_queue.unowned_chunk_capacity(),
+        crate::zakura::header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1,
     );
 }

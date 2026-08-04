@@ -116,6 +116,10 @@ impl EvictionFixture {
             tree_aux_schema: AuxSchema::None,
             entries: vec![entry],
         };
+        let _ = active;
+        self.reactor
+            .peer_work_queue
+            .set_capacity_for_test(&self.peer, 0, 1);
         self.reactor
             .handle_headers(self.peer.clone(), session_id, scope, response);
         // The completed target is handed to the port; clear it so the next request can stage.
@@ -147,6 +151,10 @@ impl EvictionFixture {
             tree_aux_schema: AuxSchema::None,
             entries: Vec::new(),
         };
+        let _ = active;
+        self.reactor
+            .peer_work_queue
+            .set_capacity_for_test(&self.peer, 0, 1);
         self.reactor
             .handle_headers(self.peer.clone(), session_id, scope, response);
     }

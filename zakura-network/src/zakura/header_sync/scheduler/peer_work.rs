@@ -1,18 +1,226 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
+};
 
 use zakura_header_chain::{
     EngineSnapshot, Frontier, HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
     MAX_STAGED_TARGETS_V1,
 };
 
-use super::super::{AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId};
+use super::super::{
+    AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
+};
 
-/// Exact aggregate cap for response headers awaiting one complete-target admission.
-///
-/// Integrated nodes advance finality while body sync is active, retiring header work owned by
-/// the previous finality anchor. Keep one preparation window short enough to finish between those
-/// commits while still amortizing each durable header-chain write across a fixed-size batch.
-pub(in crate::zakura::header_sync) const MAX_STAGED_HEADERS_V1: usize = 128;
+/// Exact aggregate header count owned across receiving, preparation, and application.
+// `MAX_HS_RANGE` is 4,000 and therefore fits every supported `usize` target.
+pub(in crate::zakura::header_sync) const HEADER_CHUNK_BUDGET_CAPACITY_V1: usize =
+    MAX_HS_RANGE as usize;
+
+/// Fair per-request share when all bounded target slots are active.
+pub(in crate::zakura::header_sync) const MAX_HEADER_CHUNK_RESERVATION_V1: usize =
+    HEADER_CHUNK_BUDGET_CAPACITY_V1 / MAX_STAGED_TARGETS_V1;
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct HeaderChunkUsage {
+    reserved: usize,
+    owned: usize,
+}
+
+#[derive(Debug)]
+struct HeaderChunkBudgetInner {
+    capacity: usize,
+    usage: Mutex<HeaderChunkUsage>,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderChunkBudget(Arc<HeaderChunkBudgetInner>);
+
+impl Default for HeaderChunkBudget {
+    fn default() -> Self {
+        Self(Arc::new(HeaderChunkBudgetInner {
+            capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
+            usage: Mutex::new(HeaderChunkUsage::default()),
+        }))
+    }
+}
+
+impl HeaderChunkBudget {
+    fn usage(&self) -> HeaderChunkUsage {
+        *self
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn remaining(&self) -> usize {
+        let usage = self.usage();
+        self.0
+            .capacity
+            .saturating_sub(usage.reserved.saturating_add(usage.owned))
+    }
+
+    fn reserve(&self, count: usize) -> Option<HeaderCountReservation> {
+        if count == 0 {
+            return None;
+        }
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if count
+            > self
+                .0
+                .capacity
+                .saturating_sub(usage.reserved.saturating_add(usage.owned))
+        {
+            return None;
+        }
+        usage.reserved = usage.reserved.checked_add(count)?;
+        self.publish(*usage);
+        drop(usage);
+        Some(HeaderCountReservation(Arc::new(
+            HeaderCountReservationInner {
+                budget: self.clone(),
+                remaining: AtomicUsize::new(count),
+            },
+        )))
+    }
+
+    fn consume(&self, reserved: usize, owned: usize) -> Result<Option<HeaderCapacityLease>, ()> {
+        if owned > reserved {
+            return Err(());
+        }
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if usage.reserved < reserved {
+            return Err(());
+        }
+        let new_owned = usage.owned.checked_add(owned).ok_or(())?;
+        usage.reserved -= reserved;
+        usage.owned = new_owned;
+        self.publish(*usage);
+        drop(usage);
+        Ok((owned != 0).then(|| {
+            HeaderCapacityLease(Arc::new(HeaderCapacityLeaseInner {
+                budget: self.clone(),
+                count: owned,
+            }))
+        }))
+    }
+
+    fn release_reserved(&self, count: usize) {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(usage.reserved >= count);
+        usage.reserved = usage.reserved.saturating_sub(count);
+        self.publish(*usage);
+    }
+
+    fn release_owned(&self, count: usize) {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(usage.owned >= count);
+        usage.owned = usage.owned.saturating_sub(count);
+        self.publish(*usage);
+    }
+
+    fn publish(&self, usage: HeaderChunkUsage) {
+        debug_assert!(usage.reserved.saturating_add(usage.owned) <= self.0.capacity);
+        // Counts are bounded by 4,000 and are exactly representable as f64.
+        metrics::gauge!("sync.header.chunk_budget.capacity").set(self.0.capacity as f64);
+        metrics::gauge!("sync.header.chunk_budget.reserved").set(usage.reserved as f64);
+        metrics::gauge!("sync.header.chunk_budget.owned").set(usage.owned as f64);
+        metrics::gauge!("sync.header.chunk_budget.staged").set(usage.owned as f64);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HeaderCountReservation(Arc<HeaderCountReservationInner>);
+
+#[derive(Debug)]
+struct HeaderCountReservationInner {
+    budget: HeaderChunkBudget,
+    remaining: AtomicUsize,
+}
+
+impl HeaderCountReservation {
+    fn remaining(&self) -> usize {
+        self.0.remaining.load(AtomicOrdering::SeqCst)
+    }
+
+    fn consume(&self, owned: usize) -> Result<Option<HeaderCapacityLease>, ()> {
+        let reserved = self.0.remaining.swap(0, AtomicOrdering::SeqCst);
+        if reserved == 0 || owned > reserved {
+            if reserved != 0 {
+                self.0.remaining.store(reserved, AtomicOrdering::SeqCst);
+            }
+            return Err(());
+        }
+        match self.0.budget.consume(reserved, owned) {
+            Ok(lease) => Ok(lease),
+            Err(()) => {
+                self.0.remaining.store(reserved, AtomicOrdering::SeqCst);
+                Err(())
+            }
+        }
+    }
+}
+
+impl PartialEq for HeaderCountReservation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HeaderCountReservation {}
+
+impl Drop for HeaderCountReservationInner {
+    fn drop(&mut self) {
+        let remaining = self.remaining.swap(0, AtomicOrdering::SeqCst);
+        if remaining != 0 {
+            self.budget.release_reserved(remaining);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
+
+#[derive(Debug)]
+struct HeaderCapacityLeaseInner {
+    budget: HeaderChunkBudget,
+    count: usize,
+}
+
+impl PartialEq for HeaderCapacityLease {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for HeaderCapacityLease {}
+
+impl Drop for HeaderCapacityLeaseInner {
+    fn drop(&mut self) {
+        self.budget.release_owned(self.count);
+    }
+}
 
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +431,9 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
+    budget: HeaderChunkBudget,
+    request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
+    staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
 }
 
 impl PeerWorkQueue {
@@ -238,12 +449,20 @@ impl PeerWorkQueue {
         &mut self,
         current: &EngineSnapshot,
     ) -> usize {
-        let before = self.work_by_peer.len();
-        self.work_by_peer.retain(|_, work| match work {
-            PeerWorkState::AwaitingLocator { target, .. } => target.is_current(current),
-            PeerWorkState::Active(_) => true,
-        });
-        before.saturating_sub(self.work_by_peer.len())
+        let obsolete: Vec<_> = self
+            .work_by_peer
+            .iter()
+            .filter_map(|(peer, work)| match work {
+                PeerWorkState::AwaitingLocator { target, .. } if !target.is_current(current) => {
+                    Some(peer.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for peer in &obsolete {
+            self.remove_all(peer);
+        }
+        obsolete.len()
     }
 
     /// Retire active targets whose structurally owned scope is no longer current.
@@ -296,6 +515,8 @@ impl PeerWorkQueue {
                     target: current,
                     priority: current_priority,
                 } => {
+                    self.request_reservations.remove(&peer);
+                    self.staged_capacity.remove(&peer);
                     **current = target;
                     *current_priority = priority;
                     QueueWorkResult::NeedsLocator
@@ -322,7 +543,7 @@ impl PeerWorkQueue {
             let Some(replace) = replace else {
                 return QueueWorkResult::AtCapacity;
             };
-            self.work_by_peer.remove(&replace);
+            self.remove_all(&replace);
         }
         self.work_by_peer.insert(
             peer,
@@ -361,17 +582,21 @@ impl PeerWorkQueue {
             request.target.status.selected_tip_hash,
             request.target.scope,
         ) == Some(&request.target);
-        if matches {
+        if matches && self.request_reservations.contains_key(&peer) {
             self.work_by_peer
                 .insert(peer, PeerWorkState::Active(Box::new(request)));
+            true
+        } else {
+            false
         }
-        matches
     }
 
     pub(in crate::zakura::header_sync) fn remove(
         &mut self,
         peer: &ZakuraPeerId,
     ) -> Option<ActiveHeaderRequest> {
+        self.request_reservations.remove(peer);
+        self.staged_capacity.remove(peer);
         match self.work_by_peer.remove(peer) {
             Some(PeerWorkState::Active(request)) => Some(*request),
             Some(PeerWorkState::AwaitingLocator { .. }) | None => None,
@@ -408,7 +633,7 @@ impl PeerWorkQueue {
             self.work_by_peer.get(peer),
             Some(PeerWorkState::AwaitingLocator { .. })
         ) {
-            self.work_by_peer.remove(peer);
+            self.remove_all(peer);
         }
     }
 
@@ -423,7 +648,7 @@ impl PeerWorkQueue {
             .awaiting(peer, session_id, target_tip_hash, scope)
             .is_some()
         {
-            self.work_by_peer.remove(peer);
+            self.remove_all(peer);
         }
     }
 
@@ -447,24 +672,155 @@ impl PeerWorkQueue {
         }
     }
 
-    pub(in crate::zakura::header_sync) fn has_staging_capacity(
-        &self,
-        additional_headers: usize,
-    ) -> bool {
-        additional_headers <= self.staging_capacity_remaining()
+    fn remove_all(&mut self, peer: &ZakuraPeerId) {
+        self.request_reservations.remove(peer);
+        self.staged_capacity.remove(peer);
+        self.work_by_peer.remove(peer);
     }
 
-    /// Return the exact aggregate capacity not yet occupied by staged response headers.
-    pub(in crate::zakura::header_sync) fn staging_capacity_remaining(&self) -> usize {
-        let staged = self
-            .work_by_peer
-            .values()
-            .filter_map(|work| match work {
-                PeerWorkState::Active(request) => Some(request.entries.len()),
-                PeerWorkState::AwaitingLocator { .. } => None,
-            })
-            .fold(0usize, usize::saturating_add);
-        MAX_STAGED_HEADERS_V1.saturating_sub(staged)
+    /// Bound one request by its fair share and currently unowned capacity.
+    pub(in crate::zakura::header_sync) fn reservable_header_count(&self, desired: u32) -> u32 {
+        let desired = usize::try_from(desired).unwrap_or(usize::MAX);
+        u32::try_from(
+            desired
+                .min(MAX_HEADER_CHUNK_RESERVATION_V1)
+                .min(self.budget.remaining()),
+        )
+        .expect("the header budget capacity fits u32")
+    }
+
+    /// Reserve capacity before publishing one wire request.
+    pub(in crate::zakura::header_sync) fn reserve_request(
+        &mut self,
+        peer: &ZakuraPeerId,
+        count: u32,
+    ) -> bool {
+        if self.request_reservations.contains_key(peer) {
+            return false;
+        }
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        if count > MAX_HEADER_CHUNK_RESERVATION_V1 {
+            return false;
+        }
+        let Some(reservation) = self.budget.reserve(count) else {
+            return false;
+        };
+        self.request_reservations.insert(peer.clone(), reservation);
+        true
+    }
+
+    /// Release a request reservation after the wire send fails.
+    pub(in crate::zakura::header_sync) fn cancel_request_reservation(
+        &mut self,
+        peer: &ZakuraPeerId,
+    ) {
+        self.request_reservations.remove(peer);
+    }
+
+    /// Transfer one response's consumed count into owned staged capacity.
+    pub(in crate::zakura::header_sync) fn consume_response_capacity(
+        &mut self,
+        peer: &ZakuraPeerId,
+        returned: usize,
+    ) -> bool {
+        let Some(reservation) = self.request_reservations.remove(peer) else {
+            return false;
+        };
+        let Ok(lease) = reservation.consume(returned) else {
+            return false;
+        };
+        if let Some(lease) = lease {
+            self.staged_capacity
+                .entry(peer.clone())
+                .or_default()
+                .push(lease);
+        }
+        self.publish_phase_metrics();
+        true
+    }
+
+    pub(in crate::zakura::header_sync) fn owned_header_count(&self, peer: &ZakuraPeerId) -> usize {
+        self.staged_capacity
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .map(|lease| lease.0.count)
+            .fold(0usize, usize::saturating_add)
+    }
+
+    pub(in crate::zakura::header_sync) fn reserved_header_count(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> usize {
+        self.request_reservations
+            .get(peer)
+            .map_or(0, HeaderCountReservation::remaining)
+    }
+
+    pub(in crate::zakura::header_sync) fn budget_is_full(&self) -> bool {
+        self.budget.remaining() == 0
+    }
+
+    /// Return capacity that no live reservation or staged chunk owns.
+    #[cfg(test)]
+    pub(in crate::zakura::header_sync) fn unowned_chunk_capacity(&self) -> usize {
+        self.budget.remaining()
+    }
+
+    #[cfg(any(test, feature = "header-fuzz"))]
+    pub(in crate::zakura::header_sync) fn chunk_budget_usage(&self) -> (usize, usize) {
+        let usage = self.budget.usage();
+        (usage.reserved, usage.owned)
+    }
+
+    pub(in crate::zakura::header_sync) fn publish_phase_metrics(&self) {
+        let mut receiving = 0usize;
+        let mut preparing = 0usize;
+        let mut applying = 0usize;
+        for (peer, work) in &self.work_by_peer {
+            let PeerWorkState::Active(request) = work else {
+                continue;
+            };
+            let count = self.owned_header_count(peer);
+            match request.phase {
+                HeaderTargetPhase::Receiving => receiving = receiving.saturating_add(count),
+                HeaderTargetPhase::Preparing => preparing = preparing.saturating_add(count),
+                HeaderTargetPhase::Applying => applying = applying.saturating_add(count),
+            }
+        }
+        // Counts are bounded by 4,000 and are exactly representable as f64.
+        metrics::gauge!("sync.header.chunk_budget.receiving").set(receiving as f64);
+        metrics::gauge!("sync.header.chunk_budget.preparing").set(preparing as f64);
+        metrics::gauge!("sync.header.chunk_budget.applying").set(applying as f64);
+    }
+
+    #[cfg(test)]
+    pub(in crate::zakura::header_sync) fn set_capacity_for_test(
+        &mut self,
+        peer: &ZakuraPeerId,
+        staged: usize,
+        reserved: usize,
+    ) {
+        self.request_reservations.remove(peer);
+        self.staged_capacity.remove(peer);
+        if staged != 0 {
+            let reservation = self
+                .budget
+                .reserve(staged)
+                .expect("the test staged count fits the aggregate budget");
+            let lease = reservation
+                .consume(staged)
+                .expect("the test consumes its exact staged reservation")
+                .expect("a nonzero staged reservation returns an owned lease");
+            self.staged_capacity.insert(peer.clone(), vec![lease]);
+        }
+        if reserved != 0 {
+            let reservation = self
+                .budget
+                .reserve(reserved)
+                .expect("the test request count fits remaining capacity");
+            self.request_reservations.insert(peer.clone(), reservation);
+        }
     }
 }
 
@@ -649,6 +1005,7 @@ mod tests {
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         };
+        assert!(queue.reserve_request(&peer(1), 1));
         assert!(queue.start(request.clone()));
         assert_eq!(queue.active(&peer(1)), Some(&request));
         assert_eq!(
@@ -699,6 +1056,7 @@ mod tests {
             queue.stage(peer(2), active.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::NeedsLocator
         );
+        assert!(queue.reserve_request(&peer(2), 1));
         assert!(queue.start(active_request(2, active, &local, Vec::new())));
 
         let mut current = local;
@@ -746,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_staged_header_cap_spans_all_peers_and_releases_on_retirement() {
+    fn aggregate_owned_header_budget_spans_all_peers_and_releases_on_retirement() {
         let local = snapshot();
         let entry = HeaderEntry {
             header: Arc::new(*regtest_genesis_block().header),
@@ -754,34 +1112,139 @@ mod tests {
             tree_aux: None,
         };
         let mut queue = PeerWorkQueue::default();
-        let first_count = MAX_STAGED_HEADERS_V1 * 3 / 4;
-        let remaining = MAX_STAGED_HEADERS_V1 - first_count;
+        let first_count = HEADER_CHUNK_BUDGET_CAPACITY_V1 * 3 / 4;
+        let remaining = HEADER_CHUNK_BUDGET_CAPACITY_V1 - first_count;
 
         let first = advertisement(1);
         assert_eq!(
             queue.stage(peer(1), first.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::NeedsLocator
         );
+        assert!(queue.reserve_request(&peer(1), 1));
         assert!(queue.start(active_request(
             1,
             first,
             &local,
             vec![entry.clone(); first_count],
         )));
-        assert!(queue.has_staging_capacity(remaining));
-        assert!(!queue.has_staging_capacity(remaining + 1));
+        queue.set_capacity_for_test(&peer(1), first_count, 0);
+        assert_eq!(queue.unowned_chunk_capacity(), remaining);
 
         let second = advertisement(2);
         assert_eq!(
             queue.stage(peer(2), second.clone(), PeerWorkPriority::Normal),
             QueueWorkResult::NeedsLocator
         );
+        assert!(queue.reserve_request(&peer(2), 1));
         assert!(queue.start(active_request(2, second, &local, vec![entry; remaining],)));
-        assert!(queue.has_staging_capacity(0));
-        assert!(!queue.has_staging_capacity(1));
+        queue.set_capacity_for_test(&peer(2), remaining, 0);
+        assert_eq!(queue.unowned_chunk_capacity(), 0);
 
         queue.remove(&peer(1));
-        assert!(queue.has_staging_capacity(first_count));
+        assert_eq!(queue.unowned_chunk_capacity(), first_count);
+    }
+
+    #[test]
+    fn header_chunk_leases_release_unused_and_owned_capacity_exactly_once() {
+        let budget = HeaderChunkBudget::default();
+        let reservation = budget
+            .reserve(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .expect("the fair share fits an empty budget");
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: MAX_HEADER_CHUNK_RESERVATION_V1,
+                owned: 0,
+            }
+        );
+
+        let returned = MAX_HEADER_CHUNK_RESERVATION_V1 / 2;
+        let lease = reservation
+            .consume(returned)
+            .expect("a partial response fits its reservation")
+            .expect("a nonempty response returns an owned lease");
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: 0,
+                owned: returned,
+            },
+            "unused response capacity is returned immediately"
+        );
+        drop(lease);
+        assert_eq!(budget.usage(), HeaderChunkUsage::default());
+
+        let empty = budget
+            .reserve(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .expect("released capacity can be reserved again");
+        assert!(empty
+            .consume(0)
+            .expect("an empty response consumes its reservation")
+            .is_none());
+        assert_eq!(budget.usage(), HeaderChunkUsage::default());
+    }
+
+    #[test]
+    fn malformed_overreturn_preserves_reservation_until_terminal_cleanup() {
+        let budget = HeaderChunkBudget::default();
+        let reservation = budget.reserve(1).expect("one header fits the budget");
+        assert!(reservation.consume(2).is_err());
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: 1,
+                owned: 0,
+            },
+            "a rejected conversion remains owned by the request"
+        );
+        drop(reservation);
+        assert_eq!(budget.usage(), HeaderChunkUsage::default());
+    }
+
+    #[test]
+    fn fair_reservations_fill_the_aggregate_budget_without_overcommit() {
+        let mut queue = PeerWorkQueue::default();
+        for marker in 1..=MAX_STAGED_TARGETS_V1 {
+            let marker = u8::try_from(marker).expect("the target-slot count fits u8");
+            assert_eq!(
+                queue.reservable_header_count(MAX_HS_RANGE),
+                u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1)
+                    .expect("the fair reservation fits u32")
+            );
+            assert!(queue.reserve_request(
+                &peer(marker),
+                u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1)
+                    .expect("the fair reservation fits u32"),
+            ));
+        }
+        assert_eq!(
+            queue.chunk_budget_usage(),
+            (HEADER_CHUNK_BUDGET_CAPACITY_V1, 0)
+        );
+        assert_eq!(queue.reservable_header_count(MAX_HS_RANGE), 0);
+        assert!(!queue.reserve_request(&peer(17), 1));
+
+        queue.cancel_request_reservation(&peer(1));
+        assert_eq!(
+            queue.unowned_chunk_capacity(),
+            MAX_HEADER_CHUNK_RESERVATION_V1
+        );
+    }
+
+    #[test]
+    fn active_work_requires_a_preallocated_response_reservation() {
+        let local = snapshot();
+        let target = advertisement(1);
+        let mut queue = PeerWorkQueue::default();
+        assert_eq!(
+            queue.stage(peer(1), target.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        let request = active_request(1, target, &local, Vec::new());
+        assert!(!queue.start(request.clone()));
+        assert!(queue.active(&peer(1)).is_none());
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start(request));
     }
 
     #[test]

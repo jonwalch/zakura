@@ -155,9 +155,10 @@ fn seed_applying_request(
             .stage(peer.clone(), advertised.clone(), PeerWorkPriority::Normal,),
         QueueWorkResult::NeedsLocator
     );
+    assert!(reactor.peer_work_queue.reserve_request(&peer, 1));
     assert!(reactor.peer_work_queue.start(ActiveHeaderRequest {
         purpose: HeaderTargetPurpose::Normal,
-        peer,
+        peer: peer.clone(),
         source,
         target: advertised,
         sent_locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
@@ -173,6 +174,7 @@ fn seed_applying_request(
         max_header_count: 1,
         tree_aux_schema: AuxSchema::None,
     }));
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
     (source, owner, owner.header_authority().branch)
 }
 
