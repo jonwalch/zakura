@@ -398,6 +398,25 @@ jobs:
           sudo systemctl enable zakura-broadcast-testnet.service
           sudo systemctl restart zakura-broadcast-testnet.service
           sudo systemctl --no-pager --full status zakura-broadcast-testnet.service || true
+
+          gateway_ready=false
+          for _ in {1..30}; do
+            if curl -fsS --connect-timeout 1 --max-time 2 \
+              "http://127.0.0.1:8092/healthz" >/dev/null; then
+              gateway_ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$gateway_ready" != true ]; then
+            sudo systemctl --no-pager --full status \
+              zakura-broadcast-testnet.service || true
+            sudo journalctl --no-pager -u zakura-broadcast-testnet.service \
+              --since "2 minutes ago" || true
+            exit 1
+          fi
+
           curl -fsS "http://127.0.0.1:8092/healthz"
           echo
 
