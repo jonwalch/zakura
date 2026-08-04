@@ -5,9 +5,12 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use zakura_chain::block;
 
+#[cfg(not(any(test, feature = "fuzz-impl")))]
+use crate::graph::GraphOverlay;
+use crate::graph::HeaderGraphView;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineMode, FinalitySource, Frontier,
-    HeaderChainEngine, HeaderNode, MemHeaderStore, ProjectionDelta, TransitionPlan,
+    HeaderChainEngine, HeaderNode, ProjectionDelta, TransitionPlan,
 };
 
 /// Stable, category-specific projected-state invariant failures.
@@ -67,7 +70,10 @@ pub(crate) fn verify_plan(
         return Err(InvariantViolation::SourceSnapshot);
     }
     let source_metadata = before.metadata();
-    let graph = plan.projected_graph();
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    let graph = plan.projected_graph().clone();
+    #[cfg(not(any(test, feature = "fuzz-impl")))]
+    let graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta());
     let metadata = &plan.change_set.metadata;
     if source_metadata.state_version != source.state_version
         || metadata.mode != source.mode
@@ -75,7 +81,7 @@ pub(crate) fn verify_plan(
     {
         return Err(InvariantViolation::SourceSnapshot);
     }
-    if metadata.frontiers.finalized != graph.finalized()
+    if metadata.frontiers.finalized != graph.view_finalized()
         || metadata.frontiers.finalized.height < source.frontiers.finalized.height
         || match plan.change_set.finality_append {
             Some(record) => {
@@ -101,7 +107,7 @@ pub(crate) fn verify_plan(
                         .saturating_sub(record.current.height.0)
                         == plan.limits.local_finality_depth.get()
                     && graph
-                        .ancestor(selected_tip.hash, record.current.height)
+                        .view_ancestor(selected_tip.hash, record.current.height)
                         .ok()
                         .flatten()
                         == Some(record.current)
@@ -114,67 +120,74 @@ pub(crate) fn verify_plan(
     } else if metadata.finality_epoch != source_metadata.finality_epoch {
         return Err(InvariantViolation::Generation);
     }
-    for node in graph.nodes() {
-        verify_node(graph, node, metadata.work_origin.hash)?;
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    let nodes = graph.view_nodes();
+    #[cfg(not(any(test, feature = "fuzz-impl")))]
+    let nodes = changed_boundary_nodes(&graph, plan);
+    for node in nodes {
+        verify_node(&graph, node, metadata.work_origin.hash)?;
     }
     verify_indexes(before, plan)?;
     let selected = projected_path(before, &source, &plan.change_set.selected_projection, true)?;
     let verified = projected_path(before, &source, &plan.change_set.verified_projection, false)?;
     verify_projection(
-        graph,
+        &graph,
         &selected,
         metadata.frontiers.header_best,
         InvariantViolation::SelectedProjection,
     )?;
     let best = graph
-        .select_header_best()
+        .view_select_header_best()
         .map_err(|_| InvariantViolation::Selection)?;
     if best.0 != metadata.frontiers.header_best || best.1 != metadata.header_best_score {
         return Err(InvariantViolation::Selection);
     }
     verify_verified(
-        graph,
+        &graph,
         metadata.mode,
         &verified,
         metadata.frontiers.verified_best,
     )?;
-    verify_pins(graph, &plan.trust_pins, &selected, &verified)?;
-    verify_protected(graph, plan)?;
-    if graph.node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
-        || graph.eligible_tips().len() > plan.limits.max_candidate_tips.get()
+    verify_pins(&graph, &plan.trust_pins, &selected, &verified)?;
+    verify_protected(&graph, plan)?;
+    if graph.view_node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
+        || graph.view_eligible_tips().len() > plan.limits.max_candidate_tips.get()
     {
         return Err(InvariantViolation::Limits);
     }
     verify_generations(before, plan, &selected, &verified)?;
-    verify_aux(before, plan)?;
+    verify_aux(before, &graph, plan)?;
     Ok(())
 }
 
-fn verify_node(
-    graph: &MemHeaderStore,
+fn verify_node<G: HeaderGraphView>(
+    graph: &G,
     node: &HeaderNode,
     work_origin: block::Hash,
 ) -> Result<(), InvariantViolation> {
     if node.header.hash() != node.hash {
         return Err(InvariantViolation::NodeHash(node.hash));
     }
-    if !graph.hashes_at_height(node.height).contains(&node.hash) {
+    if !graph
+        .view_hashes_at_height(node.height)
+        .contains(&node.hash)
+    {
         return Err(InvariantViolation::Index(node.hash));
     }
     if node.work_coordinate().origin_hash() != work_origin {
         return Err(InvariantViolation::Work(node.hash));
     }
-    if node.hash == graph.finalized().hash {
+    if node.hash == graph.view_finalized().hash {
         if node.eligibility.inherited_from.is_some() {
             return Err(InvariantViolation::Eligibility(node.hash));
         }
         return Ok(());
     }
     let parent = graph
-        .node(node.parent_hash)
+        .view_node(node.parent_hash)
         .ok_or(InvariantViolation::Parent(node.hash))?;
     if parent.height.next().ok() != Some(node.height)
-        || !graph.children(parent.hash).contains(&node.hash)
+        || !graph.view_children(parent.hash).contains(&node.hash)
     {
         return Err(InvariantViolation::Parent(node.hash));
     }
@@ -191,6 +204,11 @@ fn verify_indexes(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
+    if plan.change_set.put_nodes != plan.graph_delta().put_nodes
+        || plan.change_set.delete_nodes != plan.graph_delta().delete_nodes
+    {
+        return Err(InvariantViolation::Index(block::Hash([0; 32])));
+    }
     let mut inserted = HashSet::new();
     for node in &plan.change_set.put_nodes {
         if before.graph().node(node.hash).is_none() {
@@ -263,13 +281,13 @@ fn projected_path(
     Ok(path)
 }
 
-fn verify_projection(
-    graph: &MemHeaderStore,
+fn verify_projection<G: HeaderGraphView>(
+    graph: &G,
     projection: &[Frontier],
     tip: Frontier,
     failure: fn(block::Hash) -> InvariantViolation,
 ) -> Result<(), InvariantViolation> {
-    if projection.first().copied() != Some(graph.finalized())
+    if projection.first().copied() != Some(graph.view_finalized())
         || projection.last().copied() != Some(tip)
     {
         return Err(failure(tip.hash));
@@ -277,7 +295,7 @@ fn verify_projection(
     for pair in projection.windows(2) {
         if pair[1].height.0 != pair[0].height.0 + 1
             || graph
-                .node(pair[1].hash)
+                .view_node(pair[1].hash)
                 .is_none_or(|node| node.parent_hash != pair[0].hash)
         {
             return Err(failure(pair[1].hash));
@@ -286,8 +304,8 @@ fn verify_projection(
     Ok(())
 }
 
-fn verify_verified(
-    graph: &MemHeaderStore,
+fn verify_verified<G: HeaderGraphView>(
+    graph: &G,
     mode: EngineMode,
     projection: &[Frontier],
     tip: Frontier,
@@ -298,13 +316,13 @@ fn verify_verified(
         tip,
         InvariantViolation::VerifiedProjection,
     )?;
-    if mode == EngineMode::HeadersOnly && projection != [graph.finalized()] {
+    if mode == EngineMode::HeadersOnly && projection != [graph.view_finalized()] {
         return Err(InvariantViolation::VerifiedProjection(tip.hash));
     }
     if mode == EngineMode::Integrated {
         for frontier in projection.iter().skip(1) {
             if !matches!(
-                graph.node(frontier.hash).map(|node| node.body.clone()),
+                graph.view_node(frontier.hash).map(|node| node.body.clone()),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(InvariantViolation::VerifiedProjection(frontier.hash));
@@ -314,8 +332,8 @@ fn verify_verified(
     Ok(())
 }
 
-fn verify_pins(
-    graph: &MemHeaderStore,
+fn verify_pins<G: HeaderGraphView>(
+    graph: &G,
     pins: &[Frontier],
     selected: &[Frontier],
     verified: &[Frontier],
@@ -331,12 +349,12 @@ fn verify_pins(
                 }
             }
         }
-        for hash in graph.hashes_at_height(pin.height) {
+        for hash in graph.view_hashes_at_height(pin.height) {
             if hash == pin.hash {
                 continue;
             }
             let node = graph
-                .node(hash)
+                .view_node(hash)
                 .ok_or(InvariantViolation::TrustPin(pin.height))?;
             let has_reason = node.eligibility.direct_reasons.iter().any(|reason| {
                 matches!(reason,
@@ -352,8 +370,8 @@ fn verify_pins(
     Ok(())
 }
 
-fn verify_protected(
-    graph: &MemHeaderStore,
+fn verify_protected<G: HeaderGraphView>(
+    graph: &G,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
     for frontier in [
@@ -361,7 +379,7 @@ fn verify_protected(
         plan.change_set.metadata.frontiers.header_best,
         plan.change_set.metadata.frontiers.verified_best,
     ] {
-        if graph.node(frontier.hash).is_none()
+        if graph.view_node(frontier.hash).is_none()
             || plan.change_set.delete_nodes.contains(&frontier.hash)
         {
             return Err(InvariantViolation::Protected(frontier.hash));
@@ -438,7 +456,11 @@ fn verify_generations(
     Ok(())
 }
 
-fn verify_aux(before: &HeaderChainEngine, plan: &TransitionPlan) -> Result<(), InvariantViolation> {
+fn verify_aux<G: HeaderGraphView>(
+    before: &HeaderChainEngine,
+    graph: &G,
+    plan: &TransitionPlan,
+) -> Result<(), InvariantViolation> {
     let deletes: Vec<_> = plan
         .change_set
         .aux_changes
@@ -473,7 +495,16 @@ fn verify_aux(before: &HeaderChainEngine, plan: &TransitionPlan) -> Result<(), I
             AuxDelta::Delete { .. } => None,
         })
         .collect();
-    for node in plan.projected.nodes() {
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    let nodes = graph.view_nodes();
+    #[cfg(not(any(test, feature = "fuzz-impl")))]
+    let nodes: Vec<_> = plan
+        .change_set
+        .put_nodes
+        .iter()
+        .filter_map(|changed| graph.view_node(changed.hash))
+        .collect();
+    for node in nodes {
         let mut deliveries = before.aux_deliveries(node.hash).to_vec();
         deliveries.retain(|delivery| !deleted_ids.contains(&delivery.delivery_id));
         deliveries.extend(
@@ -490,7 +521,7 @@ fn verify_aux(before: &HeaderChainEngine, plan: &TransitionPlan) -> Result<(), I
         }
     }
     for delivery in puts.values() {
-        if plan.projected.node(delivery.header_hash).is_none() {
+        if graph.view_node(delivery.header_hash).is_none() {
             return Err(InvariantViolation::Auxiliary(delivery.header_hash));
         }
     }
@@ -502,4 +533,34 @@ fn verify_aux(before: &HeaderChainEngine, plan: &TransitionPlan) -> Result<(), I
         }
     }
     Ok(())
+}
+
+#[cfg(not(any(test, feature = "fuzz-impl")))]
+fn changed_boundary_nodes<'a, G: HeaderGraphView>(
+    graph: &'a G,
+    plan: &TransitionPlan,
+) -> Vec<&'a HeaderNode> {
+    let mut hashes = HashSet::from([
+        plan.change_set.metadata.frontiers.finalized.hash,
+        plan.change_set.metadata.frontiers.header_best.hash,
+        plan.change_set.metadata.frontiers.verified_best.hash,
+    ]);
+    for node in &plan.graph_delta().put_nodes {
+        hashes.insert(node.hash);
+        hashes.insert(node.parent_hash);
+        hashes.extend(graph.view_children(node.hash));
+    }
+    for (parent, child) in plan
+        .graph_delta()
+        .add_children
+        .iter()
+        .chain(&plan.graph_delta().remove_children)
+    {
+        hashes.insert(*parent);
+        hashes.insert(*child);
+    }
+    hashes
+        .into_iter()
+        .filter_map(|hash| graph.view_node(hash))
+        .collect()
 }

@@ -44,6 +44,7 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     .expect("resource refusal produces an alarm-only plan");
     assert_eq!(refused.cause(), TransitionCause::ResourceStalled);
     assert!(refused.change_set.metadata.alarms.resource_stalled);
+    assert_eq!(refused.graph_delta, crate::graph::GraphDelta::default());
     assert_eq!(
         refused.change_set.metadata.state_version,
         StateVersion::new(1)

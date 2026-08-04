@@ -122,23 +122,32 @@ impl HeaderChainEngine {
         durable: DurableTransitionFacts,
     ) -> Result<EngineTransition, TransitionFailure> {
         let plan = apply_transition_engine(self, &durable, request, context)?;
-        let mut projected = Self {
-            graph: plan.projected_graph().clone(),
-            metadata: plan.change_set().metadata.clone(),
-            selected: self.selected.clone(),
-            verified: self.verified.clone(),
-            aux: self.aux.clone(),
+        let projected = {
+            let mut projected = self.clone();
+            projected.apply_verified_plan(&plan)?;
+            projected
         };
-        apply_projection_delta(
-            &mut projected.selected,
-            &plan.change_set().selected_projection,
-        );
-        apply_projection_delta(
-            &mut projected.verified,
-            &plan.change_set().verified_projection,
-        );
-        apply_aux_delta(&mut projected.aux, &plan.change_set().aux_changes);
         Ok(EngineTransition { plan, projected })
+    }
+
+    /// Apply a verified graph delta after its durable batch has committed.
+    pub fn apply_committed(&mut self, transition: EngineTransition) {
+        assert_eq!(
+            self.snapshot(),
+            *transition.before(),
+            "a committed header transition must apply to its verified source snapshot"
+        );
+        self.apply_verified_plan(&transition.plan)
+            .expect("a verified header graph delta applies to its unchanged source graph");
+    }
+
+    fn apply_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
+        self.graph.apply_delta(plan.graph_delta())?;
+        self.metadata = plan.change_set().metadata.clone();
+        apply_projection_delta(&mut self.selected, &plan.change_set().selected_projection);
+        apply_projection_delta(&mut self.verified, &plan.change_set().verified_projection);
+        apply_aux_delta(&mut self.aux, &plan.change_set().aux_changes);
+        Ok(())
     }
 
     /// Return the atomic externally meaningful snapshot.

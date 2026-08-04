@@ -293,6 +293,7 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
     )
     .expect("the exact operator evidence replays idempotently");
     assert!(replay.is_no_change());
+    assert_eq!(replay.graph_delta, crate::graph::GraphDelta::default());
 }
 
 #[test]

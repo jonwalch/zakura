@@ -17,6 +17,70 @@ use crate::{
     WorkCoordinateError,
 };
 
+mod overlay;
+pub(crate) use overlay::{GraphDelta, GraphOverlay};
+
+pub(crate) trait HeaderGraphView {
+    fn view_finalized(&self) -> Frontier;
+    fn view_node_count(&self) -> usize;
+    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode>;
+    fn view_nodes(&self) -> Vec<&HeaderNode>;
+    fn view_retained_hashes(&self) -> Vec<block::Hash>;
+    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash>;
+    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash>;
+    fn view_eligible_tips(&self) -> Vec<Frontier>;
+    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError>;
+    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError>;
+    fn view_ancestor(
+        &self,
+        descendant: block::Hash,
+        height: block::Height,
+    ) -> Result<Option<Frontier>, GraphError>;
+}
+
+pub(crate) trait HeaderGraphEdit: HeaderGraphView {
+    fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError>;
+    fn edit_insert(
+        &mut self,
+        header: Arc<block::Header>,
+        block_work: Work,
+        validation: HeaderValidationState,
+        direct_reasons: Vec<EligibilityReason>,
+        body: BodyValidationState,
+    ) -> Result<InsertResult, GraphError>;
+    fn edit_add_reason(
+        &mut self,
+        hash: block::Hash,
+        reason: EligibilityReason,
+    ) -> Result<bool, GraphError>;
+    fn edit_remove_operator_invalidation(
+        &mut self,
+        hash: block::Hash,
+        id: OperatorInvalidationId,
+    ) -> Result<bool, GraphError>;
+    fn edit_set_consensus_body_invalid(
+        &mut self,
+        hash: block::Hash,
+        evidence: EvidenceId,
+        rule: BodyRuleId,
+    ) -> Result<bool, GraphError>;
+    fn edit_set_body_state(
+        &mut self,
+        hash: block::Hash,
+        body: BodyValidationState,
+    ) -> Result<bool, GraphError>;
+    fn edit_set_validation(
+        &mut self,
+        hash: block::Hash,
+        validation: HeaderValidationState,
+    ) -> Result<bool, GraphError>;
+    fn edit_advance_finalized(
+        &mut self,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError>;
+    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError>;
+}
+
 /// Failure to construct or query a coherent in-memory header DAG.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GraphError {
@@ -675,6 +739,300 @@ impl MemHeaderStore {
             .filter(|node| node.is_eligible() && !self.has_eligible_child(node.hash))
             .map(|node| node.hash)
             .collect();
+    }
+
+    pub(crate) fn apply_delta(&mut self, delta: &GraphDelta) -> Result<(), GraphError> {
+        for hash in &delta.delete_nodes {
+            if !self.nodes.contains_key(hash) {
+                return Err(GraphError::UnknownNode(*hash));
+            }
+        }
+        for node in &delta.put_nodes {
+            if delta.delete_nodes.contains(&node.hash) {
+                return Err(GraphError::ConflictingDuplicate(node.hash));
+            }
+        }
+
+        for hash in &delta.delete_nodes {
+            let node = self
+                .nodes
+                .remove(hash)
+                .expect("delta deletions were validated before mutation");
+            self.children.remove(hash);
+            if let Some(hashes) = self.heights.get_mut(&node.height) {
+                hashes.remove(hash);
+                if hashes.is_empty() {
+                    self.heights.remove(&node.height);
+                }
+            }
+        }
+        for node in &delta.put_nodes {
+            let old = self.nodes.insert(node.hash, node.clone());
+            if old.is_none() {
+                self.heights
+                    .entry(node.height)
+                    .or_default()
+                    .insert(node.hash);
+            }
+        }
+        for (parent, child) in &delta.remove_children {
+            if let Some(children) = self.children.get_mut(parent) {
+                children.remove(child);
+                if children.is_empty() {
+                    self.children.remove(parent);
+                }
+            }
+        }
+        for (parent, child) in &delta.add_children {
+            self.children.entry(*parent).or_default().insert(*child);
+        }
+        for hash in &delta.remove_eligible_tips {
+            self.eligible_tips.remove(hash);
+        }
+        self.eligible_tips
+            .extend(delta.add_eligible_tips.iter().copied());
+        if let Some(finalized) = delta.finalized {
+            self.finalized = finalized;
+        }
+        Ok(())
+    }
+}
+
+impl HeaderGraphView for MemHeaderStore {
+    fn view_finalized(&self) -> Frontier {
+        self.finalized()
+    }
+
+    fn view_node_count(&self) -> usize {
+        self.node_count()
+    }
+
+    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
+        self.node(hash)
+    }
+
+    fn view_nodes(&self) -> Vec<&HeaderNode> {
+        self.nodes().collect()
+    }
+
+    fn view_retained_hashes(&self) -> Vec<block::Hash> {
+        self.retained_hashes().collect()
+    }
+
+    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
+        self.hashes_at_height(height)
+    }
+
+    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash> {
+        self.children(parent)
+    }
+
+    fn view_eligible_tips(&self) -> Vec<Frontier> {
+        self.eligible_tips()
+    }
+
+    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError> {
+        self.select_header_best()
+    }
+
+    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
+        self.score(hash)
+    }
+
+    fn view_ancestor(
+        &self,
+        descendant: block::Hash,
+        height: block::Height,
+    ) -> Result<Option<Frontier>, GraphError> {
+        self.ancestor(descendant, height)
+    }
+}
+
+impl HeaderGraphEdit for MemHeaderStore {
+    fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
+        self.node_mut(hash)
+    }
+
+    fn edit_insert(
+        &mut self,
+        header: Arc<block::Header>,
+        block_work: Work,
+        validation: HeaderValidationState,
+        direct_reasons: Vec<EligibilityReason>,
+        body: BodyValidationState,
+    ) -> Result<InsertResult, GraphError> {
+        self.insert(header, block_work, validation, direct_reasons, body)
+    }
+
+    fn edit_add_reason(
+        &mut self,
+        hash: block::Hash,
+        reason: EligibilityReason,
+    ) -> Result<bool, GraphError> {
+        self.add_reason(hash, reason)
+    }
+
+    fn edit_remove_operator_invalidation(
+        &mut self,
+        hash: block::Hash,
+        id: OperatorInvalidationId,
+    ) -> Result<bool, GraphError> {
+        self.remove_operator_invalidation(hash, id)
+    }
+
+    fn edit_set_consensus_body_invalid(
+        &mut self,
+        hash: block::Hash,
+        evidence: EvidenceId,
+        rule: BodyRuleId,
+    ) -> Result<bool, GraphError> {
+        self.set_consensus_body_invalid(hash, evidence, rule)
+    }
+
+    fn edit_set_body_state(
+        &mut self,
+        hash: block::Hash,
+        body: BodyValidationState,
+    ) -> Result<bool, GraphError> {
+        self.set_body_state(hash, body)
+    }
+
+    fn edit_set_validation(
+        &mut self,
+        hash: block::Hash,
+        validation: HeaderValidationState,
+    ) -> Result<bool, GraphError> {
+        self.set_validation(hash, validation)
+    }
+
+    fn edit_advance_finalized(
+        &mut self,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError> {
+        self.advance_finalized(finalized)
+    }
+
+    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
+        self.remove_leaf(hash)
+    }
+}
+
+impl HeaderGraphView for GraphOverlay<'_> {
+    fn view_finalized(&self) -> Frontier {
+        self.finalized()
+    }
+
+    fn view_node_count(&self) -> usize {
+        self.node_count()
+    }
+
+    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
+        self.node(hash)
+    }
+
+    fn view_nodes(&self) -> Vec<&HeaderNode> {
+        self.nodes().collect()
+    }
+
+    fn view_retained_hashes(&self) -> Vec<block::Hash> {
+        self.retained_hashes().collect()
+    }
+
+    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
+        self.hashes_at_height(height)
+    }
+
+    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash> {
+        self.children(parent)
+    }
+
+    fn view_eligible_tips(&self) -> Vec<Frontier> {
+        self.eligible_tips()
+    }
+
+    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError> {
+        self.select_header_best()
+    }
+
+    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
+        self.score(hash)
+    }
+
+    fn view_ancestor(
+        &self,
+        descendant: block::Hash,
+        height: block::Height,
+    ) -> Result<Option<Frontier>, GraphError> {
+        self.ancestor(descendant, height)
+    }
+}
+
+impl HeaderGraphEdit for GraphOverlay<'_> {
+    fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
+        self.node_mut(hash)
+    }
+
+    fn edit_insert(
+        &mut self,
+        header: Arc<block::Header>,
+        block_work: Work,
+        validation: HeaderValidationState,
+        direct_reasons: Vec<EligibilityReason>,
+        body: BodyValidationState,
+    ) -> Result<InsertResult, GraphError> {
+        self.insert(header, block_work, validation, direct_reasons, body)
+    }
+
+    fn edit_add_reason(
+        &mut self,
+        hash: block::Hash,
+        reason: EligibilityReason,
+    ) -> Result<bool, GraphError> {
+        self.add_reason(hash, reason)
+    }
+
+    fn edit_remove_operator_invalidation(
+        &mut self,
+        hash: block::Hash,
+        id: OperatorInvalidationId,
+    ) -> Result<bool, GraphError> {
+        self.remove_operator_invalidation(hash, id)
+    }
+
+    fn edit_set_consensus_body_invalid(
+        &mut self,
+        hash: block::Hash,
+        evidence: EvidenceId,
+        rule: BodyRuleId,
+    ) -> Result<bool, GraphError> {
+        self.set_consensus_body_invalid(hash, evidence, rule)
+    }
+
+    fn edit_set_body_state(
+        &mut self,
+        hash: block::Hash,
+        body: BodyValidationState,
+    ) -> Result<bool, GraphError> {
+        self.set_body_state(hash, body)
+    }
+
+    fn edit_set_validation(
+        &mut self,
+        hash: block::Hash,
+        validation: HeaderValidationState,
+    ) -> Result<bool, GraphError> {
+        self.set_validation(hash, validation)
+    }
+
+    fn edit_advance_finalized(
+        &mut self,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError> {
+        self.advance_finalized(finalized)
+    }
+
+    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
+        self.remove_leaf(hash)
     }
 }
 
