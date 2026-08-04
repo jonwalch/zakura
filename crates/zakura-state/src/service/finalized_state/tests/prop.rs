@@ -1696,7 +1696,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // far too short to complete a subtree, so `z_getsubtreesbyindex` at index 0 is an
             // ordinary "nothing here yet" empty list, exactly as on a legacy node.
             prop_assert_eq!(
-                check_historical_sapling_subtrees_available(&fast.db, 0.into(), &BTreeMap::new()),
+                check_historical_sapling_subtrees_available(&fast.db, 0.into(), None, &BTreeMap::new()),
                 Ok(()),
                 "an index past the last completed subtree stays an empty list, not an error"
             );

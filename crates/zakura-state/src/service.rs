@@ -2269,7 +2269,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // half — then re-apply the continuity contract over the whole thing.
                     let range = range_for(start_index, end_index);
                     let mut merged = state.db.sapling_subtree_list_by_index_range(range);
-                    merged.extend(artifact.sapling_range(range));
+                    read::merge_published_subtrees(&mut merged, artifact.sapling_range(range));
 
                     read::contiguous_subtrees_from(merged, start_index)
                 } else {
@@ -2279,6 +2279,7 @@ impl Service<ReadRequest> for ReadStateService {
                 read::check_historical_sapling_subtrees_available(
                     &state.db,
                     start_index,
+                    end_index,
                     &sapling_subtrees,
                 )?;
 
@@ -2311,7 +2312,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // half — then re-apply the continuity contract over the whole thing.
                     let range = range_for(start_index, end_index);
                     let mut merged = state.db.orchard_subtree_list_by_index_range(range);
-                    merged.extend(artifact.orchard_range(range));
+                    read::merge_published_subtrees(&mut merged, artifact.orchard_range(range));
 
                     read::contiguous_subtrees_from(merged, start_index)
                 } else {
@@ -2321,6 +2322,7 @@ impl Service<ReadRequest> for ReadStateService {
                 read::check_historical_orchard_subtrees_available(
                     &state.db,
                     start_index,
+                    end_index,
                     &orchard_subtrees,
                 )?;
 
@@ -2349,7 +2351,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // half — then re-apply the continuity contract over the whole thing.
                     let range = range_for(start_index, end_index);
                     let mut merged = state.db.ironwood_subtree_list_by_index_range(range);
-                    merged.extend(artifact.ironwood_range(range));
+                    read::merge_published_subtrees(&mut merged, artifact.ironwood_range(range));
 
                     read::contiguous_subtrees_from(merged, start_index)
                 } else {
@@ -2359,6 +2361,7 @@ impl Service<ReadRequest> for ReadStateService {
                 read::check_historical_ironwood_subtrees_available(
                     &state.db,
                     start_index,
+                    end_index,
                     &ironwood_subtrees,
                 )?;
 

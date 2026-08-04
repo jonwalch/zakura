@@ -97,37 +97,108 @@ pub(crate) fn subtree_completed_by_handoff(
     u64::from(start_index) < (handoff_leaves >> TRACKED_SUBTREE_HEIGHT)
 }
 
-/// Returns an error if the subtree at `start_index` is missing because it completed inside the
-/// verified-commitment-trees absent band, where no subtree roots were recorded.
+/// Returns an error if the served run stops short of a subtree that exists on this chain but
+/// this node cannot supply.
 ///
-/// Callers pass `found = false` only when a subtree list came back without `start_index`, so a
-/// subtree that is present is never rejected. `handoff_leaves` reads the pool's commitment count
-/// at the handoff, which bounds the indices the fast path could have skipped: anything at or
-/// above that bound completed after the handoff and is genuinely absent, not skipped, so a
+/// `first_missing` is the lowest index the served run does not cover: `start_index` when nothing
+/// was served, otherwise one past the end of the contiguous run. `handoff_leaves` reads the pool's
+/// commitment count at the handoff, which bounds the indexes the fast path could have skipped:
+/// anything at or above it completed after the handoff and is genuinely absent on any node, so a
 /// client asking past the tip still gets today's empty list.
+///
+/// # Correctness
+///
+/// Checking only that `start_index` was served is not enough. `z_getsubtreesbyindex` returns one
+/// contiguous run, so a gap anywhere in it truncates the response — and a single unbounded request
+/// from index 0 would then return a short list with no error, which a client reads as "that is
+/// every subtree on this chain". That is the same silent-truncation failure the typed errors exist
+/// to remove, just arriving through a truncated artifact instead of an absent one.
 fn check_historical_subtree_available(
     db: &ZakuraDb,
     pool: &'static str,
-    start_index: NoteCommitmentSubtreeIndex,
-    found: bool,
-    handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> u64,
+    first_missing: Option<NoteCommitmentSubtreeIndex>,
+    handoff_leaves: impl FnOnce(&ZakuraDb, block::Height) -> Option<u64>,
 ) -> Result<(), HistoricalSubtreeUnavailable> {
-    if found {
+    // No gap: either the run covered everything asked for, or it ran past the last possible index.
+    let Some(first_missing) = first_missing else {
         return Ok(());
-    }
+    };
 
     let Some(handoff) = db.vct_synced_below() else {
         return Ok(());
     };
 
-    if subtree_completed_by_handoff(start_index, handoff_leaves(db, handoff)) {
+    // Without the handoff leaf count there is no way to tell a skipped subtree from one that
+    // never existed, so fail closed. Reporting the archive-mode error for a subtree that was
+    // genuinely never completed is a visible, diagnosable wrong answer; serving a truncated list
+    // is the silent one this whole path exists to remove. The tree at the handoff is outside the
+    // absent band and at or below the tip, so this is not expected to happen — but "not expected"
+    // is the wrong thing to lean on when the failure is silent.
+    let Some(leaves) = handoff_leaves(db, handoff) else {
+        tracing::error!(
+            pool,
+            ?handoff,
+            "no note commitment tree at the checkpoint handoff, so completed subtrees cannot be \
+             distinguished from absent ones; refusing to serve",
+        );
+        metrics::counter!("state.historical_tree.handoff_tree_missing").increment(1);
+
+        return Err(HistoricalSubtreeUnavailable {
+            pool,
+            index: first_missing,
+            handoff,
+        });
+    };
+
+    if subtree_completed_by_handoff(first_missing, leaves) {
         Err(HistoricalSubtreeUnavailable {
             pool,
-            index: start_index,
+            index: first_missing,
             handoff,
         })
     } else {
         Ok(())
+    }
+}
+
+/// Merges published subtree records into `stored`, keeping the node's own row wherever both carry
+/// an index.
+///
+/// The node computed and verified its own rows; a published record is trusted only after a digest
+/// the artifact carries itself, which is not a signature. A correct artifact holds only subtrees
+/// completed at or below the handoff and so never overlaps what the node stores, which means an
+/// overlap is precisely the corrupt-or-hostile case where precedence decides whether a wrong root
+/// reaches a client.
+pub fn merge_published_subtrees<Node>(
+    stored: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    published: impl IntoIterator<Item = (NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>)>,
+) {
+    for (index, data) in published {
+        stored.entry(index).or_insert(data);
+    }
+}
+
+/// Returns the lowest index in `[start_index, end_index)` that `subtrees` does not serve, or
+/// `None` when the run covers the whole request.
+///
+/// `subtrees` is contiguous from `start_index` by the time this runs, so the first index it fails
+/// to cover is one past its last key.
+pub(crate) fn first_missing_subtree_index<Node>(
+    subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
+) -> Option<NoteCommitmentSubtreeIndex> {
+    let first_missing = match subtrees.keys().next_back() {
+        // `u16::MAX` is the last index that can exist, so a run reaching it has no successor to
+        // be missing.
+        Some(last) => NoteCommitmentSubtreeIndex(last.0.checked_add(1)?),
+        None => start_index,
+    };
+
+    // An index the client did not ask for is not missing from its answer.
+    match end_index {
+        Some(end) if first_missing >= end => None,
+        _ => Some(first_missing),
     }
 }
 
@@ -138,6 +209,7 @@ fn check_historical_subtree_available(
 pub fn check_historical_sapling_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
     subtrees: &BTreeMap<
         NoteCommitmentSubtreeIndex,
         NoteCommitmentSubtreeData<sapling_crypto::Node>,
@@ -146,12 +218,8 @@ pub fn check_historical_sapling_subtrees_available(
     check_historical_subtree_available(
         db,
         "sapling",
-        start_index,
-        subtrees.contains_key(&start_index),
-        |db, handoff| {
-            db.sapling_tree_by_height(&handoff)
-                .map_or(0, |tree| tree.count())
-        },
+        first_missing_subtree_index(subtrees, start_index, end_index),
+        |db, handoff| db.sapling_tree_by_height(&handoff).map(|tree| tree.count()),
     )
 }
 
@@ -162,17 +230,14 @@ pub fn check_historical_sapling_subtrees_available(
 pub fn check_historical_orchard_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
     subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
 ) -> Result<(), HistoricalSubtreeUnavailable> {
     check_historical_subtree_available(
         db,
         "orchard",
-        start_index,
-        subtrees.contains_key(&start_index),
-        |db, handoff| {
-            db.orchard_tree_by_height(&handoff)
-                .map_or(0, |tree| tree.count())
-        },
+        first_missing_subtree_index(subtrees, start_index, end_index),
+        |db, handoff| db.orchard_tree_by_height(&handoff).map(|tree| tree.count()),
     )
 }
 
@@ -183,16 +248,16 @@ pub fn check_historical_orchard_subtrees_available(
 pub fn check_historical_ironwood_subtrees_available(
     db: &ZakuraDb,
     start_index: NoteCommitmentSubtreeIndex,
+    end_index: Option<NoteCommitmentSubtreeIndex>,
     subtrees: &BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
 ) -> Result<(), HistoricalSubtreeUnavailable> {
     check_historical_subtree_available(
         db,
         "ironwood",
-        start_index,
-        subtrees.contains_key(&start_index),
+        first_missing_subtree_index(subtrees, start_index, end_index),
         |db, handoff| {
             db.ironwood_tree_by_height(&handoff)
-                .map_or(0, |tree| tree.count())
+                .map(|tree| tree.count())
         },
     )
 }

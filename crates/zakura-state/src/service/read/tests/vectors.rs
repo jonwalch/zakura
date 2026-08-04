@@ -28,8 +28,9 @@ use crate::{
         finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::Chain,
         read::{
-            contiguous_subtrees_from, ironwood_subtrees, orchard_subtrees, sapling_subtrees,
-            tree::subtree_completed_by_handoff,
+            contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
+            orchard_subtrees, sapling_subtrees,
+            tree::{first_missing_subtree_index, subtree_completed_by_handoff},
         },
     },
     Config, ReadRequest, ReadResponse,
@@ -736,4 +737,111 @@ fn contiguous_subtrees_spans_published_and_stored_rows() {
         vec![NoteCommitmentSubtreeIndex(2), NoteCommitmentSubtreeIndex(3)],
         "the run starts at the requested index"
     );
+}
+
+/// The served run must be checked to its end, not just at its start.
+///
+/// `z_getsubtreesbyindex` returns one contiguous run, so a gap anywhere truncates the response.
+/// A single unbounded request from index 0 against a truncated artifact would otherwise return a
+/// short list with no error, which a client reads as "that is every subtree on this chain" — the
+/// same silent-truncation failure the typed errors exist to remove.
+#[test]
+fn first_missing_subtree_index_finds_the_end_of_the_run() {
+    let data = || {
+        NoteCommitmentSubtreeData::new(
+            Height(1),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+    let map = |indexes: &[u16]| {
+        indexes
+            .iter()
+            .map(|i| (NoteCommitmentSubtreeIndex(*i), data()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    // A run that stops early reports the index just past its end, not "nothing missing".
+    assert_eq!(
+        first_missing_subtree_index(&map(&[0, 1, 2]), NoteCommitmentSubtreeIndex(0), None),
+        Some(NoteCommitmentSubtreeIndex(3))
+    );
+
+    // Nothing served at all: the requested start is the first missing index.
+    assert_eq!(
+        first_missing_subtree_index(&map(&[]), NoteCommitmentSubtreeIndex(7), None),
+        Some(NoteCommitmentSubtreeIndex(7))
+    );
+
+    // An index the client did not ask for is not missing from its answer.
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[0, 1, 2]),
+            NoteCommitmentSubtreeIndex(0),
+            Some(NoteCommitmentSubtreeIndex(3))
+        ),
+        None,
+        "a fully satisfied bounded request has no gap"
+    );
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[0, 1]),
+            NoteCommitmentSubtreeIndex(0),
+            Some(NoteCommitmentSubtreeIndex(5))
+        ),
+        Some(NoteCommitmentSubtreeIndex(2)),
+        "a bounded request served short still reports the gap"
+    );
+
+    // `u16::MAX` is the last index that can exist, so a run reaching it has no successor.
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[u16::MAX]),
+            NoteCommitmentSubtreeIndex(u16::MAX),
+            None
+        ),
+        None,
+        "the final index must not overflow into a phantom gap"
+    );
+}
+
+/// A published subtree record must never displace the node's own row.
+///
+/// The node computed and verified its rows; a published record is trusted only after a digest the
+/// artifact carries itself, which is not a signature. A correct artifact never overlaps, so an
+/// overlap is exactly the corrupt-or-hostile case where precedence decides whether a wrong root
+/// reaches a client and builds a wrong witness.
+#[test]
+fn published_subtrees_never_displace_the_nodes_own_rows() {
+    let node = |root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(11),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert(NoteCommitmentSubtreeIndex(0), node(1));
+    stored.insert(NoteCommitmentSubtreeIndex(1), node(2));
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            // Collides with a row the node holds.
+            (NoteCommitmentSubtreeIndex(1), node(4)),
+            // Fills a genuine gap, which is what the artifact is for.
+            (NoteCommitmentSubtreeIndex(2), node(3)),
+        ],
+    );
+
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(1)].root,
+        node(2).root,
+        "the node's own row wins on collision"
+    );
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(2)].root,
+        node(3).root,
+        "a published record still fills an index the node lacks"
+    );
+    assert_eq!(stored.len(), 3);
 }
