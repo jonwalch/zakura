@@ -6,7 +6,7 @@ workflow validates that the requested `v*` tag matches the `zakura` package
 version, builds and verifies the release assets from that exact commit, and
 then creates the tag by publishing a complete pre-release. The tag push then
 triggers [`release-binaries.yml`](../.github/workflows/release-binaries.yml) to
-publish Docker images and open the installer metadata update pull request.
+publish Docker images.
 
 ## GitHub App
 
@@ -16,13 +16,9 @@ Apps**, select **New GitHub App**, and create an organization-owned app with:
 - Name `zakura-release-bot`
 - Homepage URL set to the `zakura-core/zakura` repository
 - Repository permission `Contents: Read and write`
-- Repository permission `Pull requests: Read and write`
 - All other permissions set to `No access`
 - Webhooks disabled
 - Installation restricted to `zakura-core`
-
-The pull-request permission allows the app to open and update pull requests,
-while the contents permission allows it to create their branches and commits.
 
 After creating the app, select **Install App**, install it on `zakura-core`, and
 grant it access only to the `zakura` repository.
@@ -33,12 +29,6 @@ Create a private key for the app. Configure a GitHub Actions environment named
 `RELEASE_APP_PRIVATE_KEY`. Configure required reviewers for the environment so
 that creating a release requires explicit approval. Restrict this environment
 to the `main` deployment branch.
-
-Configure a second environment named `release-automation` with the same
-variable and secret. Allow deployments from the `main` branch and tags matching
-`v*`. This environment is used only after assets are published to open the
-installer metadata update pull request. It is separate so tag deployment rules
-or approvals cannot block post-release automation.
 
 The app private key is a credential. Store its source copy in the team's secret
 manager and do not commit it or paste it into issues, pull requests, or logs.
@@ -68,9 +58,14 @@ ruleset administration must remain limited.
 
 1. Merge the release version bump into `main`.
 2. Open **Actions > Create release > Run workflow**.
-3. Select the `main` branch and enter the exact release tag.
-4. Wait for the workflow to build and verify the release assets and no-push
-   Docker builds. Nothing is tagged or published during this stage.
+3. Select the `main` branch, enter the exact release tag, and set the expected
+   tag delay. Dispatching the workflow acknowledges that no release hold is
+   active.
+4. The workflow resolves the latest digest-verified Mainnet release-state
+   bundle and warns about release-level, committed-state, or
+   `ESTIMATED_RELEASE_HEIGHT` readiness problems. Then wait for it to build and
+   verify the release assets and no-push Docker builds. Nothing is tagged or
+   published during this stage.
 5. Approve the `release` environment deployment. The workflow publishes the
    complete pre-release, creating the protected tag as its final step.
 6. Confirm that `Release binaries` starts from the new tag, skips rebuilding

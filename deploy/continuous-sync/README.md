@@ -16,8 +16,8 @@ test a fresh genesis-to-tip sync from the latest `origin/main` build:
 Each node runs a local systemd controller. GitHub Actions installs and audits the
 controller, but it does not hold an SSH session open during the long sync.
 
-The dual-stack and Zakura/v2-only nodes exercise the [experimental Zakura P2P
-v2 stack](../../book/src/user/p2p.md).
+The dual-stack and Zakura/v2-only nodes exercise the experimental Zakura P2P
+v2 stack.
 
 ## Lifecycle
 
@@ -162,6 +162,12 @@ Alert ownership matches the original temporary-node script:
 
 The status helper reports service state, metrics reachability, current block
 height, controller state, and the diagnostic paths included in Slack alerts.
+
+Down alerts fire when the controller is halted or `zakura.service` is inactive
+while a sync is expected. A metrics scrape timeout or error alone does not page
+as down while the service stays active (those are logged as
+`metrics-degraded`), because `/metrics` can grow large during long genesis
+syncs when historical per-peer series accumulate.
 
 ## Completion Criteria
 

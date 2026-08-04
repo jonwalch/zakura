@@ -24,6 +24,11 @@
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
+#   VERIFY_MODE           checkpoint | semantic                (default checkpoint)
+#                         semantic sets consensus.checkpoint_sync = false, so every
+#                         block past the mandatory checkpoints gets full script and
+#                         proof verification (the snapshot tip is past them)
+#   FULL_VERIFY_LIMIT     full_verify_concurrency_limit        (default 20)
 #   TARGET_P2P_STACK            legacy | zakura | dual
 #                               default: zakura
 #   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: legacy)
@@ -63,13 +68,15 @@ WALL_CAP="${WALL_CAP:-2000}"
 FEED_PEER="${FEED_PEER-167.99.162.47:8233}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
+VERIFY_MODE="${VERIFY_MODE:-checkpoint}"
+FULL_VERIFY_LIMIT="${FULL_VERIFY_LIMIT:-20}"
 PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
-SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
-SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
-SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra.valargroup.dev/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
+SNAPSHOT_URL="${SNAPSHOT_URL:-https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst}"
+SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac}"
+SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-}"
 BENCH_HOME="${BENCH_HOME:-/opt/zakura-bench}"
 GH_REPO="${GH_REPO:-zakura-core/zakura}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
@@ -103,6 +110,14 @@ die()  { log "FATAL: $*"; exit 1; }
 
 if ! [[ "$WALL_CAP" =~ ^[0-9]+$ ]]; then
   die "WALL_CAP must be a non-negative integer number of seconds, got '$WALL_CAP'"
+fi
+
+case "$VERIFY_MODE" in
+  checkpoint|semantic) ;;
+  *) die "invalid VERIFY_MODE '$VERIFY_MODE' (use checkpoint or semantic)" ;;
+esac
+if ! [[ "$FULL_VERIFY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  die "FULL_VERIFY_LIMIT must be a positive integer, got '$FULL_VERIFY_LIMIT'"
 fi
 
 normalize_bool() {
@@ -196,8 +211,10 @@ ensure_bench_home() {
 # stored on disk (the box has only ~one disk and can't hold tarball + extracted state).
 # sha256 is computed over the compressed stream via tee and checked after extraction.
 ensure_snapshot() {
-  if [[ -f "$MASTER/state/v27/mainnet/version" ]]; then
-    log "snapshot master present: $MASTER (db v$(cat "$MASTER/state/v27/mainnet/version"))"
+  local version_file
+  version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
+  if [[ -n "$version_file" ]]; then
+    log "snapshot master present: $MASTER (db v$(cat "$version_file"))"
     return
   fi
   local tmp="$MASTER.tmp.$$" sumf; sumf="$BENCH_HOME/snapshots/.sha.$$"
@@ -207,7 +224,7 @@ ensure_snapshot() {
   for url in "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR"; do
     [[ -n "$url" ]] || continue
     log "source: $url"
-    if curl --http1.1 -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
+    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
          | tee >(sha256sum | awk '{print $1}' > "$sumf") \
          | zstd -dc --long=31 | tar -x -C "$tmp"; then
       ok=1; break
@@ -229,8 +246,9 @@ ensure_snapshot() {
     [[ -n "$inner" ]] || die "could not locate state/ in extracted snapshot"
     mv "$inner" "$MASTER"; rm -rf "$tmp"
   fi
-  [[ -f "$MASTER/state/v27/mainnet/version" ]] || die "extracted snapshot missing state/v27/mainnet/version"
-  log "snapshot ready: db v$(cat "$MASTER/state/v27/mainnet/version")"
+  version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
+  [[ -n "$version_file" ]] || die "extracted snapshot missing state/v*/mainnet/version"
+  log "snapshot ready: db v$(cat "$version_file")"
 }
 
 # ---- 2. release binary (download once per tag, cached) -----------------------
@@ -477,8 +495,13 @@ run_one() {
       echo '[sync]'
       echo "checkpoint_verify_concurrency_limit = $CKPT_LIMIT"
       echo "download_concurrency_limit = $DL_LIMIT"
-      echo 'full_verify_concurrency_limit = 20'
+      echo "full_verify_concurrency_limit = $FULL_VERIFY_LIMIT"
       echo ''
+      if [[ "$VERIFY_MODE" == "semantic" ]]; then
+        echo '[consensus]'
+        echo 'checkpoint_sync = false'
+        echo ''
+      fi
       echo '[metrics]'
       echo "endpoint_addr = \"127.0.0.1:$METRICS_PORT\""
       echo ''
@@ -488,7 +511,7 @@ run_one() {
   }
 
   local pid t0 mode="p2p_stack"
-  log "starting zakurad ($tag), p2p_stack=$p2p_stack, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
+  log "starting zakurad ($tag), p2p_stack=$p2p_stack, verify=$VERIFY_MODE, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
@@ -668,7 +691,12 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo ""
   echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
   echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
-  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
+  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT, full_verify=$FULL_VERIFY_LIMIT"
+  if [[ "$VERIFY_MODE" == "semantic" ]]; then
+    echo "- verify mode: **semantic** (consensus.checkpoint_sync = false; full script+proof verification past the mandatory checkpoints)"
+  else
+    echo "- verify mode: checkpoint"
+  fi
   if [[ -n "$GITHUB_RUN_URL" ]]; then
     echo "- GitHub run: [${GITHUB_RUN_ID:-open}]($GITHUB_RUN_URL)"
   fi

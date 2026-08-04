@@ -4,10 +4,9 @@ Measure/debug local sync performance from the 1.8M snapshot, reproducibly. The
 bench node syncs a fixed range (≈1.80M→1.83M) peering **only** with two frozen
 serving nodes we control, over a private Zakura cohort (the `dev_network`
 feature, PR #262), so other engineers churning the public fleet can't perturb a
-run. Background: `book/src/dev/private-zakura-network.md`.
+run.
 
-This benchmark intentionally exercises the [experimental Zakura P2P v2
-stack](../../book/src/user/p2p.md).
+This benchmark intentionally exercises the experimental Zakura P2P v2 stack.
 
 Everything lives in `/root/zakura/deploy/runner/` (untracked local tooling).
 `perf.sh` is the entry point — it wraps the deployer and the run/analyze scripts.
@@ -93,7 +92,7 @@ the nodes.
 - Warm master: `/mnt/roman-dev-2-data/zebra-ckpt-1800000-warm` (tip 1,802,000).
   `feed_run.sh` makes a hard-link fork per run and breaks links on the
   RocksDB metadata + `version`. If the branch DB format changes, re-check
-  `zakura-state/src/constants.rs` and relabel the warm master `version`.
+  `crates/zakura-state/src/constants.rs` and relabel the warm master `version`.
 
 ## Gotchas
 

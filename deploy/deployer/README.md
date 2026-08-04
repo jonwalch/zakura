@@ -106,8 +106,8 @@ volume at `/mnt/data`; legacy `/mnt/<node-name>-data` paths are compatibility
 symlinks only. The compat Zakura process uses the same snapshot layout on its
 host.
 
-The `"dual"` setting enables the [experimental Zakura P2P v2
-stack](../../book/src/user/p2p.md) alongside the legacy stack.
+The `"dual"` setting enables the experimental Zakura P2P v2 stack alongside the
+legacy stack.
 
 The workflow also refreshes a simple fleet status dashboard on
 `zakura-testnet-1`:
@@ -122,6 +122,25 @@ RPC height, whether the height advanced in the last five minutes, and an upgrade
 ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
 cluster block movement when enough samples are available, otherwise it falls back
 to `--target-spacing 7.5`.
+
+The same service exposes the narrow public website API at
+`/ironwood-status.json` and its liveness check at `/healthz`. The public response
+selects one healthy node from the highest agreed tip and contains only the
+network, Ironwood activation and balance data, observation time, and source
+client metadata. It never proxies caller-supplied RPC requests.
+
+It also installs the public broadcast-only JSON-RPC gateway on
+`zakura-testnet-1` (see `deploy/gateway/`):
+
+- service: `zakura-broadcast-testnet.service`
+- public URL: `https://zakura-broadcast.testnet.valargroup.dev/`
+- origin: `http://127.0.0.1:8092/`
+- install dir: `/opt/zakura-gateway-testnet`
+- TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/testnet/Caddyfile`
+
+The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
+load-balances across the testnet `:18232` backends listed in
+`deploy/gateway/testnet/backends.toml`.
 
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
 `zakura-testnet-1`:
@@ -156,6 +175,7 @@ python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
+  --network testnet \
   --upgrade-height 4134000 \
   --target-spacing 7.5
 ```
@@ -193,7 +213,7 @@ The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
 mempool/sync tuning, and an inline `zakura_node_secret_key` that pins each node's
 iroh identity (the node ids hardcoded as bootstrap peers in
-`zakura-network/src/zakura/handler.rs`) — and their state DB lives at
+`crates/zakura-network/src/zakura/handler.rs`) — and their state DB lives at
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
 `manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
@@ -211,16 +231,33 @@ The workflow refreshes a fleet status dashboard on `us-east-0`:
 - URL: `http://159.65.183.89:8090/`
 - install dir: `/opt/zakura-mainnet-dashboard`
 
+It also installs the public broadcast-only JSON-RPC gateway on the same host
+(see `deploy/gateway/`):
+
+- service: `zakura-broadcast-mainnet.service`
+- public URL: `https://zakura-broadcast.valargroup.dev/`
+- origin: `http://127.0.0.1:8092/`
+- install dir: `/opt/zakura-gateway-mainnet`
+- TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/mainnet/Caddyfile`
+
+The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
+load-balances across the mainnet `:8232` backends listed in
+`deploy/gateway/mainnet/backends.toml`.
+
 It is the same `zakura-cluster-status.py` as testnet, launched with
-`--upgrade-height 0`, which hides the upgrade-ETA cards (mainnet has no pending
-Zakura activation to count down to). Manual run:
+`--upgrade-height 3428143` for the Ironwood mainnet activation height. The ETA
+uses observed cluster block movement when enough samples are available,
+otherwise it falls back to `--target-spacing 75` (post-Blossom mainnet spacing).
+Manual run:
 
 ```bash
 python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --upgrade-height 0
+  --network mainnet \
+  --upgrade-height 3428143 \
+  --target-spacing 75
 ```
 
 The mainnet workflow also installs a Slack watchdog on `us-east-0`:
