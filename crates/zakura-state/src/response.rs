@@ -185,6 +185,10 @@ pub struct MinedTx {
 
     /// The time of the block where the transaction was mined.
     pub block_time: DateTime<Utc>,
+
+    /// The best-chain tip hash captured in the same state snapshot used to
+    /// compute `confirmations`.
+    pub best_chain_tip_hash: block::Hash,
 }
 
 impl MinedTx {
@@ -194,12 +198,14 @@ impl MinedTx {
         height: block::Height,
         confirmations: u32,
         block_time: DateTime<Utc>,
+        best_chain_tip_hash: block::Hash,
     ) -> Self {
         Self {
             tx,
             height,
             confirmations,
             block_time,
+            best_chain_tip_hash,
         }
     }
 }

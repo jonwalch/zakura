@@ -1334,14 +1334,6 @@ where
     ) -> Result<GetBlockResponse> {
         let verbosity = verbosity.unwrap_or(1);
         let network = self.network.clone();
-        let original_hash_or_height = hash_or_height.clone();
-
-        // If verbosity requires a call to `get_block_header`, resolve it here
-        let get_block_header_future = if matches!(verbosity, 1 | 2) {
-            Some(self.get_block_header(original_hash_or_height.clone(), Some(true)))
-        } else {
-            None
-        };
 
         let hash_or_height =
             HashOrHeight::new(&hash_or_height, self.latest_chain_tip.best_tip_height())
@@ -1367,9 +1359,12 @@ where
                 }
                 _ => unreachable!("unmatched response to a block request"),
             }
-        } else if let Some(get_block_header_future) = get_block_header_future {
-            let get_block_header_result: Result<GetBlockHeaderResponse> =
-                get_block_header_future.await;
+        } else if matches!(verbosity, 1 | 2) {
+            // Reuse the already-resolved value so tip-relative inputs cannot resolve
+            // to different blocks if the chain changes during this RPC call.
+            let get_block_header_result: Result<GetBlockHeaderResponse> = self
+                .get_block_header(hash_or_height.to_string(), Some(true))
+                .await;
 
             let GetBlockHeaderResponse::Object(block_header) = get_block_header_result? else {
                 panic!("must return Object")
@@ -1398,6 +1393,7 @@ where
             // We look up by block hash so the hash, transaction IDs, and confirmations
             // are consistent.
             let hash_or_height = hash.into();
+            let in_active_chain = confirmations >= 0;
             let transactions_request = match verbosity {
                 1 => zakura_state::ReadRequest::TransactionIdsForBlock(hash_or_height),
                 2 => zakura_state::ReadRequest::BlockAndSize(hash_or_height),
@@ -1462,7 +1458,7 @@ where
                                     &network,
                                     Some(block_time),
                                     Some(hash),
-                                    Some(true),
+                                    Some(in_active_chain),
                                     tx.hash(),
                                 ),
                             ))
@@ -3290,22 +3286,6 @@ where
             };
         }
 
-        // TODO: Ensure that the returned tip hash is always valid for the response, i.e. that Zebra can't return a tip that
-        //       hadn't yet included the queried transaction output.
-
-        // Get the best block tip hash
-        let tip_rsp = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Tip)
-            .await
-            .map_misc_error()?;
-
-        let best_block_hash = match tip_rsp {
-            zakura_state::ReadResponse::Tip(tip) => tip.ok_or_misc_error("No blocks in state")?.1,
-            _ => unreachable!("unmatched response to a `Tip` request"),
-        };
-
         // State path
         let rsp = self
             .read_state
@@ -3316,6 +3296,7 @@ where
 
         match rsp {
             zakura_state::ReadResponse::Transaction(Some(tx)) => {
+                let best_block_hash = tx.best_chain_tip_hash;
                 let outputs = tx.tx.outputs();
                 let index: usize = n.try_into().expect("u32 always fits in usize");
                 let output = match outputs.get(index) {
