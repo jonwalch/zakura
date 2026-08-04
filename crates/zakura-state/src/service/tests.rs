@@ -298,8 +298,10 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     // Set the maximum checkpoint height to block 1, so the checkpoint phase ends once block 1 is
     // committed to the finalized state.
     let max_checkpoint_height = blocks[1].coinbase_height().unwrap();
+    let mut config = Config::ephemeral();
+    config.enable_zakura_header_seed_from_committed_blocks = true;
     let (mut state_service, _read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, max_checkpoint_height, 0).await;
+        StateService::new(config, &network, max_checkpoint_height, 0).await;
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
     // finalized tip catches up to the maximum checkpoint height and the last block hash we sent.
@@ -366,6 +368,56 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     })
     .await
     .expect("the production writer attaches the header runtime at handoff");
+
+    Ok(())
+}
+
+/// Legacy-only nodes must preserve the ordinary state handoff without creating or
+/// reconstructing the native header runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_mode_handoff_keeps_header_runtime_detached() -> Result<()> {
+    use std::task::{Context, Waker};
+
+    use tower::Service;
+    use zakura_node_services::sync_lifecycle::HeaderRuntimeStatus;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = zakura_test::vectors::MAINNET_BLOCKS
+        .get(&0)
+        .expect("the mainnet genesis vector is available")
+        .zcash_deserialize_into::<Arc<Block>>()?;
+
+    let (mut state, read, _tip, _tip_change) =
+        StateService::new(Config::ephemeral(), &network, Height(0), 0).await;
+    let result = state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .await;
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "genesis should commit: {result:?}"
+    );
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let _ = state.poll_ready(&mut cx);
+    assert!(
+        state.block_write_sender.finalized.is_none(),
+        "legacy state still hands off to semantic writes"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(
+        &*read.subscribe_header_runtime_status().borrow(),
+        HeaderRuntimeStatus::Detached { .. }
+    ));
+    assert!(read.subscribe_header_chain_snapshots().borrow().is_none());
+    assert!(
+        !crate::service::finalized_state::header_chain::HeaderChainStore::new(
+            state.read_service.db.header_chain_disk_db(),
+        )
+        .is_initialized()?,
+        "legacy handoff must not create durable header-runtime state"
+    );
 
     Ok(())
 }

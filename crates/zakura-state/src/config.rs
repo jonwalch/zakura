@@ -102,6 +102,22 @@ pub struct Config {
     ///       Zebra's last non-finalized state before it shut down.
     pub should_backup_non_finalized_state: bool,
 
+    /// Legacy compatibility switch for the retired opt-in header-store repair.
+    ///
+    /// Native header-runtime attachment now performs its required startup audit and
+    /// reconstruction unconditionally. This field remains deserializable so configs
+    /// written by earlier Zakura releases keep working, but it is no longer emitted.
+    #[serde(skip_serializing)]
+    pub repair_zakura_header_store_on_startup: bool,
+
+    /// Whether this process runs the native Zakura header runtime.
+    ///
+    /// `zakurad` enables this only when the selected P2P stack includes Zakura v2.
+    /// It is not a user-facing state option because `network.p2p_stack` owns that
+    /// choice.
+    #[serde(skip)]
+    pub enable_zakura_header_seed_from_committed_blocks: bool,
+
     /// Mirror of `consensus.checkpoint_sync`, set by zakurad at startup.
     ///
     /// When `true` (the default), a node syncing under checkpoint trust uses the fast
@@ -409,6 +425,8 @@ impl Default for Config {
             cache_dir: default_cache_dir(),
             ephemeral: false,
             should_backup_non_finalized_state: true,
+            repair_zakura_header_store_on_startup: false,
+            enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
             delete_old_database: true,
@@ -429,6 +447,18 @@ mod tests {
         assert!(
             Config::default().vct_fast_sync,
             "VCT fast sync is enabled by default when checkpoint sync and embedded frontiers are available"
+        );
+        assert!(!Config::default().repair_zakura_header_store_on_startup);
+
+        let legacy_repair: Config =
+            toml::from_str(r#"repair_zakura_header_store_on_startup = true"#)
+                .expect("legacy startup repair config remains parseable");
+        assert!(legacy_repair.repair_zakura_header_store_on_startup);
+        assert!(
+            !toml::to_string(&legacy_repair)
+                .expect("state config serializes")
+                .contains("repair_zakura_header_store_on_startup"),
+            "retired startup repair config is not emitted in new configs"
         );
 
         let archive: Config = toml::from_str(r#"storage_mode = "archive""#)

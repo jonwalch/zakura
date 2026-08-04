@@ -1207,6 +1207,10 @@ impl BlockWriteSender {
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
+        let attach_header_chain_at_handoff = finalized_state
+            .db
+            .config()
+            .enable_zakura_header_seed_from_committed_blocks;
         Self::spawn_with_header_chain(
             finalized_state,
             non_finalized_state,
@@ -1215,7 +1219,7 @@ impl BlockWriteSender {
             should_use_finalized_block_write_sender,
             backup_dir_path,
             None,
-            true,
+            attach_header_chain_at_handoff,
             header_chain_observers,
         )
     }
