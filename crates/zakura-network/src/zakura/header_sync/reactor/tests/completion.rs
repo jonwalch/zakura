@@ -296,7 +296,7 @@ fn durable_prefix_headroom_accounts_for_staged_headers_at_exact_limits() {
 }
 
 #[tokio::test]
-async fn requester_caps_the_initial_wire_request_at_durable_graph_headroom() {
+async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -355,7 +355,7 @@ async fn requester_caps_the_initial_wire_request_at_durable_graph_headroom() {
         .send(HeaderSyncEvent::SessionWireMessage {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(remote_status),
+            msg: HeaderSyncMessage::Status(remote_status.clone()),
         })
         .await
         .expect("the target status reaches the reactor");
@@ -388,6 +388,61 @@ async fn requester_caps_the_initial_wire_request_at_durable_graph_headroom() {
         other => panic!("expected GetHeaders, got {other:?}"),
     };
     assert_eq!(request.max_header_count, durable_prefix_count);
+
+    let (second_send, mut second_outbound) = framed_channel(8);
+    let second_peer =
+        ZakuraPeerId::new(vec![0x72; 32]).expect("the second peer ID has the required length");
+    handle
+        .send(HeaderSyncEvent::PeerConnected(
+            HeaderSyncPeerSession::from_parts(
+                second_peer.clone(),
+                second_send,
+                CancellationToken::new(),
+            ),
+        ))
+        .await
+        .expect("the second peer connects");
+    let _second_status = second_outbound
+        .recv()
+        .await
+        .expect("the second peer receives initial status");
+    let second_target = block::Hash([0x53; 32]);
+    let mut second_remote_status = remote_status;
+    second_remote_status.selected_tip_hash = second_target;
+    handle
+        .send(HeaderSyncEvent::SessionWireMessage {
+            peer: second_peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessage::Status(second_remote_status),
+        })
+        .await
+        .expect("the second target status reaches the reactor");
+    let second_scope = match next_action(&mut actions).await {
+        HeaderPortOperation::QueryHeaderLocator {
+            target_tip_hash,
+            scope,
+            ..
+        } if target_tip_hash == second_target => scope,
+        other => panic!("expected second locator query, got {other:?}"),
+    };
+    handle
+        .send(HeaderSyncEvent::HeaderLocatorReady {
+            peer: second_peer,
+            session_id: 0,
+            target_tip_hash: second_target,
+            scope: second_scope,
+            locator: Some(zakura_header_chain::HeaderLocator::for_continuation(
+                snapshot.frontiers.header_best,
+            )),
+        })
+        .await
+        .expect("the second locator reaches the reactor");
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), second_outbound.recv())
+            .await
+            .is_err(),
+        "the first request's durable reservation prevents a duplicate wire request"
+    );
 
     let mut first_header = *regtest_genesis_block().header;
     first_header.previous_block_hash = snapshot.frontiers.header_best.hash;

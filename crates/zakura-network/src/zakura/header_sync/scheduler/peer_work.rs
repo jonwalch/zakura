@@ -65,6 +65,11 @@ impl HeaderChunkBudget {
             .saturating_sub(usage.reserved.saturating_add(usage.owned))
     }
 
+    fn claimed(&self) -> usize {
+        let usage = self.usage();
+        usage.reserved.saturating_add(usage.owned)
+    }
+
     fn reserve(&self, count: usize) -> Option<HeaderCountReservation> {
         if count == 0 {
             return None;
@@ -767,6 +772,11 @@ impl PeerWorkQueue {
 
     pub(in crate::zakura::header_sync) fn budget_is_full(&self) -> bool {
         self.budget.remaining() == 0
+    }
+
+    /// Return all response reservations and staged headers that can consume durable headroom.
+    pub(in crate::zakura::header_sync) fn claimed_header_count(&self) -> usize {
+        self.budget.claimed()
     }
 
     /// Return capacity that no live reservation or staged chunk owns.
