@@ -67,7 +67,7 @@ query inside the band is a hard RPC error. This is what actually stops a wallet,
 lightwalletd-style clients fetch the `trees` sizes once per block.
 
 **Silent, and worse.** `z_gettreestate` maps an absent tree to a JSON `null` rather than
-an error. Clients following the lightwalletd contract treat an absent tree as the *empty*
+an error. Clients following the lightwalletd contract treat an absent tree as the _empty_
 tree, so a wallet derives a birthday anchor asserting an empty commitment tree at a height
 deep in the chain. No error is raised at the point of corruption. The typed guard for this
 already exists (`ZakuraDb::vct_historical_tree_unavailable`) but has no non-test callers.
@@ -142,7 +142,7 @@ cold replay runs into minutes — far outside any RPC budget. Measured entry siz
 715 B, not the 1,489 B used above as a conservative bound, because that figure includes
 Sprout.
 
-A *uniform* grid cannot bound the worst case at a sane size: 2 s worst-case needs
+A _uniform_ grid cannot bound the worst case at a sane size: 2 s worst-case needs
 ~110-block spacing, 30,527 entries, ~21.8 MB. Spacing entries by estimated replay cost
 instead concentrates them where blocks are expensive. At a 2 s per-entry budget that is
 3,380 entries and 3.25 MB, measuring median 1.07 s, p90 2.50 s, max 4.71 s per cold
@@ -237,13 +237,13 @@ in the protocol commits to subtree roots. They exist only as a local by-product 
 tree maintenance the fast path deliberately skips, which is why they cannot be recorded
 during fast sync at all.
 
-**Qualified (2026-08-03).** The first sentence holds for a *serving* node, which is why the
+**Qualified (2026-08-03).** The first sentence holds for a _serving_ node, which is why the
 artifact still ships at review-level trust. It does not hold for the **publisher**, which
 replays the band regardless: subtree roots fall out of that replay as interior nodes, pinned
 between two root-checked grid entries. Verified against ground truth — above a fast-synced
 node's handoff the database does store subtree rows, and replaying `(3,358,006, 3,432,538]`
 reproduces all 5 of them exactly. So the generator can verify what it publishes, which is
-stronger than the reproducibility gate below; what is unchanged is that a *consumer* still
+stronger than the reproducibility gate below; what is unchanged is that a _consumer_ still
 cannot check a record cheaply, except opportunistically as §4.6's second bullet describes.
 
 The set is small and static. Decoding the embedded final frontier at the handoff
