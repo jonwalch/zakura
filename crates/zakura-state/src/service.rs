@@ -2062,17 +2062,33 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
-            ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
-                read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::SaplingTree(hash_or_height) => {
+                let tree = read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height);
+                if tree.is_none() {
+                    read::check_historical_tree_available(&state.db, hash_or_height)?;
+                }
 
-            ReadRequest::OrchardTree(hash_or_height) => Ok(ReadResponse::OrchardTree(
-                read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+                Ok(ReadResponse::SaplingTree(tree))
+            }
 
-            ReadRequest::IronwoodTree(hash_or_height) => Ok(ReadResponse::IronwoodTree(
-                read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::OrchardTree(hash_or_height) => {
+                let tree = read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height);
+                if tree.is_none() {
+                    read::check_historical_tree_available(&state.db, hash_or_height)?;
+                }
+
+                Ok(ReadResponse::OrchardTree(tree))
+            }
+
+            ReadRequest::IronwoodTree(hash_or_height) => {
+                let tree =
+                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height);
+                if tree.is_none() {
+                    read::check_historical_tree_available(&state.db, hash_or_height)?;
+                }
+
+                Ok(ReadResponse::IronwoodTree(tree))
+            }
 
             ReadRequest::SaplingSubtrees { start_index, limit } => {
                 let end_index = limit
@@ -2089,6 +2105,13 @@ impl Service<ReadRequest> for ReadStateService {
                     // the trees run out.)
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
                 };
+
+                read::check_historical_sapling_subtrees_available(
+                    &state.db,
+                    start_index,
+                    end_index,
+                    &sapling_subtrees,
+                )?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2109,6 +2132,13 @@ impl Service<ReadRequest> for ReadStateService {
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
                 };
 
+                read::check_historical_orchard_subtrees_available(
+                    &state.db,
+                    start_index,
+                    end_index,
+                    &orchard_subtrees,
+                )?;
+
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
 
@@ -2123,6 +2153,13 @@ impl Service<ReadRequest> for ReadStateService {
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
                 };
+
+                read::check_historical_ironwood_subtrees_available(
+                    &state.db,
+                    start_index,
+                    end_index,
+                    &ironwood_subtrees,
+                )?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }
