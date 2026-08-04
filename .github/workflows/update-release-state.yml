@@ -64,6 +64,7 @@ jobs:
           CHECKPOINTS: crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           FRONTIER: crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           PROVENANCE: crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          SUBTREES: crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           EOS_FILE: crates/zakurad/src/components/sync/end_of_support.rs
         run: |
           set -euo pipefail
@@ -91,11 +92,56 @@ jobs:
           cp "$BUNDLE/main-checkpoints.txt" "$CHECKPOINTS"
           cp "$BUNDLE/mainnet-frontier.bin" "$FRONTIER"
 
-          python3 - "$RESOLUTION" "$BUNDLE" "$CHECKPOINTS" "$FRONTIER" "$PROVENANCE" <<'PY'
+          # The subtree-root artifact is optional: generating it replays the whole absent band,
+          # so a publisher may skip it (SKIP_TREESTATE_ARTIFACTS). A bundle without it leaves the
+          # committed copy untouched rather than deleting it.
+          if [ -f "$BUNDLE/mainnet-treestate-subtrees.bin" ]; then
+            # Records are append-only. The frame is not a byte-prefix of its successor -- the
+            # header carries per-pool counts and a payload digest -- so the contract is checked
+            # over the records themselves. A rewrite of published history fails closed here,
+            # because a changed root would silently rebuild wrong witnesses on every consumer.
+            if [ -f "$SUBTREES" ]; then
+              python3 - "$SUBTREES" "$BUNDLE/mainnet-treestate-subtrees.bin" <<'PY'
+          import struct, sys
+
+          HEADER = 8 + 2 + 1 + 4 + 4 + 4 + 4 + 32
+          RECORD = 2 + 4 + 32
+
+          def pools(path):
+              data = open(path, "rb").read()
+              magic, _version, _network, _handoff, *counts = struct.unpack("<8sHBIIII", data[:27])
+              if magic != b"ZKVCTST1":
+                  sys.exit(f"{path} is not a subtree-root artifact")
+              out, off = [], HEADER
+              for count in counts:
+                  out.append(data[off:off + count * RECORD])
+                  off += count * RECORD
+              return out
+
+          for name, old, new in zip(("sapling", "orchard", "ironwood"), pools(sys.argv[1]), pools(sys.argv[2])):
+              if not new.startswith(old):
+                  sys.exit(f"bundle rewrites committed {name} subtree roots; refusing")
+          PY
+            fi
+            cp "$BUNDLE/mainnet-treestate-subtrees.bin" "$SUBTREES"
+            echo "imported subtree-root artifact"
+          else
+            echo "bundle carries no subtree-root artifact; leaving the committed copy unchanged"
+          fi
+
+          python3 - "$RESOLUTION" "$BUNDLE" "$CHECKPOINTS" "$FRONTIER" "$PROVENANCE" "$SUBTREES" <<'PY'
           import hashlib, json, sys
-          resolution_path, bundle, checkpoints, frontier, provenance_path = sys.argv[1:6]
+          resolution_path, bundle, checkpoints, frontier, provenance_path, subtrees = sys.argv[1:7]
           resolution = json.load(open(resolution_path, encoding="utf-8"))
           frontier_bytes = open(frontier, "rb").read()
+          try:
+              subtree_bytes = open(subtrees, "rb").read()
+              subtree_provenance = {
+                  "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
+                  "subtrees_size": len(subtree_bytes),
+              }
+          except FileNotFoundError:
+              subtree_provenance = {}
           provenance = {
               "schema_version": 1,
               "network": "Mainnet",
@@ -106,6 +152,7 @@ jobs:
               "checkpoints_sha256": hashlib.sha256(open(checkpoints, "rb").read()).hexdigest(),
               "frontier_sha256": hashlib.sha256(frontier_bytes).hexdigest(),
               "frontier_size": len(frontier_bytes),
+              **subtree_provenance,
               "meta_sha256": resolution["meta_sha256"],
           }
           with open(provenance_path, "w", encoding="utf-8") as out:
@@ -169,6 +216,7 @@ jobs:
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
