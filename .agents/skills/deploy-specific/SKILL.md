@@ -24,6 +24,9 @@ Require or confirm:
 - `network`: required when a node name is ambiguous, such as `zakura-compat`.
 - `force_rebuild`: optional; defaults to `false`.
 - `no_restart`: optional; defaults to `false`.
+- `p2p_stack`: optional testnet override; defaults to `auto`, which preserves
+  the inventory role (`zakura-testnet-3` is pure Zakura P2P v2 and the other
+  ordinary testnet nodes are dual-stack).
 
 For any mainnet node, confirm the `ref` and complete node list explicitly with
 the user immediately before dispatch.
@@ -118,11 +121,18 @@ Append these workflow fields only when requested:
 -f no_restart=true
 ```
 
+Do not override `p2p_stack` merely because a node is being redeployed. Let
+`auto` preserve its inventory role. In particular, `zakura-testnet-3` must stay
+pure v2 unless the user explicitly requests a topology experiment.
+
 ## Verification
 
 - Confirm every workflow run succeeded and its final node status is healthy.
 - Confirm each node reports the expected commit/version.
 - For restarted nodes, confirm RPC height is current and advances.
+- Confirm the configured P2P role after testnet deploys: `zakura-testnet-3`
+  must not expose the legacy TCP listener under the default inventory, while
+  dual-stack nodes must expose both stacks.
 - For testnet `zakura-compat`, confirm the zcashd sidecar sync check passes.
 - Stop on failure; do not continue to additional requested nodes.
 - Report each requested node and its workflow run URL.
@@ -132,6 +142,8 @@ Append these workflow fields only when requested:
 - Never dispatch with an empty `node` input.
 - Never add unrequested nodes to the deployment.
 - Do not change cache, state, identity, or node configuration paths.
+- Preserve the node-specific P2P role unless the user explicitly requests an
+  override.
 - Only one deploy per network runs at a time (`cancel-in-progress: false`).
 
 ## References
