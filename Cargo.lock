@@ -8363,7 +8363,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "3.1.0-rc1"
+version = "4.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -8433,7 +8433,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "5.1.0-rc1"
+version = "6.0.0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8510,7 +8510,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "5.1.0-rc1"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "bitflags",
