@@ -40,7 +40,9 @@ trusted_proxies = []
 
 Set `enabled = false` to disable the listener. Environment variable overrides
 use the same nesting, for example
-`ZAKURA_RPC__TRANSACTION_SUBMISSION__REQUESTS_PER_SECOND=20`.
+`ZAKURA_RPC__TRANSACTION_SUBMISSION__REQUESTS_PER_SECOND=20`. Separate trusted
+proxy networks with commas in
+`ZAKURA_RPC__TRANSACTION_SUBMISSION__TRUSTED_PROXIES`.
 
 Zakura rejects zero limits, per-IP limits above their global limits, more than
 500 global in-flight submissions, more than 100,000 global connections, more

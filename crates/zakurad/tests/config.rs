@@ -326,6 +326,10 @@ fn config_transaction_submission_nested_env_vars() {
         "ZAKURA_RPC__TRANSACTION_SUBMISSION__REQUESTS_PER_SECOND",
         "12",
     );
+    env.set_var(
+        "ZAKURA_RPC__TRANSACTION_SUBMISSION__TRUSTED_PROXIES",
+        "127.0.0.1/32,192.0.2.10/32",
+    );
 
     let config = ZakuradConfig::load(None).expect("load transaction submission env vars");
 
@@ -335,6 +339,17 @@ fn config_transaction_submission_nested_env_vars() {
         Some("127.0.0.1:18237".parse().expect("valid address"))
     );
     assert_eq!(config.rpc.transaction_submission.requests_per_second, 12);
+    assert_eq!(config.rpc.transaction_submission.trusted_proxies.len(), 2);
+    assert!(config
+        .rpc
+        .transaction_submission
+        .trusted_proxies
+        .contains(&"127.0.0.1/32".parse().expect("valid network")));
+    assert!(config
+        .rpc
+        .transaction_submission
+        .trusted_proxies
+        .contains(&"192.0.2.10/32".parse().expect("valid network")));
 }
 
 #[test]
