@@ -8502,6 +8502,8 @@ dependencies = [
 name = "zakura-jsonl-trace"
 version = "1.1.0-rc1"
 dependencies = [
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -8686,6 +8688,7 @@ dependencies = [
  "metrics",
  "mset",
  "once_cell",
+ "orchard",
  "proptest",
  "proptest-derive",
  "rand 0.8.6",
