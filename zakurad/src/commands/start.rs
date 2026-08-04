@@ -424,9 +424,9 @@ impl StartCmd {
             .as_ref()
             .is_some_and(|snapshots| snapshots.borrow().is_none());
         let zakura_block_sync_handoff = if legacy_bootstrap_needed {
-            zakura::BlockSyncHandoff::new_legacy_bootstrap()
+            zakura::SyncCoordinator::new_legacy_bootstrap()
         } else {
-            zakura::BlockSyncHandoff::new()
+            zakura::SyncCoordinator::new()
         };
 
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
@@ -2600,7 +2600,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2715,7 +2715,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2862,7 +2862,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             trace.clone(),
             Some(probe),
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3017,7 +3017,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3136,7 +3136,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3243,7 +3243,7 @@ mod zakura_header_sync_driver_tests {
             1,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3351,7 +3351,7 @@ mod zakura_header_sync_driver_tests {
             1,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3416,7 +3416,7 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::spawn_block_sync_reactor(startup);
         let commit_count = Arc::new(AtomicUsize::new(0));
         let verifier = counting_verifier(commit_count.clone(), None);
-        let handoff = super::zakura::BlockSyncHandoff::new();
+        let handoff = super::zakura::SyncCoordinator::new();
         let _fallback_lease = handoff
             .acquire_legacy_fallback(Duration::from_secs(1))
             .await
@@ -3520,7 +3520,7 @@ mod zakura_header_sync_driver_tests {
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state =
             read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
-        let handoff = super::zakura::BlockSyncHandoff::new();
+        let handoff = super::zakura::SyncCoordinator::new();
         let drain_handoff = handoff.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
@@ -3639,7 +3639,7 @@ mod zakura_header_sync_driver_tests {
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
-        let handoff = super::zakura::BlockSyncHandoff::new();
+        let handoff = super::zakura::SyncCoordinator::new();
         let _fallback_lease = handoff
             .acquire_legacy_fallback(Duration::from_secs(1))
             .await
@@ -3719,7 +3719,7 @@ mod zakura_header_sync_driver_tests {
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state =
             read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
-        let handoff = super::zakura::BlockSyncHandoff::new();
+        let handoff = super::zakura::SyncCoordinator::new();
         let _fallback_lease = handoff
             .acquire_legacy_fallback(Duration::from_secs(1))
             .await
@@ -3869,7 +3869,7 @@ mod zakura_header_sync_driver_tests {
             1,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4280,7 +4280,7 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let handoff = super::zakura::BlockSyncHandoff::new();
+        let handoff = super::zakura::SyncCoordinator::new();
         let permit = handoff
             .begin_apply()
             .expect("native apply owns a permit before fallback");
@@ -4420,7 +4420,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4521,7 +4521,7 @@ mod zakura_header_sync_driver_tests {
             zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4636,7 +4636,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4770,7 +4770,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4930,7 +4930,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
-            super::zakura::BlockSyncHandoff::new(),
+            super::zakura::SyncCoordinator::new(),
             async move {
                 let _ = shutdown_rx.await;
             },

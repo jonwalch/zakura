@@ -554,10 +554,10 @@ where
 /// the fallback node might be the only peer with working legacy ingest, so it
 /// must keep advertising frontiers and serving headers/bodies to Zakura peers.
 async fn engage_legacy_fallback_alongside_zakura(
-    block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
+    block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
 ) -> Result<
     crate::commands::start::zakura::LegacyFallbackLease,
-    crate::commands::start::zakura::BlockSyncHandoffError,
+    zakura_node_services::sync_lifecycle::LifecycleTransitionError,
 > {
     let lease = block_sync_handoff
         .acquire_legacy_fallback(std::time::Duration::from_secs(60))
@@ -1080,7 +1080,7 @@ where
         mut read_state: RS,
         mut committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
         legacy_fallback: bool,
-        block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
+        block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
     ) -> Result<(), Report>
     where
         RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
@@ -1215,7 +1215,7 @@ where
     /// Runs one fully drained legacy recovery round, then returns apply ownership to Zakura.
     async fn run_legacy_fallback_round(
         &mut self,
-        block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
+        block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
     ) {
         let lease = match engage_legacy_fallback_alongside_zakura(block_sync_handoff).await {
             Ok(lease) => lease,

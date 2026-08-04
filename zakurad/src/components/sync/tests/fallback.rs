@@ -21,7 +21,7 @@ use super::super::{
 
 #[test]
 fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new_legacy_bootstrap();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new_legacy_bootstrap();
 
     assert!(
         handoff.clone().begin_apply().is_none(),
@@ -48,8 +48,7 @@ fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
 
 #[test]
 fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
-    let bootstrap_handoff =
-        crate::commands::start::zakura::BlockSyncHandoff::new_legacy_bootstrap();
+    let bootstrap_handoff = crate::commands::start::zakura::SyncCoordinator::new_legacy_bootstrap();
     futures::executor::block_on(
         bootstrap_handoff.acquire_legacy_fallback(std::time::Duration::from_secs(1)),
     )
@@ -59,7 +58,7 @@ fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
         "fallback recovery must not bypass initial checkpoint bootstrap ownership"
     );
 
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
 
     let lease = futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff))
         .expect("a drained native pipeline yields one fallback lease");
@@ -409,7 +408,7 @@ fn stalled_zakura_with_legacy_fallback_keeps_zakura_reactors_alive() {
         ZakuraWatchdogAction::FallbackToLegacy,
         "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let _lease = futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff))
         .expect("an idle native pipeline yields one fallback lease");
     assert!(
@@ -486,7 +485,7 @@ fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let _lease = futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff))
         .expect("an idle native pipeline yields one fallback lease");
     assert!(
@@ -580,7 +579,7 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
 /// serving bridge.
 #[tokio::test(start_paused = true)]
 async fn fallback_handoff_drains_applies_without_cancelling_zakura() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let permit = handoff.begin_apply().expect("applies run before fallback");
 
     let drain_handoff = handoff.clone();
@@ -612,7 +611,7 @@ async fn fallback_handoff_drains_applies_without_cancelling_zakura() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let permit = handoff.begin_apply().expect("applies run before fallback");
 
     let drain_handoff = handoff.clone();
@@ -648,7 +647,7 @@ async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
 
 #[tokio::test(start_paused = true)]
 async fn fallback_diagnostic_intervals_never_authorize_legacy_with_a_live_apply() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let permit = handoff.begin_apply().expect("native apply starts");
     let drain_handoff = handoff.clone();
     let fallback = tokio::spawn(async move {
@@ -683,7 +682,7 @@ async fn fallback_diagnostic_intervals_never_authorize_legacy_with_a_live_apply(
 
 #[tokio::test]
 async fn cancelling_fallback_drain_restores_native_ownership() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let permit = handoff.begin_apply().expect("native apply starts");
     let drain_handoff = handoff.clone();
     let fallback = tokio::spawn(async move {
@@ -708,7 +707,7 @@ async fn cancelling_fallback_drain_restores_native_ownership() {
 
 #[tokio::test]
 async fn panic_during_fallback_round_restores_native_ownership() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let panic_handoff = handoff.clone();
     let fallback = tokio::spawn(async move {
         let _lease = panic_handoff
@@ -729,7 +728,7 @@ async fn panic_during_fallback_round_restores_native_ownership() {
 
 #[tokio::test]
 async fn only_one_fallback_lease_can_own_an_apply_epoch() {
-    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
     let lease = handoff
         .acquire_legacy_fallback(std::time::Duration::from_secs(60))
         .await

@@ -4,6 +4,7 @@ pub use zakura_chain::parameters::checkpoint::constants;
 pub mod header_chain;
 pub mod mempool;
 pub mod service_traits;
+pub mod sync_lifecycle;
 
 #[cfg(any(test, feature = "rpc-client"))]
 pub mod rpc_client;

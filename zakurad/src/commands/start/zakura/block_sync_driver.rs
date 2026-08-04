@@ -74,7 +74,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     combined_apply_limit: usize,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
-    block_sync_handoff: std::sync::Arc<super::BlockSyncHandoff>,
+    block_sync_handoff: std::sync::Arc<super::SyncCoordinator>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -880,7 +880,7 @@ pub(crate) fn coalesce_stale_needed_block_queries(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_completed_block_apply<ReadState, BlockVerifier>(
-    handoff: &std::sync::Arc<super::BlockSyncHandoff>,
+    handoff: &std::sync::Arc<super::SyncCoordinator>,
     completed: BlockApplyCompletion,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
@@ -933,7 +933,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_pending_block_applies<ReadState, BlockVerifier>(
-    handoff: &std::sync::Arc<super::BlockSyncHandoff>,
+    handoff: &std::sync::Arc<super::SyncCoordinator>,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
     checkpoint_in_flight: &mut usize,
