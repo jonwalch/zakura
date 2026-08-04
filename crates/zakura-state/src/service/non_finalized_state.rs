@@ -28,6 +28,9 @@ use crate::{
 
 mod backup;
 mod chain;
+pub mod fork_trace;
+
+use fork_trace::{ForkTrace, ForkTrigger};
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -78,6 +81,9 @@ pub struct NonFinalizedState {
     #[cfg(feature = "progress-bar")]
     chain_count_bar: Option<howudoin::Tx>,
 
+    /// Structured tracing for competing chains and best-chain switches.
+    fork_trace: ForkTrace,
+
     /// A chain fork length transmitter for each [`Chain`] in [`chain_set`](Self.chain_set).
     ///
     /// Because `chain_set` contains `Arc<Chain>`s, it is difficult to update the metrics state
@@ -103,6 +109,7 @@ impl Clone for NonFinalizedState {
     fn clone(&self) -> Self {
         Self {
             chain_set: self.chain_set.clone(),
+            fork_trace: self.fork_trace.clone(),
             network: self.network.clone(),
             invalidated_blocks: self.invalidated_blocks.clone(),
             should_count_metrics: self.should_count_metrics,
@@ -121,6 +128,7 @@ impl NonFinalizedState {
         NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),
+            fork_trace: ForkTrace::noop(),
             invalidated_blocks: Default::default(),
             should_count_metrics: true,
             #[cfg(feature = "progress-bar")]
@@ -278,6 +286,32 @@ impl NonFinalizedState {
         self.insert_with(chain, |_ignored_chain| { /* no filter */ })
     }
 
+    /// Attach a fork tracer to this state.
+    pub fn with_fork_trace(mut self, fork_trace: ForkTrace) -> Self {
+        self.fork_trace = fork_trace;
+        self
+    }
+
+    /// Record how a change to the chain set moved the best tip.
+    ///
+    /// `previous_best` is the best tip observed before the change. Building the
+    /// chain list is deferred behind a closure so a disabled tracer costs
+    /// nothing on the commit path.
+    fn trace_chain_set_change(
+        &self,
+        trigger: ForkTrigger,
+        previous_best: Option<(block::Height, Hash)>,
+    ) {
+        if !self.fork_trace.is_enabled() {
+            return;
+        }
+
+        self.fork_trace
+            .record_chain_set_change(trigger, previous_best, || {
+                self.chain_set.iter().map(Arc::as_ref).collect()
+            });
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_test_chain(&mut self, chain: Arc<Chain>) {
         self.insert(chain);
@@ -357,6 +391,7 @@ impl NonFinalizedState {
     ) -> Result<(), ValidateContextError> {
         let parent_hash = prepared.block.header.previous_block_hash;
         let (height, hash) = (prepared.height, prepared.hash);
+        let previous_best = self.best_tip();
 
         let parent_chain = self.parent_chain(parent_hash)?;
 
@@ -373,6 +408,7 @@ impl NonFinalizedState {
         });
 
         self.update_metrics_for_committed_block(height, hash);
+        self.trace_chain_set_change(ForkTrigger::CommitBlock, previous_best);
 
         Ok(())
     }
@@ -522,6 +558,7 @@ impl NonFinalizedState {
         prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZakuraDb,
     ) -> Result<(), ValidateContextError> {
+        let previous_best = self.best_tip();
         let finalized_tip_height = finalized_state.finalized_tip_height();
 
         // TODO: fix tests that don't initialize the finalized state
@@ -549,6 +586,7 @@ impl NonFinalizedState {
         // If the block is valid, add the new chain fork to the set of recent chains.
         self.insert(chain);
         self.update_metrics_for_committed_block(height, hash);
+        self.trace_chain_set_change(ForkTrigger::NewChain, previous_best);
 
         Ok(())
     }
