@@ -40,17 +40,20 @@ proptest! {
                 current_height.min(blossom_activation_height),
                 network_height.min(blossom_activation_height),
                 NU_BEFORE_BLOSSOM,
+                &network,
             )
             // Estimate time difference for heights after Blossom activation.
             + estimate_time_difference(
                 current_height.max(blossom_activation_height),
                 network_height.max(blossom_activation_height),
                 NetworkUpgrade::Blossom,
+                &network,
             );
 
         let time_displacement = calculate_time_displacement(
             time_displacement_factor,
             NetworkUpgrade::current(&network, network_height),
+            &network,
         );
 
         let mock_local_time = current_block_time + estimated_time_difference + time_displacement;
@@ -69,8 +72,9 @@ fn estimate_time_difference(
     start_height: block::Height,
     end_height: block::Height,
     active_network_upgrade: NetworkUpgrade,
+    network: &Network,
 ) -> Duration {
-    let spacing_seconds = active_network_upgrade.target_spacing().num_seconds();
+    let spacing_seconds = active_network_upgrade.target_spacing(network).num_seconds();
     let height_difference = end_height - start_height;
 
     if height_difference > 0 {
@@ -85,8 +89,12 @@ fn estimate_time_difference(
 ///
 /// This is used to "displace" the time used in the test so that the test inputs aren't exact
 /// multiples of the target spacing.
-fn calculate_time_displacement(displacement: f64, network_upgrade: NetworkUpgrade) -> Duration {
-    let target_spacing = network_upgrade.target_spacing();
+fn calculate_time_displacement(
+    displacement: f64,
+    network_upgrade: NetworkUpgrade,
+    network: &Network,
+) -> Duration {
+    let target_spacing = network_upgrade.target_spacing(network);
 
     let nanoseconds = target_spacing
         .num_nanoseconds()
