@@ -17,9 +17,7 @@ use crate::{
         any_ancestor_blocks,
         block_iter::any_chain_ancestor_iter,
         check::{
-            difficulty::{
-                BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
-            },
+            difficulty::{pow_adjustment_block_span, BLOCK_MAX_TIME_SINCE_MEDIAN},
             AdjustedDifficulty,
         },
         finalized_state::ZakuraDb,
@@ -54,7 +52,7 @@ pub fn get_block_template_chain_info(
     network: &Network,
 ) -> Result<GetBlockTemplateChainInfo, BoxError> {
     let mut best_relevant_chain_and_history_tree_result =
-        best_relevant_chain_and_history_tree(non_finalized_state, db);
+        best_relevant_chain_and_history_tree(non_finalized_state, db, network);
 
     // Retry the finalized state query if it was interrupted by a finalizing block.
     //
@@ -65,7 +63,7 @@ pub fn get_block_template_chain_info(
         }
 
         best_relevant_chain_and_history_tree_result =
-            best_relevant_chain_and_history_tree(non_finalized_state, db);
+            best_relevant_chain_and_history_tree(non_finalized_state, db, network);
     }
 
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
@@ -162,6 +160,7 @@ pub fn solution_rate(
 fn best_relevant_chain_and_history_tree(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
+    network: &Network,
 ) -> Result<(Height, block::Hash, Vec<Arc<Block>>, Arc<HistoryTree>), BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
@@ -171,7 +170,7 @@ fn best_relevant_chain_and_history_tree(
         any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
     let best_relevant_chain: Vec<_> = best_relevant_chain
         .into_iter()
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
+        .take(pow_adjustment_block_span(network))
         .collect();
 
     if best_relevant_chain.is_empty() {
@@ -224,9 +223,10 @@ fn difficulty_time_and_history_tree(
     // > the median-time-past of that block.
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
     let median_time_past = calculate_median_time_past(
+        network,
         relevant_chain
             .iter()
-            .take(POW_MEDIAN_BLOCK_SPAN)
+            .take(network.pow_median_block_span())
             .cloned()
             .collect(),
     );

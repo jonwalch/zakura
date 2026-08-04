@@ -962,6 +962,18 @@ struct DTestnetParameters {
     funding_streams: Option<Vec<ConfiguredFundingStreams>>,
     pre_blossom_halving_interval: Option<u32>,
     lockbox_disbursements: Option<Vec<ConfiguredLockboxDisbursement>>,
+    /// The target block spacing after Blossom activation, in seconds.
+    post_blossom_pow_target_spacing: Option<u32>,
+    /// The averaging window for difficulty threshold arithmetic mean calculations.
+    pow_averaging_window: Option<usize>,
+    /// The median block span for time median calculations.
+    pow_median_block_span: Option<usize>,
+    /// The damping factor for median timespan variance.
+    pow_damping_factor: Option<i32>,
+    /// The maximum upward adjustment percentage for median timespan variance.
+    pow_max_adjust_up_percent: Option<i32>,
+    /// The maximum downward adjustment percentage for median timespan variance.
+    pow_max_adjust_down_percent: Option<i32>,
     #[serde(default)]
     checkpoints: ConfiguredCheckpoints,
     /// If `true`, automatically repeats configured funding stream addresses to fill
@@ -1080,6 +1092,12 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                     .map(Into::into)
                     .collect(),
             ),
+            post_blossom_pow_target_spacing: Some(params.post_blossom_pow_target_spacing()),
+            pow_averaging_window: Some(params.pow_averaging_window()),
+            pow_median_block_span: Some(params.pow_median_block_span()),
+            pow_damping_factor: Some(params.pow_damping_factor()),
+            pow_max_adjust_up_percent: Some(params.pow_max_adjust_up_percent()),
+            pow_max_adjust_down_percent: Some(params.pow_max_adjust_down_percent()),
             checkpoints: if params.checkpoints() == testnet::Parameters::default().checkpoints() {
                 ConfiguredCheckpoints::Default(true)
             } else {
@@ -1355,6 +1373,12 @@ where
         funding_streams,
         pre_blossom_halving_interval,
         lockbox_disbursements,
+        post_blossom_pow_target_spacing,
+        pow_averaging_window,
+        pow_median_block_span,
+        pow_damping_factor,
+        pow_max_adjust_up_percent,
+        pow_max_adjust_down_percent,
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
@@ -1402,6 +1426,35 @@ where
     if let Some(height) = max_block_time_start_height {
         params_builder = params_builder
             .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
+    }
+
+    // Each proof-of-work parameter defaults to the consensus value, so an
+    // unset key leaves difficulty adjustment exactly as it is on Mainnet.
+    // `to_network` below rejects combinations the state cannot evaluate.
+    if let Some(post_blossom_pow_target_spacing) = post_blossom_pow_target_spacing {
+        params_builder =
+            params_builder.with_post_blossom_pow_target_spacing(post_blossom_pow_target_spacing);
+    }
+
+    if let Some(pow_averaging_window) = pow_averaging_window {
+        params_builder = params_builder.with_pow_averaging_window(pow_averaging_window);
+    }
+
+    if let Some(pow_median_block_span) = pow_median_block_span {
+        params_builder = params_builder.with_pow_median_block_span(pow_median_block_span);
+    }
+
+    if let Some(pow_damping_factor) = pow_damping_factor {
+        params_builder = params_builder.with_pow_damping_factor(pow_damping_factor);
+    }
+
+    if let Some(pow_max_adjust_up_percent) = pow_max_adjust_up_percent {
+        params_builder = params_builder.with_pow_max_adjust_up_percent(pow_max_adjust_up_percent);
+    }
+
+    if let Some(pow_max_adjust_down_percent) = pow_max_adjust_down_percent {
+        params_builder =
+            params_builder.with_pow_max_adjust_down_percent(pow_max_adjust_down_percent);
     }
 
     // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.

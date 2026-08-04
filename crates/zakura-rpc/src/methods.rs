@@ -69,7 +69,6 @@ use zakura_chain::{
             FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
-        POW_AVERAGING_WINDOW,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -3099,7 +3098,7 @@ where
         let mut num_blocks = num_blocks.unwrap_or(DEFAULT_SOLUTION_RATE_WINDOW_SIZE);
         // But if it is 0 or negative, it uses the proof of work averaging window.
         if num_blocks < 1 {
-            num_blocks = i32::try_from(POW_AVERAGING_WINDOW).expect("fits in i32");
+            num_blocks = i32::try_from(self.network.pow_averaging_window()).expect("fits in i32");
         }
         let num_blocks =
             usize::try_from(num_blocks).expect("just checked for negatives, i32 fits in usize");
