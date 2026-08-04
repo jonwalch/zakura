@@ -7,13 +7,12 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
       - docs/specs/fork-aware-header-chain-engine.md
-      - supply-chain/**
+      - qa/supply-chain/**
       - "scripts/**.sh"
-      - zakura-header-chain/conformance.toml
+      - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
@@ -26,13 +25,12 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-      - clippy.toml
       - .cargo/config.toml
       - .github/workflows/lint.yml
       - docs/specs/fork-aware-header-chain-engine.md
-      - supply-chain/**
+      - qa/supply-chain/**
       - "scripts/**.sh"
-      - zakura-header-chain/conformance.toml
+      - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
       # ci-python-tests covers these suites, so changes to them must trigger it.
@@ -177,7 +175,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh .github/workflows/scripts/*.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
@@ -317,7 +315,7 @@ jobs:
 
       - name: Run cargo-vet check
         if: ${{ !cancelled() }}
-        run: cargo vet check
+        run: cargo vet check --store-path ./qa/supply-chain/
 
   lint-success:
     name: lint success

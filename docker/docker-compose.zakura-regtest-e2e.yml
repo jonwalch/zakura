@@ -16,7 +16,7 @@
 # asserts legacy compatibility, Zakura propagation, and block sync.
 #
 # Host networking is required: Regtest only accepts localhost initial peers
-# (zakura-network/src/config.rs: initial_peers filters to is_localhost), so the
+# (crates/zakura-network/src/config.rs: initial_peers filters to is_localhost), so the
 # nodes share 127.0.0.1 on distinct ports. State is ephemeral by default and
 # traces/temp live on tmpfs, so a run leaves nothing on disk. Node2 has a
 # dedicated named mount below so restart-matrix runs can deliberately preserve
