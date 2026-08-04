@@ -3766,16 +3766,26 @@ mod tests {
     }
 
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
-        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+        let result = tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
-                if node.supervisor().registered_ids().await.len() == count {
+                let observed = node.supervisor().registered_ids().await.len();
+                if observed == count {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+        .await;
+
+        if result.is_err() {
+            let observed = node.supervisor().registered_ids().await.len();
+            return Err(format!(
+                "timed out waiting for {count} peer registrations; observed {observed}"
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Regression for `claude-legacy-request-orphaned-handler-permits`.
