@@ -20,10 +20,7 @@ use zakura_node_services::header_chain::{
     self as port, HeaderChainFuture, HeaderChainPort, HeaderChainPortError,
 };
 
-use super::{
-    verified_block_tip_from_state, ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT,
-    ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
-};
+use super::{verified_block_tip_from_state, ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT};
 
 pub(crate) async fn zakura_header_sync_driver_startup<State>(
     state: State,
@@ -132,6 +129,11 @@ async fn wait_for_header_runtime(
 ) -> Result<(), Report> {
     use zakura_node_services::sync_lifecycle::HeaderRuntimeStatus;
 
+    const RECONSTRUCTION_DIAGNOSTIC_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    let mut latest_progress = None;
+    let mut last_progress_at = tokio::time::Instant::now();
     loop {
         let current = status.borrow().clone();
         match current {
@@ -152,9 +154,15 @@ async fn wait_for_header_runtime(
                 return Err(eyre!("header runtime attachment failed: {error}"))
             }
             HeaderRuntimeStatus::Reconstructing { epoch, progress } => {
-                match tokio::time::timeout(ZAKURA_HEADER_CHAIN_STARTUP_TIMEOUT, status.changed())
-                    .await
-                {
+                if latest_progress != Some((epoch, progress)) {
+                    latest_progress = Some((epoch, progress));
+                    last_progress_at = tokio::time::Instant::now();
+                }
+                match tokio::time::timeout(
+                    RECONSTRUCTION_DIAGNOSTIC_INTERVAL,
+                    status.changed(),
+                )
+                .await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => {
                         return Err(eyre!(
@@ -164,6 +172,7 @@ async fn wait_for_header_runtime(
                     Err(_) => tracing::warn!(
                         header_runtime_epoch = epoch.get(),
                         ?progress,
+                        progress_stale_for = ?last_progress_at.elapsed(),
                         "header runtime reconstruction is still active"
                     ),
                 }
@@ -1070,6 +1079,34 @@ mod tests {
             early_result.is_err(),
             "full-state reconstruction must not inherit the ordinary driver request deadline"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reconstruction_has_no_completion_deadline() {
+        use zakura_node_services::sync_lifecycle::{HeaderRuntimeStatus, LifecycleEpoch};
+
+        let (status_sender, mut status) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Reconstructing {
+                epoch: LifecycleEpoch::new(1),
+                progress:
+                    zakura_node_services::sync_lifecycle::HeaderReconstructionProgress::STARTING,
+            });
+        let waiter = tokio::spawn(async move { wait_for_header_runtime(&mut status).await });
+
+        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
+        assert!(
+            !waiter.is_finished(),
+            "diagnostics must never abort reconstruction"
+        );
+        status_sender
+            .send(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the reconstruction waiter remains subscribed");
+        waiter
+            .await
+            .expect("the waiter task remains live")
+            .expect("readiness completes the unbounded wait");
     }
 
     #[test]

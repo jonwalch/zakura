@@ -38,6 +38,7 @@ use super::{
         },
         header_chain_values::{
             HeaderChainValueError, HeaderEligibilityReasonDisk, HeaderNodeDisk,
+            HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk,
             HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
@@ -48,6 +49,7 @@ use super::{
 };
 
 const METADATA_KEY: &[u8] = b"";
+const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
@@ -104,6 +106,9 @@ pub enum HeaderChainStoreError {
     /// The serialized writer lock was poisoned by a prior panic.
     #[error("header-chain serialized writer lock is poisoned")]
     WriterPoisoned,
+    /// Authenticated full state was missing a canonical header during reconstruction.
+    #[error("authenticated full state is missing canonical header {0:?}")]
+    MissingCanonicalHeader(block::Height),
     /// A staged full-state value disagreed with the header plan derived from the same evidence.
     #[error("staged full-state verified frontier {expected:?} differs from projected header frontier {actual:?}")]
     VerifiedFrontierMismatch {
@@ -1691,6 +1696,198 @@ impl HeaderChainStore {
         ))
     }
 
+    /// Resume bounded canonical reconstruction without materializing finalized history.
+    pub(in crate::service) fn startup_reconciled_streaming<F, P>(
+        self,
+        config: &EngineConfig,
+        full_state_finalized: Frontier,
+        restored_path: Vec<VerifiedHeaderRef>,
+        mut canonical_header: F,
+        mut report_progress: P,
+    ) -> Result<(HeaderChainRuntime, StartupReport), HeaderChainStoreError>
+    where
+        F: FnMut(block::Height) -> Result<VerifiedHeaderRef, HeaderChainStoreError>,
+        P: FnMut(zakura_node_services::sync_lifecycle::HeaderReconstructionProgress),
+    {
+        use zakura_node_services::sync_lifecycle::{
+            HeaderReconstructionProgress, HeaderReconstructionStage,
+        };
+
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let initial = audit_store(&self, config)?;
+        if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
+            return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+        }
+        let previous = initial.before.clone();
+        let mut repairs = initial.repairs.clone();
+        if !initial.is_clean() {
+            self.db.write(self.recovery_batch(&initial)?)?;
+        }
+
+        let snapshot = self.snapshot()?;
+        if snapshot.frontiers.finalized.height > full_state_finalized.height {
+            return Err(HeaderChainStoreError::Incoherent(
+                "header reconstruction target is below durable finality",
+            ));
+        }
+        let base = snapshot.frontiers.finalized;
+        let network = config.network.kind();
+        let mut progress = match self.reconstruction_progress()? {
+            Some(mut progress) => {
+                if progress.network != network
+                    || progress.last_committed != snapshot.frontiers.finalized
+                    || progress.target.height > full_state_finalized.height
+                    || progress.last_committed.height > progress.target.height
+                    || (progress.target.height == full_state_finalized.height
+                        && progress.target.hash != full_state_finalized.hash)
+                {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "invalid durable header reconstruction progress",
+                    ));
+                }
+                let expected_next = progress
+                    .last_committed
+                    .height
+                    .next()
+                    .unwrap_or(progress.last_committed.height);
+                if progress.next_height != expected_next {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "header reconstruction progress has a discontinuous next height",
+                    ));
+                }
+                if progress.target.height < full_state_finalized.height {
+                    progress.phase = HeaderReconstructionPhaseDisk::FinalizedPath;
+                }
+                progress.target = full_state_finalized;
+                progress
+            }
+            None => HeaderReconstructionProgressDisk {
+                network,
+                target: full_state_finalized,
+                next_height: snapshot
+                    .frontiers
+                    .finalized
+                    .height
+                    .next()
+                    .unwrap_or(snapshot.frontiers.finalized.height),
+                phase: HeaderReconstructionPhaseDisk::FinalizedPath,
+                last_committed: snapshot.frontiers.finalized,
+            },
+        };
+        self.write_reconstruction_progress(&progress)?;
+
+        let finalized_total =
+            u64::from(full_state_finalized.height.0.saturating_sub(base.height.0));
+        let restored_total = u64::try_from(restored_path.len()).unwrap_or(u64::MAX);
+        let total = finalized_total.saturating_add(restored_total);
+        report_progress(HeaderReconstructionProgress {
+            stage: HeaderReconstructionStage::FullStateReconciliation,
+            completed: 0,
+            total: Some(total),
+            target: Some(full_state_finalized),
+            last_committed: Some(progress.last_committed),
+        });
+
+        if progress.phase == HeaderReconstructionPhaseDisk::FinalizedPath {
+            let max_nodes = config.limits.max_non_finalized_nodes.get();
+            while progress.last_committed.height < full_state_finalized.height {
+                let remaining = full_state_finalized
+                    .height
+                    .0
+                    .saturating_sub(progress.last_committed.height.0);
+                let chunk_len = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(max_nodes);
+                let mut chunk = Vec::with_capacity(chunk_len);
+                let mut expected_parent = progress.last_committed.hash;
+                for offset in 0..chunk_len {
+                    let offset = u32::try_from(offset).map_err(|_| {
+                        HeaderChainStoreError::Incoherent("reconstruction chunk is too large")
+                    })?;
+                    let height = block::Height(
+                        progress
+                            .last_committed
+                            .height
+                            .0
+                            .checked_add(offset.saturating_add(1))
+                            .ok_or(HeaderChainStoreError::Incoherent(
+                                "header reconstruction height overflow",
+                            ))?,
+                    );
+                    let header = canonical_header(height)?;
+                    if header.height != height
+                        || header.header.previous_block_hash != expected_parent
+                    {
+                        return Err(HeaderChainStoreError::Incoherent(
+                            "canonical reconstruction chunk is discontinuous",
+                        ));
+                    }
+                    expected_parent = header.hash;
+                    chunk.push(header);
+                }
+                let chunk_tip = chunk
+                    .last()
+                    .map(|header| Frontier::new(header.height, header.hash))
+                    .ok_or(HeaderChainStoreError::Incoherent(
+                        "header reconstruction produced an empty chunk",
+                    ))?;
+                self.reconcile_verified_path(config, chunk)?;
+                progress.last_committed = chunk_tip;
+                progress.next_height = chunk_tip.height.next().unwrap_or(chunk_tip.height);
+                self.reconcile_finalized_with_progress(config, chunk_tip, Some(&progress))?;
+                report_progress(HeaderReconstructionProgress {
+                    stage: HeaderReconstructionStage::FullStateReconciliation,
+                    completed: u64::from(chunk_tip.height.0.saturating_sub(base.height.0)),
+                    total: Some(total),
+                    target: Some(full_state_finalized),
+                    last_committed: Some(chunk_tip),
+                });
+            }
+        }
+
+        progress.phase = HeaderReconstructionPhaseDisk::RestoredPath;
+        self.write_reconstruction_progress(&progress)?;
+        self.reconcile_verified_path(config, restored_path)?;
+        progress.phase = HeaderReconstructionPhaseDisk::FinalAudit;
+        self.write_reconstruction_progress(&progress)?;
+        report_progress(HeaderReconstructionProgress {
+            stage: HeaderReconstructionStage::FullStateReconciliation,
+            completed: total,
+            total: Some(total),
+            target: Some(full_state_finalized),
+            last_committed: Some(progress.last_committed),
+        });
+
+        let final_audit = audit_store(&self, config)?;
+        repairs.extend(final_audit.repairs.iter().copied());
+        if !final_audit.is_clean() {
+            self.db.write(self.recovery_batch(&final_audit)?)?;
+        }
+        self.clear_reconstruction_progress()?;
+        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
+        let current = final_audit.metadata.snapshot();
+        let report = StartupReport {
+            previous,
+            current: current.clone(),
+            repairs,
+            publication_allowed: true,
+        };
+        let publisher = Publisher::new(current);
+        drop(writer);
+        Ok((
+            HeaderChainRuntime {
+                store: self,
+                publisher,
+                leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
+                transition_engine,
+            },
+            report,
+        ))
+    }
+
     fn reconcile_verified_path(
         &self,
         config: &EngineConfig,
@@ -1755,6 +1952,15 @@ impl HeaderChainStore {
         config: &EngineConfig,
         full_state_finalized: Frontier,
     ) -> Result<(), HeaderChainStoreError> {
+        self.reconcile_finalized_with_progress(config, full_state_finalized, None)
+    }
+
+    fn reconcile_finalized_with_progress(
+        &self,
+        config: &EngineConfig,
+        full_state_finalized: Frontier,
+        progress: Option<&HeaderReconstructionProgressDisk>,
+    ) -> Result<(), HeaderChainStoreError> {
         struct Authority(EvidenceId);
 
         impl FullStateEvidenceAuthority for Authority {
@@ -1765,6 +1971,9 @@ impl HeaderChainStore {
 
         let snapshot = self.snapshot()?;
         if snapshot.frontiers.finalized == full_state_finalized {
+            if let Some(progress) = progress {
+                self.write_reconstruction_progress(progress)?;
+            }
             return Ok(());
         }
         let proof = self
@@ -1803,8 +2012,48 @@ impl HeaderChainStore {
             DurableTransitionFacts::None,
         )?;
         if !transition.is_no_change() {
-            self.db.write(self.batch_for(transition.change_set())?)?;
+            let mut batch = DiskWriteBatch::new();
+            if let Some(progress) = progress {
+                self.put_value(
+                    &mut batch,
+                    HEADER_ENGINE_META,
+                    RECONSTRUCTION_PROGRESS_KEY,
+                    progress,
+                )?;
+            }
+            self.db
+                .write(self.batch_for_combined(transition.change_set(), batch)?)?;
+        } else if let Some(progress) = progress {
+            self.write_reconstruction_progress(progress)?;
         }
+        Ok(())
+    }
+
+    fn reconstruction_progress(
+        &self,
+    ) -> Result<Option<HeaderReconstructionProgressDisk>, HeaderChainStoreError> {
+        self.get_value(HEADER_ENGINE_META, RECONSTRUCTION_PROGRESS_KEY)
+    }
+
+    fn write_reconstruction_progress(
+        &self,
+        progress: &HeaderReconstructionProgressDisk,
+    ) -> Result<(), HeaderChainStoreError> {
+        let mut batch = DiskWriteBatch::new();
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            RECONSTRUCTION_PROGRESS_KEY,
+            progress,
+        )?;
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    fn clear_reconstruction_progress(&self) -> Result<(), HeaderChainStoreError> {
+        let mut batch = DiskWriteBatch::new();
+        self.delete_raw(&mut batch, HEADER_ENGINE_META, RECONSTRUCTION_PROGRESS_KEY)?;
+        self.db.write(batch)?;
         Ok(())
     }
 

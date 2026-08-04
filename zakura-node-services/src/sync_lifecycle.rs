@@ -3,6 +3,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use zakura_header_chain::Frontier;
+
 /// Checked monotonic identity for one lifecycle generation.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LifecycleEpoch(u64);
@@ -217,6 +219,10 @@ pub struct HeaderReconstructionProgress {
     pub completed: u64,
     /// Known total work units, or `None` before the audit determines it.
     pub total: Option<u64>,
+    /// Fixed canonical finalized target for this attachment attempt.
+    pub target: Option<Frontier>,
+    /// Last canonical frontier durably committed with restart progress.
+    pub last_committed: Option<Frontier>,
 }
 
 /// Why the durable header runtime is not attached yet.
@@ -234,6 +240,8 @@ impl HeaderReconstructionProgress {
         stage: HeaderReconstructionStage::StartupAudit,
         completed: 0,
         total: None,
+        target: None,
+        last_committed: None,
     };
 }
 

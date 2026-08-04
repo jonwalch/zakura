@@ -198,8 +198,6 @@ pub(crate) enum HeaderChainAttachmentError {
     GenesisMismatch,
     #[error("persisted header finality is not an ancestor of finalized full state")]
     FinalizedDivergence,
-    #[error("finalized state is missing a header required to reconcile height {0:?}")]
-    MissingFinalizedHeader(Height),
     #[error(transparent)]
     Config(#[from] EngineConfigError),
     #[error(transparent)]
@@ -285,10 +283,22 @@ impl HeaderChainWriter {
         })))
     }
 
+    #[cfg(test)]
     fn attach_at_semantic_handoff(
         finalized_state: &FinalizedState,
         non_finalized_state: &NonFinalizedState,
     ) -> Result<Self, HeaderChainAttachmentError> {
+        Self::attach_at_semantic_handoff_with_progress(finalized_state, non_finalized_state, |_| {})
+    }
+
+    fn attach_at_semantic_handoff_with_progress<P>(
+        finalized_state: &FinalizedState,
+        non_finalized_state: &NonFinalizedState,
+        report_progress: P,
+    ) -> Result<Self, HeaderChainAttachmentError>
+    where
+        P: FnMut(zakura_node_services::sync_lifecycle::HeaderReconstructionProgress),
+    {
         let network = finalized_state.db.network();
         let (genesis_hash, genesis_header) = finalized_state
             .db
@@ -329,24 +339,24 @@ impl HeaderChainWriter {
             {
                 return Err(HeaderChainAttachmentError::FinalizedDivergence);
             }
-            let mut finalized_path = Vec::new();
-            let mut height = persisted_finalized.height;
-            while height < full_state_height {
-                height = height
-                    .next()
-                    .map_err(|_| HeaderChainAttachmentError::FinalizedDivergence)?;
-                let (hash, header) = finalized_state
-                    .db
-                    .header_by_height(height)
-                    .ok_or(HeaderChainAttachmentError::MissingFinalizedHeader(height))?;
-                finalized_path.push(VerifiedHeaderRef {
-                    height,
-                    hash,
-                    header,
-                });
-            }
             store
-                .startup_reconciled(&config, full_state_finalized, finalized_path, restored_path)?
+                .startup_reconciled_streaming(
+                    &config,
+                    full_state_finalized,
+                    restored_path,
+                    |height| {
+                        let (hash, header) = finalized_state
+                            .db
+                            .header_by_height(height)
+                            .ok_or(HeaderChainStoreError::MissingCanonicalHeader(height))?;
+                        Ok(VerifiedHeaderRef {
+                            height,
+                            hash,
+                            header,
+                        })
+                    },
+                    report_progress,
+                )?
                 .0
         } else {
             initialize_header_chain_reconciled(&finalized_state.db, &config, restored_path)?.0
@@ -1037,6 +1047,27 @@ impl HeaderChainObservers {
         Ok(())
     }
 
+    fn progress(
+        &self,
+        epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch,
+        progress: zakura_node_services::sync_lifecycle::HeaderReconstructionProgress,
+    ) {
+        use zakura_node_services::sync_lifecycle::HeaderRuntimeTransition;
+
+        let current = self.runtime_status_sender.borrow().clone();
+        match current.transition(HeaderRuntimeTransition::ReportProgress {
+            expected_epoch: epoch,
+            progress,
+        }) {
+            Ok(next) => self.publish_runtime_status(next),
+            Err(error) => tracing::error!(
+                ?error,
+                ?progress,
+                "could not publish header-runtime reconstruction progress"
+            ),
+        }
+    }
+
     fn failed(
         &self,
         epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch,
@@ -1688,9 +1719,10 @@ impl WriteBlockWorkerTask {
         };
         if *attach_header_chain_at_handoff && header_chain.is_none() {
             let epoch = runtime_epoch.expect("runtime attachment has an explicit lifecycle epoch");
-            let writer = match HeaderChainWriter::attach_at_semantic_handoff(
+            let writer = match HeaderChainWriter::attach_at_semantic_handoff_with_progress(
                 finalized_state,
                 non_finalized_state,
+                |progress| header_chain_observers.progress(epoch, progress),
             ) {
                 Ok(writer) => writer,
                 Err(error) => {

@@ -152,6 +152,142 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
 }
 
 #[test]
+fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
+    let db_config = Config::ephemeral();
+    let (mut engine_config, anchor, metadata) = fixture();
+    engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the header schema initializes");
+
+    let mut path = Vec::new();
+    let mut parent = Frontier::new(anchor.height, anchor.hash);
+    let mut parent_header = anchor.header;
+    for _ in 0..5 {
+        let mut header = *parent_header;
+        header.previous_block_hash = parent.hash;
+        let header = Arc::new(header);
+        let height = parent
+            .height
+            .next()
+            .expect("the bounded fixture height has a successor");
+        let hash = header.hash();
+        path.push(VerifiedHeaderRef {
+            height,
+            hash,
+            header: header.clone(),
+        });
+        parent = Frontier::new(height, hash);
+        parent_header = header;
+    }
+
+    let first_attempt = store.clone().startup_reconciled_streaming(
+        &engine_config,
+        parent,
+        Vec::new(),
+        |height| {
+            if height == block::Height(3) {
+                return Err(HeaderChainStoreError::MissingCanonicalHeader(height));
+            }
+            Ok(path[usize::try_from(height.0 - 1).expect("fixture index fits")].clone())
+        },
+        |_| {},
+    );
+    assert!(matches!(
+        first_attempt,
+        Err(HeaderChainStoreError::MissingCanonicalHeader(
+            block::Height(3)
+        ))
+    ));
+    assert_eq!(
+        store
+            .snapshot()
+            .expect("the first chunk snapshot is readable")
+            .frontiers
+            .finalized,
+        Frontier::new(path[1].height, path[1].hash)
+    );
+    let durable_progress = store
+        .reconstruction_progress()
+        .expect("the restart marker is readable")
+        .expect("the interrupted attempt retains a marker");
+    assert_eq!(
+        durable_progress.last_committed,
+        Frontier::new(path[1].height, path[1].hash)
+    );
+    assert_eq!(durable_progress.next_height, block::Height(3));
+
+    let requested = std::cell::RefCell::new(Vec::new());
+    let (runtime, report) = store
+        .startup_reconciled_streaming(
+            &engine_config,
+            parent,
+            Vec::new(),
+            |height| {
+                requested.borrow_mut().push(height);
+                Ok(path[usize::try_from(height.0 - 1).expect("fixture index fits")].clone())
+            },
+            |_| {},
+        )
+        .expect("the second attempt resumes from its committed marker");
+    assert!(report.publication_allowed);
+    assert_eq!(
+        requested.into_inner(),
+        [block::Height(3), block::Height(4), block::Height(5)]
+    );
+    assert_eq!(runtime.publisher().snapshot().frontiers.finalized, parent);
+    assert_eq!(
+        runtime
+            .store
+            .reconstruction_progress()
+            .expect("the completed marker lookup is readable"),
+        None,
+        "publication is enabled only after the restart marker is removed"
+    );
+}
+
+#[test]
+fn malformed_reconstruction_progress_fails_closed() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor)
+        .expect("the header schema initializes");
+    let mut corrupt = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut corrupt,
+            HEADER_ENGINE_META,
+            RECONSTRUCTION_PROGRESS_KEY,
+            [99],
+        )
+        .expect("the progress row is addressable");
+    store
+        .db
+        .write(corrupt)
+        .expect("the malformed marker is durable");
+
+    assert!(matches!(
+        store.startup_reconciled_streaming(
+            &engine_config,
+            anchor_frontier,
+            Vec::new(),
+            |_| unreachable!("the malformed marker fails before canonical reads"),
+            |_| {},
+        ),
+        Err(HeaderChainStoreError::Codec(
+            HeaderChainValueError::UnknownDiscriminant {
+                field: "header_reconstruction_version",
+                value: 99,
+            }
+        ))
+    ));
+}
+
+#[test]
 fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
     let cache = tempfile::tempdir().expect("the test cache directory is created");
     let db_config = Config {

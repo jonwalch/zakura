@@ -81,6 +81,101 @@ pub enum HeaderChainValueError {
     TreeAuxRoot(&'static str),
 }
 
+/// Durable phase of bounded full-state/header reconciliation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderReconstructionPhaseDisk {
+    /// Canonical finalized headers are being reconciled in bounded chunks.
+    FinalizedPath,
+    /// Restored non-finalized headers are being reconciled.
+    RestoredPath,
+    /// All paths are present and the final exhaustive audit remains.
+    FinalAudit,
+}
+
+/// Versioned restart marker for bounded header-runtime reconstruction.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderReconstructionProgressDisk {
+    /// Source full-state network.
+    pub network: NetworkKind,
+    /// Canonical finalized target fixed or rebased for this attempt.
+    pub target: Frontier,
+    /// First canonical height not yet reconciled.
+    pub next_height: block::Height,
+    /// Current bounded reconstruction phase.
+    pub phase: HeaderReconstructionPhaseDisk,
+    /// Last canonical frontier committed with this marker.
+    pub last_committed: Frontier,
+}
+
+impl FallibleDiskValue for HeaderReconstructionProgressDisk {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        encoder.u8(match self.network {
+            NetworkKind::Mainnet => 0,
+            NetworkKind::Testnet => 1,
+            NetworkKind::Regtest => 2,
+        });
+        put_frontier(&mut encoder, self.target);
+        encoder.u32(self.next_height.0);
+        encoder.u8(match self.phase {
+            HeaderReconstructionPhaseDisk::FinalizedPath => 0,
+            HeaderReconstructionPhaseDisk::RestoredPath => 1,
+            HeaderReconstructionPhaseDisk::FinalAudit => 2,
+        });
+        put_frontier(&mut encoder, self.last_committed);
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        match decoder.u8()? {
+            1 => {}
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "header_reconstruction_version",
+                    value,
+                })
+            }
+        }
+        let network = match decoder.u8()? {
+            0 => NetworkKind::Mainnet,
+            1 => NetworkKind::Testnet,
+            2 => NetworkKind::Regtest,
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "header_reconstruction_network",
+                    value,
+                })
+            }
+        };
+        let target = get_frontier(&mut decoder)?;
+        let next_height = block::Height(decoder.u32()?);
+        let phase = match decoder.u8()? {
+            0 => HeaderReconstructionPhaseDisk::FinalizedPath,
+            1 => HeaderReconstructionPhaseDisk::RestoredPath,
+            2 => HeaderReconstructionPhaseDisk::FinalAudit,
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "header_reconstruction_phase",
+                    value,
+                })
+            }
+        };
+        let last_committed = get_frontier(&mut decoder)?;
+        decoder.finish()?;
+        Ok(Self {
+            network,
+            target,
+            next_height,
+            phase,
+            last_committed,
+        })
+    }
+}
+
 #[derive(Default)]
 struct Encoder(Vec<u8>);
 
@@ -1061,6 +1156,39 @@ mod tests {
 
     fn digest(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn reconstruction_progress_round_trips_and_rejects_unknown_versions() {
+        let progress = HeaderReconstructionProgressDisk {
+            network: NetworkKind::Testnet,
+            target: frontier(200, 2),
+            next_height: block::Height(151),
+            phase: HeaderReconstructionPhaseDisk::RestoredPath,
+            last_committed: frontier(150, 1),
+        };
+        let bytes = progress.encode().expect("progress fixture encodes");
+        assert_eq!(
+            HeaderReconstructionProgressDisk::decode(&bytes),
+            Ok(progress)
+        );
+
+        let mut unknown_version = bytes.clone();
+        unknown_version[0] = 2;
+        assert_eq!(
+            HeaderReconstructionProgressDisk::decode(&unknown_version),
+            Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "header_reconstruction_version",
+                value: 2,
+            })
+        );
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(
+            HeaderReconstructionProgressDisk::decode(&trailing),
+            Err(HeaderChainValueError::Trailing)
+        );
     }
 
     #[test]
