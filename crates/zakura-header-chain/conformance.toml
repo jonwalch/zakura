@@ -97,7 +97,7 @@ id = "LC-DAG-03"
 name = "Bounded orphan staging"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::PeerWorkQueue"
-tests = ["DG-06::aggregate_staged_header_cap_spans_all_peers_and_releases_on_retirement", "DG-06::aggregate_staging_overflow_retires_work_without_peer_punishment", "PW-03::requester_stages_all_pages_before_one_exact_admission"]
+tests = ["DG-06::aggregate_owned_header_budget_spans_all_peers_and_releases_on_retirement", "DG-06::fair_reservations_fill_the_aggregate_budget_without_overcommit", "PW-03::requester_stages_all_pages_before_one_exact_admission"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
