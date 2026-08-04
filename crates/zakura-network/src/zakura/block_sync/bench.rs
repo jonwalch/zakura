@@ -150,10 +150,14 @@ pub fn spawn_bench_sequencer(
         verified_block_hash,
     };
     let owner = zakura_header_chain::BodyWorkAuthority {
-        state_version: zakura_header_chain::StateVersion::new(1),
-        header_generation: zakura_header_chain::HeaderGeneration::new(1),
-        verified_generation: Some(zakura_header_chain::VerifiedGeneration::new(1)),
-        branch: zakura_header_chain::BranchId::new(verified_block_hash, block::Hash([0xb1; 32])),
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(
+                verified_block_hash,
+                block::Hash([0xb1; 32]),
+            ),
+        },
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
     }
     .bind(
         1,
