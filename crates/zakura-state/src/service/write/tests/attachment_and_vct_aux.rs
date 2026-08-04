@@ -233,7 +233,7 @@ fn stale_vct_aux_rejection_has_zero_durable_effects() {
     let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
     let before = writer.runtime.publisher().snapshot();
     let mut stale = before.clone();
-    stale.state_version = StateVersion::new(0);
+    stale.verified_generation = VerifiedGeneration::new(0);
     let current = zakura_header_chain::AuxDelivery {
         delivery_id: EvidenceId::from_digest([0x73; 32]),
         header_hash: anchor.hash(),
