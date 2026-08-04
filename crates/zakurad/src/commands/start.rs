@@ -1709,6 +1709,7 @@ mod zakura_header_sync_driver_tests {
             cache_dir: state_dir,
             ephemeral: false,
             debug_skip_non_finalized_state_backup_task: true,
+            enable_zakura_header_seed_from_committed_blocks: true,
             ..Default::default()
         };
         let network = zakura_chain::parameters::Network::Mainnet;
