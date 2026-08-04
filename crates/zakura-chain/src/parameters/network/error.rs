@@ -57,6 +57,26 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     InvaildDifficultyLimits,
 
+    #[error("target difficulty limit is too large for the configured averaging window")]
+    #[non_exhaustive]
+    TargetDifficultyLimitOverflowRisk,
+
+    #[error("difficulty averaging window must be greater than zero")]
+    #[non_exhaustive]
+    InvalidPowAveragingWindow,
+
+    #[error("difficulty median block span must be greater than zero")]
+    #[non_exhaustive]
+    InvalidPowMedianBlockSpan,
+
+    #[error("post-Blossom target block spacing must be greater than zero")]
+    #[non_exhaustive]
+    InvalidPowTargetSpacing,
+
+    #[error("difficulty averaging window plus median block span is {configured}, which is more than the maximum of {maximum}")]
+    #[non_exhaustive]
+    PowAdjustmentBlockSpanTooLarge { configured: usize, maximum: usize },
+
     #[error("halving interval on ParametersBuilder must not be set after setting funding streams")]
     #[non_exhaustive]
     HalvingIntervalAfterFundingStreams,

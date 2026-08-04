@@ -13,7 +13,11 @@ use crate::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
         constants::{magics, SLOW_START_INTERVAL, SLOW_START_SHIFT},
         network::error::ParametersBuilderError,
-        network_upgrade::{TESTNET_ACTIVATION_HEIGHTS, TESTNET_MAX_TIME_START_HEIGHT},
+        network_upgrade::{
+            MAX_POW_ADJUSTMENT_BLOCK_SPAN, POST_BLOSSOM_POW_TARGET_SPACING, POW_AVERAGING_WINDOW,
+            POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT, POW_MAX_ADJUST_UP_PERCENT,
+            POW_MEDIAN_BLOCK_SPAN, TESTNET_ACTIVATION_HEIGHTS, TESTNET_MAX_TIME_START_HEIGHT,
+        },
         subsidy::{
             constants::mainnet,
             constants::testnet,
@@ -634,6 +638,18 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The target block spacing after Blossom activation, in seconds
+    post_blossom_pow_target_spacing: u32,
+    /// The averaging window for difficulty threshold arithmetic mean calculations
+    pow_averaging_window: usize,
+    /// The median block span for time median calculations
+    pow_median_block_span: usize,
+    /// The damping factor for median timespan variance
+    pow_damping_factor: i32,
+    /// The maximum upward adjustment percentage for median timespan variance
+    pow_max_adjust_up_percent: i32,
+    /// The maximum downward adjustment percentage for median timespan variance
+    pow_max_adjust_down_percent: i32,
 }
 
 impl Default for ParametersBuilder {
@@ -674,6 +690,12 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            post_blossom_pow_target_spacing: POST_BLOSSOM_POW_TARGET_SPACING,
+            pow_averaging_window: POW_AVERAGING_WINDOW,
+            pow_median_block_span: POW_MEDIAN_BLOCK_SPAN,
+            pow_damping_factor: POW_DAMPING_FACTOR,
+            pow_max_adjust_up_percent: POW_MAX_ADJUST_UP_PERCENT,
+            pow_max_adjust_down_percent: POW_MAX_ADJUST_DOWN_PERCENT,
         }
     }
 }
@@ -904,6 +926,51 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the post-Blossom target block spacing, in seconds, to be used in the
+    /// [`Parameters`] being built.
+    pub fn with_post_blossom_pow_target_spacing(
+        mut self,
+        post_blossom_pow_target_spacing: u32,
+    ) -> Self {
+        self.post_blossom_pow_target_spacing = post_blossom_pow_target_spacing;
+        self
+    }
+
+    /// Sets the difficulty adjustment averaging window to be used in the
+    /// [`Parameters`] being built.
+    pub fn with_pow_averaging_window(mut self, pow_averaging_window: usize) -> Self {
+        self.pow_averaging_window = pow_averaging_window;
+        self
+    }
+
+    /// Sets the median block span used by the difficulty adjustment in the
+    /// [`Parameters`] being built.
+    pub fn with_pow_median_block_span(mut self, pow_median_block_span: usize) -> Self {
+        self.pow_median_block_span = pow_median_block_span;
+        self
+    }
+
+    /// Sets the difficulty adjustment damping factor to be used in the
+    /// [`Parameters`] being built.
+    pub fn with_pow_damping_factor(mut self, pow_damping_factor: i32) -> Self {
+        self.pow_damping_factor = pow_damping_factor;
+        self
+    }
+
+    /// Sets the maximum upward difficulty adjustment percentage to be used in
+    /// the [`Parameters`] being built.
+    pub fn with_pow_max_adjust_up_percent(mut self, pow_max_adjust_up_percent: i32) -> Self {
+        self.pow_max_adjust_up_percent = pow_max_adjust_up_percent;
+        self
+    }
+
+    /// Sets the maximum downward difficulty adjustment percentage to be used in
+    /// the [`Parameters`] being built.
+    pub fn with_pow_max_adjust_down_percent(mut self, pow_max_adjust_down_percent: i32) -> Self {
+        self.pow_max_adjust_down_percent = pow_max_adjust_down_percent;
+        self
+    }
+
     /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
@@ -1019,6 +1086,12 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            post_blossom_pow_target_spacing,
+            pow_averaging_window,
+            pow_median_block_span,
+            pow_damping_factor,
+            pow_max_adjust_up_percent,
+            pow_max_adjust_down_percent,
         } = self;
         Parameters {
             network_name,
@@ -1037,6 +1110,12 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            post_blossom_pow_target_spacing,
+            pow_averaging_window,
+            pow_median_block_span,
+            pow_damping_factor,
+            pow_max_adjust_up_percent,
+            pow_max_adjust_down_percent,
         }
     }
 
@@ -1047,6 +1126,8 @@ impl ParametersBuilder {
 
     /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
+        self.validate_pow_parameters()?;
+
         let network = self.to_network_unchecked();
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
@@ -1068,6 +1149,50 @@ impl ParametersBuilder {
         }
 
         Ok(network)
+    }
+
+    /// Checks that the configured proof-of-work parameters produce a difficulty
+    /// adjustment the state can actually evaluate.
+    fn validate_pow_parameters(&self) -> Result<(), ParametersBuilderError> {
+        // `MeanTarget` divides by the window and `ActualTimespan` indexes the
+        // median spans, so neither may be empty. A zero spacing would make
+        // `AveragingWindowTimespan` zero and divide by it in `ThresholdBits`.
+        if self.pow_averaging_window == 0 {
+            return Err(ParametersBuilderError::InvalidPowAveragingWindow);
+        }
+        if self.pow_median_block_span == 0 {
+            return Err(ParametersBuilderError::InvalidPowMedianBlockSpan);
+        }
+        if self.post_blossom_pow_target_spacing == 0 {
+            return Err(ParametersBuilderError::InvalidPowTargetSpacing);
+        }
+
+        // The adjustment context is held in fixed-capacity buffers, so the sum of
+        // the two spans is what the state has to be able to read per block.
+        if self
+            .pow_averaging_window
+            .saturating_add(self.pow_median_block_span)
+            > MAX_POW_ADJUSTMENT_BLOCK_SPAN
+        {
+            return Err(ParametersBuilderError::PowAdjustmentBlockSpanTooLarge {
+                configured: self
+                    .pow_averaging_window
+                    .saturating_add(self.pow_median_block_span),
+                maximum: MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+            });
+        }
+
+        // `MeanTarget` sums `PoWAveragingWindow` expanded difficulties into a
+        // `U256` before dividing. With the default window of 17 the Mainnet and
+        // Testnet `PoWLimit`s cannot overflow that sum, but a configured network
+        // may widen the window, so the pair has to be checked together.
+        let max_safe_target_difficulty_limit =
+            ExpandedDifficulty::from(U256::MAX / U256::from(self.pow_averaging_window));
+        if self.target_difficulty_limit > max_safe_target_difficulty_limit {
+            return Err(ParametersBuilderError::TargetDifficultyLimitOverflowRisk);
+        }
+
+        Ok(())
     }
 
     /// Returns true if these [`Parameters`] should be compatible with the default Testnet parameters.
@@ -1092,6 +1217,12 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            post_blossom_pow_target_spacing,
+            pow_averaging_window,
+            pow_median_block_span,
+            pow_damping_factor,
+            pow_max_adjust_up_percent,
+            pow_max_adjust_down_percent,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1107,6 +1238,12 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.post_blossom_pow_target_spacing == post_blossom_pow_target_spacing
+            && self.pow_averaging_window == pow_averaging_window
+            && self.pow_median_block_span == pow_median_block_span
+            && self.pow_damping_factor == pow_damping_factor
+            && self.pow_max_adjust_up_percent == pow_max_adjust_up_percent
+            && self.pow_max_adjust_down_percent == pow_max_adjust_down_percent
     }
 }
 
@@ -1172,6 +1309,18 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The target block spacing after Blossom activation, in seconds
+    post_blossom_pow_target_spacing: u32,
+    /// The averaging window for difficulty threshold arithmetic mean calculations
+    pow_averaging_window: usize,
+    /// The median block span for time median calculations
+    pow_median_block_span: usize,
+    /// The damping factor for median timespan variance
+    pow_damping_factor: i32,
+    /// The maximum upward adjustment percentage for median timespan variance
+    pow_max_adjust_up_percent: i32,
+    /// The maximum downward adjustment percentage for median timespan variance
+    pow_max_adjust_down_percent: i32,
 }
 
 impl Default for Parameters {
@@ -1277,6 +1426,15 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // The difficulty adjustment parameters are tunable on Regtest, the
+            // same way activation heights are: retuning them must not change
+            // what network this is.
+            post_blossom_pow_target_spacing: _,
+            pow_averaging_window: _,
+            pow_median_block_span: _,
+            pow_damping_factor: _,
+            pow_max_adjust_up_percent: _,
+            pow_max_adjust_down_percent: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1329,6 +1487,36 @@ impl Parameters {
     /// Returns the target difficulty limit for this network
     pub fn target_difficulty_limit(&self) -> ExpandedDifficulty {
         self.target_difficulty_limit
+    }
+
+    /// Returns the post-Blossom target block spacing, in seconds, for this network
+    pub fn post_blossom_pow_target_spacing(&self) -> u32 {
+        self.post_blossom_pow_target_spacing
+    }
+
+    /// Returns the difficulty adjustment averaging window for this network
+    pub fn pow_averaging_window(&self) -> usize {
+        self.pow_averaging_window
+    }
+
+    /// Returns the median block span used by the difficulty adjustment for this network
+    pub fn pow_median_block_span(&self) -> usize {
+        self.pow_median_block_span
+    }
+
+    /// Returns the difficulty adjustment damping factor for this network
+    pub fn pow_damping_factor(&self) -> i32 {
+        self.pow_damping_factor
+    }
+
+    /// Returns the maximum upward difficulty adjustment percentage for this network
+    pub fn pow_max_adjust_up_percent(&self) -> i32 {
+        self.pow_max_adjust_up_percent
+    }
+
+    /// Returns the maximum downward difficulty adjustment percentage for this network
+    pub fn pow_max_adjust_down_percent(&self) -> i32 {
+        self.pow_max_adjust_down_percent
     }
 
     /// Returns true if proof-of-work validation should be disabled for this network
@@ -1407,6 +1595,67 @@ impl Network {
             params.disable_pow()
         } else {
             false
+        }
+    }
+
+    /// Returns the post-Blossom target block spacing, in seconds, for this network.
+    ///
+    /// [`POST_BLOSSOM_POW_TARGET_SPACING`] on Mainnet, and on any configured
+    /// Testnet that does not override it.
+    pub fn post_blossom_pow_target_spacing(&self) -> u32 {
+        match self {
+            Self::Testnet(params) => params.post_blossom_pow_target_spacing(),
+            Self::Mainnet => POST_BLOSSOM_POW_TARGET_SPACING,
+        }
+    }
+
+    /// Returns the difficulty adjustment averaging window for this network.
+    ///
+    /// `PoWAveragingWindow` in the Zcash specification.
+    pub fn pow_averaging_window(&self) -> usize {
+        match self {
+            Self::Testnet(params) => params.pow_averaging_window(),
+            Self::Mainnet => POW_AVERAGING_WINDOW,
+        }
+    }
+
+    /// Returns the median block span used by the difficulty adjustment for this network.
+    ///
+    /// `PoWMedianBlockSpan` in the Zcash specification.
+    pub fn pow_median_block_span(&self) -> usize {
+        match self {
+            Self::Testnet(params) => params.pow_median_block_span(),
+            Self::Mainnet => POW_MEDIAN_BLOCK_SPAN,
+        }
+    }
+
+    /// Returns the difficulty adjustment damping factor for this network.
+    ///
+    /// `PoWDampingFactor` in the Zcash specification.
+    pub fn pow_damping_factor(&self) -> i32 {
+        match self {
+            Self::Testnet(params) => params.pow_damping_factor(),
+            Self::Mainnet => POW_DAMPING_FACTOR,
+        }
+    }
+
+    /// Returns the maximum upward difficulty adjustment percentage for this network.
+    ///
+    /// `PoWMaxAdjustUp * 100` in the Zcash specification.
+    pub fn pow_max_adjust_up_percent(&self) -> i32 {
+        match self {
+            Self::Testnet(params) => params.pow_max_adjust_up_percent(),
+            Self::Mainnet => POW_MAX_ADJUST_UP_PERCENT,
+        }
+    }
+
+    /// Returns the maximum downward difficulty adjustment percentage for this network.
+    ///
+    /// `PoWMaxAdjustDown * 100` in the Zcash specification.
+    pub fn pow_max_adjust_down_percent(&self) -> i32 {
+        match self {
+            Self::Testnet(params) => params.pow_max_adjust_down_percent(),
+            Self::Mainnet => POW_MAX_ADJUST_DOWN_PERCENT,
         }
     }
 

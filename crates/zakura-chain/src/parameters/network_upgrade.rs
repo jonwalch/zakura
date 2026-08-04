@@ -246,15 +246,62 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
 ];
 
 /// The target block spacing before Blossom.
-const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
+pub const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
 
 /// The target block spacing after Blossom activation.
+///
+/// The consensus value on Mainnet, and the default for configured Testnets. See
+/// [`Network::post_blossom_pow_target_spacing`] for the value in force on a
+/// given network.
 pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 
 /// The averaging window for difficulty threshold arithmetic mean calculations.
 ///
-/// `PoWAveragingWindow` in the Zcash specification.
+/// `PoWAveragingWindow` in the Zcash specification. The consensus value on
+/// Mainnet, and the default for configured Testnets. See
+/// [`Network::pow_averaging_window`] for the value in force on a given network.
 pub const POW_AVERAGING_WINDOW: usize = 17;
+
+/// The median block span for time median calculations.
+///
+/// `PoWMedianBlockSpan` in the Zcash specification. The consensus value on
+/// Mainnet, and the default for configured Testnets. See
+/// [`Network::pow_median_block_span`] for the value in force on a given network.
+pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
+
+/// The damping factor for median timespan variance.
+///
+/// `PoWDampingFactor` in the Zcash specification. The consensus value on
+/// Mainnet, and the default for configured Testnets. See
+/// [`Network::pow_damping_factor`] for the value in force on a given network.
+pub const POW_DAMPING_FACTOR: i32 = 4;
+
+/// The maximum upward adjustment percentage for median timespan variance.
+///
+/// `PoWMaxAdjustUp * 100` in the Zcash specification. The consensus value on
+/// Mainnet, and the default for configured Testnets. See
+/// [`Network::pow_max_adjust_up_percent`] for the value in force on a given
+/// network.
+pub const POW_MAX_ADJUST_UP_PERCENT: i32 = 16;
+
+/// The maximum downward adjustment percentage for median timespan variance.
+///
+/// `PoWMaxAdjustDown * 100` in the Zcash specification. The consensus value on
+/// Mainnet, and the default for configured Testnets. See
+/// [`Network::pow_max_adjust_down_percent`] for the value in force on a given
+/// network.
+pub const POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
+
+/// The largest difficulty adjustment context any network may ask for.
+///
+/// `PoWAveragingWindow + PoWMedianBlockSpan` is 28 on Mainnet and the default
+/// Testnet, but a configured Testnet may raise either term. This constant is the
+/// compile-time ceiling on the sum: it bounds the buffers that hold the
+/// adjustment context, so a configured network cannot make the state read an
+/// unbounded number of headers per block. Configured values above it are
+/// rejected when the network is built, not clamped, because silently shortening
+/// the window would change which difficulty a node computes.
+pub const MAX_POW_ADJUSTMENT_BLOCK_SPAN: usize = 64;
 
 /// The multiplier used to derive the testnet minimum difficulty block time gap
 /// threshold.
@@ -395,19 +442,21 @@ impl NetworkUpgrade {
         NetworkUpgrade::branch_id_list().get(self).cloned()
     }
 
-    /// Returns the target block spacing for the network upgrade.
+    /// Returns the target block spacing for the network upgrade on `network`.
     ///
     /// Based on [`PRE_BLOSSOM_POW_TARGET_SPACING`] and
-    /// [`POST_BLOSSOM_POW_TARGET_SPACING`] from the Zcash specification.
-    pub fn target_spacing(&self) -> Duration {
+    /// [`POST_BLOSSOM_POW_TARGET_SPACING`] from the Zcash specification. A
+    /// configured Testnet may override the post-Blossom spacing, so this takes
+    /// `network` rather than reading the constant directly.
+    pub fn target_spacing(&self, network: &Network) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => {
-                POST_BLOSSOM_POW_TARGET_SPACING.into()
+                network.post_blossom_pow_target_spacing().into()
             }
 
             #[cfg(zcash_unstable = "zfuture")]
-            ZFuture => POST_BLOSSOM_POW_TARGET_SPACING.into(),
+            ZFuture => network.post_blossom_pow_target_spacing().into(),
         };
 
         Duration::seconds(spacing_seconds)
@@ -417,7 +466,7 @@ impl NetworkUpgrade {
     ///
     /// See [`NetworkUpgrade::target_spacing`] for details.
     pub fn target_spacing_for_height(network: &Network, height: block::Height) -> Duration {
-        NetworkUpgrade::current(network, height).target_spacing()
+        NetworkUpgrade::current(network, height).target_spacing(network)
     }
 
     /// Returns all the target block spacings for `network` and the heights where they start.
@@ -428,7 +477,7 @@ impl NetworkUpgrade {
             (NetworkUpgrade::Genesis, PRE_BLOSSOM_POW_TARGET_SPACING),
             (
                 NetworkUpgrade::Blossom,
-                POST_BLOSSOM_POW_TARGET_SPACING.into(),
+                network.post_blossom_pow_target_spacing().into(),
             ),
         ]
         .into_iter()
@@ -457,7 +506,10 @@ impl NetworkUpgrade {
             (Network::Mainnet, _) => None,
             (Network::Testnet(_params), _) => {
                 let network_upgrade = NetworkUpgrade::current(network, height);
-                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
+                Some(
+                    network_upgrade.target_spacing(network)
+                        * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER,
+                )
             }
         }
     }
@@ -493,11 +545,15 @@ impl NetworkUpgrade {
         }
     }
 
-    /// Returns the averaging window timespan for the network upgrade.
+    /// Returns the averaging window timespan for the network upgrade on `network`.
     ///
     /// `AveragingWindowTimespan` from the Zcash specification.
-    pub fn averaging_window_timespan(&self) -> Duration {
-        self.target_spacing() * POW_AVERAGING_WINDOW.try_into().expect("fits in i32")
+    pub fn averaging_window_timespan(&self, network: &Network) -> Duration {
+        self.target_spacing(network)
+            * network
+                .pow_averaging_window()
+                .try_into()
+                .expect("averaging window is bounded by MAX_POW_ADJUSTMENT_BLOCK_SPAN")
     }
 
     /// Returns the averaging window timespan for `network` and `height`.
@@ -507,7 +563,7 @@ impl NetworkUpgrade {
         network: &Network,
         height: block::Height,
     ) -> Duration {
-        NetworkUpgrade::current(network, height).averaging_window_timespan()
+        NetworkUpgrade::current(network, height).averaging_window_timespan(network)
     }
 
     /// Returns an iterator over [`NetworkUpgrade`] variants.
