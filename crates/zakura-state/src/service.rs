@@ -1573,6 +1573,10 @@ impl Service<Request> for StateService {
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
                 let timer = CodeTimer::start();
+                // The write task reports rejected bodies asynchronously. Drain those
+                // reports before consulting the sent set so a different body with the
+                // same header hash is not misclassified as a duplicate.
+                self.drain_non_finalized_rejected_hashes();
                 let sent_hash_response = self.known_sent_hash(&hash);
                 let read_service = self.read_service.clone();
 
