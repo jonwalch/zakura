@@ -40,18 +40,20 @@ pub(crate) enum BlockApplyClass {
     Full,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingBlockApply {
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     class: BlockApplyClass,
     block: Arc<block::Block>,
+    operation: Option<super::BlockApplyOperation>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlockApplyCompletion {
     class: BlockApplyClass,
+    result: BlockApplyResult,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,6 +112,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut full_in_flight = 0usize;
     let mut deferred_actions = VecDeque::new();
     let mut shutting_down = false;
+    let mut apply_phase = block_sync_handoff.subscribe_apply_phase();
 
     loop {
         if block_sync_handoff.is_yielded_to_legacy() {
@@ -137,8 +140,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
         if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
             shutting_down = true;
-            pending_applies.clear();
-            pending_probe_applies.clear();
+            block_sync_handoff.request_apply_shutdown();
+            release_pending_applies(&block_sync, &mut pending_applies, &trace);
+            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
             deferred_actions.clear();
         }
 
@@ -202,8 +206,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             select! {
                 _ = &mut shutdown => {
                     shutting_down = true;
-                    pending_applies.clear();
-                    pending_probe_applies.clear();
+                    block_sync_handoff.request_apply_shutdown();
+                    release_pending_applies(&block_sync, &mut pending_applies, &trace);
+                    release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
                     deferred_actions.clear();
                     continue;
                 },
@@ -211,6 +216,13 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     if !block_sync_handoff.zakura_owns_applies()
                         && !block_sync_handoff.is_yielded_to_legacy() =>
                 {
+                    continue;
+                }
+                changed = apply_phase.changed() => {
+                    if changed.is_err() {
+                        shutting_down = true;
+                        block_sync_handoff.request_apply_shutdown();
+                    }
                     continue;
                 }
                 completed = in_flight_applies.next(), if !in_flight_applies.is_empty() => {
@@ -239,7 +251,15 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 }
                 action = actions.recv() => {
                     let Some(action) = action else {
-                        return;
+                        shutting_down = true;
+                        block_sync_handoff.request_apply_shutdown();
+                        release_pending_applies(&block_sync, &mut pending_applies, &trace);
+                        release_pending_probe_applies(
+                            &block_sync,
+                            &mut pending_probe_applies,
+                            &trace,
+                        );
+                        continue;
                     };
                     action
                 }
@@ -627,6 +647,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         token,
                         class,
                         block,
+                        operation: None,
                     };
                     if let Some(height) = height {
                         pending_probe_applies.insert(height, pending);
@@ -656,12 +677,18 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                     continue;
                 }
+                let Some(operation) = block_sync_handoff.queue_apply() else {
+                    abandon_block_apply(&block_sync, owner, source, token, block.as_ref(), &trace);
+                    continue;
+                };
+                debug!(operation_id = ?operation.id(), token, "queued native block apply operation");
                 pending_applies.push_back(PendingBlockApply {
                     owner,
                     source,
                     token,
                     class,
                     block,
+                    operation: Some(operation),
                 });
                 drain_pending_block_applies(
                     &block_sync_handoff,
@@ -753,7 +780,10 @@ fn abandoned_pending_apply_finished_events(
     pending_applies: &mut VecDeque<PendingBlockApply>,
 ) -> Vec<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
     let mut events = Vec::new();
-    while let Some(pending) = pending_applies.pop_front() {
+    while let Some(mut pending) = pending_applies.pop_front() {
+        if let Some(operation) = pending.operation.take() {
+            operation.cancel();
+        }
         if let Some(event) = abandoned_block_apply_finished_event(
             pending.owner,
             pending.source,
@@ -999,11 +1029,22 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         }
 
         let class = pending.class;
-        let Some(permit) = handoff.begin_apply() else {
+        let operation = pending
+            .operation
+            .expect("ordinary pending applies own a registered operation");
+        let Some(accepted) = operation.accept() else {
             decrement_in_flight_apply_count(class, checkpoint_in_flight, full_in_flight);
-            pending_applies.push_front(pending);
-            return;
+            abandon_block_apply(
+                &block_sync,
+                pending.owner,
+                pending.source,
+                pending.token,
+                pending.block.as_ref(),
+                &trace,
+            );
+            continue;
         };
+        debug!(operation_id = ?accepted.id(), token = pending.token, "accepted native block apply operation");
         let apply = apply_block_sync_body(
             block_verifier.clone(),
             latest_chain_tip.clone(),
@@ -1020,10 +1061,17 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         );
         in_flight_applies.push(
             async move {
-                // Hold the gate slot for the whole apply, so fallback observes
-                // this work until it has finished.
-                let _permit = permit;
-                apply.await
+                let completed = apply.await;
+                let terminal = match completed.result {
+                    BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
+                        super::BlockApplyTerminal::Committed
+                    }
+                    BlockApplyResult::Rejected
+                    | BlockApplyResult::Unavailable
+                    | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
+                };
+                accepted.complete(terminal);
+                completed
             }
             .boxed(),
         );
@@ -1225,7 +1273,10 @@ where
             ?expected_hash,
             "Zakura block sync cannot apply body without coinbase height"
         );
-        return BlockApplyCompletion { class };
+        return BlockApplyCompletion {
+            class,
+            result: BlockApplyResult::Rejected,
+        };
     };
 
     emit_commit_state(&trace, cs_trace::COMMIT_START, "block_sync_driver", |row| {
@@ -1292,7 +1343,7 @@ where
         },
     );
 
-    BlockApplyCompletion { class }
+    BlockApplyCompletion { class, result }
 }
 
 #[cfg(test)]
@@ -1968,6 +2019,7 @@ mod tests {
                 token: 11,
                 class: BlockApplyClass::Full,
                 block: block1,
+                operation: None,
             },
             PendingBlockApply {
                 owner: test_owner(),
@@ -1975,6 +2027,7 @@ mod tests {
                 token: 12,
                 class: BlockApplyClass::Full,
                 block: block2,
+                operation: None,
             },
         ]);
 
