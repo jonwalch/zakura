@@ -2154,3 +2154,6 @@ impl WriteBlockWorkerTask {
         BlockWriteTaskExit::Completed
     }
 }
+
+#[cfg(test)]
+mod tests;
