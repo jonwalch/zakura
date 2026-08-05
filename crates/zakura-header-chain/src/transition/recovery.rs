@@ -656,3 +656,403 @@ fn source_failure(violation: AuditViolation) -> RecoveryFailure {
         violations: vec![violation],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use zakura_chain::{
+        block::genesis::regtest_genesis_block,
+        parameters::{testnet::RegtestParameters, Network},
+    };
+
+    use super::*;
+    use crate::{
+        AlarmSet, AuxAuthentication, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BranchId,
+        ChainScore, CheckpointSet, EligibilityState, EngineMode, EvidenceId, FinalityEpoch,
+        FrontierSet, HeaderChainDiskVersion, HeaderGeneration, HeaderValidationState,
+        HeaderWorkAuthority, HeaderWorkOwner, SourceId, StateVersion, SuffixWork, TrustedAnchor,
+        VerifiedGeneration, WorkCoordinate,
+    };
+
+    #[derive(Clone)]
+    struct AuditStore {
+        metadata: EngineMetadata,
+        snapshot: EngineSnapshot,
+        nodes: Vec<HeaderNode>,
+        children: Vec<(block::Hash, block::Hash)>,
+        selected: Vec<Frontier>,
+        verified: Vec<Frontier>,
+        deferred: Vec<(DateTime<Utc>, block::Hash)>,
+        reasons: Vec<(block::Hash, EligibilityReason)>,
+        aux: Vec<AuxDelivery>,
+        contexts: Vec<ValidationContextRecord>,
+        finality: Vec<FinalityRecord>,
+    }
+
+    impl StoreAuditRead for AuditStore {
+        fn snapshot(&self) -> Result<EngineSnapshot, StoreError> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn metadata(&self) -> Result<EngineMetadata, StoreError> {
+            Ok(self.metadata.clone())
+        }
+
+        fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
+            Ok(self.nodes.clone())
+        }
+
+        fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
+            Ok(self.children.clone())
+        }
+
+        fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+            Ok(self.selected.clone())
+        }
+
+        fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+            Ok(self.verified.clone())
+        }
+
+        fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError> {
+            Ok(self.deferred.clone())
+        }
+
+        fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
+            Ok(self.reasons.clone())
+        }
+
+        fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError> {
+            Ok(self.aux.clone())
+        }
+
+        fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {
+            Ok(self.contexts.clone())
+        }
+
+        fn visit_finality_history(
+            &self,
+            visitor: &mut dyn FnMut(FinalityRecord) -> Result<(), StoreError>,
+        ) -> Result<(), StoreError> {
+            for record in &self.finality {
+                visitor(*record)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn fixture() -> (AuditStore, EngineConfig) {
+        let network = Network::new_regtest(RegtestParameters::default());
+        let block = regtest_genesis_block();
+        let anchor = Frontier::new(block::Height(0), block.hash());
+        let config = EngineConfig::new(
+            EngineMode::Integrated,
+            network,
+            TrustedAnchor {
+                frontier: anchor,
+                header: block.header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the audit fixture configuration is coherent");
+        let anchor_work = block
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture target has work");
+        let anchor_node = HeaderNode::from_durable_parts(
+            block.header.clone(),
+            anchor.hash,
+            block.header.previous_block_hash,
+            anchor.height,
+            anchor_work,
+            WorkCoordinate::new(anchor.hash, anchor_work.as_u256()),
+            HeaderValidationState::Valid,
+            EligibilityState::default(),
+            BodyValidationState::Unknown,
+            Vec::new(),
+        )
+        .expect("the canonical anchor fields agree");
+        let mut child_header = *block.header;
+        child_header.previous_block_hash = anchor.hash;
+        child_header.nonce = [1; 32].into();
+        let child_header = Arc::new(child_header);
+        let child_hash = child_header.hash();
+        let child_work = child_header
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture child target has work");
+        let child = Frontier::new(block::Height(1), child_hash);
+        let child_node = HeaderNode::from_durable_parts(
+            child_header,
+            child_hash,
+            anchor.hash,
+            child.height,
+            child_work,
+            anchor_node
+                .work_coordinate()
+                .checked_add(child_work)
+                .expect("the fixture work fits"),
+            HeaderValidationState::Valid,
+            EligibilityState::default(),
+            BodyValidationState::Unknown,
+            Vec::new(),
+        )
+        .expect("the canonical child fields agree");
+        let score = ChainScore::new(SuffixWork::new(child_work.as_u256()), child.hash);
+        let metadata = EngineMetadata {
+            disk_format: HeaderChainDiskVersion(1),
+            mode: EngineMode::Integrated,
+            network_id: config.network.kind(),
+            anchor_manifest_digest: config.trust_anchor_digest(),
+            work_origin: anchor,
+            state_version: StateVersion::new(1),
+            header_generation: HeaderGeneration::new(1),
+            verified_generation: VerifiedGeneration::new(1),
+            finality_epoch: FinalityEpoch::new(0),
+            frontiers: FrontierSet {
+                finalized: anchor,
+                header_best: child,
+                verified_best: anchor,
+            },
+            header_best_score: score,
+            oldest_retained_height: anchor.height,
+            alarms: AlarmSet::default(),
+            last_transition_id: EvidenceId::from_digest([0; 32]),
+        };
+        (
+            AuditStore {
+                snapshot: metadata.snapshot(),
+                metadata,
+                nodes: vec![anchor_node, child_node],
+                children: vec![(anchor.hash, child.hash)],
+                selected: vec![anchor, child],
+                verified: vec![anchor],
+                deferred: Vec::new(),
+                reasons: Vec::new(),
+                aux: Vec::new(),
+                contexts: Vec::new(),
+                finality: Vec::new(),
+            },
+            config,
+        )
+    }
+
+    fn violations(store: &AuditStore, config: &EngineConfig) -> Vec<AuditViolation> {
+        match audit_store(store, config) {
+            Err(RecoveryFailure::Source { violations }) => violations,
+            other => panic!("expected source audit failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coherent_source_and_indexes_need_no_recovery_write() {
+        let (store, config) = fixture();
+        let plan = audit_store(&store, &config).expect("the coherent fixture audits cleanly");
+        assert!(plan.is_clean());
+        assert_eq!(plan.metadata, store.metadata);
+    }
+
+    #[test]
+    fn body_unavailability_alarm_is_reconstructed_from_the_selected_node() {
+        let (mut store, config) = fixture();
+        let summary = BodyUnavailableSummary {
+            attempts: 10,
+            suppliers: 2,
+            alarmed: true,
+            ..Default::default()
+        };
+        store.nodes[1].body = crate::BodyValidationState::Unavailable(summary);
+
+        let plan = audit_store(&store, &config).expect("the derived alarm is reconstructible");
+        assert_eq!(
+            plan.repairs,
+            BTreeSet::from([RecoveryRepair::BodyAvailabilityAlarm])
+        );
+        assert_eq!(
+            plan.metadata.alarms.header_best_body_unavailable,
+            Some(summary)
+        );
+        assert_eq!(plan.metadata.state_version, StateVersion::new(2));
+        assert_eq!(plan.metadata.header_generation, HeaderGeneration::new(1));
+    }
+
+    #[test]
+    fn recompute_not_cached_projection() {
+        let (mut store, config) = fixture();
+        let anchor = store.metadata.frontiers.finalized;
+        let child_hash = store.metadata.frontiers.header_best.hash;
+        store.children.clear();
+        store.selected = vec![anchor];
+        store.verified.clear();
+        store.deferred.push((Utc::now(), child_hash));
+        store.nodes[1].eligibility.inherited_from = Some(anchor.hash);
+
+        let plan = audit_store(&store, &config).expect("cache corruption is reconstructible");
+        assert_eq!(
+            plan.repairs,
+            BTreeSet::from([
+                RecoveryRepair::ChildIndex,
+                RecoveryRepair::DeferredIndex,
+                RecoveryRepair::SelectedProjection,
+                RecoveryRepair::VerifiedProjection,
+                RecoveryRepair::InheritedEligibility,
+            ])
+        );
+        assert_eq!(plan.metadata.state_version, StateVersion::new(2));
+        assert_eq!(plan.metadata.header_generation, HeaderGeneration::new(2));
+        assert_eq!(
+            plan.metadata.verified_generation,
+            VerifiedGeneration::new(2)
+        );
+    }
+
+    #[test]
+    fn audits_each_normative_invariant() {
+        let (base, config) = fixture();
+        let child_hash = base.metadata.frontiers.header_best.hash;
+
+        let mut store = base.clone();
+        store.metadata.anchor_manifest_digest[0] ^= 1;
+        store.snapshot = store.metadata.snapshot();
+        assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
+
+        let mut store = base.clone();
+        store.nodes[1].hash = block::Hash([8; 32]);
+        assert!(
+            violations(&store, &config).contains(&AuditViolation::NodeHash(block::Hash([8; 32])))
+        );
+
+        let mut store = base.clone();
+        let missing = block::Hash([9; 32]);
+        store.nodes[1].parent_hash = missing;
+        store.nodes[1].header = Arc::new(block::Header {
+            previous_block_hash: missing,
+            ..*store.nodes[1].header
+        });
+        store.nodes[1].hash = store.nodes[1].header.hash();
+        assert!(violations(&store, &config)
+            .iter()
+            .any(|violation| matches!(violation, AuditViolation::Parent(_))));
+
+        let mut store = base.clone();
+        store.nodes[1] = HeaderNode::from_durable_parts(
+            store.nodes[1].header.clone(),
+            child_hash,
+            store.nodes[1].parent_hash,
+            store.nodes[1].height,
+            store.nodes[1].block_work,
+            WorkCoordinate::new(store.metadata.work_origin.hash, Default::default()),
+            store.nodes[1].validation,
+            store.nodes[1].eligibility.clone(),
+            store.nodes[1].body.clone(),
+            Vec::new(),
+        )
+        .expect("the isolated node fields remain canonical");
+        assert!(violations(&store, &config).contains(&AuditViolation::Work(child_hash)));
+
+        let mut store = base.clone();
+        store.nodes[1].body = BodyValidationState::ConsensusInvalid {
+            evidence: EvidenceId::from_digest([2; 32]),
+            rule: BodyRuleId::new("body.rule"),
+        };
+        assert!(violations(&store, &config).contains(&AuditViolation::BodyEligibility(child_hash)));
+
+        let mut store = base.clone();
+        let corrupted_until = store.nodes[1].header.time + Duration::hours(100);
+        store.nodes[1].validation = crate::HeaderValidationState::DeferredUntil(corrupted_until);
+        store.deferred = vec![(corrupted_until, child_hash)];
+        assert!(violations(&store, &config).contains(&AuditViolation::HeaderValidation(child_hash)));
+
+        let mut store = base.clone();
+        store.reasons.push((
+            child_hash,
+            EligibilityReason::OperatorInvalid {
+                id: crate::OperatorInvalidationId::new([3; 16]),
+            },
+        ));
+        assert!(violations(&store, &config).contains(&AuditViolation::EligibilityRoot(child_hash)));
+
+        let mut checkpointed = config.clone();
+        checkpointed.local_checkpoints =
+            CheckpointSet::new([Frontier::new(block::Height(1), block::Hash([0xaa; 32]))])
+                .expect("the checkpoint fixture is unique");
+        let mut store = base.clone();
+        store.metadata.anchor_manifest_digest = checkpointed.trust_anchor_digest();
+        store.snapshot = store.metadata.snapshot();
+        assert!(violations(&store, &checkpointed)
+            .contains(&AuditViolation::TrustPin(block::Height(1), child_hash)));
+
+        let mut store = base.clone();
+        store.nodes[1]
+            .aux_delivery_ids
+            .push(EvidenceId::from_digest([4; 32]));
+        assert!(violations(&store, &config).contains(&AuditViolation::Auxiliary(child_hash)));
+
+        let mut store = base.clone();
+        store.contexts.push(ValidationContextRecord {
+            header: regtest_genesis_block().header.clone(),
+            height: block::Height(7),
+        });
+        assert!(violations(&store, &config)
+            .iter()
+            .any(|violation| matches!(violation, AuditViolation::ValidationContext(_))));
+
+        let mut store = base.clone();
+        store.metadata.frontiers.finalized = Frontier::new(block::Height(1), child_hash);
+        store.snapshot = store.metadata.snapshot();
+        assert!(violations(&store, &config)
+            .iter()
+            .any(|violation| matches!(violation, AuditViolation::ValidationContext(_))));
+
+        let mut store = base.clone();
+        store.metadata.finality_epoch = FinalityEpoch::new(1);
+        store.snapshot = store.metadata.snapshot();
+        assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+
+        let mut headers_only = config.clone();
+        headers_only.mode = EngineMode::HeadersOnly;
+        let mut store = base.clone();
+        store.metadata.mode = EngineMode::HeadersOnly;
+        store.snapshot = store.metadata.snapshot();
+        store.finality.push(FinalityRecord {
+            previous: store.metadata.frontiers.finalized,
+            current: store.metadata.frontiers.finalized,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: store.metadata.frontiers.header_best,
+            },
+            epoch: FinalityEpoch::new(0),
+        });
+        assert!(violations(&store, &headers_only).contains(&AuditViolation::Finality));
+
+        let mut limited = config.clone();
+        limited.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
+        let mut oversized = base.clone();
+        oversized.nodes.push(oversized.nodes[1].clone());
+        assert!(violations(&oversized, &limited).contains(&AuditViolation::Limits));
+
+        let mut store = base.clone();
+        let evidence = EvidenceId::from_digest([5; 32]);
+        store.aux.push(AuxDelivery {
+            delivery_id: evidence,
+            header_hash: block::Hash([6; 32]),
+            source: SourceId::from_digest([7; 32]),
+            owner: HeaderWorkOwner {
+                authority: HeaderWorkAuthority {
+                    header_generation: HeaderGeneration::new(1),
+                    branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
+                },
+                session_id: 1,
+                request_id: NonZeroU64::new(1).expect("one is nonzero"),
+            }
+            .into(),
+            body_size: BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: AuxAuthentication::Unauthenticated,
+        });
+        assert!(violations(&store, &config)
+            .iter()
+            .any(|violation| matches!(violation, AuditViolation::Auxiliary(_))));
+    }
+}

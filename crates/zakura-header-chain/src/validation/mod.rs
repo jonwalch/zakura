@@ -279,3 +279,186 @@ pub fn validate_future_time(
 ) -> Result<(), block::BlockTimeError> {
     header.time_is_valid_at(now, &height, &hash)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakura_chain::{
+        block::{genesis::regtest_genesis_block, Commitment},
+        parameters::testnet::{ConfiguredActivationHeights, Parameters, RegtestParameters},
+        work::difficulty::U256,
+    };
+
+    #[test]
+    fn canonical_version_hash_link_and_height_boundaries() {
+        let header = *regtest_genesis_block().header;
+        let expected_hash = header.hash();
+        assert_eq!(
+            validate_encoding_version_hash(&header),
+            Ok(expected_hash),
+            "the shared validator hashes the complete canonical header"
+        );
+
+        let mut historical_non_four = header;
+        historical_non_four.version = 5;
+        assert!(validate_encoding_version_hash(&historical_non_four).is_ok());
+        let mut too_old = header;
+        too_old.version = 3;
+        assert!(matches!(
+            validate_encoding_version_hash(&too_old),
+            Err(HeaderEncodingError { version: 3, .. })
+        ));
+        let mut high_bit = header;
+        high_bit.version = 1 << 31;
+        assert!(validate_encoding_version_hash(&high_bit).is_err());
+
+        let mut child = header;
+        child.previous_block_hash = expected_hash;
+        assert_eq!(
+            validate_link(header.previous_block_hash, &[header, child]),
+            Ok(())
+        );
+        child.previous_block_hash = block::Hash([9; 32]);
+        assert!(matches!(
+            validate_link(header.previous_block_hash, &[header, child]),
+            Err(HeaderLinkError { offset: 1, .. })
+        ));
+        assert_eq!(
+            infer_height(block::Height(7), Some(block::Height(8))),
+            Ok(block::Height(8))
+        );
+        assert!(matches!(
+            infer_height(block::Height(7), Some(block::Height(9))),
+            Err(HeaderHeightError::PeerMismatch { .. })
+        ));
+        assert_eq!(
+            infer_height(block::Height::MAX, None),
+            Err(HeaderHeightError::Overflow(block::Height::MAX))
+        );
+    }
+
+    #[test]
+    fn pow_policy_waiver_is_derived_only_from_custom_network_identity() {
+        assert_eq!(
+            PowPolicy::authenticated_custom_waiver(&Network::Mainnet),
+            Err(PowPolicyError::ProductionNetwork(NetworkKind::Mainnet))
+        );
+        assert!(!PowPolicy::for_network(&Network::Mainnet)
+            .expect("mainnet always validates proof of work")
+            .is_authenticated_custom_waiver());
+        let testnet = Network::new_default_testnet();
+        assert_eq!(
+            PowPolicy::authenticated_custom_waiver(&testnet),
+            Err(PowPolicyError::ProductionNetwork(NetworkKind::Testnet))
+        );
+        assert!(!PowPolicy::for_network(&testnet)
+            .expect("default testnet always validates proof of work")
+            .is_authenticated_custom_waiver());
+        let regtest = Network::new_regtest(RegtestParameters::default());
+        let regtest_policy =
+            PowPolicy::for_network(&regtest).expect("regtest is an authenticated custom network");
+        assert!(regtest_policy.is_authenticated_custom_waiver());
+        assert!(validate_compact_target(&regtest_genesis_block().header, &regtest).is_ok());
+        let mut wrong_shape = *regtest_genesis_block().header;
+        wrong_shape.solution = equihash::Solution::for_proposal();
+        assert!(matches!(
+            regtest_policy.validate_solution(&wrong_shape),
+            Err(equihash::Error::InvalidSolutionSize { .. })
+        ));
+
+        let pow_disabled_custom = Parameters::build()
+            .with_network_name("PowDisabledCustom")
+            .expect("the custom network name is valid")
+            .with_disable_pow(true)
+            .to_network()
+            .expect("the test custom-network parameters are valid");
+        let custom_policy = PowPolicy::for_network(&pow_disabled_custom)
+            .expect("configured custom networks may authenticate a PoW waiver");
+        assert!(custom_policy.is_authenticated_custom_waiver());
+        let proposal_header = block::Header {
+            solution: equihash::Solution::for_proposal(),
+            ..*regtest_genesis_block().header
+        };
+        assert!(custom_policy.validate_solution(&proposal_header).is_ok());
+    }
+
+    #[test]
+    fn custom_overlapping_activations_select_the_configured_commitment_variant() {
+        let activation_height = block::Height(10);
+        let heartwood_canopy = Parameters::build()
+            .with_network_name("OverlappingCommitments")
+            .expect("the custom network name is valid")
+            .with_activation_heights(ConfiguredActivationHeights {
+                heartwood: Some(activation_height.0),
+                canopy: Some(activation_height.0),
+                ..Default::default()
+            })
+            .expect("same-height upgrades are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("the custom-network parameters are valid");
+        let mut header = *regtest_genesis_block().header;
+        header.commitment_bytes = [0; 32].into();
+        assert_eq!(
+            validate_commitment_structure(&header, &heartwood_canopy, activation_height),
+            Ok(Commitment::ChainHistoryActivationReserved),
+            "an overwritten Heartwood activation still requires its reserved value"
+        );
+        header.commitment_bytes = [1; 32].into();
+        assert!(matches!(
+            validate_commitment_structure(&header, &heartwood_canopy, activation_height),
+            Err(CommitmentError::InvalidChainHistoryActivationReserved { .. })
+        ));
+
+        let through_nu5 = Parameters::build()
+            .with_network_name("OverlappingNu5Commitment")
+            .expect("the custom network name is valid")
+            .with_activation_heights(ConfiguredActivationHeights {
+                heartwood: Some(activation_height.0),
+                canopy: Some(activation_height.0),
+                nu5: Some(activation_height.0),
+                ..Default::default()
+            })
+            .expect("same-height upgrades are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("the custom-network parameters are valid");
+        assert!(matches!(
+            validate_commitment_structure(&header, &through_nu5, activation_height),
+            Ok(Commitment::ChainHistoryBlockTxAuthCommitment(_))
+        ));
+    }
+
+    #[test]
+    fn hash_filter_accepts_equality_and_rejects_one_above() {
+        let target = ExpandedDifficulty::from(U256::from(42));
+        let mut equal_bytes = [0; 32];
+        equal_bytes[0] = 42;
+        assert_eq!(
+            validate_hash_filter(block::Hash(equal_bytes), target),
+            Ok(())
+        );
+
+        let mut above_bytes = equal_bytes;
+        above_bytes[0] = 43;
+        assert_eq!(
+            validate_hash_filter(block::Hash(above_bytes), target),
+            Err(HashFilterError {
+                hash: block::Hash(above_bytes),
+                target,
+            })
+        );
+    }
+
+    #[test]
+    fn future_time_accepts_two_hour_equality_and_rejects_one_second_above() {
+        let mut header = *regtest_genesis_block().header;
+        let now = header.time;
+        let height = block::Height(1);
+        let hash = header.hash();
+        header.time = now + chrono::Duration::hours(2);
+        assert!(validate_future_time(&header, now, height, hash).is_ok());
+        header.time += chrono::Duration::seconds(1);
+        assert!(validate_future_time(&header, now, height, hash).is_err());
+    }
+}
