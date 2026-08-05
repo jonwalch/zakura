@@ -220,6 +220,7 @@ pub(crate) struct BlockWriteTaskFailure {
 pub(crate) enum BlockWriteTaskExit {
     Completed,
     HeaderChainAttachmentFailed(HeaderChainAttachmentError),
+    HeaderChainRuntimeFailed(BlockWriteTaskFailure),
 }
 
 impl From<&HeaderChainAttachmentError> for BlockWriteTaskFailure {
@@ -228,6 +229,38 @@ impl From<&HeaderChainAttachmentError> for BlockWriteTaskFailure {
             message: error.to_string().into(),
         }
     }
+}
+
+impl BlockWriteTaskFailure {
+    fn runtime(context: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!("{context}: {error}").into(),
+        }
+    }
+}
+
+impl BlockWriteTaskExit {
+    fn failure(&self) -> Option<BlockWriteTaskFailure> {
+        match self {
+            Self::Completed => None,
+            Self::HeaderChainAttachmentFailed(error) => Some(error.into()),
+            Self::HeaderChainRuntimeFailed(error) => Some(error.clone()),
+        }
+    }
+}
+
+fn header_chain_finalization_failure(error: CommitCheckpointVerifiedError) -> BlockWriteTaskExit {
+    if matches!(error.inner(), CommitBlockError::HeaderChainError { .. }) {
+        return BlockWriteTaskExit::HeaderChainRuntimeFailed(BlockWriteTaskFailure::runtime(
+            "header-chain reorg-limit finalization failed",
+            error,
+        ));
+    }
+
+    panic!(
+        "unexpected finalized block commit error after note commitment and history trees were \
+         checked by the non-finalized state: {error:?}"
+    );
 }
 
 impl HeaderChainWriter {
@@ -1277,8 +1310,8 @@ impl BlockWriteSender {
                     header_chain_observers,
                 }
                 .run();
-                if let BlockWriteTaskExit::HeaderChainAttachmentFailed(error) = &result {
-                    let _ = worker_task_failure.set(error.into());
+                if let Some(failure) = result.failure() {
+                    let _ = worker_task_failure.set(failure);
                 }
                 result
             })
@@ -1486,7 +1519,12 @@ impl WriteBlockWorkerTask {
                             hash = ?ordered_block.0.hash,
                             "stopping finalized writer after incoherent header auxiliary read"
                         );
-                        return BlockWriteTaskExit::Completed;
+                        return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                            BlockWriteTaskFailure::runtime(
+                                "incoherent header auxiliary read stopped the finalized writer",
+                                error,
+                            ),
+                        );
                     }
                 }
             } else {
@@ -1507,7 +1545,15 @@ impl WriteBlockWorkerTask {
                     hash = ?ordered_block.0.hash,
                     "stopping finalized writer after an incoherent ready VCT auxiliary window"
                 );
-                return BlockWriteTaskExit::Completed;
+                return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                    BlockWriteTaskFailure::runtime(
+                        "incoherent ready VCT auxiliary window stopped the finalized writer",
+                        format_args!(
+                            "missing exact roots for {:?} at {:?}",
+                            ordered_block.0.hash, ordered_block.0.height
+                        ),
+                    ),
+                );
             }
 
             if needs_vct_successor
@@ -1771,7 +1817,12 @@ impl WriteBlockWorkerTask {
                             ?error,
                             "stopping state writer after deferred-header maintenance failure"
                         );
-                        return BlockWriteTaskExit::Completed;
+                        return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                            BlockWriteTaskFailure::runtime(
+                                "deferred-header maintenance stopped the state writer",
+                                error,
+                            ),
+                        );
                     }
                 },
             };
@@ -2059,12 +2110,16 @@ impl WriteBlockWorkerTask {
                         "commit contextually-verified request",
                     )
                 };
-                prev_finalized_note_commitment_trees = commit_result
-                    .expect(
-                        "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
-                    )
-                    .1
-                    .into();
+                prev_finalized_note_commitment_trees = match commit_result {
+                    Ok((_, trees)) => Some(trees),
+                    Err(error) => {
+                        tracing::error!(
+                            ?error,
+                            "stopping state writer after header-chain finalization failure"
+                        );
+                        return header_chain_finalization_failure(error);
+                    }
+                };
                 if header_chain.is_some() {
                     update_latest_chain_channels(
                         non_finalized_state,

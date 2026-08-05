@@ -2,6 +2,7 @@
 
 mod attachment_and_vct_aux;
 mod deferred;
+mod failure_exit;
 mod full_state_coherence;
 mod selection_and_evidence;
 

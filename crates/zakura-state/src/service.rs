@@ -327,6 +327,9 @@ impl Drop for ReadStateService {
                     Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
                         tracing::error!(?error, "block write task stopped during header attachment")
                     }
+                    Ok(write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)) => {
+                        tracing::error!(?error, "block write task stopped after a runtime failure")
+                    }
                     Ok(write::BlockWriteTaskExit::Completed) => {
                         debug!("shutting down the state because the block write task has finished")
                     }
@@ -1876,6 +1879,9 @@ impl Service<ReadRequest> for ReadStateService {
                     match block_write_task.join() {
                         Err(thread_panic) => std::panic::resume_unwind(thread_panic),
                         Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
+                            return Poll::Ready(Err(Box::new(error)));
+                        }
+                        Ok(write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)) => {
                             return Poll::Ready(Err(Box::new(error)));
                         }
                         Ok(write::BlockWriteTaskExit::Completed) => {}
