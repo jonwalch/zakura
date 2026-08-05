@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-};
+use std::{future::Future, sync::Arc};
 
 use color_eyre::eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
@@ -135,6 +128,7 @@ async fn wait_for_header_runtime(
 
     let mut latest_progress = None;
     let mut last_progress_at = tokio::time::Instant::now();
+    let mut attachment_pending_since = None;
     loop {
         let current = status.borrow().clone();
         match current {
@@ -145,16 +139,36 @@ async fn wait_for_header_runtime(
             }
             | HeaderRuntimeStatus::Ready { .. } => return Ok(()),
             HeaderRuntimeStatus::Detached {
+                epoch,
                 reason:
                     zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
                 ..
-            } => status.changed().await.map_err(|_| {
-                eyre!("header-runtime lifecycle publisher closed before attachment started")
-            })?,
+            } => {
+                let pending_since = attachment_pending_since.get_or_insert_with(tokio::time::Instant::now);
+                match tokio::time::timeout(
+                    RECONSTRUCTION_DIAGNOSTIC_INTERVAL,
+                    status.changed(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err(eyre!(
+                            "header-runtime lifecycle publisher closed before attachment started"
+                        ))
+                    }
+                    Err(_) => tracing::warn!(
+                        header_runtime_epoch = epoch.get(),
+                        attachment_pending_for = ?pending_since.elapsed(),
+                        "header runtime attachment is still pending"
+                    ),
+                }
+            }
             HeaderRuntimeStatus::Failed { error, .. } => {
                 return Err(eyre!("header runtime attachment failed: {error}"))
             }
             HeaderRuntimeStatus::Reconstructing { epoch, progress } => {
+                attachment_pending_since = None;
                 if latest_progress != Some((epoch, progress)) {
                     latest_progress = Some((epoch, progress));
                     last_progress_at = tokio::time::Instant::now();
@@ -289,18 +303,11 @@ pub(crate) fn block_roots_cover_range(
 pub(crate) struct HeaderChainServicePort<State, ReadState> {
     state: State,
     read_state: ReadState,
-    next_path_token: Arc<AtomicU64>,
-    retained_path_ids: Arc<Mutex<HashMap<port::HeaderPathToken, u64>>>,
 }
 
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
     pub(crate) fn new(state: State, read_state: ReadState) -> Self {
-        Self {
-            state,
-            read_state,
-            next_path_token: Arc::new(AtomicU64::new(1)),
-            retained_path_ids: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self { state, read_state }
     }
 }
 
@@ -382,13 +389,7 @@ where
         request: port::AcquireHeaderPath,
     ) -> HeaderChainFuture<'_, Result<port::AcquireHeaderPathReply, HeaderChainPortError>> {
         let read_state = self.read_state.clone();
-        let token = port::HeaderPathToken::from_adapter_id(
-            self.next_path_token.fetch_add(1, Ordering::Relaxed),
-        );
-        let retained_path_ids = self.retained_path_ids.clone();
-        Box::pin(
-            async move { acquire_header_path(read_state, request, token, retained_path_ids).await },
-        )
+        Box::pin(async move { acquire_header_path(read_state, request).await })
     }
 
     fn read_header_path(
@@ -397,10 +398,7 @@ where
         request: port::ReadHeaderPath,
     ) -> HeaderChainFuture<'_, Result<port::ReadHeaderPathReply, HeaderChainPortError>> {
         let read_state = self.read_state.clone();
-        let retained_path_ids = self.retained_path_ids.clone();
-        Box::pin(
-            async move { read_header_path(read_state, path, request, retained_path_ids).await },
-        )
+        Box::pin(async move { read_header_path(read_state, path, request).await })
     }
 
     fn release_header_path(
@@ -408,8 +406,7 @@ where
         path: port::RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), HeaderChainPortError>> {
         let read_state = self.read_state.clone();
-        let retained_path_ids = self.retained_path_ids.clone();
-        Box::pin(async move { release_header_path(read_state, path, retained_path_ids).await })
+        Box::pin(async move { release_header_path(read_state, path).await })
     }
 
     fn prepare_header_target(
@@ -770,8 +767,6 @@ fn header_target_apply_failure(
 async fn acquire_header_path<ReadState>(
     read_state: ReadState,
     request: port::AcquireHeaderPath,
-    token: port::HeaderPathToken,
-    retained_path_ids: Arc<Mutex<HashMap<port::HeaderPathToken, u64>>>,
 ) -> Result<port::AcquireHeaderPathReply, HeaderChainPortError>
 where
     ReadState: Service<
@@ -803,13 +798,9 @@ where
     {
         Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathLease(outcome))) => match outcome {
             zakura_state::RetainedPathLeaseOutcome::Acquired(lease) => {
-                retained_path_ids
-                    .lock()
-                    .map_err(|_| HeaderChainPortError::Unavailable { source: None })?
-                    .insert(token, lease.lease_id);
                 Ok(port::AcquireHeaderPathReply::Acquired(Box::new(
                     port::RetainedHeaderPath::from_adapter(
-                        token,
+                        port::HeaderPathToken::from_adapter_id(lease.lease_id),
                         source,
                         session_id,
                         lease.common_ancestor,
@@ -841,7 +832,6 @@ async fn read_header_path<ReadState>(
     read_state: ReadState,
     path: port::RetainedHeaderPath,
     request: port::ReadHeaderPath,
-    retained_path_ids: Arc<Mutex<HashMap<port::HeaderPathToken, u64>>>,
 ) -> Result<port::ReadHeaderPathReply, HeaderChainPortError>
 where
     ReadState: Service<
@@ -853,12 +843,7 @@ where
     ReadState::Future: Send + 'static,
 {
     let (token, source, session_id) = path.adapter_identity();
-    let lease_id = retained_path_ids
-        .lock()
-        .map_err(|_| HeaderChainPortError::Unavailable { source: None })?
-        .get(&token)
-        .copied()
-        .ok_or(HeaderChainPortError::Unavailable { source: None })?;
+    let lease_id = token.adapter_id();
     let port::ReadHeaderPath {
         after_hash,
         max_header_count,
@@ -985,7 +970,6 @@ fn selected_aux_delivery(
 async fn release_header_path<ReadState>(
     read_state: ReadState,
     path: port::RetainedHeaderPath,
-    retained_path_ids: Arc<Mutex<HashMap<port::HeaderPathToken, u64>>>,
 ) -> Result<(), HeaderChainPortError>
 where
     ReadState: Service<
@@ -997,11 +981,7 @@ where
     ReadState::Future: Send + 'static,
 {
     let (token, source, session_id) = path.adapter_identity();
-    let lease_id = retained_path_ids
-        .lock()
-        .map_err(|_| HeaderChainPortError::Unavailable { source: None })?
-        .remove(&token)
-        .ok_or(HeaderChainPortError::Unavailable { source: None })?;
+    let lease_id = token.adapter_id();
     match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
         read_state.oneshot(zakura_state::ReadRequest::ReleaseRetainedHeaderPath {
@@ -1131,6 +1111,36 @@ mod tests {
             early_result.is_err(),
             "full-state reconstruction must not inherit the ordinary driver request deadline"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn attachment_pending_has_no_completion_deadline() {
+        use zakura_node_services::sync_lifecycle::{
+            HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+        };
+
+        let (status_sender, mut status) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+                epoch: LifecycleEpoch::new(1),
+                reason: HeaderRuntimeDetachedReason::AttachmentPending,
+            });
+        let waiter = tokio::spawn(async move { wait_for_header_runtime(&mut status).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(2 * 30 + 1)).await;
+        assert!(
+            !waiter.is_finished(),
+            "periodic attachment diagnostics must not turn the startup wait into a failure"
+        );
+        status_sender
+            .send(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the attachment waiter remains subscribed");
+        waiter
+            .await
+            .expect("the waiter task remains live")
+            .expect("readiness completes the unbounded attachment wait");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1310,19 +1320,114 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
 
-        let result = acquire_header_path(
-            pending_read_state(),
-            request,
-            port::HeaderPathToken::from_adapter_id(1),
-            Arc::new(Mutex::new(HashMap::new())),
-        )
-        .await;
+        let result = acquire_header_path(pending_read_state(), request).await;
 
         assert!(matches!(result, Err(HeaderChainPortError::Timeout)));
         assert_eq!(
             tokio::time::Instant::now().duration_since(started),
             ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT
         );
+    }
+
+    #[tokio::test]
+    async fn retained_path_token_round_trips_the_state_lease_id_without_adapter_registry() {
+        let lease_id = 42;
+        let owner = owner();
+        let source = zakura_header_chain::SourceId::from_digest([7; 32]);
+        let target = zakura_header_chain::Frontier::new(
+            block::Height(2),
+            owner.header_authority().branch.target_tip_hash,
+        );
+        let common_ancestor = zakura_header_chain::Frontier::new(
+            block::Height(1),
+            owner.header_authority().branch.anchor_hash,
+        );
+        let acquire_request = port::AcquireHeaderPath {
+            source,
+            session_id: owner.session_id(),
+            scope: owner.header_authority(),
+            target_tip_hash: target.hash,
+            locator_hashes: vec![common_ancestor.hash],
+        };
+        let acquired = acquire_header_path(
+            tower::service_fn(move |request| {
+                assert!(matches!(
+                    request,
+                    zakura_state::ReadRequest::AcquireRetainedHeaderPath { .. }
+                ));
+                let lease = zakura_state::RetainedPathLease {
+                    lease_id,
+                    peer: source,
+                    session_id: owner.session_id(),
+                    target,
+                    common_ancestor,
+                    scope: owner.header_authority(),
+                    idle_deadline: tokio::time::Instant::now(),
+                };
+                async move {
+                    Ok::<_, zakura_state::BoxError>(
+                        zakura_state::ReadResponse::RetainedHeaderPathLease(
+                            zakura_state::RetainedPathLeaseOutcome::Acquired(Box::new(lease)),
+                        ),
+                    )
+                }
+            }),
+            acquire_request,
+        )
+        .await
+        .expect("the fixture state service acquires a retained path");
+        let port::AcquireHeaderPathReply::Acquired(path) = acquired else {
+            panic!("the fixture state service grants the retained path");
+        };
+        assert_eq!(path.adapter_identity().0.adapter_id(), lease_id);
+
+        let read_path = (*path).clone();
+        let read = read_header_path(
+            tower::service_fn(move |request| {
+                let zakura_state::ReadRequest::ReadRetainedHeaderPath {
+                    lease_id: requested_lease_id,
+                    ..
+                } = request
+                else {
+                    panic!("the adapter reads through the retained-path request");
+                };
+                assert_eq!(requested_lease_id, lease_id);
+                async move {
+                    Ok::<_, zakura_state::BoxError>(
+                        zakura_state::ReadResponse::RetainedHeaderPathPage(
+                            zakura_state::RetainedPathReadOutcome::Unavailable,
+                        ),
+                    )
+                }
+            }),
+            read_path,
+            port::ReadHeaderPath {
+                after_hash: common_ancestor.hash,
+                max_header_count: 1,
+            },
+        )
+        .await
+        .expect("the fixture state service reads through the retained path");
+        assert!(matches!(read, port::ReadHeaderPathReply::Unavailable));
+
+        release_header_path(
+            tower::service_fn(move |request| {
+                let zakura_state::ReadRequest::ReleaseRetainedHeaderPath {
+                    lease_id: released_lease_id,
+                    ..
+                } = request
+                else {
+                    panic!("the adapter releases through the retained-path request");
+                };
+                assert_eq!(released_lease_id, lease_id);
+                async move {
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderLocator(None))
+                }
+            }),
+            *path,
+        )
+        .await
+        .expect("the fixture state service releases the retained path");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
