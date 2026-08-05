@@ -1542,3 +1542,6 @@ fn projection_delta(old: &[Frontier], new: &[Frontier]) -> ProjectionDelta {
         put: new[common..].to_vec(),
     }
 }
+
+#[cfg(test)]
+mod tests;
