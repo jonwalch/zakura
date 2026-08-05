@@ -108,6 +108,8 @@ pub use disk_format::{
     FallibleDiskValue, FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex,
     TransactionLocation, MAX_ON_DISK_HEIGHT,
 };
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
 pub(crate) use vct::{VctAuxRejection, VctAuxWindow};
 #[allow(unused_imports)]
