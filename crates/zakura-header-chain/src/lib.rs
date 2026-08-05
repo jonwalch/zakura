@@ -40,8 +40,11 @@ pub use ownership::{
 };
 pub use transition::*;
 pub use validation::{
-    infer_height, validate_commitment_structure, validate_compact_target,
+    infer_height, prepare_context_free_headers, prepare_headers, validate_commitment_structure,
+    validate_compact_target, validate_contextual_difficulty_and_time,
     validate_encoding_version_hash, validate_future_time, validate_hash_filter, validate_link,
-    CompactTargetError, HashFilterError, HeaderEncodingError, HeaderHeightError, HeaderLinkError,
-    PowPolicy, PowPolicyError,
+    AdjustedDifficulty, CompactTargetError, ContextualValidationError, HashFilterError,
+    HeaderBatchInput, HeaderEncodingError, HeaderFailure, HeaderHeightError, HeaderLinkError,
+    HeaderRule, HeaderRules, PowPolicy, PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN,
+    POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
 };
