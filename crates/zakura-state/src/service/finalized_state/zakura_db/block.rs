@@ -886,7 +886,9 @@ impl ZakuraDb {
     /// been deleted yet:
     /// <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
     ///
-    ///     obj.pushKV("pruned", fPruneMode);
+    /// ```text
+    /// obj.pushKV("pruned", fPruneMode);
+    /// ```
     ///
     /// A node configured with
     /// [`StorageMode::Pruned`](crate::StorageMode::Pruned) prunes nothing until
@@ -969,17 +971,6 @@ impl ZakuraDb {
         };
         let upgrade = self.vct_upgrade_height().unwrap_or(Height(0));
         upgrade <= height && height < handoff
-    }
-
-    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
-    /// whose per-height note-commitment tree is unavailable because this is a
-    /// vct-synced database (the tree within the `[U, H)` absent band was never
-    /// written). Read-request handlers use this to return an archive-mode error
-    /// instead of a misleading "not found".
-    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
-        hash_or_height
-            .height_or_else(|hash| self.height(hash))
-            .is_some_and(|height| self.vct_tree_absent(height))
     }
 
     /// Returns the half-open range of block heights `[from, until)` whose raw
@@ -1274,11 +1265,6 @@ impl ZakuraDb {
     /// Writes the given batch to the database.
     pub fn write_batch(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch)
-    }
-
-    /// Writes the given batch and synchronizes its write-ahead log before returning.
-    pub(crate) fn write_batch_sync(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        self.db.write_sync(batch)
     }
 
     /// Flushes pending writes to SST files.

@@ -42,9 +42,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        state_database_format_version_in_code, MAX_FIND_BLOCK_HASHES_RESULTS,
-        MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
-        STATE_DATABASE_KIND,
+        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
+        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
     request::TimedSpan,
@@ -346,12 +345,21 @@ impl StateService {
             let network = network.clone();
             tokio::task::spawn_blocking(move || {
                 let timer = CodeTimer::start();
+                // `expect` would format the error with `Debug`, which drops the actionable
+                // guidance each `StateInitError` carries in its `Display` message.
                 let finalized_state = FinalizedState::new(&config, &network)
-                    .expect(
-                        "opening the read-write finalized state database failed; check that the \
-                     state cache directory is writable and not locked by another Zakura instance, \
-                     and that there is free disk space",
-                    )
+                    .unwrap_or_else(|error| match error {
+                        // This database cannot be repaired, and the generic hint below would
+                        // send the operator looking at permissions and disk space instead.
+                        error @ StateInitError::VctSproutHistoryUnrepairable => {
+                            panic!("{error}")
+                        }
+                        error => panic!(
+                            "opening the read-write finalized state database failed: {error}; \
+                             check that the state cache directory is writable and not locked by \
+                             another Zakura instance, and that there is free disk space"
+                        ),
+                    })
                     .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
                 timer.finish_desc("opening finalized state database");
 
@@ -2062,17 +2070,23 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
-            ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
-                read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::SaplingTree(hash_or_height) => {
+                let tree =
+                    read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                Ok(ReadResponse::SaplingTree(tree))
+            }
 
-            ReadRequest::OrchardTree(hash_or_height) => Ok(ReadResponse::OrchardTree(
-                read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::OrchardTree(hash_or_height) => {
+                let tree =
+                    read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                Ok(ReadResponse::OrchardTree(tree))
+            }
 
-            ReadRequest::IronwoodTree(hash_or_height) => Ok(ReadResponse::IronwoodTree(
-                read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::IronwoodTree(hash_or_height) => {
+                let tree =
+                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                Ok(ReadResponse::IronwoodTree(tree))
+            }
 
             ReadRequest::SaplingSubtrees { start_index, limit } => {
                 let end_index = limit
@@ -2088,7 +2102,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
                     read::sapling_subtrees(best_chain, &state.db, start_index..)
-                };
+                }?;
 
                 Ok(ReadResponse::SaplingSubtrees(sapling_subtrees))
             }
@@ -2107,7 +2121,7 @@ impl Service<ReadRequest> for ReadStateService {
                     // `zcashd` does. (It never calculates an end bound, so it just keeps iterating until
                     // the trees run out.)
                     read::orchard_subtrees(best_chain, &state.db, start_index..)
-                };
+                }?;
 
                 Ok(ReadResponse::OrchardSubtrees(orchard_subtrees))
             }
@@ -2122,7 +2136,7 @@ impl Service<ReadRequest> for ReadStateService {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..end_index)
                 } else {
                     read::ironwood_subtrees(best_chain, &state.db, start_index..)
-                };
+                }?;
 
                 Ok(ReadResponse::IronwoodSubtrees(ironwood_subtrees))
             }
@@ -2394,28 +2408,6 @@ pub fn init_read_only(
         finalized_state.db.clone(),
         non_finalized_state_sender,
     ))
-}
-
-/// Opens an existing database read-only and audits its completed VCT Sprout-history repair.
-pub fn validate_vct_sprout_history(
-    config: Config,
-    network: &Network,
-) -> Result<
-    finalized_state::VctSproutHistoryValidationSummary,
-    finalized_state::VctSproutHistoryValidationError,
-> {
-    let db = ZakuraDb::new_for_vct_sprout_history_validation(
-        &config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        finalized_state::STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-    )
-    .map_err(finalized_state::VctSproutHistoryValidationError::OpenDatabase)?;
-
-    finalized_state::validate_completed_repair(&db)
 }
 
 /// Calls [`init_read_only`] with the provided [`Config`] and [`Network`] from a blocking task.

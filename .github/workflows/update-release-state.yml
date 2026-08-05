@@ -154,8 +154,6 @@ jobs:
         if: steps.import.outputs.has_changes == 'true'
         run: |
           cargo test -p zakura-state --lib -- frontier sprout_change
-          cargo test -p zakura-state --lib -- \
-            embedded_mainnet_artifact_matches_frozen_identity_and_current_sprout_root
 
       - name: Restrict the generated diff to release-state files
         if: steps.import.outputs.has_changes == 'true'
@@ -220,7 +218,12 @@ jobs:
             - Meta SHA-256: `${{ steps.import.outputs.meta_sha256 }}`
 
             The checkpoint diff is append-only over the committed list, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
-          labels: A-release
+          # `A-release-state` marks this as an automated release-state refresh rather than the
+          # release PR itself, so the changelog gate does not require it to consume every
+          # pending fragment. `A-release` stays for the release CI paths.
+          labels: |
+            A-release
+            A-release-state
           commit-message: "chore(chain): update Mainnet checkpoints and VCT frontier"
           sign-commits: true
           draft: always-true
