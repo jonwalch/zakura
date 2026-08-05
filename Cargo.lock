@@ -8548,7 +8548,9 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-node-services",
  "zakura-test",
 ]
 
