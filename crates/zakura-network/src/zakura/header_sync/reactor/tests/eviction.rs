@@ -11,6 +11,7 @@ struct EvictionFixture {
     /// Kept alive so the session's outbound queue never fails for want of a reader.
     _outbound: FramedRecv,
     _snapshots_tx: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    _handle: HeaderSyncHandle,
 }
 
 fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> EvictionFixture {
@@ -20,7 +21,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
     let snapshot = committed_snapshot(anchor);
     let (snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
     startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, actions, mut reactor) =
+    let (handle, actions, mut reactor) =
         build_header_sync_reactor(startup).expect("the eviction fixture builds");
     let peer = peer();
     let cancel = CancellationToken::new();
@@ -45,6 +46,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
         cancel,
         _outbound: outbound,
         _snapshots_tx: snapshots_tx,
+        _handle: handle,
     }
 }
 
@@ -343,6 +345,12 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
 
     fixture.time_out_one_request(7);
     assert!(!fixture.is_admitted());
+    let node_id = node_id_from_peer(&fixture.peer).expect("the test peer has a node identity");
+    assert_eq!(
+        fixture.reactor.candidates.borrow().backed_off_node_ids,
+        vec![node_id],
+        "the transport is told not to reopen a peer during its cooldown"
+    );
 
     let refused = CancellationToken::new();
     let (send, _refused_outbound) = framed_channel(8);
@@ -361,6 +369,16 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
     );
 
     time::advance(cooldown + std::time::Duration::from_secs(1)).await;
+    fixture.reactor.refresh_statuses();
+    assert!(
+        fixture
+            .reactor
+            .candidates
+            .borrow()
+            .backed_off_node_ids
+            .is_empty(),
+        "maintenance republishes cooldown expiry"
+    );
     let readmitted = CancellationToken::new();
     let (send, _readmitted_outbound) = framed_channel(8);
     fixture.reactor.handle_event(HeaderSyncEvent::PeerConnected(

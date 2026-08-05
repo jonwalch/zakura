@@ -11,6 +11,7 @@ use zakura_node_services::header_chain as port;
 #[derive(Debug)]
 struct PanickingPort {
     release: Option<Arc<Notify>>,
+    vct_release: Option<Arc<Notify>>,
 }
 
 impl port::HeaderChainPort for PanickingPort {
@@ -35,7 +36,13 @@ impl port::HeaderChainPort for PanickingPort {
         _height: block::Height,
     ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::HeaderChainPortError>>
     {
-        Box::pin(async { panic!("internal repair port panic") })
+        let release = self.vct_release.clone();
+        Box::pin(async move {
+            if let Some(release) = release {
+                release.notified().await;
+            }
+            panic!("internal repair port panic")
+        })
     }
 
     fn acquire_header_path(
@@ -129,7 +136,10 @@ fn connected_session(
 
 #[tokio::test]
 async fn port_future_panic_disconnects_exact_session_and_reactor_survives() {
-    let mut reactor = direct_reactor(Arc::new(PanickingPort { release: None }));
+    let mut reactor = direct_reactor(Arc::new(PanickingPort {
+        release: None,
+        vct_release: None,
+    }));
     let peer = peer();
     let session_id = 7;
     let (connection_cancel, close_cause) =
@@ -172,6 +182,7 @@ async fn stale_port_panic_does_not_disconnect_replacement_session() {
     let release = Arc::new(Notify::new());
     let mut reactor = direct_reactor(Arc::new(PanickingPort {
         release: Some(release.clone()),
+        vct_release: None,
     }));
     let peer = peer();
     let (old_cancel, _) = connected_session(&mut reactor, peer.clone(), 10);
@@ -214,7 +225,10 @@ async fn stale_port_panic_does_not_disconnect_replacement_session() {
 
 #[tokio::test]
 async fn internal_vct_port_panic_is_contained_without_peer_disconnect() {
-    let mut reactor = direct_reactor(Arc::new(PanickingPort { release: None }));
+    let mut reactor = direct_reactor(Arc::new(PanickingPort {
+        release: None,
+        vct_release: None,
+    }));
     let peer = peer();
     let (connection_cancel, _) = connected_session(&mut reactor, peer.clone(), 7);
     let snapshot = reactor
@@ -243,6 +257,39 @@ async fn internal_vct_port_panic_is_contained_without_peer_disconnect() {
     assert!(reactor.peer_state.contains_key(&peer));
 }
 
+#[tokio::test(start_paused = true)]
+async fn hanging_vct_port_future_is_removed_at_the_request_deadline() {
+    let mut reactor = direct_reactor(Arc::new(PanickingPort {
+        release: None,
+        vct_release: Some(Arc::new(Notify::new())),
+    }));
+    let snapshot = reactor
+        .committed_snapshot
+        .clone()
+        .expect("the fixture has a committed snapshot");
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+        INTERNAL_VCT_REPAIR_SESSION_ID,
+        std::num::NonZeroU64::new(1).expect("one is nonzero"),
+    );
+    let started = Instant::now();
+
+    assert!(
+        reactor.dispatch_action(HeaderPortOperation::QueryVctRepairContext {
+            owner,
+            height: block::Height(1),
+        })
+    );
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the direct port timeout completes the hung operation");
+    reactor.handle_port_completion(completion);
+
+    assert!(Instant::now().duration_since(started) >= reactor.startup.request_timeout);
+    assert!(reactor.pending_port_operations.is_empty());
+}
+
 #[tokio::test]
 async fn port_panic_trace_is_bounded_and_request_scope_serializes_null_generation() {
     let mut capture =
@@ -252,7 +299,10 @@ async fn port_panic_trace_is_bounded_and_request_scope_serializes_null_generatio
     let snapshot = committed_snapshot(anchor);
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
     startup.committed_snapshots = Some(snapshots_rx);
-    startup.header_chain_port = Arc::new(PanickingPort { release: None });
+    startup.header_chain_port = Arc::new(PanickingPort {
+        release: None,
+        vct_release: None,
+    });
     startup.trace = crate::zakura::ZakuraTrace::new(capture.tracer(), "panic-test");
     startup.use_direct_port();
     let (_, _, mut reactor) =

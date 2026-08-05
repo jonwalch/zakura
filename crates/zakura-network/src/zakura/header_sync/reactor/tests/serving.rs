@@ -118,6 +118,36 @@ fn new_request_replaces_idle_served_path_and_releases_its_lease() {
     ));
 }
 
+#[test]
+fn failed_path_acquisition_dispatch_removes_state_and_deadline() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the serving fixture builds");
+    let peer = peer();
+    for _ in 0..128 {
+        reactor
+            .actions
+            .try_send(HeaderPortOperation::Misbehavior {
+                peer: peer.clone(),
+                reason: HeaderSyncMisbehavior::MalformedMessage,
+            })
+            .expect("the bounded action queue has exactly 128 slots");
+    }
+
+    reactor.handle_get_headers(
+        peer.clone(),
+        7,
+        request(10, block::Hash([0x32; 32]), anchor.hash),
+    );
+
+    assert!(!reactor.served_paths.contains_key(&peer));
+    assert!(!reactor.served_path_deadlines.contains_key(&peer));
+}
+
 #[tokio::test]
 async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     let shutdown = CancellationToken::new();

@@ -163,6 +163,20 @@ fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
         Some(HeaderTargetPhase::Preparing)
     ));
     assert!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("preparation retains the active capacity owner")
+            .entries
+            .is_empty(),
+        "staged entries move into preparation instead of remaining cloned"
+    );
+    assert_eq!(
+        reactor.peer_work_queue.owned_header_count(&peer),
+        HEADER_CHUNK_BUDGET_CAPACITY_V1,
+        "moving entries does not release their RAII capacity before admission"
+    );
+    assert!(
         actions.try_recv().is_err(),
         "prefix preparation replaces the overflowing continuation request"
     );

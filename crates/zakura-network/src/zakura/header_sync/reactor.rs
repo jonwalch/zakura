@@ -448,9 +448,12 @@ impl HeaderSyncReactor {
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let terminal_outcome = loop {
             let maintenance = self.next_maintenance_deadline();
+            if maintenance <= Instant::now() {
+                self.refresh_statuses();
+                continue;
+            }
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
-                biased;
                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
                 event = self.lifecycle.recv() => match event {
                     Some(event) => self.handle_event(event),
@@ -994,6 +997,7 @@ impl HeaderSyncReactor {
             request: request.clone(),
         }) {
             self.served_paths.remove(&peer);
+            self.served_path_deadlines.remove(&peer);
             self.send_headers_outcome(
                 &peer,
                 request.request_id,
@@ -1014,7 +1018,7 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
-        let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
+        let Some(active) = self.peer_work_queue.active(&peer) else {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
         };
@@ -1045,7 +1049,7 @@ impl HeaderSyncReactor {
         );
         if let HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target, ..
-        } = active.purpose
+        } = &active.purpose
         {
             let exact_shape = response.target_tip_hash == selected_target.hash
                 && active.sent_locator.entries() == [returned_ancestor]
@@ -1072,6 +1076,7 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
+        let active_target_tip_hash = active.target.status.selected_tip_hash;
         if !self
             .peer_work_queue
             .consume_response_capacity(&peer, response.entries.len())
@@ -1083,24 +1088,17 @@ impl HeaderSyncReactor {
         if response.complete
             && response.entries.is_empty()
             && returned_ancestor.hash == response.target_tip_hash
-            && response.target_tip_hash == active.target.status.selected_tip_hash
+            && response.target_tip_hash == active_target_tip_hash
         {
             self.retire_peer_work(&peer, HeaderRequestTerminal::AlreadyKnown);
             metrics::counter!("sync.header.target.already_known.total").increment(1);
             return;
         }
-        // A page that stages nothing leaves the continuation locator unchanged, so a peer can
-        // answer empty pages forever and keep resetting its own deadline below. Charge those,
-        // and clear the count as soon as the peer supplies a header. The already-known branch
-        // above returned before this point: a peer that reports it is at our selected tip
-        // answered correctly and must never be charged, or every synced peer is evicted.
-        if response.entries.is_empty() {
-            if self.charge_unproductive_request(&peer, session_id, "empty_header_page") {
-                return;
-            }
-        } else {
-            self.reset_unproductive_requests(&peer, session_id);
-        }
+        debug_assert!(
+            !response.entries.is_empty(),
+            "the wire decoder accepts empty header pages only for already-known targets",
+        );
+        self.reset_unproductive_requests(&peer, session_id);
         self.request_deadlines
             .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
 
@@ -1200,7 +1198,7 @@ impl HeaderSyncReactor {
                 common_ancestor,
                 target: staged_tip,
                 completion,
-                entries: active.entries.clone(),
+                entries: std::mem::take(&mut active.entries),
             };
             let _ = active;
             self.peer_work_queue.publish_phase_metrics();
@@ -2298,11 +2296,12 @@ impl HeaderSyncReactor {
         let owner = task.owner;
         let height = task.height;
         if self.dispatch_action(HeaderPortOperation::QueryVctRepairContext { owner, height }) {
+            let deadline = now + self.startup.request_timeout;
             let _ = self
                 .vct_repair
                 .get_mut(owner)
                 .expect("the context-needing repair remains owned during synchronous dispatch")
-                .mark_context_requested();
+                .mark_context_requested(deadline, deadline + VCT_REPAIR_RETRY_INTERVAL);
             if let Some(task) = self.vct_repair.get(owner) {
                 self.emit_vct_repair_state(task, "context_request", None);
             }
@@ -2317,7 +2316,7 @@ impl HeaderSyncReactor {
         if self
             .vct_repair
             .get(owner)
-            .is_none_or(|task| task.state != RepairPolicyState::QueryingContext)
+            .is_none_or(|task| !matches!(task.state, RepairPolicyState::QueryingContext { .. }))
         {
             return;
         }
@@ -2492,6 +2491,8 @@ impl HeaderSyncReactor {
                 self.retry_vct_repair(wire_owner, source, HeaderRequestTerminal::LocalError);
                 return;
             }
+            self.request_deadlines
+                .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
             metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
             debug!(
                 ?peer,
@@ -2630,7 +2631,9 @@ impl HeaderSyncReactor {
         self.retry_pending_lease_releases(now);
         self.retire_timed_out_requests(now);
         self.release_idle_served_paths(now);
-        self.prune_unproductive_cooldowns(now);
+        if self.prune_unproductive_cooldowns(now) {
+            self.publish_peer_state();
+        }
         let peers: Vec<_> = self
             .peer_state
             .iter()
@@ -2886,11 +2889,20 @@ impl HeaderSyncReactor {
             .collect();
         admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         admitted_node_ids.dedup();
+        let now = Instant::now();
+        let mut backed_off_node_ids: Vec<_> = self
+            .unproductive_peer_cooldowns
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .filter_map(|(peer, _)| node_id_from_peer(peer))
+            .collect();
+        backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        backed_off_node_ids.dedup();
         let tip = *self.tip.borrow();
         let _ = self.candidates.send(ZakuraHeaderSyncCandidateState {
             target_height: next_height(tip.0),
             admitted_node_ids,
-            backed_off_node_ids: Vec::new(),
+            backed_off_node_ids,
         });
     }
 
@@ -3132,6 +3144,7 @@ impl HeaderSyncReactor {
 
         let panic_context = self.port_panic_context(&action);
         let header_chain = self.startup.header_chain_port.clone();
+        let request_timeout = self.startup.request_timeout;
         let operation: Pin<Box<dyn Future<Output = HeaderSyncPortCompletion> + Send + 'static>> =
             match action {
                 HeaderPortOperation::Misbehavior { peer, reason } => {
@@ -3177,13 +3190,24 @@ impl HeaderSyncReactor {
                 }),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
                     Box::pin(async move {
-                        let result = match header_chain.vct_repair_context(owner, height).await {
-                            Ok(port::VctRepairContextReply::Resolved(context)) => {
+                        let result = match tokio::time::timeout(
+                            request_timeout,
+                            header_chain.vct_repair_context(owner, height),
+                        )
+                        .await
+                        {
+                            Ok(Ok(port::VctRepairContextReply::Resolved(context))) => {
                                 VctRepairContextResult::Resolved(context)
                             }
-                            Ok(port::VctRepairContextReply::Stale) => VctRepairContextResult::Stale,
-                            Err(error) => {
+                            Ok(Ok(port::VctRepairContextReply::Stale)) => {
+                                VctRepairContextResult::Stale
+                            }
+                            Ok(Err(error)) => {
                                 tracing::debug!(?owner, ?error, "VCT repair context unavailable");
+                                VctRepairContextResult::Unavailable
+                            }
+                            Err(_) => {
+                                tracing::debug!(?owner, "VCT repair context timed out");
                                 VctRepairContextResult::Unavailable
                             }
                         };
@@ -3793,7 +3817,7 @@ impl HeaderSyncReactor {
         let cooldown = self.startup.config.unproductive_peer_cooldown;
         if !cooldown.is_zero() {
             let now = Instant::now();
-            self.prune_unproductive_cooldowns(now);
+            let _ = self.prune_unproductive_cooldowns(now);
             self.unproductive_peer_cooldowns
                 .insert(peer.clone(), now + cooldown);
         }
@@ -3806,9 +3830,11 @@ impl HeaderSyncReactor {
         self.handle_peer_disconnected(peer, session_id, reason);
     }
 
-    fn prune_unproductive_cooldowns(&mut self, now: Instant) {
+    fn prune_unproductive_cooldowns(&mut self, now: Instant) -> bool {
+        let before = self.unproductive_peer_cooldowns.len();
         self.unproductive_peer_cooldowns
             .retain(|_, until| *until > now);
+        self.unproductive_peer_cooldowns.len() != before
     }
 
     fn retire_peer_work(&mut self, peer: &ZakuraPeerId, terminal_outcome: HeaderRequestTerminal) {

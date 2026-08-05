@@ -13,7 +13,12 @@ pub(in crate::zakura::header_sync) enum RepairPolicyState {
     /// Work needs an exact state context read.
     NeedsContext,
     /// The exact state context read is outstanding.
-    QueryingContext,
+    QueryingContext {
+        /// Latest time the context read may remain outstanding.
+        deadline: Instant,
+        /// Retry deadline used if the outstanding read never completes.
+        retry_at: Instant,
+    },
     /// A failed context read is waiting for its bounded retry deadline.
     ContextBackoff {
         /// Earliest time another context read may begin.
@@ -85,17 +90,21 @@ impl RepairRequirement {
     }
 
     /// Record that one bounded state context read is outstanding.
-    pub fn mark_context_requested(&mut self) -> Result<(), RepairPolicyError> {
+    pub fn mark_context_requested(
+        &mut self,
+        deadline: Instant,
+        retry_at: Instant,
+    ) -> Result<(), RepairPolicyError> {
         if self.state != RepairPolicyState::NeedsContext {
             return Err(RepairPolicyError::IllegalState);
         }
-        self.state = RepairPolicyState::QueryingContext;
+        self.state = RepairPolicyState::QueryingContext { deadline, retry_at };
         Ok(())
     }
 
     /// Attach a still-current exact selected request context.
     pub fn resolve(&mut self, context: VctRepairContext) -> Result<(), RepairPolicyError> {
-        if self.state != RepairPolicyState::QueryingContext {
+        if !matches!(self.state, RepairPolicyState::QueryingContext { .. }) {
             return Err(RepairPolicyError::IllegalState);
         }
         if context.target.height != self.height {
@@ -107,7 +116,7 @@ impl RepairRequirement {
 
     /// Release one failed local context read for a later retry.
     pub fn context_unavailable(&mut self, retry_at: Instant) -> Result<(), RepairPolicyError> {
-        if self.state != RepairPolicyState::QueryingContext {
+        if !matches!(self.state, RepairPolicyState::QueryingContext { .. }) {
             return Err(RepairPolicyError::IllegalState);
         }
         self.state = RepairPolicyState::ContextBackoff { retry_at };
@@ -175,6 +184,11 @@ impl RepairRequirement {
     /// Resume a deferred context or supplier cycle once its backoff has elapsed.
     pub fn resume_retry_cycle(&mut self, now: Instant) {
         match &self.state {
+            RepairPolicyState::QueryingContext { deadline, retry_at } if *deadline <= now => {
+                self.state = RepairPolicyState::ContextBackoff {
+                    retry_at: *retry_at,
+                };
+            }
             RepairPolicyState::ContextBackoff { retry_at } if *retry_at <= now => {
                 self.state = RepairPolicyState::NeedsContext;
             }
@@ -191,6 +205,7 @@ impl RepairRequirement {
     /// Return the next task-owned maintenance deadline.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.state {
+            RepairPolicyState::QueryingContext { deadline, .. } => Some(deadline),
             RepairPolicyState::ContextBackoff { retry_at }
             | RepairPolicyState::SupplierBackoff { retry_at, .. } => Some(retry_at),
             _ => None,
@@ -333,6 +348,12 @@ mod tests {
         RepairRequirement::new(owner(snapshot), block::Height(19), 11)
     }
 
+    fn mark_context_requested(task: &mut RepairRequirement) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        task.mark_context_requested(deadline, deadline + std::time::Duration::from_secs(1))
+            .expect("needed context can be queried");
+    }
+
     fn context() -> VctRepairContext {
         VctRepairContext {
             target: Frontier::new(block::Height(19), hash(5)),
@@ -349,8 +370,7 @@ mod tests {
         let mut task = task(&snapshot);
         let source = SourceId::from_digest([8; 32]);
         let context = context();
-        task.mark_context_requested()
-            .expect("needed context can be queried");
+        mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context can resolve");
         task.assign(task.owner).expect("ready work can go on wire");
@@ -379,8 +399,7 @@ mod tests {
         let first = SourceId::from_digest([8; 32]);
         let second = SourceId::from_digest([9; 32]);
         let context = context();
-        task.mark_context_requested()
-            .expect("needed context can be queried");
+        mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
         task.assign(task.owner)
@@ -404,8 +423,7 @@ mod tests {
     fn context_backoff_wakes_at_its_deadline() {
         let mut task = task(&snapshot());
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        task.mark_context_requested()
-            .expect("needed context can be queried");
+        mark_context_requested(&mut task);
         task.context_unavailable(deadline)
             .expect("an unavailable query enters context backoff");
 
@@ -419,6 +437,20 @@ mod tests {
     }
 
     #[test]
+    fn outstanding_context_query_times_out_before_retrying() {
+        let mut task = task(&snapshot());
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let retry_at = deadline + std::time::Duration::from_secs(2);
+        task.mark_context_requested(deadline, retry_at)
+            .expect("needed context can be queried");
+
+        task.resume_retry_cycle(deadline);
+        assert_eq!(task.state, RepairPolicyState::ContextBackoff { retry_at });
+        task.resume_retry_cycle(retry_at);
+        assert_eq!(task.state, RepairPolicyState::NeedsContext);
+    }
+
+    #[test]
     // AUD-09: enumerate every repair policy state to prove a generation change
     // retires all old work, rather than sampling only the active state.
     fn generation_change_retires_every_repair_state() {
@@ -427,7 +459,10 @@ mod tests {
         let context = context();
         let states = vec![
             RepairPolicyState::NeedsContext,
-            RepairPolicyState::QueryingContext,
+            RepairPolicyState::QueryingContext {
+                deadline,
+                retry_at: deadline + std::time::Duration::from_secs(1),
+            },
             RepairPolicyState::ContextBackoff { retry_at: deadline },
             RepairPolicyState::Ready {
                 context: context.clone(),
