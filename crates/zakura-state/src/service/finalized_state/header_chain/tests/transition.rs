@@ -1,6 +1,95 @@
 use super::*;
 
 #[test]
+fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let (engine_config, anchor, mut metadata) = fixture();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the finality suffix fixture initializes");
+
+    let second = Frontier::new(block::Height(10), block::Hash([0x21; 32]));
+    let third = Frontier::new(block::Height(20), block::Hash([0x31; 32]));
+    let fourth = Frontier::new(block::Height(30), block::Hash([0x41; 32]));
+    let record_two = FinalityRecord {
+        previous: anchor_frontier,
+        current: second,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x22; 32]),
+        },
+        epoch: FinalityEpoch::new(2),
+    };
+    let record_three = FinalityRecord {
+        previous: second,
+        current: third,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x32; 32]),
+        },
+        epoch: FinalityEpoch::new(3),
+    };
+    let record_four = FinalityRecord {
+        previous: third,
+        current: fourth,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x42; 32]),
+        },
+        epoch: FinalityEpoch::new(4),
+    };
+    metadata.finality_epoch = FinalityEpoch::new(4);
+    metadata.frontiers.finalized = fourth;
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_FINALITY_HISTORY,
+            HeaderFinalityKey(FinalityEpoch::new(1)).as_bytes(),
+            [0xff],
+        )
+        .expect("the deliberately corrupt old epoch is staged");
+    for record in [record_two, record_three, record_four] {
+        store
+            .put_value(
+                &mut batch,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &record,
+            )
+            .expect("the recent finality record encodes");
+    }
+    store
+        .put_value(&mut batch, HEADER_ENGINE_META, METADATA_KEY, &metadata)
+        .expect("the current finality metadata encodes");
+    db.write(batch)
+        .expect("the finality suffix fixture commits");
+
+    assert_eq!(
+        store
+            .finality_rebase_path(third.hash, fourth, 1)
+            .expect("one recent epoch is sufficient"),
+        vec![record_four]
+    );
+    assert_eq!(
+        store
+            .finality_rebase_path(second.hash, fourth, 2)
+            .expect("two recent epochs are sufficient"),
+        vec![record_three, record_four]
+    );
+    assert!(store
+        .finality_rebase_path(anchor_frontier.hash, fourth, 2)
+        .expect("an insufficient generation bound is a stale path")
+        .is_empty());
+}
+
+#[test]
 fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
     let cache = tempfile::tempdir().expect("the test cache directory is created");
     let db_config = Config {

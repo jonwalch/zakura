@@ -549,12 +549,18 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     assert!(!reader
         .release_retained_path(owner, 7, lease.lease_id, wrong_scope)
         .expect("a mismatched release scope is non-fatal"));
+    let writer_guard = runtime
+        .store
+        .writer
+        .lock()
+        .expect("the serialized writer mutex is not poisoned");
     let RetainedPathReadOutcome::Page(page) = reader
         .read_retained_path(owner, 7, lease.lease_id, lease_scope, anchor.hash, 1)
-        .expect("the lease page is readable")
+        .expect("a lease page read does not wait for the serialized writer")
     else {
         panic!("the current owner should read its lease");
     };
+    drop(writer_guard);
     assert_eq!(page.headers.len(), 1);
     assert_eq!(page.headers[0].hash(), child.hash);
     assert_eq!(page.common_ancestor, anchor_frontier);
@@ -715,11 +721,16 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("capacity refusal is a normal outcome"),
         RetainedPathLeaseOutcome::Busy
     );
-    let active_references = runtime
-        .leases
-        .lock()
-        .expect("the lease registry mutex is not poisoned")
-        .active_references(Instant::now());
+    let active_references = {
+        let mut leases = runtime
+            .leases
+            .lock()
+            .expect("the lease registry mutex is not poisoned");
+        let active_references = leases.active_references(Instant::now());
+        let cached_references = leases.active_references(Instant::now());
+        assert!(Arc::ptr_eq(&active_references, &cached_references));
+        active_references
+    };
     assert!(active_references.contains(&anchor.hash));
     assert!(active_references.contains(&child.hash));
 
