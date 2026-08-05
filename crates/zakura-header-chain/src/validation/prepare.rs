@@ -327,3 +327,252 @@ fn prepare_headers_inner(
     )
     .map_err(|error| invalid(0, HeaderRule::ValidationLease, error))
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use zakura_chain::{
+        block::genesis::regtest_genesis_block,
+        parameters::{testnet::RegtestParameters, Network},
+    };
+
+    use super::*;
+    use crate::{CheckpointSet, EngineMode, Frontier, TrustedAnchor};
+
+    #[derive(Copy, Clone)]
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    fn fixture() -> (HeaderRules, ValidationLease, Arc<block::Header>) {
+        let anchor_header = regtest_genesis_block().header.clone();
+        let anchor = Frontier::new(block::Height(0), anchor_header.hash());
+        let network = Network::new_regtest(RegtestParameters::default());
+        let config = EngineConfig::new(
+            EngineMode::Integrated,
+            network,
+            TrustedAnchor {
+                frontier: anchor,
+                header: anchor_header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the regtest anchor and release manifest are coherent");
+        let rules = HeaderRules::from_engine_config(&config)
+            .expect("authenticated regtest parameters define their PoW policy");
+        let lease = ValidationLease::new(
+            anchor,
+            vec![HeaderContextFact {
+                frontier: anchor,
+                difficulty_threshold: anchor_header.difficulty_threshold,
+                time: anchor_header.time,
+            }],
+            config.trust_anchor_digest(),
+        );
+        (rules, lease, anchor_header)
+    }
+
+    fn child(parent: Frontier, template: &block::Header, seconds: i64) -> Arc<block::Header> {
+        Arc::new(block::Header {
+            previous_block_hash: parent.hash,
+            time: template.time + Duration::seconds(seconds),
+            nonce: [u8::try_from(seconds).unwrap_or(u8::MAX); 32].into(),
+            ..*template
+        })
+    }
+
+    #[test]
+    fn complete_batch_is_sealed_to_lease_and_uses_internal_context() {
+        let (rules, lease, anchor) = fixture();
+        let first = child(lease.parent, &anchor, 1);
+        let first_frontier = Frontier::new(block::Height(1), first.hash());
+        let second = child(first_frontier, &first, 2);
+        let headers = [first, second];
+
+        let batch = prepare_headers(
+            HeaderBatchInput::new(&headers),
+            &lease,
+            &rules,
+            &FixedClock(anchor.time + Duration::hours(1)),
+        )
+        .expect("the continuous custom-network batch is valid");
+
+        assert_eq!(batch.receipt().parent(), lease.parent());
+        assert_eq!(
+            batch.receipt().trust_anchor_digest(),
+            lease.trust_anchor_digest()
+        );
+        assert_eq!(batch.headers().len(), 2);
+        assert_eq!(batch.headers()[0].height, block::Height(1));
+        assert_eq!(batch.headers()[1].height, block::Height(2));
+        assert_eq!(
+            batch.headers()[1].header.previous_block_hash,
+            headers[0].hash()
+        );
+    }
+
+    #[test]
+    fn future_time_is_deferred_but_deterministic_failures_are_rejected() {
+        let (rules, lease, anchor) = fixture();
+        let future = child(lease.parent, &anchor, 3 * 60 * 60);
+        let now = anchor.time;
+        let batch = prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&future)),
+            &lease,
+            &rules,
+            &FixedClock(now),
+        )
+        .expect("local future time is admitted only as deferred");
+        assert_eq!(
+            batch.headers()[0].validation,
+            HeaderValidationState::DeferredUntil(future.time - Duration::hours(2))
+        );
+
+        let mut disconnected = *future;
+        disconnected.previous_block_hash = block::Hash([0x55; 32]);
+        let disconnected = Arc::new(disconnected);
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&disconnected)),
+                &lease,
+                &rules,
+                &FixedClock(now),
+            ),
+            Err(HeaderFailure::Invalid {
+                rule: HeaderRule::ParentLink,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn context_free_receipt_excludes_parent_and_branch_context_claims() {
+        let (rules, lease, anchor) = fixture();
+        let mut disconnected = *child(lease.parent, &anchor, 0);
+        disconnected.previous_block_hash = block::Hash([0x55; 32]);
+        let disconnected = Arc::new(disconnected);
+
+        let batch = prepare_context_free_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&disconnected)),
+            lease.parent(),
+            &rules,
+            &FixedClock(anchor.time),
+        )
+        .expect("graph-independent preparation does not claim parent linkage or MTP");
+
+        assert_eq!(batch.receipt().parent(), lease.parent());
+        assert_eq!(
+            batch.receipt().trust_anchor_digest(),
+            rules.trust_anchor_digest()
+        );
+        assert_eq!(batch.headers()[0].hash, disconnected.hash());
+        assert_eq!(batch.headers()[0].height, block::Height(1));
+    }
+
+    #[test]
+    fn invalid_version_is_rejected_before_link_hashing() {
+        let (rules, lease, anchor) = fixture();
+        let mut invalid = *child(lease.parent, &anchor, 1);
+        invalid.version = 3;
+        let invalid = Arc::new(invalid);
+
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&invalid)),
+                &lease,
+                &rules,
+                &FixedClock(anchor.time),
+            ),
+            Err(HeaderFailure::Invalid {
+                rule: HeaderRule::EncodingVersionHash,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_and_mutated_leases_fail_before_header_validation() {
+        let (rules, lease, anchor) = fixture();
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(&[]),
+                &lease,
+                &rules,
+                &FixedClock(anchor.time),
+            ),
+            Err(HeaderFailure::Empty)
+        ));
+
+        let mut mutated = lease.clone();
+        mutated.parent.height = block::Height(1);
+        let header = child(lease.parent, &anchor, 1);
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&header)),
+                &mutated,
+                &rules,
+                &FixedClock(anchor.time),
+            ),
+            Err(HeaderFailure::InvalidLease)
+        ));
+
+        let high_parent = Frontier::new(block::Height(100), lease.parent.hash);
+        let short_lease = ValidationLease::new(
+            high_parent,
+            vec![HeaderContextFact {
+                frontier: high_parent,
+                difficulty_threshold: anchor.difficulty_threshold,
+                time: anchor.time,
+            }],
+            lease.trust_anchor_digest,
+        );
+        let header = child(high_parent, &anchor, 1);
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&header)),
+                &short_lease,
+                &rules,
+                &FixedClock(anchor.time),
+            ),
+            Err(HeaderFailure::InvalidLease)
+        ));
+    }
+
+    #[test]
+    fn validation_stages_expose_their_exact_normative_rule_ids() {
+        let cases: &[(HeaderRule, &[RuleId])] = &[
+            (HeaderRule::EncodingVersionHash, &[RuleId::new("LC-VAL-02")]),
+            (HeaderRule::ParentLink, &[RuleId::new("LC-VAL-03")]),
+            (HeaderRule::InferredHeight, &[RuleId::new("LC-HEIGHT-01")]),
+            (
+                HeaderRule::CommitmentStructure,
+                &[RuleId::new("LC-COMMIT-01"), RuleId::new("LC-COMMIT-02")],
+            ),
+            (HeaderRule::CompactTarget, &[RuleId::new("LC-VAL-05")]),
+            (HeaderRule::HashToTarget, &[RuleId::new("LC-VAL-05")]),
+            (HeaderRule::Equihash, &[RuleId::new("LC-VAL-04")]),
+            (
+                HeaderRule::ContextualDifficultyAndTime,
+                &[
+                    RuleId::new("LC-VAL-06"),
+                    RuleId::new("LC-VAL-07"),
+                    RuleId::new("LC-TIME-01"),
+                ],
+            ),
+            (HeaderRule::LocalFutureTime, &[RuleId::new("LC-VAL-08")]),
+            (
+                HeaderRule::ValidationLease,
+                &[RuleId::new("LC-ANCHOR-03"), RuleId::new("LC-VAL-11")],
+            ),
+            (HeaderRule::Work, &[RuleId::new("LC-VAL-10")]),
+        ];
+
+        for (stage, expected) in cases {
+            assert_eq!(stage.rule_ids(), *expected, "{stage:?}");
+        }
+    }
+}
