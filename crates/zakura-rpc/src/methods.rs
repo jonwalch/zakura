@@ -2709,30 +2709,29 @@ where
 
         let height = chain_info.tip_height.next().map_misc_error()?;
 
-        // Randomly select some mempool transactions.
-        let mempool_txs = select_mempool_transactions(
-            &self.network,
-            height,
-            miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-        );
-
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
-
-        // - After this point, the template only depends on the previously fetched data.
-
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let permit = self.gbt.acquire_template_construction_permit().await?;
         let response = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+
+            // Randomly select some mempool transactions.
+            let mempool_txs = select_mempool_transactions(
+                &network,
+                height,
+                &miner_params,
+                mempool_txs,
+                mempool_tx_deps,
+            );
+
+            tracing::debug!(
+                selected_mempool_tx_hashes = ?mempool_txs
+                    .iter()
+                    .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
+                    .collect::<Vec<_>>(),
+                "selected transactions for the template from the mempool"
+            );
+
             BlockTemplateResponse::new_internal(
                 &network,
                 None,
