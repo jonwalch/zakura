@@ -12,6 +12,8 @@ mod pipe;
 mod reactor;
 mod scheduler;
 mod service;
+#[cfg(test)]
+mod tests;
 mod wire;
 
 pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};
