@@ -265,6 +265,17 @@ impl ZakuraDb {
         self.db.zs_get(&hash_by_height, &height)
     }
 
+    /// Returns the first height in `[start, end]` whose block body is not retained, if any.
+    ///
+    /// A body is absent because it was pruned, or because the height was never committed. Replaying
+    /// note commitments needs every body in the replay range, so this reports whether a range is
+    /// replayable at all.
+    pub fn first_missing_block_body(&self, start: Height, end: Height) -> Option<Height> {
+        (start.0..=end.0)
+            .map(Height)
+            .find(|height| !self.contains_body_at_height(*height))
+    }
+
     /// Returns the height of the given block if it exists.
     #[allow(clippy::unwrap_in_result)]
     pub fn height(&self, hash: block::Hash) -> Option<block::Height> {
@@ -971,17 +982,6 @@ impl ZakuraDb {
         };
         let upgrade = self.vct_upgrade_height().unwrap_or(Height(0));
         upgrade <= height && height < handoff
-    }
-
-    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
-    /// whose per-height note-commitment tree is unavailable because this is a
-    /// vct-synced database (the tree within the `[U, H)` absent band was never
-    /// written). Read-request handlers use this to return an archive-mode error
-    /// instead of a misleading "not found".
-    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
-        hash_or_height
-            .height_or_else(|hash| self.height(hash))
-            .is_some_and(|height| self.vct_tree_absent(height))
     }
 
     /// Returns the half-open range of block heights `[from, until)` whose raw
