@@ -650,6 +650,10 @@ pub struct ParametersBuilder {
     pow_max_adjust_up_percent: i32,
     /// The maximum downward adjustment percentage for median timespan variance
     pow_max_adjust_down_percent: i32,
+    /// The height at which proof-of-work validation begins. Blocks below this height
+    /// skip the Equihash solution and difficulty filter checks. `None` enforces
+    /// proof-of-work from genesis.
+    pow_start_height: Option<Height>,
 }
 
 impl Default for ParametersBuilder {
@@ -696,6 +700,7 @@ impl Default for ParametersBuilder {
             pow_damping_factor: POW_DAMPING_FACTOR,
             pow_max_adjust_up_percent: POW_MAX_ADJUST_UP_PERCENT,
             pow_max_adjust_down_percent: POW_MAX_ADJUST_DOWN_PERCENT,
+            pow_start_height: None,
         }
     }
 }
@@ -971,6 +976,35 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height at which proof-of-work validation begins in the
+    /// [`Parameters`] being built.
+    ///
+    /// Blocks below this height skip the Equihash solution check and the
+    /// difficulty filter. This exists so a private network can be seeded with
+    /// cheap unsolved blocks and still enforce real proof-of-work from the
+    /// seeded tip onwards, which is what lets the chain start at its
+    /// equilibrium difficulty instead of climbing to it.
+    ///
+    /// `None` (the default) enforces proof-of-work from genesis.
+    pub fn with_pow_start_height(
+        mut self,
+        pow_start_height: impl Into<Option<Height>>,
+    ) -> Result<Self, ParametersBuilderError> {
+        let pow_start_height = pow_start_height.into();
+
+        // A start height of 0 is indistinguishable from `None`, and one above
+        // `Height::MAX` would silently disable proof-of-work forever. Both are
+        // more likely to be a configuration mistake than an intent.
+        if let Some(height) = pow_start_height {
+            if height == Height(0) || height > Height::MAX {
+                return Err(ParametersBuilderError::InvalidPowStartHeight);
+            }
+        }
+
+        self.pow_start_height = pow_start_height;
+        Ok(self)
+    }
+
     /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
@@ -1092,6 +1126,7 @@ impl ParametersBuilder {
             pow_damping_factor,
             pow_max_adjust_up_percent,
             pow_max_adjust_down_percent,
+            pow_start_height,
         } = self;
         Parameters {
             network_name,
@@ -1116,6 +1151,7 @@ impl ParametersBuilder {
             pow_damping_factor,
             pow_max_adjust_up_percent,
             pow_max_adjust_down_percent,
+            pow_start_height,
         }
     }
 
@@ -1223,6 +1259,7 @@ impl ParametersBuilder {
             pow_damping_factor,
             pow_max_adjust_up_percent,
             pow_max_adjust_down_percent,
+            pow_start_height,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1244,6 +1281,7 @@ impl ParametersBuilder {
             && self.pow_damping_factor == pow_damping_factor
             && self.pow_max_adjust_up_percent == pow_max_adjust_up_percent
             && self.pow_max_adjust_down_percent == pow_max_adjust_down_percent
+            && self.pow_start_height == pow_start_height
     }
 }
 
@@ -1321,6 +1359,10 @@ pub struct Parameters {
     pow_max_adjust_up_percent: i32,
     /// The maximum downward adjustment percentage for median timespan variance
     pow_max_adjust_down_percent: i32,
+    /// The height at which proof-of-work validation begins. Blocks below this height
+    /// skip the Equihash solution and difficulty filter checks. `None` enforces
+    /// proof-of-work from genesis.
+    pow_start_height: Option<Height>,
 }
 
 impl Default for Parameters {
@@ -1435,6 +1477,9 @@ impl Parameters {
             pow_damping_factor: _,
             pow_max_adjust_up_percent: _,
             pow_max_adjust_down_percent: _,
+            // Regtest disables proof-of-work outright, so a start height cannot
+            // change how blocks are validated on it.
+            pow_start_height: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1529,6 +1574,12 @@ impl Parameters {
         self.max_block_time_start_height
     }
 
+    /// Returns the height at which proof-of-work validation begins for this network,
+    /// or `None` if proof-of-work is enforced from genesis.
+    pub fn pow_start_height(&self) -> Option<Height> {
+        self.pow_start_height
+    }
+
     /// Returns true if this network should allow transactions with transparent outputs
     /// that spend coinbase outputs.
     pub fn should_allow_unshielded_coinbase_spends(&self) -> bool {
@@ -1596,6 +1647,26 @@ impl Network {
         } else {
             false
         }
+    }
+
+    /// Returns the height at which proof-of-work validation begins for this network,
+    /// or `None` if proof-of-work is enforced from genesis. Always `None` on Mainnet.
+    pub fn pow_start_height(&self) -> Option<Height> {
+        if let Self::Testnet(params) = self {
+            params.pow_start_height()
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the Equihash solution and difficulty filter checks should be
+    /// skipped for a block at `height` on this network.
+    ///
+    /// This is only ever true below a configured [`Network::pow_start_height`], which
+    /// lets a private network be seeded with cheap unsolved blocks while still
+    /// enforcing real proof-of-work on everything mined afterwards.
+    pub fn should_skip_pow_at_height(&self, height: Height) -> bool {
+        self.pow_start_height().is_some_and(|start| height < start)
     }
 
     /// Returns the post-Blossom target block spacing, in seconds, for this network.
