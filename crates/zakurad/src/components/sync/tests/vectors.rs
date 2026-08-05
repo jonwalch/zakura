@@ -1465,7 +1465,10 @@ fn far_ahead_block_does_not_score_serving_peer() {
         advertiser_addr: Some(serving_peer),
     };
 
-    assert!(chain_sync.handle_block_response(Err(far_ahead)).is_err());
+    assert!(
+        chain_sync.handle_block_response(Err(far_ahead)).is_ok(),
+        "a far-ahead block is dropped without restarting sync"
+    );
     assert!(
         matches!(
             misbehavior_rx.try_recv(),
@@ -1482,7 +1485,7 @@ fn far_ahead_block_does_not_score_serving_peer() {
 
     assert!(chain_sync
         .handle_block_response(Err(invalid_height))
-        .is_err());
+        .is_ok());
     assert_eq!(
         misbehavior_rx.try_recv(),
         Ok((serving_peer, 100)),

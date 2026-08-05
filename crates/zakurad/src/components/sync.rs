@@ -2139,9 +2139,9 @@ where
             // requested, but the height came from whichever peer supplied the
             // hash in a `FindBlocks` response. Those are usually different
             // peers, and `Response::BlockHashes` carries no address, so the
-            // responsible peer is unknown here. The block is still dropped by
-            // `handle_response`; scoring the server would ban a peer for
-            // honestly answering our own request.
+            // responsible peer is unknown here. The download task has already
+            // discarded the block without verifying it; scoring the server as
+            // well would ban a peer for honestly answering our own request.
             Err(_) => {}
         };
 
