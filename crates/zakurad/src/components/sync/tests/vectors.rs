@@ -1760,6 +1760,58 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
     );
 }
 
+/// A block above the lookahead limit is dropped without scoring the peer that
+/// served it, because that peer answered a hash this node asked for. Errors the
+/// serving peer is genuinely responsible for are still scored.
+#[test]
+fn far_ahead_block_does_not_score_serving_peer() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(2);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let serving_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    let far_ahead = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+        height: Height(60_000),
+        hash: block::Hash([0xC1; 32]),
+        advertiser_addr: Some(serving_peer),
+    };
+
+    assert!(
+        chain_sync.handle_block_response(Err(far_ahead)).is_ok(),
+        "a far-ahead block is dropped without restarting sync"
+    );
+    assert!(
+        matches!(
+            misbehavior_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "the peer that served a far-ahead block we requested must not be scored"
+    );
+
+    // The same peer is still scored for a block whose own contents are bad.
+    let invalid_height = BlockDownloadVerifyError::InvalidHeight {
+        hash: block::Hash([0xC2; 32]),
+        advertiser_addr: Some(serving_peer),
+    };
+
+    assert!(chain_sync
+        .handle_block_response(Err(invalid_height))
+        .is_ok());
+    assert_eq!(
+        misbehavior_rx.try_recv(),
+        Ok((serving_peer, 100)),
+        "a block with no valid height is still the serving peer's fault"
+    );
+}
+
 /// A scratch state can have finalized genesis tip metadata before
 /// `KnownBlock(genesis)` can find a block body. In that state, committing the
 /// downloaded genesis block returns duplicate/finalized; the genesis bootstrap
@@ -1910,8 +1962,9 @@ async fn above_lookahead_does_not_restart_sync() {
     );
 }
 
-/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now
-/// carries `advertiser_addr` so the offending peer can be scored.
+/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` carries
+/// `advertiser_addr` so the serving peer is named in the drop logs. It is not
+/// scored — see [`far_ahead_block_does_not_score_serving_peer`].
 #[tokio::test]
 async fn above_lookahead_has_peer_attribution() {
     let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
@@ -1924,7 +1977,7 @@ async fn above_lookahead_has_peer_attribution() {
     assert_eq!(
         err.advertiser_addr(),
         Some(addr),
-        "AboveLookaheadHeightLimit should carry advertiser_addr for peer scoring \
+        "AboveLookaheadHeightLimit should carry advertiser_addr for drop logs \
          (GHSA-gvjc-3w7c-92jx fix)"
     );
 }
