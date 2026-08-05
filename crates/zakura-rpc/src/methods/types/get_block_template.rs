@@ -549,6 +549,22 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
 /// Maximum number of concurrent block template construction tasks.
 const MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS: usize = 18;
 
+/// How a caller acquires block template construction capacity.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TemplateConstructionPriority {
+    /// External RPC clients fail fast with [`ErrorCode::ServerIsBusy`] when
+    /// construction capacity is exhausted, so expensive proving work stays bounded.
+    External,
+    /// In-process callers bypass the capacity limit, so external load can never
+    /// starve them.
+    ///
+    /// The capacity limit exists to bound untrusted external work. Internal
+    /// callers are trusted and issue one template request at a time: the internal
+    /// miner runs a single template generator loop, and `generate` builds blocks
+    /// sequentially and is only reachable on networks with PoW disabled.
+    Internal,
+}
+
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -614,6 +630,25 @@ where
     }
 
     /// Reserves capacity for a block template or coinbase construction task.
+    ///
+    /// [`TemplateConstructionPriority::External`] callers fail fast with
+    /// [`ErrorCode::ServerIsBusy`] when capacity is exhausted;
+    /// [`TemplateConstructionPriority::Internal`] callers are exempt from the
+    /// capacity limit and hold no permit.
+    pub fn acquire_template_construction_permit(
+        &self,
+        priority: TemplateConstructionPriority,
+    ) -> RpcResult<Option<OwnedSemaphorePermit>> {
+        match priority {
+            TemplateConstructionPriority::External => {
+                self.try_acquire_template_construction_permit().map(Some)
+            }
+            TemplateConstructionPriority::Internal => Ok(None),
+        }
+    }
+
+    /// Reserves capacity for a block template or coinbase construction task,
+    /// failing fast with [`ErrorCode::ServerIsBusy`] when capacity is exhausted.
     pub fn try_acquire_template_construction_permit(&self) -> RpcResult<OwnedSemaphorePermit> {
         self.template_construction_semaphore
             .clone()

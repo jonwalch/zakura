@@ -327,7 +327,11 @@ where
 
     // Shut down the task when all the template receivers are dropped, or Zebra shuts down.
     while !template_sender.is_closed() && !is_shutting_down() {
-        let template: Result<_, _> = rpc.get_block_template(Some(parameters.clone())).await;
+        // Use internal construction admission so external RPC load can't starve the
+        // miner with "server is busy" errors.
+        let template: Result<_, _> = rpc
+            .get_block_template_internal(Some(parameters.clone()))
+            .await;
 
         // Wait for the chain to sync so we get a valid template.
         let Ok(template) = template else {
