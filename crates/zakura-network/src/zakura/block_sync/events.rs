@@ -301,11 +301,11 @@ pub enum BlockSyncAction {
         /// Exact invalid body conclusion and its authenticated supplier.
         invalid: zakura_header_chain::ConsensusBodyInvalid,
     },
-    /// Persist a fresh episode after discovering a changed eligible supplier set.
+    /// Persist changed supplier evidence without clearing the current alarm episode.
     RestartBodyAvailability {
         /// Durable version whose selected alarm is being restarted.
         expected_version: zakura_header_chain::StateVersion,
-        /// Authenticated supplier-set evidence and fresh summary.
+        /// Authenticated supplier-set evidence preserving the alarm's age and attempts.
         discovery: zakura_header_chain::BodySupplierDiscovered,
     },
     /// Persist a fresh episode after an authenticated operator request.

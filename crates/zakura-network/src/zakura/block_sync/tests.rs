@@ -563,7 +563,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
 }
 
 #[tokio::test]
-async fn newly_eligible_supplier_restarts_persistent_body_alarm_once() {
+async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
     let snapshot = alarmed_committed_snapshot(header);
     let previous = snapshot
@@ -607,13 +607,11 @@ async fn newly_eligible_supplier_restarts_persistent_body_alarm_once() {
         }
     };
     assert_eq!(discovery.hash, header.hash);
-    assert_eq!(discovery.availability.attempts, 0);
+    assert_eq!(discovery.availability.started_at, previous.started_at);
+    assert_eq!(discovery.availability.attempts, previous.attempts);
     assert_eq!(discovery.availability.suppliers, 1);
-    assert!(!discovery.availability.alarmed);
-    assert_eq!(
-        discovery.availability.started_at,
-        discovery.availability.next_probe_at
-    );
+    assert!(discovery.availability.alarmed);
+    assert!(discovery.availability.next_probe_at >= discovery.availability.started_at);
     assert_ne!(
         discovery.availability.supplier_set_digest, previous.supplier_set_digest,
         "the restart must authenticate the newly eligible supplier identity set"

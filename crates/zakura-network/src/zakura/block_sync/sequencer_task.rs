@@ -848,8 +848,7 @@ impl SequencerTask {
             .body_retries
             .get_mut(owner.header_generation, owner.branch, hash)
             .expect("the exact retry episode exists because it was inserted above");
-        let restarted =
-            episode.refresh_suppliers(eligible_sources.clone(), &zakura_header_chain::SystemClock);
+        episode.refresh_suppliers(eligible_sources.clone());
         let update = episode.record_failure(
             source,
             &zakura_header_chain::SystemClock,
@@ -872,9 +871,6 @@ impl SequencerTask {
                 failure.availability.suppliers = persisted.suppliers;
                 failure.availability.supplier_set_digest = persisted.supplier_set_digest;
             }
-        }
-        if restarted {
-            self.registry.clear_body_retry(owner.authority(), hash);
         }
         self.registry.defer_body_retry(
             deferred_sources,

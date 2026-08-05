@@ -905,11 +905,11 @@ pub enum Request {
         invalid: zakura_header_chain::ConsensusBodyInvalid,
     },
 
-    /// Persist a fresh retry episode after authenticated supplier discovery.
+    /// Persist authenticated supplier discovery without resetting the alarm episode.
     RestartHeaderChainBodyAvailability {
         /// Durable version whose selected alarm is being restarted.
         expected_version: zakura_header_chain::StateVersion,
-        /// Exact supplier-set evidence and fresh episode summary.
+        /// Exact supplier-set evidence preserving the alarm's age and attempts.
         discovery: zakura_header_chain::BodySupplierDiscovered,
     },
 

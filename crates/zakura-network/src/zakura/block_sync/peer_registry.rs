@@ -228,6 +228,10 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Install the exact current set of supplier-specific retry deferrals for one body.
+    ///
+    /// Replacing this set removes departed suppliers' deferrals while preserving
+    /// the separate durable all-supplier alarm gate.
     pub(super) fn defer_body_retry(
         &self,
         sources: impl IntoIterator<Item = zakura_header_chain::SourceId>,
@@ -236,7 +240,9 @@ impl PeerRegistry {
         until: Instant,
     ) {
         let key = BodyRetryKey::new(scope, hash);
+        let sources: std::collections::BTreeSet<_> = sources.into_iter().collect();
         let mut retries = self.body_retry_lock();
+        retries.retain(|(source, candidate), _| *candidate != key || sources.contains(source));
         for source in sources {
             retries.insert((source, key), until);
         }
@@ -1088,6 +1094,45 @@ mod floor_bias_tests {
             ..scope
         }));
         assert!(!reg.is_body_retry_avoided(&failed, scope, hash, now));
+    }
+
+    #[test]
+    fn refreshing_retry_suppliers_removes_only_departed_supplier_deferrals() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (first, second) = (peer(1), peer(2));
+        register(&reg, &config, &first, 1, 1, 1);
+        register(&reg, &config, &second, 1, 1, 1);
+        let scope = super::super::test_work_scope();
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        let until = now + std::time::Duration::from_secs(60);
+
+        reg.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest([1; 32])],
+            scope,
+            hash,
+            until,
+        );
+        reg.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest([2; 32])],
+            scope,
+            hash,
+            until,
+        );
+
+        assert!(
+            !reg.is_body_retry_avoided(&first, scope, hash, now),
+            "a departed supplier must not retain a stale per-supplier deferral"
+        );
+        assert!(reg.is_body_retry_avoided(&second, scope, hash, now));
+
+        reg.set_persisted_body_alarm(Some((scope, hash, until)));
+        assert!(
+            reg.is_body_retry_avoided(&first, scope, hash, now),
+            "refreshing supplier-specific deferrals must not reopen a durable alarm"
+        );
+        assert!(reg.is_body_retry_avoided(&second, scope, hash, now));
     }
 
     #[test]

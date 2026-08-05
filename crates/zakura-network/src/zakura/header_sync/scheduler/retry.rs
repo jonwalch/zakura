@@ -141,29 +141,19 @@ impl BodyRetryEpisode {
         }
     }
 
-    /// Replace this episode when a newly eligible supplier can change availability.
-    pub fn refresh_suppliers<C: Clock>(
-        &mut self,
-        eligible_suppliers: BTreeSet<SourceId>,
-        clock: &C,
-    ) -> bool {
-        let has_new_supplier = eligible_suppliers
-            .iter()
-            .any(|supplier| !self.eligible_suppliers.contains(supplier));
-        if has_new_supplier {
-            *self = Self::new(
-                self.branch,
-                self.generation,
-                self.header,
-                eligible_suppliers,
-                clock,
-            );
-        } else {
-            self.eligible_suppliers = eligible_suppliers;
-            self.tried_suppliers
-                .retain(|supplier| self.eligible_suppliers.contains(supplier));
-        }
-        has_new_supplier
+    /// Merge the current eligible suppliers without resetting this episode's history.
+    ///
+    /// Supplier membership is ephemeral peer information, not evidence that an
+    /// unavailable body became available. Only [`Self::restart`] may reset the
+    /// authoritative age, attempts, alarm state, or probe cadence.
+    ///
+    /// Returns whether the eligible membership changed.
+    pub fn refresh_suppliers(&mut self, eligible_suppliers: BTreeSet<SourceId>) -> bool {
+        let changed = self.eligible_suppliers != eligible_suppliers;
+        self.eligible_suppliers = eligible_suppliers;
+        self.tried_suppliers
+            .retain(|supplier| self.eligible_suppliers.contains(supplier));
+        changed
     }
 
     /// Start a new episode after an explicit operator retry command.
@@ -450,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn jitter_and_final_delay_are_clamped_and_a_new_supplier_starts_a_fresh_episode() {
+    fn jitter_and_final_delay_are_clamped_and_only_restart_resets_an_episode() {
         let clock = clock();
         let first = source(3);
         let second = source(4);
@@ -475,15 +465,62 @@ mod tests {
             Duration::seconds(60),
             "the jittered delay itself must not exceed the normative cap"
         );
-        assert!(episode.refresh_suppliers([first, second].into_iter().collect(), &clock));
-        assert_eq!(episode.attempts, 0);
-        assert!(episode.tried_suppliers.is_empty());
+        let started_at = episode.started_at;
+        let attempts = episode.attempts;
+        let next_probe_at = episode.next_probe_at;
+        assert!(episode.refresh_suppliers([first, second].into_iter().collect()));
+        assert_eq!(episode.started_at, started_at);
+        assert_eq!(episode.attempts, attempts);
+        assert_eq!(episode.tried_suppliers, [first].into_iter().collect());
+        assert_eq!(episode.next_probe_at, next_probe_at);
         assert!(!episode.alarmed);
         episode.record_failure(second, &clock, &FixedJitter(0));
-        assert_ne!(episode.attempts, 0);
+        assert_eq!(episode.attempts, attempts.saturating_add(1));
         episode.restart(&clock);
         assert_eq!(episode.attempts, 0);
         assert!(episode.is_due(&clock));
+    }
+
+    #[test]
+    fn supplier_churn_cannot_suppress_a_persistent_alarm() {
+        let clock = clock();
+        let first = source(3);
+        let mut episode = episode(&clock, &[first]);
+        let jitter = FixedJitter(0);
+
+        for _ in 0..ALARM_ATTEMPTS {
+            assert!(matches!(
+                episode.record_failure(first, &clock, &jitter),
+                RetryUpdate::RetryAt(_) | RetryUpdate::Alarmed { .. }
+            ));
+            if !episode.alarmed {
+                clock.advance(Duration::seconds(60));
+            }
+        }
+        assert!(episode.alarmed);
+        let started_at = episode.started_at;
+        let attempts = episode.attempts;
+        let next_probe_at = episode.next_probe_at;
+
+        let mut suppliers: BTreeSet<_> = [first].into_iter().collect();
+        for value in 4..=10 {
+            let supplier = source(value);
+            assert!(suppliers.insert(supplier));
+            assert!(episode.refresh_suppliers(suppliers.clone()));
+            assert_eq!(episode.started_at, started_at);
+            assert_eq!(episode.attempts, attempts);
+            assert!(episode.alarmed);
+            assert_eq!(episode.next_probe_at, next_probe_at);
+            assert_eq!(episode.tried_suppliers, [first].into_iter().collect());
+        }
+
+        clock.advance(ALARM_PROBE_INTERVAL);
+        assert_eq!(
+            episode.record_failure(first, &clock, &jitter),
+            RetryUpdate::ProbeAt(clock.now() + ALARM_PROBE_INTERVAL)
+        );
+        assert_eq!(episode.attempts, attempts.saturating_add(1));
+        assert!(episode.alarmed);
     }
 
     #[test]

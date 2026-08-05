@@ -1195,11 +1195,11 @@ impl BlockSyncReactor {
 
         let now = chrono::Utc::now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
-            started_at: now,
-            attempts: 0,
+            started_at: previous.started_at,
+            attempts: previous.attempts,
             suppliers,
             supplier_set_digest,
-            alarmed: false,
+            alarmed: true,
             next_probe_at: now,
         };
         let mut hasher = blake2b_simd::Params::new()

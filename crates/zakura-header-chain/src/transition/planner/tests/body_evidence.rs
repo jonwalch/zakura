@@ -43,7 +43,7 @@ fn transient_body_evidence_cannot_regress_a_verified_body() {
 }
 
 #[test]
-fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
+fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let now = Utc::now();
     let clock = ManualClock(now);
@@ -61,12 +61,12 @@ fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
         .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
         .expect("the selected fixture body exists");
     store.metadata.alarms.header_best_body_unavailable = Some(old);
-    let fresh = crate::BodyUnavailableSummary {
-        started_at: now,
-        attempts: 0,
+    let updated = crate::BodyUnavailableSummary {
+        started_at: old.started_at,
+        attempts: old.attempts,
         suppliers: 2,
         supplier_set_digest: [0x22; 32],
-        alarmed: false,
+        alarmed: true,
         next_probe_at: now,
     };
     let evidence = EvidenceId::from_digest([0xc1; 32]);
@@ -75,7 +75,7 @@ fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
         event: TransitionEvent::BodySupplierDiscovered(crate::BodySupplierDiscovered {
             hash: selected.hash,
             evidence,
-            availability: fresh,
+            availability: updated,
         }),
     };
 
@@ -84,14 +84,14 @@ fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
         request.clone(),
         &context(&config, &clock, Some(&Authority)),
     )
-    .expect("a changed supplier set starts a fresh availability episode");
+    .expect("a changed supplier set makes the persistent episode probeable");
     assert_eq!(plan.change_set.metadata.frontiers, store.metadata.frontiers);
     assert_eq!(
         plan.projected
             .node(selected.hash)
             .expect("the selected node remains retained")
             .body,
-        BodyValidationState::Unavailable(fresh)
+        BodyValidationState::Unavailable(updated)
     );
     assert_eq!(
         plan.projected
@@ -106,7 +106,7 @@ fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
     );
     assert_eq!(
         plan.change_set.metadata.alarms.header_best_body_unavailable,
-        None
+        Some(updated)
     );
     store.commit(&plan);
     let replay = apply_transition(
@@ -122,7 +122,7 @@ fn new_body_supplier_restarts_only_the_selected_persistent_alarm() {
 }
 
 #[test]
-fn body_supplier_restart_rejects_nonfresh_or_nonexpanding_evidence() {
+fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let now = Utc::now();
     let clock = ManualClock(now);
@@ -157,11 +157,11 @@ fn body_supplier_restart_rejects_nonfresh_or_nonexpanding_evidence() {
 
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
-            started_at: now,
-            attempts: 0,
+            started_at: old.started_at,
+            attempts: old.attempts,
             suppliers: 2,
             supplier_set_digest: old.supplier_set_digest,
-            alarmed: false,
+            alarmed: true,
             next_probe_at: now,
         }),
         Err(TransitionFailure::InvalidEvidence(
@@ -171,23 +171,36 @@ fn body_supplier_restart_rejects_nonfresh_or_nonexpanding_evidence() {
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
             started_at: now,
-            attempts: 1,
+            attempts: old.attempts,
             suppliers: 3,
             supplier_set_digest: [0x22; 32],
-            alarmed: false,
+            alarmed: true,
             next_probe_at: now,
         }),
         Err(TransitionFailure::InvalidEvidence(
-            "body supplier discovery has an invalid fresh episode"
+            "body supplier discovery must preserve the persistent retry episode"
         ))
     ));
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
-            started_at: now,
-            attempts: 0,
+            started_at: old.started_at,
+            attempts: old.attempts,
+            suppliers: 3,
+            supplier_set_digest: [0x22; 32],
+            alarmed: true,
+            next_probe_at: now + chrono::Duration::minutes(1),
+        }),
+        Err(TransitionFailure::InvalidEvidence(
+            "body supplier discovery must preserve the persistent retry episode"
+        ))
+    ));
+    assert!(matches!(
+        apply(crate::BodyUnavailableSummary {
+            started_at: old.started_at,
+            attempts: old.attempts,
             suppliers: 1,
             supplier_set_digest: [0x22; 32],
-            alarmed: false,
+            alarmed: true,
             next_probe_at: now,
         }),
         Err(TransitionFailure::InvalidEvidence(

@@ -998,24 +998,29 @@ fn apply_event<G: HeaderGraphEdit>(
             )?;
         }
         TransitionEvent::BodySupplierDiscovered(event) => {
-            if event.hash != graph.view_select_header_best()?.0.hash
-                || event.availability.attempts != 0
-                || event.availability.suppliers == 0
-                || event.availability.alarmed
-                || event.availability.started_at != event.availability.next_probe_at
-            {
-                return Err(TransitionFailure::InvalidEvidence(
-                    "body supplier discovery has an invalid fresh episode",
-                ));
-            }
             let old = match graph.view_node(event.hash).map(|node| &node.body) {
-                Some(BodyValidationState::Unavailable(summary)) if summary.alarmed => *summary,
+                Some(BodyValidationState::Unavailable(summary))
+                    if event.hash == graph.view_select_header_best()?.0.hash && summary.alarmed =>
+                {
+                    *summary
+                }
                 _ => {
                     return Err(TransitionFailure::InvalidEvidence(
                         "body supplier discovery requires the selected persistent alarm",
                     ));
                 }
             };
+            if event.availability.started_at != old.started_at
+                || event.availability.attempts != old.attempts
+                || event.availability.suppliers == 0
+                || !event.availability.alarmed
+                || event.availability.next_probe_at < event.availability.started_at
+                || event.availability.next_probe_at > context.clock.now()
+            {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "body supplier discovery must preserve the persistent retry episode",
+                ));
+            }
             let has_new_supplier = event.availability.suppliers > old.suppliers
                 || (event.availability.suppliers == old.suppliers
                     && event.availability.supplier_set_digest != old.supplier_set_digest);

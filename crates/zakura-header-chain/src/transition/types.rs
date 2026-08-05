@@ -557,11 +557,11 @@ pub struct TransientBodyFailure {
 /// Authenticated discovery of a changed eligible body-supplier set.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BodySupplierDiscovered {
-    /// Exact selected header whose retry episode restarts.
+    /// Exact selected header whose persistent retry episode gains a supplier.
     pub hash: block::Hash,
     /// Stable identity of the authenticated supplier-set observation.
     pub evidence: EvidenceId,
-    /// Fresh zero-attempt episode summary.
+    /// Existing alarm episode with updated supplier evidence and a due probe.
     pub availability: BodyUnavailableSummary,
 }
 

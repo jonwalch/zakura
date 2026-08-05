@@ -297,8 +297,12 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 .expect("the fault-point list fits in u8");
             let fresh_at = started_at + chrono::Duration::minutes(20);
             let fresh = BodyUnavailableSummary {
-                started_at: fresh_at,
-                attempts: 0,
+                started_at: if operator_retry {
+                    fresh_at
+                } else {
+                    old.started_at
+                },
+                attempts: if operator_retry { 0 } else { old.attempts },
                 suppliers: if operator_retry {
                     old.suppliers
                 } else {
@@ -309,7 +313,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 } else {
                     [0x32; 32]
                 },
-                alarmed: false,
+                alarmed: !operator_retry,
                 next_probe_at: fresh_at,
             };
             let evidence = EvidenceId::from_digest([marker; 32]);
@@ -413,7 +417,15 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
             );
             assert_eq!(
                 durable.alarms.header_best_body_unavailable,
-                if committed { None } else { Some(old) },
+                if committed {
+                    if operator_retry {
+                        None
+                    } else {
+                        Some(fresh)
+                    }
+                } else {
+                    Some(old)
+                },
                 "{target:?}, operator_retry={operator_retry}"
             );
             assert_eq!(
@@ -442,7 +454,15 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     .current
                     .alarms
                     .header_best_body_unavailable,
-                if committed { None } else { Some(old) },
+                if committed {
+                    if operator_retry {
+                        None
+                    } else {
+                        Some(fresh)
+                    }
+                } else {
+                    Some(old)
+                },
                 "{target:?}, operator_retry={operator_retry}"
             );
             assert_eq!(
