@@ -43,7 +43,7 @@ use std::{
 use chrono::Utc;
 use derive_getters::Getters;
 use derive_new::new;
-use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
+use futures::{future::OptionFuture, stream::FuturesOrdered, FutureExt, StreamExt, TryFutureExt};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
@@ -2453,6 +2453,7 @@ where
         //
         // Set up the loop.
         let mut max_time_reached = false;
+        let mut precomputed_coinbase_task = None;
 
         // The loop returns the server long poll ID, which should be different to the client one.
         let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
@@ -2558,18 +2559,14 @@ where
             let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
             // `+2`: we expect the tip to advance by one block before waking us up.
             let precomputed_height = Height(chain_info.tip_height.0 + 2);
-            let wait_for_new_tip = async {
-                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
-                // will return this provisional block upon a chain tip change so that miners can
-                // mine on the newest tip, and don't waste their effort on a shorter chain while we
-                // compute a new template for a properly filled block. We do this precomputation
-                // before we start waiting for a new tip since computing the coinbase tx takes a few
-                // seconds if the miner mines to a shielded address, and we want to return fast
-                // when the tip changes.
+            if precomputed_coinbase_task
+                .as_ref()
+                .is_none_or(|(height, _)| *height != precomputed_height)
+            {
                 let network = self.network.clone();
                 let miner_params = miner_params.clone();
-                let permit = self.gbt.acquire_template_construction_permit().await?;
-                let precomputed_coinbase = tokio::task::spawn_blocking(move || {
+                let permit = self.gbt.try_acquire_template_construction_permit()?;
+                let task = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     TransactionTemplate::new_coinbase(
                         &network,
@@ -2578,13 +2575,32 @@ where
                         Amount::zero(),
                     )
                     .expect("valid coinbase tx")
-                })
-                .await
-                .expect("valid coinbase tx");
+                });
+                let task = async move { task.await.expect("valid coinbase tx") }
+                    .boxed()
+                    .shared();
+
+                precomputed_coinbase_task = Some((precomputed_height, task));
+            }
+
+            let precomputed_coinbase = precomputed_coinbase_task
+                .as_ref()
+                .expect("precomputed coinbase task was initialized above")
+                .1
+                .clone();
+            let wait_for_new_tip = async {
+                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
+                // will return this provisional block upon a chain tip change so that miners can
+                // mine on the newest tip, and don't waste their effort on a shorter chain while we
+                // compute a new template for a properly filled block. We do this precomputation
+                // before we start waiting for a new tip since computing the coinbase tx takes a few
+                // seconds if the miner mines to a shielded address, and we want to return fast
+                // when the tip changes.
+                let precomputed_coinbase = precomputed_coinbase.await;
 
                 let _ = wait_for_new_tip.await;
 
-                Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
+                precomputed_coinbase
             };
 
             // Wait for the maximum block time to elapse. This can change the block header
@@ -2630,7 +2646,6 @@ where
                 }
 
                 precomputed_coinbase = wait_for_new_tip => {
-                    let precomputed_coinbase = precomputed_coinbase?;
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
 
                     let server_long_poll_id = LongPollInput::new(
@@ -2657,7 +2672,10 @@ where
                     // chain.
                     let network = self.network.clone();
                     let miner_params = miner_params.clone();
-                    let permit = self.gbt.acquire_template_construction_permit().await?;
+                    let permit = precomputed_coinbase
+                        .is_none()
+                        .then(|| self.gbt.try_acquire_template_construction_permit())
+                        .transpose()?;
                     let response = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         BlockTemplateResponse::new_internal(
@@ -2711,7 +2729,7 @@ where
 
         let network = self.network.clone();
         let miner_params = miner_params.clone();
-        let permit = self.gbt.acquire_template_construction_permit().await?;
+        let permit = self.gbt.try_acquire_template_construction_permit()?;
         let response = tokio::task::spawn_blocking(move || {
             let _permit = permit;
 

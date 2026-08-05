@@ -11,7 +11,6 @@ mod tests;
 use std::{
     fmt::{self},
     sync::Arc,
-    time::Duration,
 };
 
 use derive_getters::Getters;
@@ -547,8 +546,8 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
-/// Maximum time a request waits for block template construction capacity.
-const TEMPLATE_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of concurrent block template construction tasks.
+const MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS: usize = 18;
 
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
@@ -587,16 +586,13 @@ where
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> Self {
-        let template_construction_limit = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
-            .clamp(2, 8);
-
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             sync_status,
-            template_construction_semaphore: Arc::new(Semaphore::new(template_construction_limit)),
+            template_construction_semaphore: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS,
+            )),
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
         }
@@ -617,21 +613,18 @@ where
         self.block_verifier_router.clone()
     }
 
-    /// Waits until another block template or coinbase construction task can start.
-    pub async fn acquire_template_construction_permit(&self) -> RpcResult<OwnedSemaphorePermit> {
-        let acquire_permit = self.template_construction_semaphore.clone().acquire_owned();
-
-        let permit = tokio::time::timeout(TEMPLATE_CONSTRUCTION_TIMEOUT, acquire_permit)
-            .await
+    /// Reserves capacity for a block template or coinbase construction task.
+    pub fn try_acquire_template_construction_permit(&self) -> RpcResult<OwnedSemaphorePermit> {
+        self.template_construction_semaphore
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| {
                 ErrorObject::borrowed(
-                    ErrorCode::InternalError.code(),
-                    "timed out waiting for block template construction capacity",
+                    ErrorCode::ServerIsBusy.code(),
+                    "block template construction capacity is exhausted",
                     None,
                 )
-            })?;
-
-        Ok(permit.expect("template construction semaphore is never closed"))
+            })
     }
 
     /// Advertises the mined block.
