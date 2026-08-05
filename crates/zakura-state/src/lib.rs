@@ -25,6 +25,7 @@ extern crate tracing;
 pub mod config;
 // Most constants are exported by default
 pub mod constants;
+mod header_chain;
 
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -45,15 +46,15 @@ pub use config::{
 };
 pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 pub use error::{
-    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
+    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
     HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    StateInitError, StoreIncoherentError, ValidateContextError,
+    StateInitError, ValidateContextError,
 };
+pub use header_chain::*;
 pub use request::{
-    AuthenticateHeaderRootsRequest, CheckpointVerifiedBlock,
-    CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest, ReadRequest, Request,
-    SemanticallyVerifiedBlock,
+    CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
+    ReadRequest, Request, SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]
@@ -93,10 +94,7 @@ pub use service::finalized_state::{
     HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState,
 };
 pub use service::{
-    finalized_state::{
-        DiskWriteBatch, FromDisk, HighestCompletedCheckpoint, HighestCompletedCheckpointError,
-        IntoDisk, WriteDisk, ZakuraDb,
-    },
+    finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
     ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 
