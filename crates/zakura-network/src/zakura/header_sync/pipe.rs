@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -9,6 +12,11 @@ use super::{
     HeaderSyncCodec, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME,
 };
 use crate::zakura::{Frame, FramedRecv, SinkReject, ZakuraPeerId};
+
+/// Grace period for a response to a request the local reactor has retired.
+const CANCELLED_RESPONSE_GRACE: Duration = Duration::from_secs(30);
+/// Maximum cancelled response IDs remembered by one peer pipe.
+const MAX_CANCELLED_RESPONSE_IDS: usize = 64;
 
 /// Run the sole peer-owned header-sync decode pipe.
 #[allow(clippy::too_many_arguments)]
@@ -23,6 +31,7 @@ pub(super) async fn run_peer(
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
     let mut expected = HashMap::<HeaderSyncRequestId, ExpectedHeadersResponse>::new();
+    let mut cancelled = CancelledResponseIds::default();
     loop {
         enum Input {
             Frame(Frame),
@@ -45,14 +54,14 @@ pub(super) async fn run_peer(
         let frame = match input {
             Input::Done => return Ok(()),
             Input::Command(command) => {
-                apply_command(&mut expected, command);
+                apply_command(&mut expected, &mut cancelled, command);
                 continue;
             }
             Input::Frame(frame) => frame,
         };
 
         while let Ok(command) = commands.try_recv() {
-            apply_command(&mut expected, command);
+            apply_command(&mut expected, &mut cancelled, command);
         }
 
         let message_type = u8::try_from(frame.message_type).ok();
@@ -62,7 +71,11 @@ pub(super) async fn run_peer(
         ) {
             let request_id =
                 HeaderSyncCodec::peek_response_request_id(&frame).map_err(protocol_reject)?;
-            let Some(response) = expected.remove(&request_id) else {
+            let response = expected.remove(&request_id);
+            if response.is_none() && cancelled.take(request_id) {
+                continue;
+            }
+            let Some(response) = response else {
                 emit_pipe_violation(
                     &handle,
                     &peer,
@@ -144,14 +157,57 @@ fn emit_pipe_violation(
 
 fn apply_command(
     expected: &mut HashMap<HeaderSyncRequestId, ExpectedHeadersResponse>,
+    cancelled: &mut CancelledResponseIds,
     command: HeaderSyncPeerCommand,
 ) {
     match command {
         HeaderSyncPeerCommand::Reserve(response) => {
+            cancelled.remove(response.request_id);
             expected.insert(response.request_id, response);
         }
         HeaderSyncPeerCommand::Cancel(request_id) => {
-            expected.remove(&request_id);
+            if expected.remove(&request_id).is_some() {
+                cancelled.insert(request_id);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CancelledResponseIds {
+    ids: VecDeque<(HeaderSyncRequestId, tokio::time::Instant)>,
+}
+
+impl CancelledResponseIds {
+    fn insert(&mut self, request_id: HeaderSyncRequestId) {
+        self.expire();
+        self.remove(request_id);
+        while self.ids.len() >= MAX_CANCELLED_RESPONSE_IDS {
+            self.ids.pop_front();
+        }
+        self.ids.push_back((
+            request_id,
+            tokio::time::Instant::now() + CANCELLED_RESPONSE_GRACE,
+        ));
+    }
+
+    fn take(&mut self, request_id: HeaderSyncRequestId) -> bool {
+        self.expire();
+        let Some(index) = self.ids.iter().position(|(id, _)| *id == request_id) else {
+            return false;
+        };
+        self.ids.remove(index);
+        true
+    }
+
+    fn remove(&mut self, request_id: HeaderSyncRequestId) {
+        self.ids.retain(|(id, _)| *id != request_id);
+    }
+
+    fn expire(&mut self) {
+        let now = tokio::time::Instant::now();
+        while self.ids.front().is_some_and(|(_, expiry)| *expiry <= now) {
+            self.ids.pop_front();
         }
     }
 }
@@ -299,5 +355,82 @@ mod tests {
                 "a rejected response never reaches the reactor"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn locally_cancelled_response_is_dropped_but_unknown_response_is_rejected() {
+        let codec = HeaderSyncCodec::new(Network::Mainnet, 1024, 1, 0);
+        let late_response = codec
+            .encode_frame(&HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                request_id: 1,
+                target_tip_hash: block::Hash([3; 32]),
+                outcome: HeadersOutcomeCode::Busy,
+            }))
+            .expect("the late response fixture encodes");
+        let (send, recv) = framed_channel(1);
+        send.send(late_response)
+            .await
+            .expect("pipe input remains open");
+        drop(send);
+        let (handle, mut events) = handle(codec.clone());
+        let (commands_tx, commands) = mpsc::unbounded_channel();
+        let request_id = HeaderSyncRequestId::new(1).expect("one is nonzero");
+        commands_tx
+            .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                request_id,
+                scope: scope(),
+                context: HeaderSyncDecodeContext {
+                    max_header_count: 1,
+                    requested_tree_aux_schema: AuxSchema::None,
+                },
+            }))
+            .expect("the pipe command receiver is open");
+        commands_tx
+            .send(HeaderSyncPeerCommand::Cancel(request_id))
+            .expect("the pipe command receiver is open");
+
+        run_peer(
+            handle,
+            codec,
+            peer(),
+            1,
+            crate::zakura::ServicePeerDirection::Inbound,
+            commands,
+            recv,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a response to a locally cancelled request is not peer-attributable");
+        assert!(
+            events.try_recv().is_err(),
+            "late response never reaches the reactor"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelled_response_grace_is_bounded_and_expires() {
+        let mut cancelled = CancelledResponseIds::default();
+        for id in 1..=u64::try_from(MAX_CANCELLED_RESPONSE_IDS + 1)
+            .expect("the small cancellation cap fits in u64")
+        {
+            cancelled.insert(HeaderSyncRequestId::new(id).expect("fixture IDs are nonzero"));
+        }
+        assert_eq!(cancelled.ids.len(), MAX_CANCELLED_RESPONSE_IDS);
+        assert!(
+            !cancelled.take(HeaderSyncRequestId::new(1).expect("one is nonzero")),
+            "the oldest cancellation is evicted at the hard cap"
+        );
+
+        tokio::time::advance(CANCELLED_RESPONSE_GRACE).await;
+        assert!(
+            !cancelled.take(
+                HeaderSyncRequestId::new(
+                    u64::try_from(MAX_CANCELLED_RESPONSE_IDS + 1)
+                        .expect("the small cancellation cap fits in u64")
+                )
+                .expect("fixture IDs are nonzero")
+            ),
+            "a response is peer-attributable again after local cancellation grace expires"
+        );
     }
 }
