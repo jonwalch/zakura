@@ -96,6 +96,28 @@ type SemanticBlockVerifier = Buffer<
 type GossipedBlockDownloads =
     BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;
 
+/// Returns the misbehavior update for a failed gossiped block download, if the advertising peer
+/// is known and the error is worth scoring.
+///
+/// # Correctness
+///
+/// [`SemanticBlockVerifier`] is a [`BlockVerifierRouter`](zakura_consensus::router), so its boxed
+/// errors are [`RouterError`]s, not [`VerifyBlockError`]s. Both concrete types are checked here,
+/// because tests and other verifier configurations can produce a bare [`VerifyBlockError`].
+fn block_misbehavior(
+    err: BoxError,
+    advertiser_addr: Option<PeerSocketAddr>,
+) -> Option<(PeerSocketAddr, u32)> {
+    let advertiser_addr = advertiser_addr?;
+    let score = if let Some(err) = err.downcast_ref::<RouterError>() {
+        err.misbehavior_score()
+    } else {
+        err.downcast_ref::<VerifyBlockError>()?.misbehavior_score()
+    };
+
+    (score != 0).then_some((advertiser_addr, score))
+}
+
 /// Rate-limits diagnostics for missing block bodies in pruned zcashd-compat mode.
 #[derive(Debug)]
 struct PrunedBlockNotFoundLogger {
@@ -443,17 +465,12 @@ impl Service<zn::Request> for Inbound {
                 // If we returned Pending here, and there were no waiting block downloads,
                 // then inbound requests would wait for the next block download, and hang forever.
                 while let Poll::Ready(Some(result)) = block_downloads.as_mut().poll_next(cx) {
-                    let Err((err, Some(advertiser_addr))) = result else {
+                    let Err((err, advertiser_addr)) = result else {
                         continue;
                     };
 
-                    let Ok(err) = err.downcast::<VerifyBlockError>() else {
-                        continue;
-                    };
-
-                    if err.misbehavior_score() != 0 {
-                        let _ =
-                            misbehavior_sender.try_send((advertiser_addr, err.misbehavior_score()));
+                    if let Some(update) = block_misbehavior(err, advertiser_addr) {
+                        let _ = misbehavior_sender.try_send(update);
                     }
                 }
 
