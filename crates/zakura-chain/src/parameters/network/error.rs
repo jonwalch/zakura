@@ -59,6 +59,12 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     TargetDifficultyLimitOverflowRisk,
 
+    #[error(
+        "proof-of-work start height must be greater than zero and no greater than Height::MAX"
+    )]
+    #[non_exhaustive]
+    InvalidPowStartHeight,
+
     #[error("difficulty averaging window must be greater than zero")]
     #[non_exhaustive]
     InvalidPowAveragingWindow,
