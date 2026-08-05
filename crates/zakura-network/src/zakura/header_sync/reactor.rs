@@ -4103,3 +4103,6 @@ fn ordered_send_error_label(error: &OrderedSendError) -> &'static str {
         OrderedSendError::Encode(_) => "encode",
     }
 }
+
+#[cfg(test)]
+mod tests;
