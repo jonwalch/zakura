@@ -18,10 +18,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::{
-    mpsc::{self, error::TrySendError},
-    OwnedSemaphorePermit, Semaphore,
-};
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -546,25 +543,6 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
-/// Maximum number of concurrent block template construction tasks.
-const MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS: usize = 18;
-
-/// How a caller acquires block template construction capacity.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum TemplateConstructionPriority {
-    /// External RPC clients fail fast with [`ErrorCode::ServerIsBusy`] when
-    /// construction capacity is exhausted, so expensive proving work stays bounded.
-    External,
-    /// In-process callers bypass the capacity limit, so external load can never
-    /// starve them.
-    ///
-    /// The capacity limit exists to bound untrusted external work. Internal
-    /// callers are trusted and issue one template request at a time: the internal
-    /// miner runs a single template generator loop, and `generate` builds blocks
-    /// sequentially and is only reachable on networks with PoW disabled.
-    Internal,
-}
-
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -580,9 +558,6 @@ where
 
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
     sync_status: SyncStatus,
-
-    /// Limits concurrent block template and coinbase construction.
-    template_construction_semaphore: Arc<Semaphore>,
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
@@ -606,9 +581,6 @@ where
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             sync_status,
-            template_construction_semaphore: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS,
-            )),
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
         }
@@ -627,39 +599,6 @@ where
     /// Returns the block verifier router.
     pub fn block_verifier_router(&self) -> BlockVerifierRouter {
         self.block_verifier_router.clone()
-    }
-
-    /// Reserves capacity for a block template or coinbase construction task.
-    ///
-    /// [`TemplateConstructionPriority::External`] callers fail fast with
-    /// [`ErrorCode::ServerIsBusy`] when capacity is exhausted;
-    /// [`TemplateConstructionPriority::Internal`] callers are exempt from the
-    /// capacity limit and hold no permit.
-    pub fn acquire_template_construction_permit(
-        &self,
-        priority: TemplateConstructionPriority,
-    ) -> RpcResult<Option<OwnedSemaphorePermit>> {
-        match priority {
-            TemplateConstructionPriority::External => {
-                self.try_acquire_template_construction_permit().map(Some)
-            }
-            TemplateConstructionPriority::Internal => Ok(None),
-        }
-    }
-
-    /// Reserves capacity for a block template or coinbase construction task,
-    /// failing fast with [`ErrorCode::ServerIsBusy`] when capacity is exhausted.
-    pub fn try_acquire_template_construction_permit(&self) -> RpcResult<OwnedSemaphorePermit> {
-        self.template_construction_semaphore
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                ErrorObject::borrowed(
-                    ErrorCode::ServerIsBusy.code(),
-                    "block template construction capacity is exhausted",
-                    None,
-                )
-            })
     }
 
     /// Advertises the mined block.

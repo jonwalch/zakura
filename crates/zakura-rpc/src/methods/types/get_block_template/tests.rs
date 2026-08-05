@@ -8,9 +8,10 @@ use zcash_keys::address::Address;
 
 use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
+use crate::client::TransactionTemplate;
+use crate::config::mining::{default_miner_address, MinerAddressType};
 use zakura_chain::{
-    block::{Hash, Height},
-    chain_sync_status::MockSyncStatus,
+    block::Height,
     local_genesis::generate_local_testnet_with_funded_keys,
     parameters::{
         subsidy::FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
@@ -21,66 +22,8 @@ use zakura_chain::{
     transaction::Transaction,
     transparent,
 };
-use zakura_node_services::BoxError;
-use zakura_test::mock_service::MockService;
 
-use crate::client::TransactionTemplate;
-use crate::config::mining::{default_miner_address, MinerAddressType};
-
-use super::{
-    GetBlockTemplateHandler, MinerParams, TemplateConstructionPriority,
-    MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS,
-};
-
-#[test]
-fn template_construction_capacity_fails_fast() {
-    let block_verifier: MockService<zakura_consensus::Request, Hash, _, BoxError> =
-        MockService::build().for_unit_tests();
-    let handler = GetBlockTemplateHandler::new(
-        &Network::Mainnet,
-        Default::default(),
-        block_verifier,
-        MockSyncStatus::default(),
-        None,
-    );
-
-    let mut permits = (0..MAX_CONCURRENT_TEMPLATE_CONSTRUCTIONS)
-        .map(|_| {
-            handler
-                .try_acquire_template_construction_permit()
-                .expect("configured template construction capacity is available")
-        })
-        .collect::<Vec<_>>();
-
-    let error = handler
-        .try_acquire_template_construction_permit()
-        .expect_err("exhausted template construction capacity fails immediately");
-    assert_eq!(
-        error.code(),
-        jsonrpsee_types::ErrorCode::ServerIsBusy.code()
-    );
-
-    // External callers observe the capacity limit, internal callers bypass it.
-    let error = handler
-        .acquire_template_construction_permit(TemplateConstructionPriority::External)
-        .expect_err("external callers fail fast when capacity is exhausted");
-    assert_eq!(
-        error.code(),
-        jsonrpsee_types::ErrorCode::ServerIsBusy.code()
-    );
-    let internal_permit = handler
-        .acquire_template_construction_permit(TemplateConstructionPriority::Internal)
-        .expect("internal callers are exempt from the capacity limit");
-    assert!(
-        internal_permit.is_none(),
-        "internal callers hold no permit, so they can't consume external capacity"
-    );
-
-    permits.pop();
-    let _permit = handler
-        .try_acquire_template_construction_permit()
-        .expect("dropping a permit restores template construction capacity");
-}
+use super::MinerParams;
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
 /// network upgrade activation.
