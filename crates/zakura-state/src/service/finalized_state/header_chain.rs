@@ -53,6 +53,9 @@ const METADATA_KEY: &[u8] = b"";
 const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+#[path = "header_chain/coherence.rs"]
+mod coherence;
 pub(in crate::service) mod migration;
 
 pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
@@ -3364,3 +3367,6 @@ fn store_error(error: HeaderChainStoreError) -> StoreError {
         _ => StoreError::Incoherent("durable header-chain read failed"),
     }
 }
+
+#[cfg(test)]
+mod tests;
