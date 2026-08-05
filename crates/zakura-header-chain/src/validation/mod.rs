@@ -1,5 +1,18 @@
 //! Shared synchronous observable-header validation primitives.
 
+mod contextual;
+mod prepare;
+
+pub use contextual::{
+    validate_contextual_difficulty_and_time, AdjustedDifficulty, ContextualValidationError,
+    BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
+    POW_PREDECESSOR_CONTEXT_SPAN,
+};
+pub use prepare::{
+    prepare_context_free_headers, prepare_headers, HeaderBatchInput, HeaderFailure, HeaderRule,
+    HeaderRules,
+};
+
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use zakura_chain::{
