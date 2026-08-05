@@ -21,12 +21,10 @@ Require or confirm:
 
 - `ref`: Git branch, tag, or SHA to build and deploy.
 - `nodes`: one or more exact names from the inventories below.
-- `network`: required when a node name is ambiguous, such as `zakura-compat`.
 - `force_rebuild`: optional; defaults to `false`.
 - `no_restart`: optional; defaults to `false`.
 - `p2p_stack`: optional testnet override; defaults to `auto`, which preserves
-  the inventory role (`zakura-testnet-3` is pure Zakura P2P v2 and the other
-  ordinary testnet nodes are dual-stack).
+  the inventory's dual-stack role.
 
 For any mainnet node, confirm the `ref` and complete node list explicitly with
 the user immediately before dispatch.
@@ -36,11 +34,8 @@ the user immediately before dispatch.
 Testnet:
 
 - `zakura-testnet-1`
-- `zakura-testnet-2`
-- `zakura-testnet-3`
 - `zakura-testnet-eu`
 - `zakura-testnet-as`
-- `zakura-compat`
 
 Mainnet:
 
@@ -54,10 +49,8 @@ Mainnet:
 - `asia-south-0`
 - `asia-pacific-0`
 - `zakura-compat`
-- `zakura-compat-docker`
 
-Reject unknown names rather than guessing. If `zakura-compat` is requested
-without a network, ask which network.
+Reject unknown names rather than guessing.
 
 ## Preflight
 
@@ -122,18 +115,16 @@ Append these workflow fields only when requested:
 ```
 
 Do not override `p2p_stack` merely because a node is being redeployed. Let
-`auto` preserve its inventory role. In particular, `zakura-testnet-3` must stay
-pure v2 unless the user explicitly requests a topology experiment.
+`auto` preserve its inventory role unless the user explicitly requests a
+topology experiment.
 
 ## Verification
 
 - Confirm every workflow run succeeded and its final node status is healthy.
 - Confirm each node reports the expected commit/version.
 - For restarted nodes, confirm RPC height is current and advances.
-- Confirm the configured P2P role after testnet deploys: `zakura-testnet-3`
-  must not expose the legacy TCP listener under the default inventory, while
-  dual-stack nodes must expose both stacks.
-- For testnet `zakura-compat`, confirm the zcashd sidecar sync check passes.
+- Confirm the configured P2P role after an explicit testnet stack override.
+- For mainnet `zakura-compat`, confirm both Zakura and zcashd remain healthy.
 - Stop on failure; do not continue to additional requested nodes.
 - Report each requested node and its workflow run URL.
 
