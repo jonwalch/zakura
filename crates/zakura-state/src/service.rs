@@ -19,7 +19,7 @@ use std::{
     future::Future,
     ops::Bound,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -48,7 +48,7 @@ use crate::{
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
     request::TimedSpan,
-    response::NonFinalizedBlocksListener,
+    response::{NonFinalizedBlocksListener, TreestateAnchor, TreestateReconstruction},
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
@@ -62,8 +62,9 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock,
-    ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
+    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, HashOrHeight,
+    KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
+    StateInitError,
 };
 
 pub mod block_iter;
@@ -259,6 +260,15 @@ pub struct ReadStateService {
     block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
     /// Shared fail-closed attachment result, visible to every clone without joining the worker.
     block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
+
+    /// Note commitment frontiers this service has derived and root-checked for heights in a
+    /// verified-commitment-trees fast-synced database's absent band.
+    ///
+    /// Shared across clones so a wallet's sequential scan can anchor each request on the previous
+    /// one. Node-side derivation is what fills it, and that read path is not wired up on this
+    /// branch, so it currently stays empty and `z_gettreestateanchor` anchors on the last stored
+    /// tree below the upgrade height instead.
+    historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
 
     /// Published completed subtree roots for heights below the last checkpoint.
     ///
@@ -1226,6 +1236,7 @@ impl ReadStateService {
             non_finalized_state_receiver,
             block_write_task,
             block_write_failure,
+            historical_trees: Arc::default(),
             historical_subtrees,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver: header_chain.snapshots,
@@ -1926,6 +1937,72 @@ fn subtrees_with_published_fallback<Node, Error>(
     }
 }
 
+/// Returns the material for reconstructing the treestate at `hash_or_height` on the client side.
+///
+/// Every field comes from one pass over the finalized state, so the anchor, the target roots, and
+/// the hashes they are bound to describe the same chain. A client that replays the canonical
+/// blocks between them and reproduces all three target roots ends up with a treestate it verified
+/// rather than trusted, which is what makes this servable in the band where this node has no
+/// stored tree of its own.
+///
+/// `Ok(None)` when the block is not in the finalized best chain. Non-finalized heights are
+/// deliberately not served: the absent band sits far below the reorg limit, and a request up there
+/// wants `z_gettreestate`, which works.
+fn treestate_reconstruction(
+    state: &ReadStateService,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<Box<TreestateReconstruction>>, BoxError> {
+    let db = &state.db;
+
+    let Some(height) = hash_or_height.height_or_else(|hash| db.height(hash)) else {
+        return Ok(None);
+    };
+
+    // Re-resolve the hash from the height even when the caller gave one, so the response always
+    // names the block this node considers canonical at that height rather than echoing the
+    // request back.
+    let (Some(hash), Some(header)) = (db.hash(height), db.block_header(height.into())) else {
+        return Ok(None);
+    };
+
+    let material = read::reconstruction_material(db, &state.historical_trees, height)?;
+
+    let anchor = material
+        .anchor
+        .map(|anchor| {
+            db.hash(anchor.height)
+                .map(|hash| TreestateAnchor {
+                    height: anchor.height,
+                    hash,
+                    frontiers: anchor.frontiers,
+                })
+                .ok_or_else(|| {
+                    // The anchor came from this node's own verified state, so its height is
+                    // canonical by construction. A missing hash means the database is
+                    // inconsistent, and serving an anchor the client cannot pin to a block would
+                    // defeat the point of binding the material to hashes at all.
+                    BoxError::from(format!(
+                        "no canonical hash for the verified anchor at {:?}",
+                        anchor.height
+                    ))
+                })
+        })
+        .transpose()?;
+
+    Ok(Some(Box::new(TreestateReconstruction {
+        target_height: height,
+        target_hash: hash,
+        target_time: u32::try_from(header.time.timestamp()).map_err(|_| {
+            BoxError::from(format!(
+                "the header time at {height:?} does not fit in a u32"
+            ))
+        })?,
+        target_roots: material.target_roots,
+        anchor,
+        replay_from: material.replay_from,
+    })))
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2487,6 +2564,12 @@ impl Service<ReadRequest> for ReadStateService {
                 let tree =
                     read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
                 Ok(ReadResponse::IronwoodTree(tree))
+            }
+
+            ReadRequest::TreestateReconstruction(hash_or_height) => {
+                Ok(ReadResponse::TreestateReconstruction(
+                    treestate_reconstruction(&state, hash_or_height)?,
+                ))
             }
 
             ReadRequest::SaplingSubtrees { start_index, limit } => {

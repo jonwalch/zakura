@@ -64,7 +64,7 @@ pub struct CompletedSubtree {
 }
 
 /// Per-pool note commitment frontiers as of the end of one block.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedFrontiers {
     /// The Sapling frontier.
     pub sapling: Arc<sapling::tree::NoteCommitmentTree>,
@@ -244,6 +244,63 @@ pub fn derive_historical_frontiers(
         .map(|derivation| derivation.frontiers)
 }
 
+/// A verified frontier a replay can start from, and the block it is the state at the end of.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedAnchor {
+    /// The height the frontiers are the state at the end of.
+    pub height: Height,
+
+    /// The frontiers themselves, already checked against this node's authenticated roots.
+    pub frontiers: Arc<DerivedFrontiers>,
+}
+
+/// Everything a client needs to rebuild the treestate at a target height for itself.
+///
+/// This is the wallet-side counterpart of [`derive_historical_frontiers`]: instead of replaying to
+/// the target here, the node hands over the nearest verified anchor and the authenticated roots
+/// the client must reproduce. The roots are what make that safe — a frontier that reproduces them
+/// *is* the frontier, wherever the replay ran — so a wallet accepting a reconstruction under this
+/// check extends the node no more trust than it already extends its own header chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconstructionMaterial {
+    /// The authenticated per-pool roots at the target height.
+    pub target_roots: BlockCommitmentRoots,
+
+    /// The highest verified anchor at or below the target, or `None` to replay from genesis.
+    pub anchor: Option<VerifiedAnchor>,
+
+    /// The first height the client has to replay.
+    pub replay_from: Height,
+}
+
+/// Returns the material for reconstructing the treestate at `height` on the client side.
+///
+/// Does no replay: the anchor is whatever this node already holds verified, so the cost is one
+/// root lookup and one anchor lookup.
+pub fn reconstruction_material(
+    db: &ZakuraDb,
+    cache: &Mutex<HistoricalTreeCache>,
+    height: Height,
+) -> Result<ReconstructionMaterial, HistoricalTreeDerivationError> {
+    // Read the roots first. Without them there is nothing for the client to verify against, and
+    // serving an anchor it could not check would be exactly the silent-corruption path this whole
+    // design exists to close.
+    let target_roots = authenticated_roots(db, height)?;
+
+    let anchor = highest_verified_anchor(db, cache, height)?
+        .map(|(height, frontiers)| VerifiedAnchor { height, frontiers });
+
+    // The anchor is the state at the *end* of its height, so the client replays from the next
+    // block. With no anchor it replays from genesis.
+    let replay_from = Height(anchor.as_ref().map_or(0, |anchor| anchor.height.0 + 1));
+
+    Ok(ReconstructionMaterial {
+        target_roots,
+        anchor,
+        replay_from,
+    })
+}
+
 /// A completed derivation, and what it cost.
 #[derive(Clone, Debug)]
 pub struct Derivation {
@@ -254,7 +311,7 @@ pub struct Derivation {
     ///
     /// Zero when the requested height was already available as an anchor. Callers measuring cost
     /// must read this rather than infer it from the height, because the anchor may have come from
-    /// the memo or from a published grid rather than from genesis.
+    /// the memo or from a stored tree rather than from genesis.
     pub replayed_blocks: u64,
 }
 
@@ -267,7 +324,7 @@ pub fn derive_historical_frontiers_measured(
     height: Height,
     max_replay_blocks: u64,
 ) -> Result<Derivation, HistoricalTreeDerivationError> {
-    let anchor = anchor_for(db, cache, height)?;
+    let anchor = highest_verified_anchor(db, cache, height)?;
 
     if let Some((anchor_height, frontiers)) = &anchor {
         match anchor_height.cmp(&height) {
@@ -326,35 +383,64 @@ pub fn derive_historical_frontiers_measured(
     })
 }
 
-/// Returns the frontiers to replay forward from, and the height they are the state at the end of.
+/// Returns the highest verified frontier at or below `height`, and the height it is the state at
+/// the end of.
+///
+/// Two sources can supply one: the memo of frontiers this node already derived, and the last
+/// per-height tree stored below the upgrade height `U`. The *higher* of them wins rather than the
+/// first, because the only thing an anchor's provenance changes is how much replay is left — both
+/// are equally verified once accepted, and picking a lower one just costs blocks. A published
+/// frontier grid becomes a third source once that artifact lands.
 ///
 /// `None` means start from empty frontiers at genesis, which is correct when this binary committed
 /// every block from genesis (`U == 0`) and so stored no per-height trees to anchor on.
-fn anchor_for(
+fn highest_verified_anchor(
     db: &ZakuraDb,
     cache: &Mutex<HistoricalTreeCache>,
     height: Height,
 ) -> Result<Option<(Height, Arc<DerivedFrontiers>)>, HistoricalTreeDerivationError> {
-    let memoized = lock(cache).anchor_at_or_below(height);
-
-    if memoized.is_some() {
-        return Ok(memoized);
-    }
+    let best = lock(cache).anchor_at_or_below(height);
 
     // Below the upgrade height `U` this binary did not run, so per-height trees are present. The
     // tree at `U - 1` is therefore the last stored frontier before the absent band starts.
     let Some(upgrade) = db.vct_upgrade_height().filter(|upgrade| upgrade.0 > 0) else {
-        return Ok(None);
+        return Ok(best);
     };
 
     let anchor = Height(upgrade.0 - 1);
+
+    // The stored tree is the state at the *end* of `anchor`, so one above the target cannot start
+    // its replay. Fall back to the memo when it has something usable, and otherwise keep reporting
+    // the anchor that does not fit rather than replaying from genesis into a check that cannot
+    // pass — the caller learns which anchor was in the way instead of which root was missing.
+    if anchor > height {
+        if best.is_none() {
+            return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+        }
+
+        return Ok(best);
+    }
+
+    // Take the higher of the two sources rather than the first one that has an anchor: both are
+    // equally verified once accepted, so anchoring lower would only replay more blocks.
+    if best.as_ref().is_some_and(|(best, _)| anchor <= *best) {
+        return Ok(best);
+    }
+
     // Rollback can move the tip below the write-once upgrade marker. In that case a backwards tree
     // lookup would return a retained row below the rollback target and mislabel it as `anchor`.
+    //
+    // Only fatal when nothing else can anchor the replay, for the same reason as the missing-row
+    // case below: a memo entry that already covers `height` does not need the band's lower edge.
     if db
         .finalized_tip_height()
         .is_none_or(|tip_height| anchor > tip_height)
     {
-        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+        if best.is_none() {
+            return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+        }
+
+        return Ok(best);
     }
 
     // These reads intentionally search backwards because unchanged trees are deduplicated. The tip
@@ -364,7 +450,13 @@ fn anchor_for(
         db.latest_stored_orchard_tree(&anchor),
         db.latest_stored_ironwood_tree(&anchor),
     ) else {
-        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+        // Only fatal when nothing else can anchor the replay. A node whose memo already covers
+        // `height` does not care that the band's lower edge is unreadable.
+        if best.is_none() {
+            return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+        }
+
+        return Ok(best);
     };
 
     Ok(Some((
