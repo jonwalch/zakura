@@ -2599,15 +2599,13 @@ mod zakura_header_sync_driver_tests {
             BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
                 let request_tx = request_tx.clone();
                 async move {
-                    let zakura_state::Request::RecordHeaderChainBodyUnavailable {
-                        expected_version,
-                        failure,
-                    } = request
+                    let zakura_state::Request::RecordHeaderChainBodyUnavailable { prepared } =
+                        request
                     else {
                         panic!("unexpected state write while persisting body retry evidence")
                     };
                     request_tx
-                        .send((expected_version, failure))
+                        .send(prepared)
                         .await
                         .expect("body retry request receiver stays open");
                     Err::<zakura_state::Response, zakura_state::BoxError>(
@@ -2615,6 +2613,7 @@ mod zakura_header_sync_driver_tests {
                     )
                 }
             }));
+        let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
@@ -2624,6 +2623,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             Some(header_chain_write),
+            Some(body_evidence_authority.clone()),
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -2660,7 +2660,7 @@ mod zakura_header_sync_driver_tests {
             tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
                 .await
                 .expect("state writer receives body retry evidence"),
-            Some((expected_version, failure))
+            Some(body_evidence_authority.from_registered_attempt(expected_version, failure,))
         );
 
         let _ = shutdown_tx.send(());
@@ -2738,6 +2738,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -2885,6 +2886,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -3041,6 +3043,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3160,6 +3163,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height(2),
             2,
@@ -3266,6 +3270,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(2),
@@ -3375,6 +3380,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height(0),
             2,
@@ -3463,6 +3469,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -3561,6 +3568,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -3684,6 +3692,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height(0),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -3763,6 +3772,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -3892,6 +3902,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height(0),
@@ -4444,6 +4455,7 @@ mod zakura_header_sync_driver_tests {
             zakura_chain::chain_tip::NoChainTip,
             read_state,
             None,
+            None,
             verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -4544,6 +4556,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -4659,6 +4672,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
+            None,
             None,
             verifier,
             block::Height::MAX,
@@ -4791,6 +4805,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             _latest_tip,
             read_state.clone(),
+            None,
             None,
             verifier,
             // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
@@ -4953,6 +4968,7 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             latest_tip,
             read_state.clone(),
+            None,
             None,
             verifier,
             second_checkpoint_height,
