@@ -393,6 +393,7 @@ impl ActiveHeaderRequest {
             .height
             .0
             .checked_add(count)
+            .filter(|height| *height <= zakura_chain::block::Height::MAX.0)
             .map(zakura_chain::block::Height)?;
         Some(Frontier::new(height, last.header.hash()))
     }
@@ -965,6 +966,25 @@ mod tests {
         let mut pure_requester = advertisement(5);
         pure_requester.status.max_headers_per_response = 0;
         assert!(!pure_requester.is_discovery_eligible(&local));
+    }
+
+    #[test]
+    fn staged_tip_rejects_heights_above_the_protocol_maximum() {
+        let local = snapshot();
+        let target = advertisement(1);
+        let mut request = active_request(
+            1,
+            target,
+            &local,
+            vec![HeaderEntry {
+                header: regtest_genesis_block().header.clone(),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        );
+        request.common_ancestor = Some(Frontier::new(block::Height::MAX, hash(10)));
+
+        assert_eq!(request.staged_tip(), None);
     }
 
     #[test]

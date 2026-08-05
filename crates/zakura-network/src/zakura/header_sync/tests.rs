@@ -3,7 +3,10 @@ use std::io;
 use zakura_chain::{
     block::{genesis::regtest_genesis_block, merkle::AuthDataRoot},
     ironwood, orchard,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{
+        testnet::{ConfiguredCheckpoints, RegtestParameters},
+        Network, NetworkUpgrade,
+    },
     sapling,
     serialization::ZcashSerialize,
     work::difficulty::U256,
@@ -31,6 +34,98 @@ fn advertised_inflight_limit_matches_the_one_lease_per_peer_contract() {
     assert!(error
         .to_string()
         .contains("unknown field `max_inflight_requests`"));
+}
+
+#[test]
+fn configured_anchor_must_match_an_exact_network_checkpoint() {
+    let mainnet = Network::Mainnet;
+    let checkpoints = mainnet.checkpoint_list();
+    let (&checkpoint_height, &checkpoint_hash) = checkpoints
+        .iter()
+        .nth(1)
+        .expect("mainnet has a checkpoint above genesis");
+    let mut config = ZakuraHeaderSyncConfig {
+        anchor_height: Some(checkpoint_height),
+        anchor_hash: Some(checkpoint_hash),
+        ..ZakuraHeaderSyncConfig::default()
+    };
+    assert_eq!(
+        config
+            .anchor(&mainnet)
+            .expect("exact checkpoint is trusted"),
+        (checkpoint_height, checkpoint_hash),
+    );
+
+    config.anchor_hash = Some(block::Hash([0; 32]));
+    assert!(matches!(
+        config.anchor(&mainnet),
+        Err(HeaderSyncStartError::InvalidAnchor { .. })
+    ));
+
+    let non_checkpoint_height = checkpoints
+        .iter()
+        .zip(checkpoints.iter().skip(1))
+        .find_map(|((&height, _), (&next_height, _))| {
+            (next_height.0 > height.0.saturating_add(1)).then_some(block::Height(height.0 + 1))
+        })
+        .expect("mainnet checkpoint list has a non-checkpoint height");
+    config.anchor_height = Some(non_checkpoint_height);
+    config.anchor_hash = Some(checkpoint_hash);
+    assert!(matches!(
+        config.anchor(&mainnet),
+        Err(HeaderSyncStartError::InvalidAnchor { .. })
+    ));
+
+    let custom = Network::new_regtest(RegtestParameters {
+        checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (
+                block::Height(0),
+                Network::new_regtest(Default::default()).genesis_hash(),
+            ),
+            (block::Height(10), hash(0x11)),
+        ])),
+        ..Default::default()
+    });
+    config.anchor_height = Some(block::Height(10));
+    config.anchor_hash = Some(hash(0x11));
+    assert_eq!(
+        config
+            .anchor(&custom)
+            .expect("custom checkpoint is trusted"),
+        (block::Height(10), hash(0x11)),
+    );
+    config.anchor_hash = Some(hash(0x12));
+    assert!(matches!(
+        config.anchor(&custom),
+        Err(HeaderSyncStartError::InvalidAnchor { .. })
+    ));
+}
+
+#[test]
+fn status_refresh_interval_is_clamped_at_startup() {
+    let network = Network::new_regtest(Default::default());
+    let anchor = (block::Height(0), network.genesis_hash());
+    let config = ZakuraHeaderSyncConfig {
+        status_refresh_interval: std::time::Duration::ZERO,
+        ..ZakuraHeaderSyncConfig::default()
+    };
+    let startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        FullStateFrontiers {
+            finalized_height: anchor.0,
+            verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
+        },
+        Some(anchor),
+        config,
+        u32::try_from(MAX_HS_MESSAGE_BYTES).expect("the wire cap fits in u32"),
+    );
+
+    assert_eq!(
+        startup.status_refresh_interval,
+        std::time::Duration::from_secs(1),
+    );
 }
 
 fn codec() -> HeaderSyncCodec {
@@ -338,6 +433,18 @@ fn bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes() {
         ),
         Err(HeaderSyncWireError::InvalidBool { .. })
     ));
+    let mut invalid_empty_page = bytes.clone();
+    invalid_empty_page[81] = 0;
+    assert!(matches!(
+        codec().decode(
+            &invalid_empty_page,
+            Some(HeaderSyncDecodeContext {
+                max_header_count: 1,
+                requested_tree_aux_schema: AuxSchema::None,
+            })
+        ),
+        Err(HeaderSyncWireError::InvalidHeadersCompletion)
+    ));
     let mut invalid_height = bytes;
     invalid_height[41..45].copy_from_slice(&(block::Height::MAX.0 + 1).to_le_bytes());
     assert!(matches!(
@@ -481,6 +588,36 @@ fn body_hints_completion_and_aux_defaults_are_enforced() {
             ..
         })
     ));
+}
+
+#[test]
+fn headers_encoding_uses_the_exact_known_payload_capacity() {
+    let header = regtest_genesis_block().header.clone();
+    let response = Headers {
+        request_id: 1,
+        target_tip_hash: block::Hash::from(header.as_ref()),
+        common_ancestor_height: block::Height(0),
+        common_ancestor_hash: header.previous_block_hash,
+        complete: true,
+        tree_aux_schema: AuxSchema::V1,
+        entries: vec![HeaderEntry {
+            header,
+            body_size: 0,
+            tree_aux: Some(empty_aux(block::Height(1))),
+        }],
+    };
+    let expected = headers_response_bytes(
+        &codec().network,
+        response.tree_aux_schema,
+        response.entries.len(),
+    )
+    .expect("the bounded fixture has a known payload size");
+    let encoded = codec()
+        .encode(&HeaderSyncMessage::Headers(response))
+        .expect("the exact-sized response encodes");
+
+    assert_eq!(encoded.len(), expected);
+    assert_eq!(encoded.capacity(), expected);
 }
 
 #[test]

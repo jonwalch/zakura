@@ -26,9 +26,9 @@ pub struct ZakuraHeaderSyncConfig {
     pub peer_limits: ServicePeerLimits,
     /// Consecutive unproductive header requests before this node drops the peer's session.
     ///
-    /// A request is unproductive when it times out, or when the peer answers a continuation
-    /// page that stages no new header. A peer that reports it is already at our selected tip
-    /// has answered correctly and is never charged. Set to `0` to never drop a peer.
+    /// A request is unproductive when its deadline expires. A peer that reports it is already
+    /// at our selected tip has answered correctly and is never charged. Set to `0` to never
+    /// drop a peer.
     pub max_unproductive_header_requests: u32,
     /// How long a peer dropped for being unproductive is refused header-sync readmission.
     ///
@@ -74,13 +74,23 @@ impl ZakuraHeaderSyncConfig {
         LOCAL_MAX_HS_INFLIGHT_PER_PEER
     }
 
+    /// Return the status refresh interval, clamped to the publication-rate floor.
+    pub fn effective_status_refresh_interval(&self) -> Duration {
+        self.status_refresh_interval.max(Duration::from_secs(1))
+    }
+
     /// Return the configured trusted anchor, or genesis when no override is configured.
     pub fn anchor(
         &self,
         network: &Network,
     ) -> Result<(block::Height, block::Hash), HeaderSyncStartError> {
         match (self.anchor_height, self.anchor_hash) {
-            (Some(height), Some(hash)) => Ok((height, hash)),
+            (Some(height), Some(hash)) if network.checkpoint_list().hash(height) == Some(hash) => {
+                Ok((height, hash))
+            }
+            (Some(height), Some(hash)) => Err(HeaderSyncStartError::InvalidAnchor {
+                anchor: (height, hash),
+            }),
             (None, None) => Ok((block::Height(0), network.genesis_hash())),
             _ => Err(HeaderSyncStartError::IncompleteAnchor),
         }

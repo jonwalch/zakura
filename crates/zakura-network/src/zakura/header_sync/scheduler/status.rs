@@ -30,7 +30,7 @@ impl StatusPublisher {
             last_sent: None,
             last_sent_at: None,
             pending_at: Some(now),
-            refresh_interval,
+            refresh_interval: refresh_interval.max(MIN_PUBLICATION_INTERVAL),
         }
     }
 
@@ -127,5 +127,14 @@ mod tests {
             publisher.next_deadline(),
             refresh_at + PUBLICATION_RETRY_DELAY
         );
+    }
+
+    #[test]
+    fn refresh_interval_is_clamped_to_the_publication_floor() {
+        let now = Instant::now();
+        let mut publisher = StatusPublisher::new(status(1), Duration::ZERO, now);
+
+        publisher.record_sent(status(1), now);
+        assert_eq!(publisher.next_deadline(), now + MIN_PUBLICATION_INTERVAL,);
     }
 }

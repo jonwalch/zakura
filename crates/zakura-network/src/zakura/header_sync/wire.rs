@@ -617,7 +617,19 @@ impl HeaderSyncCodec {
 
     /// Encode a locally constructed message after applying every wire invariant.
     pub fn encode(&self, message: &HeaderSyncMessage) -> Result<Vec<u8>, HeaderSyncWireError> {
-        let mut bytes = Vec::new();
+        let mut bytes = match message {
+            HeaderSyncMessage::Headers(response) => Vec::with_capacity(
+                headers_response_bytes(
+                    &self.network,
+                    response.tree_aux_schema,
+                    response.entries.len(),
+                )
+                .ok_or(HeaderSyncWireError::NumericOverflow(
+                    "header response bytes",
+                ))?,
+            ),
+            _ => Vec::new(),
+        };
         bytes.write_u8(message.message_type())?;
         match message {
             HeaderSyncMessage::Status(status) => self.encode_status(&mut bytes, status)?,

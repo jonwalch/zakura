@@ -67,7 +67,7 @@ impl HeaderSyncStartup {
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
     ) -> Self {
-        let status_refresh_interval = config.status_refresh_interval;
+        let status_refresh_interval = config.effective_status_refresh_interval();
         Self {
             network,
             anchor,
