@@ -1035,3 +1035,674 @@ impl HeaderGraphEdit for GraphOverlay<'_> {
         self.remove_leaf(hash)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    fn anchor_store() -> MemHeaderStore {
+        let block = regtest_genesis_block();
+        let hash = block.hash();
+        let work = block
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the regtest genesis target has valid work");
+        MemHeaderStore::new(
+            Frontier::new(block::Height(0), hash),
+            block.header.clone(),
+            work,
+            work.as_u256(),
+        )
+        .expect("the trusted fixture header matches its hash")
+    }
+
+    fn child(parent: block::Hash, seed: u8) -> Arc<block::Header> {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent;
+        header.nonce = [seed; 32].into();
+        Arc::new(header)
+    }
+
+    fn insert_child(store: &mut MemHeaderStore, parent: block::Hash, seed: u8) -> Frontier {
+        let header = child(parent, seed);
+        let work = header
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture target has valid work");
+        match store
+            .insert(
+                header,
+                work,
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the fixture parent is retained")
+        {
+            InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        }
+    }
+
+    fn rebuild_finalized_reference(
+        store: &mut MemHeaderStore,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError> {
+        let node = store
+            .node(finalized.hash)
+            .ok_or(GraphError::UnknownNode(finalized.hash))?;
+        if node.height != finalized.height {
+            return Err(GraphError::UnknownNode(finalized.hash));
+        }
+        if !node.is_eligible() {
+            return Err(GraphError::IneligibleFinalized(finalized.hash));
+        }
+        let mut retained = HashSet::new();
+        let mut pending = vec![finalized.hash];
+        while let Some(hash) = pending.pop() {
+            if retained.insert(hash) {
+                pending.extend(store.children(hash));
+            }
+        }
+        let mut deleted: Vec<_> = store
+            .nodes
+            .keys()
+            .copied()
+            .filter(|hash| !retained.contains(hash))
+            .collect();
+        deleted.sort_unstable_by_key(|hash| hash.0);
+        let nodes: Vec<_> = store
+            .nodes
+            .values()
+            .filter(|node| retained.contains(&node.hash))
+            .cloned()
+            .collect();
+        *store = MemHeaderStore::from_nodes(finalized, nodes)?;
+        store.recompute_all_eligibility()?;
+        Ok(deleted)
+    }
+
+    #[test]
+    fn conflicting_duplicate_reports_the_duplicate_hash() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let original = child(anchor.hash, 1);
+        let original_hash = original.hash();
+        let frontier = insert_child(&mut store, anchor.hash, 1);
+        assert_eq!(frontier.hash, original_hash);
+
+        store
+            .nodes
+            .get_mut(&original_hash)
+            .expect("the inserted fixture node is retained")
+            .header = child(anchor.hash, 2);
+        let work = original
+            .difficulty_threshold
+            .to_work()
+            .expect("the fixture target has valid work");
+
+        assert_eq!(
+            store.insert(
+                original,
+                work,
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            ),
+            Err(GraphError::ConflictingDuplicate(original_hash))
+        );
+    }
+
+    #[test]
+    fn removing_a_non_leaf_reports_that_its_children_are_retained() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let parent = insert_child(&mut store, anchor.hash, 1);
+        let _child = insert_child(&mut store, parent.hash, 2);
+
+        assert_eq!(
+            store.remove_leaf(parent.hash),
+            Err(GraphError::NodeHasChildren(parent.hash))
+        );
+        assert!(store.node(parent.hash).is_some());
+    }
+
+    #[test]
+    fn advancing_finality_retains_exactly_the_new_finalized_subtree() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let selected_parent = insert_child(&mut store, anchor.hash, 1);
+        let selected_child = insert_child(&mut store, selected_parent.hash, 2);
+        let selected_tip = insert_child(&mut store, selected_child.hash, 3);
+        let rejected_sibling = insert_child(&mut store, selected_parent.hash, 4);
+        let rejected_descendant = insert_child(&mut store, rejected_sibling.hash, 5);
+
+        let mut rebuilt = store.clone();
+        let rebuilt_deleted = rebuild_finalized_reference(&mut rebuilt, selected_child)
+            .expect("the rebuild oracle accepts the same finalized node");
+
+        let deleted = store
+            .advance_finalized(selected_child)
+            .expect("the retained selected node can become finalized");
+
+        assert_eq!(store.finalized(), selected_child);
+        assert_eq!(deleted, rebuilt_deleted);
+        assert_eq!(store.nodes, rebuilt.nodes);
+        assert_eq!(store.children, rebuilt.children);
+        assert_eq!(store.heights, rebuilt.heights);
+        assert_eq!(store.eligible_tips, rebuilt.eligible_tips);
+        assert!(store.node(selected_child.hash).is_some());
+        assert!(store.node(selected_tip.hash).is_some());
+        assert!(store.node(anchor.hash).is_none());
+        assert!(store.node(selected_parent.hash).is_none());
+        assert!(store.node(rejected_sibling.hash).is_none());
+        assert!(store.node(rejected_descendant.hash).is_none());
+        assert_eq!(
+            deleted.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([
+                anchor.hash,
+                selected_parent.hash,
+                rejected_sibling.hash,
+                rejected_descendant.hash,
+            ])
+        );
+    }
+
+    #[test]
+    fn advancing_finality_rejects_an_ineligible_root_without_mutation() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let candidate = insert_child(&mut store, anchor.hash, 1);
+        store
+            .add_reason(
+                candidate.hash,
+                EligibilityReason::CheckpointConflict {
+                    height: candidate.height,
+                    expected: block::Hash([0xee; 32]),
+                },
+            )
+            .expect("the fixture marks the candidate ineligible");
+        let before = store.clone();
+
+        assert_eq!(
+            store.advance_finalized(candidate),
+            Err(GraphError::IneligibleFinalized(candidate.hash))
+        );
+        assert_eq!(store.nodes, before.nodes);
+        assert_eq!(store.children, before.children);
+        assert_eq!(store.heights, before.heights);
+        assert_eq!(store.eligible_tips, before.eligible_tips);
+        assert_eq!(store.finalized, before.finalized);
+    }
+
+    fn uncached_eligible_tips(store: &MemHeaderStore) -> Vec<Frontier> {
+        let mut tips: Vec<_> = store
+            .nodes
+            .values()
+            .filter(|node| {
+                node.is_eligible()
+                    && !store.children.get(&node.hash).is_some_and(|children| {
+                        children.iter().any(|child| {
+                            store.nodes.get(child).is_some_and(HeaderNode::is_eligible)
+                        })
+                    })
+            })
+            .map(|node| Frontier::new(node.height, node.hash))
+            .collect();
+        tips.sort_unstable_by_key(|tip| tip.hash.0);
+        tips
+    }
+
+    #[derive(Clone)]
+    struct ReferenceNode {
+        hash: block::Hash,
+        parent: Option<block::Hash>,
+        cumulative_work: U256,
+        validation: HeaderValidationState,
+        direct_reasons: BTreeSet<EligibilityReason>,
+    }
+
+    struct ReferenceDag {
+        anchor: block::Hash,
+        anchor_work: U256,
+        nodes: HashMap<block::Hash, ReferenceNode>,
+        insertion_order: Vec<block::Hash>,
+    }
+
+    impl ReferenceDag {
+        fn new(anchor: &HeaderNode) -> Self {
+            let node = ReferenceNode {
+                hash: anchor.hash,
+                parent: None,
+                cumulative_work: U256::zero(),
+                validation: HeaderValidationState::Valid,
+                direct_reasons: BTreeSet::new(),
+            };
+            Self {
+                anchor: anchor.hash,
+                anchor_work: U256::zero(),
+                nodes: HashMap::from([(anchor.hash, node)]),
+                insertion_order: vec![anchor.hash],
+            }
+        }
+
+        fn insert(&mut self, hash: block::Hash, parent: block::Hash, work: Work) {
+            let cumulative_work = self.nodes[&parent]
+                .cumulative_work
+                .checked_add(work.as_u256())
+                .expect("generated reference work does not overflow");
+            self.nodes.insert(
+                hash,
+                ReferenceNode {
+                    hash,
+                    parent: Some(parent),
+                    cumulative_work,
+                    validation: HeaderValidationState::Valid,
+                    direct_reasons: BTreeSet::new(),
+                },
+            );
+            self.insertion_order.push(hash);
+        }
+
+        fn is_eligible(&self, mut hash: block::Hash) -> bool {
+            loop {
+                let node = &self.nodes[&hash];
+                if node.validation != HeaderValidationState::Valid
+                    || !node.direct_reasons.is_empty()
+                {
+                    return false;
+                }
+                let Some(parent) = node.parent else {
+                    return hash == self.anchor;
+                };
+                hash = parent;
+            }
+        }
+
+        fn selected(&self) -> block::Hash {
+            self.nodes
+                .values()
+                .filter(|node| self.is_eligible(node.hash))
+                .max_by(|left, right| {
+                    let left_work = left
+                        .cumulative_work
+                        .checked_sub(self.anchor_work)
+                        .expect("reference descendants have anchor work");
+                    let right_work = right
+                        .cumulative_work
+                        .checked_sub(self.anchor_work)
+                        .expect("reference descendants have anchor work");
+                    left_work
+                        .cmp(&right_work)
+                        .then_with(|| left.hash.0.cmp(&right.hash.0))
+                })
+                .expect("the reference anchor is always eligible")
+                .hash
+        }
+    }
+
+    fn operation_header(parent: block::Hash, operation: usize) -> Arc<block::Header> {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent;
+        let operation = u64::try_from(operation).expect("test operation index fits in u64");
+        let mut nonce = [0; 32];
+        nonce[..8].copy_from_slice(&operation.to_le_bytes());
+        header.nonce = nonce.into();
+        Arc::new(header)
+    }
+
+    #[test]
+    fn fork_indexes_selection_and_inherited_reason_sets_are_exact() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let left = insert_child(&mut store, anchor.hash, 1);
+        let right = insert_child(&mut store, anchor.hash, 2);
+        assert_eq!(store.hashes_at_height(block::Height(1)).len(), 2);
+
+        let left_tip = insert_child(&mut store, left.hash, 3);
+        assert_eq!(
+            store.select_header_best().expect("graph is coherent").0,
+            left_tip
+        );
+
+        let first = EligibilityReason::OperatorInvalid {
+            id: crate::OperatorInvalidationId::new([1; 16]),
+        };
+        let second = EligibilityReason::OperatorInvalid {
+            id: crate::OperatorInvalidationId::new([2; 16]),
+        };
+        store
+            .add_reason(left.hash, first)
+            .expect("left is retained");
+        store
+            .add_reason(left.hash, second)
+            .expect("left is retained");
+        assert_eq!(
+            store
+                .node(left.hash)
+                .expect("retained")
+                .eligibility
+                .direct_reasons
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .node(left_tip.hash)
+                .expect("retained")
+                .eligibility
+                .inherited_from,
+            Some(left.hash)
+        );
+        assert_eq!(
+            store.select_header_best().expect("graph is coherent").0,
+            right
+        );
+
+        store
+            .remove_operator_invalidation(left.hash, crate::OperatorInvalidationId::new([1; 16]))
+            .expect("left is retained");
+        assert!(!store.node(left.hash).expect("retained").is_eligible());
+        store
+            .remove_operator_invalidation(left.hash, crate::OperatorInvalidationId::new([2; 16]))
+            .expect("left is retained");
+        assert!(store.node(left_tip.hash).expect("retained").is_eligible());
+        assert_eq!(
+            store.select_header_best().expect("graph is coherent").0,
+            left_tip
+        );
+    }
+
+    #[test]
+    fn operator_reconsider_preserves_every_unnamed_reason() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let target = insert_child(&mut store, anchor.hash, 1);
+        let descendant = insert_child(&mut store, target.hash, 2);
+        let first_id = crate::OperatorInvalidationId::new([1; 16]);
+        let second_id = crate::OperatorInvalidationId::new([2; 16]);
+        let permanent_reasons = [
+            EligibilityReason::SettledUpgradeConflict {
+                height: target.height,
+                expected: block::Hash([3; 32]),
+            },
+            EligibilityReason::CheckpointConflict {
+                height: target.height,
+                expected: block::Hash([4; 32]),
+            },
+            EligibilityReason::FinalityConflict { finalized: anchor },
+        ];
+        for reason in permanent_reasons.clone() {
+            store
+                .add_reason(target.hash, reason)
+                .expect("the operator target is retained");
+        }
+        for id in [first_id, second_id] {
+            store
+                .add_reason(target.hash, EligibilityReason::OperatorInvalid { id })
+                .expect("the operator target is retained");
+        }
+        let body_evidence = EvidenceId::from_digest([5; 32]);
+        let body_rule = BodyRuleId::new("test.operator-reconsider");
+        store
+            .set_consensus_body_invalid(target.hash, body_evidence, body_rule.clone())
+            .expect("intrinsic body invalidity is recorded independently");
+
+        store
+            .remove_operator_invalidation(target.hash, first_id)
+            .expect("the operator target is retained");
+
+        let target_node = store.node(target.hash).expect("the target is retained");
+        assert!(!target_node
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::OperatorInvalid { id: first_id }));
+        assert!(target_node
+            .eligibility
+            .direct_reasons
+            .contains(&EligibilityReason::OperatorInvalid { id: second_id }));
+        for reason in permanent_reasons {
+            assert!(target_node.eligibility.direct_reasons.contains(&reason));
+        }
+        assert!(target_node.eligibility.direct_reasons.contains(
+            &EligibilityReason::ConsensusBodyInvalid {
+                evidence: body_evidence,
+                rule: body_rule,
+            }
+        ));
+        assert_eq!(
+            store
+                .node(descendant.hash)
+                .expect("the descendant is retained")
+                .eligibility
+                .inherited_from,
+            Some(target.hash)
+        );
+    }
+
+    #[test]
+    // DG-05: testing one below, at, and one above the retention boundary in
+    // both insertion orders covers the fixed-anchor replacement edge.
+    fn fixed_anchor_replacements_cover_finalization_boundary_in_both_orders() {
+        fn insert_branch(
+            store: &mut MemHeaderStore,
+            anchor: Frontier,
+            count: u32,
+            seed_offset: u32,
+        ) -> Frontier {
+            let mut tip = anchor;
+            for offset in 0..count {
+                let seed =
+                    u8::try_from((offset + seed_offset) % 251).expect("reduced nonce fits in u8");
+                tip = insert_child(store, tip.hash, seed);
+            }
+            tip
+        }
+
+        for incumbent_depth in [999, 1_000, 1_001] {
+            for competitor_first in [false, true] {
+                let mut store = anchor_store();
+                let anchor = store.finalized();
+                let (incumbent, competitor) = if competitor_first {
+                    let competitor = insert_branch(&mut store, anchor, incumbent_depth + 1, 127);
+                    let incumbent = insert_branch(&mut store, anchor, incumbent_depth, 0);
+                    (incumbent, competitor)
+                } else {
+                    let incumbent = insert_branch(&mut store, anchor, incumbent_depth, 0);
+                    assert_eq!(
+                        store.select_header_best().expect("graph is coherent").0,
+                        incumbent
+                    );
+                    let competitor = insert_branch(&mut store, anchor, incumbent_depth + 1, 127);
+                    (incumbent, competitor)
+                };
+                assert_ne!(incumbent.hash, competitor.hash);
+                assert_eq!(
+                    store.select_header_best().expect("graph is coherent").0,
+                    competitor,
+                    "selection is anchored at finalized and independent of depth or arrival order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_availability_does_not_override_header_work_or_mark_other_bodies() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let verified = child(anchor.hash, 41);
+        let work = verified.difficulty_threshold.to_work().expect("valid work");
+        let verified_hash = verified.hash();
+        store
+            .insert(
+                verified,
+                work,
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Verified {
+                    evidence: crate::EvidenceId::from_digest([4; 32]),
+                },
+            )
+            .expect("verified fixture is inserted");
+        let unknown_parent = insert_child(&mut store, anchor.hash, 51);
+        let unknown_tip = insert_child(&mut store, unknown_parent.hash, 52);
+        store
+            .set_body_state(
+                unknown_tip.hash,
+                BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+                    attempts: 10,
+                    suppliers: 0,
+                    alarmed: true,
+                    ..Default::default()
+                }),
+            )
+            .expect("the unavailable tip is retained");
+
+        assert_eq!(
+            store.select_header_best().expect("graph is coherent").0,
+            unknown_tip
+        );
+        assert_eq!(
+            store.node(verified_hash).expect("retained").body,
+            BodyValidationState::Verified {
+                evidence: crate::EvidenceId::from_digest([4; 32])
+            }
+        );
+        assert_eq!(
+            store.node(unknown_tip.hash).expect("retained").body,
+            BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+                attempts: 10,
+                suppliers: 0,
+                alarmed: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn insertion_permutations_match_an_independent_greatest_work_model(
+            branch_lengths in prop::collection::vec(1_u8..8, 1..8),
+            reverse in any::<bool>(),
+        ) {
+            let mut store = anchor_store();
+            let anchor = store.finalized();
+            let mut branches = Vec::new();
+            for (branch, length) in branch_lengths.iter().copied().enumerate() {
+                let mut parent = anchor.hash;
+                let mut headers = Vec::new();
+                for offset in 0..length {
+                    let branch = u8::try_from(branch).expect("generated branch count fits in u8");
+                    let seed = branch.wrapping_mul(17).wrapping_add(offset).wrapping_add(1);
+                    let header = child(parent, seed);
+                    parent = header.hash();
+                    headers.push(header);
+                }
+                branches.push(headers);
+            }
+            if reverse {
+                branches.reverse();
+            }
+            for headers in &branches {
+                for header in headers {
+                    let work = header.difficulty_threshold.to_work().expect("fixture target is valid");
+                    store.insert(
+                        header.clone(),
+                        work,
+                        HeaderValidationState::Valid,
+                        [],
+                        BodyValidationState::Unknown,
+                    ).expect("each branch is inserted parent first");
+                }
+            }
+
+            let expected = branches
+                .iter()
+                .map(|branch| {
+                    let tip = branch.last().expect("generated branches are nonempty");
+                    (branch.len(), tip.hash().0, tip.hash())
+                })
+                .max_by_key(|(length, hash_bytes, _)| (*length, *hash_bytes))
+                .expect("at least one branch was generated")
+                .2;
+            prop_assert_eq!(store.select_header_best().expect("graph is coherent").0.hash, expected);
+        }
+
+
+        #[test]
+        fn arbitrary_graph_operations_match_an_independent_uncached_model(
+            operations in prop::collection::vec((0_u8..5, any::<usize>()), 1..100),
+        ) {
+            let mut store = anchor_store();
+            let anchor = store.node(store.finalized().hash).expect("anchor is retained").clone();
+            let mut model = ReferenceDag::new(&anchor);
+
+            for (operation_index, (kind, target)) in operations.into_iter().enumerate() {
+                let target_index = target % model.insertion_order.len();
+                let target_hash = model.insertion_order[target_index];
+                let mut id_bytes = [0; 16];
+                let target_id = u64::try_from(target_index).expect("test node index fits in u64");
+                id_bytes[..8].copy_from_slice(&target_id.to_le_bytes());
+                let reason = EligibilityReason::OperatorInvalid {
+                    id: crate::OperatorInvalidationId::new(id_bytes),
+                };
+
+                match kind {
+                    0 => {
+                        let header = operation_header(target_hash, operation_index + 1);
+                        let hash = header.hash();
+                        let work = header.difficulty_threshold.to_work().expect("fixture target is valid");
+                        store.insert(
+                            header,
+                            work,
+                            HeaderValidationState::Valid,
+                            [],
+                            BodyValidationState::Unknown,
+                        ).expect("generated parent is retained");
+                        model.insert(hash, target_hash, work);
+                    }
+                    1 => {
+                        if target_hash != model.anchor {
+                            store
+                                .add_reason(target_hash, reason.clone())
+                                .expect("target is retained");
+                            model.nodes.get_mut(&target_hash).expect("target exists").direct_reasons.insert(reason);
+                        }
+                    }
+                    2 => {
+                        if target_hash != model.anchor {
+                            let EligibilityReason::OperatorInvalid { id } = reason else {
+                                unreachable!("the generated reason is operator-scoped")
+                            };
+                            store.remove_operator_invalidation(target_hash, id).expect("target is retained");
+                            model.nodes.get_mut(&target_hash).expect("target exists").direct_reasons.remove(&reason);
+                        }
+                    }
+                    3 => {
+                        if target_hash != model.anchor {
+                            let until = regtest_genesis_block().header.time + chrono::Duration::days(1);
+                            store.set_validation(target_hash, HeaderValidationState::DeferredUntil(until)).expect("target is retained");
+                            model.nodes.get_mut(&target_hash).expect("target exists").validation = HeaderValidationState::DeferredUntil(until);
+                        }
+                    }
+                    4 => {
+                        if target_hash != model.anchor {
+                            store.set_validation(target_hash, HeaderValidationState::Valid).expect("target is retained");
+                            model.nodes.get_mut(&target_hash).expect("target exists").validation = HeaderValidationState::Valid;
+                        }
+                    }
+                    _ => unreachable!("the generated operation kind is bounded"),
+                }
+
+                prop_assert_eq!(
+                    store.select_header_best().expect("graph is coherent").0.hash,
+                    model.selected(),
+                );
+                prop_assert_eq!(store.eligible_tips(), uncached_eligible_tips(&store));
+            }
+        }
+    }
+}

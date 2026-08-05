@@ -315,3 +315,225 @@ const _: () = assert!(MAX_BLOCK_REORG_HEIGHT == 1_000);
 const _: () = assert!(MAX_CANDIDATE_TIPS_V1 == 10);
 const _: () = assert!(MAX_NON_FINALIZED_NODES_V1 == 65_536);
 const _: () = assert!(MAX_STAGED_TARGETS_V1 == 16);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use zakura_chain::{
+        block::{genesis::regtest_genesis_block, Block},
+        parameters::testnet::RegtestParameters,
+        serialization::ZcashDeserialize,
+    };
+
+    #[test]
+    fn engine_limits_v1_match_the_frozen_specification() {
+        let limits = EngineLimits::v1();
+        assert_eq!(limits.local_finality_depth.get(), 1_000);
+        assert_eq!(limits.max_candidate_tips.get(), 10);
+        assert_eq!(limits.max_non_finalized_nodes.get(), 65_536);
+    }
+
+    #[test]
+    fn release_manifest_pins_exact_v1_3_production_tuples() {
+        let manifest = SettledUpgradeManifest::for_release().expect("compiled pins are valid");
+        let pins: Vec<_> = manifest.iter().collect();
+        assert_eq!(pins.len(), 2);
+
+        let mainnet = manifest
+            .pin_for_network(&Network::Mainnet)
+            .expect("mainnet has a mandatory pin");
+        assert_eq!(mainnet.upgrade, NetworkUpgrade::Nu6_2);
+        assert_eq!(mainnet.activation.height, block::Height(3_364_600));
+        assert_eq!(mainnet.activation.hash.0[0], 0x65);
+        assert_eq!(mainnet.activation.hash.0[31], 0x00);
+        assert_eq!(
+            mainnet.activation.hash.to_string(),
+            "0000000000806344c408a4cfdf472f4132c632edbdc24cf2f3f672061da8b865"
+        );
+
+        let testnet = manifest
+            .pin_for_network(&Network::new_default_testnet())
+            .expect("default testnet has a mandatory pin");
+        assert_eq!(testnet.upgrade, NetworkUpgrade::Nu6_2);
+        assert_eq!(testnet.activation.height, block::Height(4_052_000));
+        assert_eq!(testnet.activation.hash.0[0], 0x12);
+        assert_eq!(testnet.activation.hash.0[31], 0x00);
+        assert_eq!(
+            testnet.activation.hash.to_string(),
+            "0010cb912b0188da5bc055ee67e3f77d30cd27611369d865974a5bf0b1ec2912"
+        );
+
+        let regtest = Network::new_regtest(RegtestParameters::default());
+        assert_eq!(manifest.pin_for_network(&regtest), None);
+        assert_eq!(
+            manifest.digest(),
+            SettledUpgradeManifest::for_release()
+                .expect("compiled pins are deterministic")
+                .digest()
+        );
+    }
+
+    #[test]
+    fn production_config_always_installs_the_release_manifest() {
+        for (network, bytes) in [
+            (
+                Network::Mainnet,
+                zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+            ),
+            (
+                Network::new_default_testnet(),
+                zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES.as_slice(),
+            ),
+        ] {
+            let block = Arc::<Block>::zcash_deserialize(bytes)
+                .expect("the production genesis vector is canonical");
+            let config = EngineConfig::new(
+                EngineMode::Integrated,
+                network.clone(),
+                TrustedAnchor {
+                    frontier: Frontier::new(block::Height(0), block.hash()),
+                    header: block.header.clone(),
+                },
+                CheckpointSet::default(),
+            )
+            .expect("the production genesis anchor passes every direct check");
+            assert!(config.settled_manifest.pin_for_network(&network).is_some());
+        }
+    }
+
+    #[test]
+    fn trusted_anchor_still_runs_every_directly_observable_check() {
+        let sapling =
+            Arc::<Block>::zcash_deserialize(zakura_test::vectors::MAINNET_BLOCKS[&419_200])
+                .expect("the Mainnet Sapling activation vector is canonical");
+        let make_config = |network: Network, height: block::Height, header: Arc<block::Header>| {
+            let frontier_hash =
+                crate::validate_encoding_version_hash(&header).unwrap_or(block::Hash([0; 32]));
+            EngineConfig::new(
+                EngineMode::Integrated,
+                network,
+                TrustedAnchor {
+                    frontier: Frontier::new(height, frontier_hash),
+                    header,
+                },
+                CheckpointSet::default(),
+            )
+        };
+        make_config(
+            Network::Mainnet,
+            block::Height(419_200),
+            sapling.header.clone(),
+        )
+        .expect("the real production activation anchor passes every direct check");
+
+        let mut bad_version = *sapling.header;
+        bad_version.version = 3;
+        assert_eq!(
+            make_config(
+                Network::Mainnet,
+                block::Height(419_200),
+                Arc::new(bad_version)
+            ),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "canonical header version and hash"
+            ))
+        );
+
+        let mut bad_commitment = *sapling.header;
+        bad_commitment.commitment_bytes.0 = [0xff; 32];
+        assert_eq!(
+            make_config(
+                Network::Mainnet,
+                block::Height(419_200),
+                Arc::new(bad_commitment)
+            ),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "height-dependent commitment structure"
+            ))
+        );
+
+        let mut bad_target = *sapling.header;
+        bad_target.difficulty_threshold =
+            zakura_chain::work::difficulty::CompactDifficulty::from_le_bytes([0; 4]);
+        assert_eq!(
+            make_config(
+                Network::Mainnet,
+                block::Height(419_200),
+                Arc::new(bad_target)
+            ),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "compact target and network limit"
+            ))
+        );
+
+        let target = crate::validate_compact_target(&sapling.header, &Network::Mainnet)
+            .expect("the vector target is valid");
+        let mut bad_hash = *sapling.header;
+        bad_hash.nonce.0[0] = bad_hash.nonce.0[0].wrapping_add(1);
+        assert!(
+            crate::validate_hash_filter(bad_hash.hash(), target).is_err(),
+            "the deterministic nonce mutation no longer satisfies production work"
+        );
+        assert_eq!(
+            make_config(Network::Mainnet, block::Height(419_200), Arc::new(bad_hash)),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "header hash filter"
+            ))
+        );
+
+        let regtest = Network::new_regtest(RegtestParameters::default());
+        let mut wrong_solution_shape = *regtest_genesis_block().header;
+        wrong_solution_shape.solution = zakura_chain::work::equihash::Solution::for_proposal();
+        assert_eq!(
+            make_config(regtest, block::Height(0), Arc::new(wrong_solution_shape)),
+            Err(EngineConfigError::InvalidTrustedAnchor(
+                "Equihash solution shape or proof"
+            ))
+        );
+    }
+
+    #[test]
+    fn engine_config_binds_and_validates_every_trust_anchor() {
+        let block = regtest_genesis_block();
+        let network = Network::new_regtest(RegtestParameters::default());
+        let anchor = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), block.hash()),
+            header: block.header.clone(),
+        };
+        let plain = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            network.clone(),
+            anchor.clone(),
+            CheckpointSet::default(),
+        )
+        .expect("the fixture anchor is canonical");
+        let checkpointed = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            network.clone(),
+            anchor.clone(),
+            CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([9; 32]))])
+                .expect("the fixture checkpoint set has unique heights"),
+        )
+        .expect("the fixture checkpoint is hash-qualified");
+        assert_ne!(
+            plain.trust_anchor_digest(),
+            checkpointed.trust_anchor_digest()
+        );
+
+        let mismatched = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), block::Hash([1; 32])),
+            ..anchor
+        };
+        assert!(matches!(
+            EngineConfig::new(
+                EngineMode::HeadersOnly,
+                network,
+                mismatched,
+                CheckpointSet::default()
+            ),
+            Err(EngineConfigError::AnchorHashMismatch { .. })
+        ));
+    }
+}
