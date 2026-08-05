@@ -19,6 +19,7 @@ use tokio::fs;
 
 use tracing::Span;
 use zakura_chain::{
+    block,
     common::atomic_write,
     parameters::{
         testnet::{
@@ -973,6 +974,14 @@ struct DTestnetParameters {
     pow_max_adjust_up_percent: Option<i32>,
     /// The maximum downward adjustment percentage for median timespan variance.
     pow_max_adjust_down_percent: Option<i32>,
+    /// The height at which proof-of-work validation begins.
+    ///
+    /// Blocks below this height skip the Equihash solution check, the difficulty
+    /// filter, and the contextual difficulty-adjustment check. This exists so a
+    /// private network can be seeded with cheap unsolved blocks and still enforce
+    /// real proof-of-work at its configured `target_difficulty_limit` from the
+    /// seeded tip onwards. If unset, proof-of-work is enforced from genesis.
+    pow_start_height: Option<u32>,
     #[serde(default)]
     checkpoints: ConfiguredCheckpoints,
     /// If `true`, automatically repeats configured funding stream addresses to fill
@@ -1096,6 +1105,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             pow_damping_factor: Some(params.pow_damping_factor()),
             pow_max_adjust_up_percent: Some(params.pow_max_adjust_up_percent()),
             pow_max_adjust_down_percent: Some(params.pow_max_adjust_down_percent()),
+            pow_start_height: params.pow_start_height().map(|height| height.0),
             checkpoints: if params.checkpoints() == testnet::Parameters::default().checkpoints() {
                 ConfiguredCheckpoints::Default(true)
             } else {
@@ -1376,6 +1386,7 @@ where
         pow_damping_factor,
         pow_max_adjust_up_percent,
         pow_max_adjust_down_percent,
+        pow_start_height,
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
@@ -1418,6 +1429,14 @@ where
 
     if let Some(disable_pow) = disable_pow {
         params_builder = params_builder.with_disable_pow(disable_pow);
+    }
+
+    if let Some(pow_start_height) = pow_start_height {
+        params_builder = params_builder
+            .with_pow_start_height(Some(
+                block::Height::try_from(pow_start_height).map_err(de::Error::custom)?,
+            ))
+            .map_err(de::Error::custom)?;
     }
 
     // Each proof-of-work parameter defaults to the consensus value, so an

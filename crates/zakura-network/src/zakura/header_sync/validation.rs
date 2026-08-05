@@ -107,7 +107,7 @@ pub async fn validate_headers_stateless(
     validate_internal_continuity(&headers)?;
     validate_header_times(&headers, context.now, context.start_height)?;
     validate_solution_sizes(&headers, context.network)?;
-    validate_pow_spawn_blocking(headers, context.network).await
+    validate_pow_spawn_blocking(headers, context.network, context.start_height).await
 }
 
 /// Check that a header range links to its anchor and is internally contiguous.
@@ -145,7 +145,7 @@ pub async fn validate_new_block_stateless(
     let header = block.header.clone();
     validate_header_times(std::slice::from_ref(&header), now, height)?;
     validate_solution_sizes(std::slice::from_ref(&header), network)?;
-    validate_pow_spawn_blocking(vec![header], network).await
+    validate_pow_spawn_blocking(vec![header], network, height).await
 }
 
 pub(super) fn validate_header_count(
@@ -212,14 +212,17 @@ pub(super) fn validate_solution_sizes(
 pub(super) async fn validate_pow_spawn_blocking(
     headers: Vec<Arc<block::Header>>,
     network: &Network,
+    start_height: block::Height,
 ) -> Result<(), HeaderSyncWireError> {
     let network = network.clone();
-    tokio::task::spawn_blocking(move || validate_pow_blocking(&headers, &network)).await?
+    tokio::task::spawn_blocking(move || validate_pow_blocking(&headers, &network, start_height))
+        .await?
 }
 
 pub(super) fn validate_pow_blocking(
     headers: &[Arc<block::Header>],
     network: &Network,
+    start_height: block::Height,
 ) -> Result<(), HeaderSyncWireError> {
     // Custom testnets can disable PoW without using Regtest parameters. Keep
     // native header sync aligned with semantic and checkpoint verification.
@@ -227,7 +230,24 @@ pub(super) fn validate_pow_blocking(
         return Ok(());
     }
 
-    for header in headers {
+    for (offset, header) in headers.iter().enumerate() {
+        let offset = u32::try_from(offset)
+            .map_err(|_| HeaderSyncWireError::NumericOverflow("header height offset"))?;
+        let height = block::Height(
+            start_height
+                .0
+                .checked_add(offset)
+                .ok_or(HeaderSyncWireError::NumericOverflow("header height"))?,
+        );
+
+        // A network seeded with unsolved blocks enforces PoW only from its
+        // configured start height. Checkpoint and semantic verification make the
+        // same exemption, so header sync has to as well or it rejects the seed
+        // chain it is trying to download.
+        if network.should_skip_pow_at_height(height) {
+            continue;
+        }
+
         // Bind the Equihash parameters to `network` so a short 36-byte
         // Regtest-shaped solution cannot pass the PoW check on Mainnet/Testnet.
         header.solution.check(header, network)?;

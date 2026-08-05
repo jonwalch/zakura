@@ -371,8 +371,18 @@ pub(crate) fn difficulty_threshold_and_time_are_valid(
     // equality check guaranteed this on PoW networks -- otherwise computing the
     // chain's cumulative work later panics (`to_work().expect`), which a
     // crafted block could use to crash the node.
+    //
+    // Blocks below a configured `pow_start_height` get the same relaxation, for
+    // the same reason: they are seed blocks seeded at the network's PoW limit,
+    // and once the seeded chain is longer than `PoWAveragingWindow` the
+    // adjustment starts deriving an expectation from their spacing. Those blocks
+    // sit before Blossom activates, so the adjustment measures them against the
+    // fixed 150-second pre-Blossom spacing no matter what the network targets,
+    // and a chain seeded at any other spacing would be rejected at replay. The
+    // first block at `pow_start_height` and everything after it is checked
+    // strictly, which is what pins the live chain to its configured difficulty.
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
-    if network.disable_pow() {
+    if network.disable_pow() || network.should_skip_pow_at_height(candidate_height) {
         if difficulty_threshold.to_work().is_none() {
             Err(ValidateContextError::InvalidDifficultyThreshold {
                 difficulty_threshold,
