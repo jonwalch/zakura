@@ -167,6 +167,70 @@ pub enum DownloadAction {
     FullQueue,
 }
 
+/// Per-hash re-request budgets for gossiped blocks rejected as poisoned, scoped to one tip.
+///
+/// The counts and the tip they belong to are paired here because neither is meaningful alone:
+/// a count only bounds anything while it is read against the tip it was recorded under.
+///
+/// # Lifetime
+///
+/// An exhausted budget is *not* released on exhaustion. Doing so would re-arm it, letting a peer
+/// buy a fresh set of re-requests by poisoning the same hash again. Budgets are released in
+/// exactly two places:
+///
+/// - [`Self::release`], when the block is finally downloaded — the only outcome that means the
+///   budget did its job.
+/// - [`Self::consume`], for *every* hash, on the first call after the tip moves.
+///
+/// The second is what actually bounds the map, because gossip usually is not the path that
+/// resolves the block: exhaustion explicitly leaves it to the syncer, whose downloads never
+/// reach [`Self::release`]. It is sound because this check only ever fires for children of the
+/// current tip, so an entry recorded under an older tip could never be read again.
+///
+/// That is also why a tip change cannot re-arm an exhausted budget: once the tip moves, the
+/// exhausted hash is no longer a tip child and can never produce a mismatch, so its fresh budget
+/// is unreachable. The one exception is a reorg back to the original tip, which costs the
+/// attacker further bannable addresses to exploit.
+///
+/// The clear is lazy — it happens on the next rejection, not when the tip moves — so a node whose
+/// attacker has stopped keeps one tip's worth of entries until the next rejection or process exit.
+#[derive(Debug, Default)]
+struct PoisonedRetryBudgets {
+    /// Re-requests already spent, keyed by block hash.
+    counts: HashMap<block::Hash, usize>,
+
+    /// The tip [`Self::counts`] is scoped to.
+    tip: Option<block::Hash>,
+}
+
+impl PoisonedRetryBudgets {
+    /// Spends one re-request from `hash`'s budget under `tip_hash`, returning the attempt number.
+    ///
+    /// Returns `None` when the budget is exhausted, leaving the block to the syncer. Discards
+    /// every budget first if `tip_hash` differs from the one they were recorded under.
+    fn consume(&mut self, hash: block::Hash, tip_hash: Option<block::Hash>) -> Option<usize> {
+        if self.tip != tip_hash {
+            self.counts.clear();
+            self.tip = tip_hash;
+        }
+
+        let spent = self.counts.entry(hash).or_default();
+
+        if *spent >= POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
+            return None;
+        }
+
+        *spent += 1;
+
+        Some(*spent)
+    }
+
+    /// Releases `hash`'s budget, because the block was downloaded.
+    fn release(&mut self, hash: &block::Hash) {
+        self.counts.remove(hash);
+    }
+}
+
 /// Manages download and verification of blocks gossiped to this peer.
 #[pin_project]
 #[derive(Debug)]
@@ -227,22 +291,8 @@ where
     /// Number of admitted tasks, active or waiting, per source.
     source_counts: HashMap<AdvertiserSource, usize>,
 
-    /// Re-request counts for gossiped hashes whose body was rejected as poisoned, keyed by
-    /// block hash. Bounded by [`POISONED_GOSSIP_BLOCK_RETRY_LIMIT`].
-    ///
-    /// An exhausted budget is *not* cleared: doing so would re-arm it, letting a peer buy a
-    /// fresh set of re-requests by poisoning the same hash again. Entries are dropped when the
-    /// hash is downloaded by this stream, and — because the syncer commonly resolves it
-    /// instead — on the first rejection after [`Self::poisoned_retry_tip`] moves. That clear is
-    /// lazy: if the attack stops, one tip's worth of entries stays resident.
-    poisoned_retry_counts: HashMap<block::Hash, usize>,
-
-    /// The tip [`Self::poisoned_retry_counts`] is scoped to.
-    ///
-    /// Poisoned-height rejections only ever apply to children of our own tip, so every entry
-    /// becomes meaningless once the tip moves — including when the syncer, rather than gossip,
-    /// is the one that resolves the block.
-    poisoned_retry_tip: Option<block::Hash>,
+    /// Re-request budgets for gossiped hashes whose body was rejected as poisoned.
+    poisoned_retries: PoisonedRetryBudgets,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -275,7 +325,7 @@ where
                 match join_result.expect("block download and verify tasks must not panic") {
                     Ok(hash) => {
                         // The block finally arrived, so its poisoned-retry budget is spent.
-                        this.poisoned_retry_counts.remove(&hash);
+                        this.poisoned_retries.release(&hash);
                         (Ok(hash), hash)
                     }
                     Err((e, hash, advertiser_addr)) => (Err((e, advertiser_addr)), hash),
@@ -346,8 +396,7 @@ where
             cancel_handles: HashMap::new(),
             source_locks: HashMap::new(),
             source_counts: HashMap::new(),
-            poisoned_retry_counts: HashMap::new(),
-            poisoned_retry_tip: None,
+            poisoned_retries: PoisonedRetryBudgets::default(),
         }
     }
 
@@ -388,32 +437,11 @@ where
     /// which case the budget is spent without dispatching anything; that case is logged here, so
     /// callers do not need to inspect the result.
     pub fn retry_poisoned(&mut self, hash: block::Hash) -> Option<DownloadAction> {
-        // Scope the budgets to the current tip. Every entry describes a child of the tip it was
-        // recorded against, so once the tip moves it can never be consulted again: the height
-        // check only fires for children of the *current* tip. That is also why this clear cannot
-        // re-arm an exhausted budget — the fresh budget belongs to a hash that can no longer
-        // produce a mismatch.
-        //
-        // Dropping them here is what keeps the map bounded, since the exhaustion path
-        // deliberately leaves entries in place and tells the caller to leave the block to the
-        // syncer, whose downloads never reach the `poll_next` release point below. The clear is
-        // lazy, so a quiescent node holds one tip's worth of entries until the next rejection.
-        //
-        // This reads the tip later than the rejection did, so they can disagree — usually
-        // because the syncer committed the block in between. See the method docs.
+        // The tip is read here, later than the rejection read it, so the two can disagree —
+        // usually because the syncer committed the block in between. See the method docs.
         let tip_hash = self.latest_chain_tip.best_tip_hash();
-        if self.poisoned_retry_tip != tip_hash {
-            self.poisoned_retry_counts.clear();
-            self.poisoned_retry_tip = tip_hash;
-        }
 
-        let retry_count = self.poisoned_retry_counts.entry(hash).or_default();
-
-        if *retry_count >= POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
-            // The entry is deliberately left in place. Clearing it here would re-arm the budget,
-            // so the next poisoned body for the same hash would buy three more re-requests. The
-            // entry is cleared when the block is finally downloaded, in `poll_next`, which is the
-            // only outcome that means the budget did its job.
+        let Some(retry_attempt) = self.poisoned_retries.consume(hash, tip_hash) else {
             warn!(
                 ?hash,
                 retry_limit = POISONED_GOSSIP_BLOCK_RETRY_LIMIT,
@@ -422,10 +450,7 @@ where
             metrics::counter!("gossip.poisoned.block.retry.limit.count").increment(1);
 
             return None;
-        }
-
-        *retry_count += 1;
-        let retry_attempt = *retry_count;
+        };
 
         // Report what actually happened, not what was attempted: the replacement can be refused
         // by the queue bounds, which spends the budget without dispatching anything.
@@ -1518,7 +1543,7 @@ mod tests {
             downloads.retry_poisoned(poisoned_hash).is_none(),
             "the budget is exhausted while the tip is unchanged"
         );
-        assert_eq!(downloads.poisoned_retry_counts.len(), 1);
+        assert_eq!(downloads.poisoned_retries.counts.len(), 1);
 
         // The block is resolved by the syncer, so the tip moves without this stream ever seeing
         // a successful download for the hash.
@@ -1529,9 +1554,42 @@ mod tests {
             "a child of the new tip gets a fresh budget"
         );
         assert!(
-            !downloads.poisoned_retry_counts.contains_key(&poisoned_hash),
+            !downloads
+                .poisoned_retries
+                .counts
+                .contains_key(&poisoned_hash),
             "the stale entry must be dropped when the tip moves, not held for the process life"
         );
-        assert_eq!(downloads.poisoned_retry_counts.len(), 1);
+        assert_eq!(downloads.poisoned_retries.counts.len(), 1);
+    }
+
+    /// A downloaded block releases its budget, so a later poisoning of the same hash starts
+    /// fresh.
+    ///
+    /// This is the one release path the `Downloads`-level tests cannot reach: they use
+    /// `pending_downloads`, whose downloads never complete.
+    #[test]
+    fn a_downloaded_block_releases_its_budget() {
+        let mut budgets = PoisonedRetryBudgets::default();
+        let tip = Some(hash(0xAA));
+        let poisoned_hash = hash(1);
+
+        for _ in 0..POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
+            assert!(budgets.consume(poisoned_hash, tip).is_some());
+        }
+        assert_eq!(budgets.consume(poisoned_hash, tip), None);
+
+        budgets.release(&poisoned_hash);
+
+        assert_eq!(
+            budgets.consume(poisoned_hash, tip),
+            Some(1),
+            "the budget restarts once the block has actually been downloaded"
+        );
+        assert_eq!(
+            budgets.consume(hash(2), tip),
+            Some(1),
+            "releasing one hash leaves the others alone"
+        );
     }
 }
