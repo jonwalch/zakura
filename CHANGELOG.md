@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-06
+
+### Fixed
+
+- `zakurad` no longer bans a peer for serving a block whose height is above the
+  sync lookahead limit. The ban used the address of the peer that answered the
+  block request, but a far-ahead height comes from whichever peer supplied that
+  hash in an earlier `FindBlocks` response — usually a different peer — so an
+  honest peer could be banned for correctly answering a request this node made.
+  Such blocks are still dropped without restarting sync, and peers that serve
+  blocks with no valid height or that fail consensus verification are still
+  scored ([#17](https://github.com/zakura-core/zakura/pull/17)).
+- Chain synchronization now downloads a peer's only unknown block hash from a short
+  `FindBlocks` response, allowing nodes near the chain tip to continue advancing
+  ([#576](https://github.com/zakura-core/zakura/pull/576)).
+
+### Security
+
+- Score and ban peers that gossip invalid blocks. `zakurad` verifies gossiped
+  blocks with the block verifier router, but inbound cleanup only recognized
+  errors from the semantic verifier, so every rejection from the production
+  path left the advertising peer unscored and it could keep supplying invalid
+  blocks over the same connection
+  ([#18](https://github.com/zakura-core/zakura-private/pull/18)).
+- Reject a downloaded block that builds on `zakurad`'s own chain tip but claims
+  a coinbase height other than one above the tip. A V5+ coinbase `scriptSig` is
+  authorizing data, so it is excluded from the block hash. That makes the height
+  malleable: a peer can rewrite it in an otherwise canonical body and still
+  answer the request for that hash. Such a poisoned body was previously
+  discarded as a benign old block — unattributed, unscored, and not requeued —
+  delaying the newest block until the next discovery round and leaving a mining
+  backend issuing work on an obsolete tip. The check now runs on both block
+  download paths, the syncer and block gossip. On each, the supplying peer is
+  scored for a ban and the block hash is re-requested straight away under its own
+  bounded retry budget, rather than waiting for the next discovery round
+  ([#19](https://github.com/zakura-core/zakura-private/pull/19)).
+
 ## [1.1.0] - 2026-08-05
 
 ### Added
