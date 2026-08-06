@@ -49,7 +49,7 @@ use cached_peer_addr_response::CachedPeerAddrResponse;
 #[cfg(test)]
 mod tests;
 
-use downloads::Downloads as BlockDownloads;
+use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 
 /// The maximum amount of time an inbound service response can take.
 ///
@@ -468,6 +468,29 @@ impl Service<zn::Request> for Inbound {
                     let Err((err, advertiser_addr)) = result else {
                         continue;
                     };
+
+                    // A rewritten coinbase height on a tip child is rejected before the block
+                    // reaches the verifier, so it is never a `RouterError` or a
+                    // `VerifyBlockError` and `block_misbehavior` cannot classify it. It is also
+                    // the one rejection that must re-request the block: the poisoned response
+                    // held the per-hash dedupe slot while it was outstanding, so honest peers'
+                    // `inv`s for the same hash were already dropped as `AlreadyQueued`. Without
+                    // the re-request the block waits for the syncer's next round, which is the
+                    // delay the attack is trying to cause.
+                    //
+                    // Scoring and re-requesting are kept together here rather than split across
+                    // `block_misbehavior`, because the re-request needs `block_downloads` and
+                    // the two decisions are the same decision.
+                    if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
+                        if let Some(advertiser_addr) = advertiser_addr {
+                            let _ = misbehavior_sender.try_send((advertiser_addr, 100));
+                        }
+
+                        // The outcome, including a replacement refused by the queue bounds, is
+                        // logged by `retry_poisoned` itself.
+                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        continue;
+                    }
 
                     if let Some(update) = block_misbehavior(err, advertiser_addr) {
                         let _ = misbehavior_sender.try_send(update);
