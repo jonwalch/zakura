@@ -547,7 +547,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<zn::PeerSource>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
 
                     // Ignore any block hashes past the response limit.

@@ -171,6 +171,30 @@ pub enum BlockSyncMisbehavior {
     StatusSpam,
 }
 
+impl BlockSyncMisbehavior {
+    /// Numeric misbehavior score for this violation.
+    ///
+    /// Uses the shared [`crate::constants::MAX_PEER_MISBEHAVIOR_SCORE`] threshold
+    /// for clear protocol/body faults. Availability misses are unscored because
+    /// a peer can honestly lack a requested range.
+    pub fn misbehavior_score(self) -> u32 {
+        use crate::constants::MAX_PEER_MISBEHAVIOR_SCORE;
+
+        match self {
+            Self::MalformedMessage
+            | Self::UnsolicitedBlock
+            | Self::GetBlocksTooLong
+            | Self::GetBlocksSpam
+            | Self::InvalidBlock
+            | Self::SizeMismatch
+            | Self::InvalidStatus
+            | Self::UnsolicitedDone
+            | Self::StatusSpam => MAX_PEER_MISBEHAVIOR_SCORE,
+            Self::RangeUnavailable => 0,
+        }
+    }
+}
+
 /// The shared routine→reactor channel (per-peer routines inverted data flow).
 ///
 /// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its

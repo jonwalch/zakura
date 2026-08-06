@@ -2161,6 +2161,17 @@ impl ZakuraRequestClient {
                 return Err(error.into());
             }
         };
+        // Attribute available blocks to the Zakura peer that supplied them.
+        // The wire codec has no peer field; only the outbound requester knows
+        // which authenticated peer answered this request.
+        if let Response::Blocks(blocks) = &mut response {
+            let source = PeerSource::Zakura(handle.peer_id().clone());
+            for entry in blocks.iter_mut() {
+                if let InventoryResponse::Available((_, peer)) = entry {
+                    *peer = Some(source.clone());
+                }
+            }
+        }
         if request_kind == LegacyRequestKind::Ping {
             // The responder can only acknowledge a Ping; the requester stamps the RTT.
             response = Response::Pong(started_at.elapsed());
@@ -3798,7 +3809,7 @@ mod tests {
         let response = adapter
             .request_from_source(
                 Request::BlocksByHash(HashSet::from([block.hash()])),
-                Some(PeerSource::Zakura(a_peer_id)),
+                Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
 
@@ -3807,8 +3818,47 @@ mod tests {
         };
         assert!(matches!(
             blocks.as_slice(),
-            [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
+            [InventoryResponse::Available((received, Some(PeerSource::Zakura(peer_id))))]
+                if received.hash() == block.hash() && *peer_id == a_peer_id
         ));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// Dual-stack compatibility requests must attribute available blocks to the
+    /// authenticated Zakura peer that answered, so legacy ChainSync can retain
+    /// the supplier across verification failures.
+    #[tokio::test]
+    async fn request_adapter_attributes_available_block_to_zakura_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let node_a = block_inventory_node(168, block.clone()).await?;
+        let node_b = ZakuraTestNode::builder(169).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let response = adapter
+            .request_from_source(
+                Request::BlocksByHash(HashSet::from([block.hash()])),
+                Some(PeerSource::Zakura(a_peer_id.clone())),
+            )
+            .await?;
+
+        let Response::Blocks(blocks) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(
+            blocks,
+            vec![InventoryResponse::Available((
+                block.clone(),
+                Some(PeerSource::Zakura(a_peer_id))
+            ))]
+        );
 
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -3901,7 +3951,7 @@ mod tests {
             .request_from_source(
                 Request::BlocksByHashFrom {
                     hashes: remote_hashes.into_iter().collect(),
-                    source: PeerSource::Zakura(a_peer_id),
+                    source: PeerSource::Zakura(a_peer_id.clone()),
                 },
                 None,
             )
@@ -3910,10 +3960,14 @@ mod tests {
             panic!("unexpected block response: {block_response:?}");
         };
         for response in blocks {
-            let received = response
+            let (received, advertiser) = response
                 .available()
-                .expect("mock sync peer serves the advertised block")
-                .0;
+                .expect("mock sync peer serves the advertised block");
+            assert_eq!(
+                advertiser,
+                Some(PeerSource::Zakura(a_peer_id.clone())),
+                "Zakura-supplied blocks must retain the delivering peer"
+            );
             local_chain.push(received.hash());
         }
         assert_eq!(local_chain.last(), Some(&block.hash()));

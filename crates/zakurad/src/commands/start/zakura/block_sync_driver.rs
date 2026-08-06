@@ -18,7 +18,8 @@ use tracing::{debug, warn};
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network::zakura::{
     BlockApplyResult, BlockApplyToken, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
-    BlockSyncEvent, BlockSyncHandle, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    BlockSyncEvent, BlockSyncHandle, Frontier, FrontierChange, ZakuraEndpoint,
+    ZakuraMisbehaviorHandle, ZakuraTrace,
 };
 
 use crate::components::sync;
@@ -95,9 +96,7 @@ impl CheckpointFrontierRefresh {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
-    // Retained so the disconnect capability stays wired into the driver, even
-    // though peer scoring no longer drives disconnects (misbehavior is record-only).
-    _supervisor: zakura_network::zakura::ZakuraSupervisorHandle,
+    zakura_misbehavior: Option<ZakuraMisbehaviorHandle>,
     endpoint: Option<ZakuraEndpoint>,
     block_sync: BlockSyncHandle,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
@@ -282,8 +281,18 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         trace.trace_block_action_received(&action);
         match action {
             BlockSyncAction::Misbehavior { peer, reason } => {
-                // Record-only: peer scoring no longer drives disconnects.
-                debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
+                let score = reason.misbehavior_score();
+                if score != 0 {
+                    if let Some(handle) = &zakura_misbehavior {
+                        handle.try_report(peer.clone(), score);
+                    }
+                }
+                debug!(
+                    ?peer,
+                    ?reason,
+                    ?score,
+                    "recorded Zakura block-sync peer violation"
+                );
             }
             BlockSyncAction::QueryNeededBlocks {
                 from,

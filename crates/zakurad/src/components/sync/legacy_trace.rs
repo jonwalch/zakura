@@ -9,7 +9,7 @@ use std::{
 use serde::Serialize;
 use zakura_chain::block::{self, Height};
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
-use zakura_network::PeerSocketAddr;
+use zakura_network::{PeerSocketAddr, PeerSource};
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("legacy_sync", "legacy_sync.jsonl");
 
@@ -51,6 +51,14 @@ impl LegacySyncTrace {
         Self {
             emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
             expose_peer_addresses,
+        }
+    }
+
+    /// Returns a transport peer label using this trace's configured privacy policy.
+    pub(super) fn peer_source_label(&self, source: &PeerSource) -> String {
+        match source {
+            PeerSource::LegacySocket(addr) => self.peer_label(*addr),
+            PeerSource::Zakura(peer_id) => format!("zakura:{peer_id:?}"),
         }
     }
 
@@ -154,13 +162,13 @@ impl LegacySyncTrace {
         hash: block::Hash,
         height: Height,
         download_elapsed: Duration,
-        peer: Option<PeerSocketAddr>,
+        peer: Option<&PeerSource>,
     ) {
         self.emitter.emit_event(|| LegacyEvent::BlockDownloaded {
             hash: hash.to_string(),
             height: height.0,
             download_elapsed_ms: elapsed_millis(download_elapsed),
-            peer: peer.map(|peer| self.peer_label(peer)),
+            peer: peer.map(|peer| self.peer_source_label(peer)),
         });
     }
 }

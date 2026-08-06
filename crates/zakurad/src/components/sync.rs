@@ -33,7 +33,7 @@ use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network::{self as zn, zakura::ZakuraMisbehaviorHandle, PeerSocketAddr, PeerSource};
 use zakura_state as zs;
 
 use crate::{
@@ -74,10 +74,11 @@ const FANOUT: usize = 3;
 const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
 
 fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresses: bool) -> String {
-    error
-        .advertiser_addr()
-        .map(|addr| peer_addr_label(addr, expose_peer_addresses))
-        .unwrap_or_else(|| "unattributed".to_string())
+    match error.advertiser() {
+        Some(PeerSource::LegacySocket(addr)) => peer_addr_label(*addr, expose_peer_addresses),
+        Some(PeerSource::Zakura(peer_id)) => format!("zakura:{peer_id:?}"),
+        None => "unattributed".to_string(),
+    }
 }
 
 /// Controls how many times the syncer requeues a required block hash after a peer responds
@@ -808,6 +809,9 @@ where
     /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
 
+    /// Optional Zakura peer-id misbehavior sink for blocks supplied over P2P v2.
+    zakura_misbehavior: Option<ZakuraMisbehaviorHandle>,
+
     /// Structured diagnostics for the legacy sync pipeline.
     trace: LegacySyncTrace,
 }
@@ -856,6 +860,7 @@ where
         state: ZS,
         latest_chain_tip: ZSTip,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+        zakura_misbehavior: Option<ZakuraMisbehaviorHandle>,
     ) -> (Self, SyncStatus) {
         let mut download_concurrency_limit = config.sync.download_concurrency_limit;
         let mut checkpoint_verify_concurrency_limit =
@@ -956,6 +961,7 @@ where
             registry_miss_retry: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
+            zakura_misbehavior,
             trace,
         };
 
@@ -2119,32 +2125,42 @@ where
 
             Err(BlockDownloadVerifyError::Invalid {
                 ref error,
-                advertiser_addr: Some(advertiser_addr),
+                ref advertiser,
                 ..
             }) if error.misbehavior_score() != 0 => {
-                let _ = self
-                    .misbehavior_sender
-                    .try_send((advertiser_addr, error.misbehavior_score()));
+                self.report_block_misbehavior(advertiser.as_ref(), error.misbehavior_score());
             }
 
-            Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit {
-                advertiser_addr: Some(advertiser_addr),
-                ..
-            }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+            Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { ref advertiser, .. }) => {
+                self.report_block_misbehavior(advertiser.as_ref(), 100);
             }
 
-            Err(BlockDownloadVerifyError::InvalidHeight {
-                advertiser_addr: Some(advertiser_addr),
-                ..
-            }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+            Err(BlockDownloadVerifyError::InvalidHeight { ref advertiser, .. }) => {
+                self.report_block_misbehavior(advertiser.as_ref(), 100);
             }
 
             Err(_) => {}
         };
 
         Self::handle_response(response, self.expose_peer_addresses)
+    }
+
+    /// Report a block-supplier misbehavior score to the matching transport sink.
+    fn report_block_misbehavior(&mut self, advertiser: Option<&PeerSource>, score: u32) {
+        if score == 0 {
+            return;
+        }
+        match advertiser {
+            Some(PeerSource::LegacySocket(addr)) => {
+                let _ = self.misbehavior_sender.try_send((*addr, score));
+            }
+            Some(PeerSource::Zakura(peer_id)) => {
+                if let Some(handle) = &self.zakura_misbehavior {
+                    handle.try_report(peer_id.clone(), score);
+                }
+            }
+            None => {}
+        }
     }
 
     /// Handles a downloaded block response, requeueing required missing block hashes.

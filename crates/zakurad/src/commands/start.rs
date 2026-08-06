@@ -486,6 +486,9 @@ impl StartCmd {
         // Hands off the Zakura bulk-apply pipeline so legacy fallback can drain
         // in-flight applies before driving commits through the same pipeline.
         let zakura_block_sync_handoff = zakura::BlockSyncHandoff::new();
+        let zakura_misbehavior = zakura_endpoint.as_ref().map(|endpoint| {
+            zakura_network::zakura::ZakuraMisbehaviorHandle::spawn(endpoint.supervisor())
+        });
 
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
@@ -538,7 +541,7 @@ impl StartCmd {
                     let block_driver_task = tokio::spawn(
                         drive_block_sync_actions(
                             block_actions,
-                            endpoint.supervisor(),
+                            zakura_misbehavior.clone(),
                             Some(endpoint.clone()),
                             block_sync.clone(),
                             latest_chain_tip.clone(),
@@ -583,6 +586,7 @@ impl StartCmd {
             state.clone(),
             latest_chain_tip.clone(),
             misbehavior_sender.clone(),
+            zakura_misbehavior,
         );
 
         info!("initializing mempool");
@@ -2733,7 +2737,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -2876,7 +2880,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3026,7 +3030,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3140,7 +3144,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3242,7 +3246,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3345,7 +3349,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3426,7 +3430,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3521,7 +3525,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3630,7 +3634,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3706,7 +3710,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -3829,7 +3833,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let mut driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -4257,7 +4261,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -4351,7 +4355,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -4472,7 +4476,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync.clone(),
             latest_chain_tip,
@@ -4596,7 +4600,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync.clone(),
             zakura_chain::chain_tip::NoChainTip,
@@ -4733,7 +4737,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
@@ -4861,7 +4865,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             _latest_tip,
@@ -5018,7 +5022,7 @@ mod zakura_header_sync_driver_tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             None,
             block_sync,
             latest_tip,

@@ -436,7 +436,7 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
-            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
+            let (block, advertiser) = if let zn::Response::Blocks(blocks) =
                 network.oneshot(request).await.map_err(|e| (e, None))?
             {
                 // A peer must answer a single-hash block request with exactly one
@@ -466,6 +466,11 @@ where
                 available
             } else {
                 unreachable!("wrong response to block request");
+            };
+            // The inbound misbehavior channel only accepts legacy sockets.
+            let advertiser_addr = match advertiser {
+                Some(zn::PeerSource::LegacySocket(addr)) => Some(addr),
+                Some(zn::PeerSource::Zakura(_)) | None => None,
             };
 
             // Bind the delivered block to the hash we requested. A peer that

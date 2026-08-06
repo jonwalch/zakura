@@ -159,6 +159,7 @@ fn request_genesis_is_rate_limited() {
         state_service,
         latest_chain_tip,
         misbehavior_tx,
+        None,
     );
 
     // Run `request_genesis()` long enough to observe multiple retries.

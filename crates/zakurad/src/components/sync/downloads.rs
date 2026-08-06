@@ -28,7 +28,7 @@ use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network::{self as zn, PeerSocketAddr, PeerSource};
 use zakura_state as zs;
 
 use crate::components::sync::{
@@ -112,7 +112,7 @@ pub enum BlockDownloadVerifyError {
     AboveLookaheadHeightLimit {
         height: block::Height,
         hash: block::Hash,
-        advertiser_addr: Option<PeerSocketAddr>,
+        advertiser: Option<PeerSource>,
     },
 
     #[error("downloaded block was too far behind the chain tip: {height:?} {hash:?}")]
@@ -124,7 +124,7 @@ pub enum BlockDownloadVerifyError {
     #[error("downloaded block had an invalid height: {hash:?}")]
     InvalidHeight {
         hash: block::Hash,
-        advertiser_addr: Option<PeerSocketAddr>,
+        advertiser: Option<PeerSource>,
     },
 
     #[error("block failed consensus validation: {error:?} {height:?} {hash:?}")]
@@ -133,7 +133,7 @@ pub enum BlockDownloadVerifyError {
         error: zakura_consensus::router::RouterError,
         height: block::Height,
         hash: block::Hash,
-        advertiser_addr: Option<PeerSocketAddr>,
+        advertiser: Option<PeerSource>,
     },
 
     #[error("block validation request failed: {error:?} {height:?} {hash:?}")]
@@ -192,19 +192,24 @@ pub(super) enum NotFoundKind {
 }
 
 impl BlockDownloadVerifyError {
-    /// Returns the connected legacy peer that supplied the invalid block, if known.
-    pub(super) fn advertiser_addr(&self) -> Option<PeerSocketAddr> {
+    /// Returns the transport peer that supplied the invalid block, if known.
+    pub(super) fn advertiser(&self) -> Option<&PeerSource> {
         match self {
-            Self::AboveLookaheadHeightLimit {
-                advertiser_addr, ..
-            }
-            | Self::InvalidHeight {
-                advertiser_addr, ..
-            }
-            | Self::Invalid {
-                advertiser_addr, ..
-            } => *advertiser_addr,
+            Self::AboveLookaheadHeightLimit { advertiser, .. }
+            | Self::InvalidHeight { advertiser, .. }
+            | Self::Invalid { advertiser, .. } => advertiser.as_ref(),
             _ => None,
+        }
+    }
+
+    /// Returns the connected legacy peer socket that supplied the invalid block, if known.
+    ///
+    /// Zakura-authenticated suppliers are excluded here: they are scored through
+    /// the Zakura peer-id misbehavior handle instead of the legacy IP ban channel.
+    pub(super) fn advertiser_addr(&self) -> Option<PeerSocketAddr> {
+        match self.advertiser()? {
+            PeerSource::LegacySocket(addr) => Some(*addr),
+            PeerSource::Zakura(_) => None,
         }
     }
 
@@ -561,7 +566,7 @@ where
                     None,
                 );
 
-                let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
+                let (block, advertiser) = if let zn::Response::Blocks(blocks) = rsp {
                     // A cooperating peer returns exactly one available block for a
                     // single-hash request. A response with a different count, or a
                     // `Missing` status, means the peer is misbehaving or raced us
@@ -660,13 +665,13 @@ where
                     );
                     metrics::counter!("sync.no.height.dropped.block.count").increment(1);
 
-                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
+                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser });
                 };
                 trace.block_downloaded(
                     hash,
                     block_height,
                     download_start.elapsed(),
-                    advertiser_addr,
+                    advertiser.as_ref(),
                 );
                 Self::transition_task(
                     &task_states,
@@ -677,7 +682,11 @@ where
                 );
 
                 if block_height > lookahead_drop_height {
-                    Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
+                    return Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+                        height: block_height,
+                        hash,
+                        advertiser,
+                    });
                 } else if block_height > lookahead_pause_height {
                     // This log can be very verbose, usually hundreds of blocks are dropped.
                     // So we only log at info level for the first above-height block.
@@ -795,7 +804,7 @@ where
                     .map(|hash| (block_height, hash))
                     .map_err(|err| {
                         match err.downcast::<zakura_consensus::router::RouterError>() {
-                            Ok(error) => BlockDownloadVerifyError::Invalid { error: *error, height: block_height, hash, advertiser_addr },
+                            Ok(error) => BlockDownloadVerifyError::Invalid { error: *error, height: block_height, hash, advertiser },
                             Err(error) => BlockDownloadVerifyError::ValidationRequestError { error, height: block_height, hash },
                         }
                     })

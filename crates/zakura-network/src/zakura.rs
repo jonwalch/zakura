@@ -23,6 +23,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod misbehavior;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
 mod trace;
@@ -36,6 +37,7 @@ pub use handshake::*;
 pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
+pub use misbehavior::ZakuraMisbehaviorHandle;
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,

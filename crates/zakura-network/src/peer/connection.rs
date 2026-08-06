@@ -35,7 +35,7 @@ use crate::{
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, InventoryHash, Message},
-        internal::{InventoryResponse, Request, Response},
+        internal::{InventoryResponse, PeerSource, Request, Response},
     },
     BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
 };
@@ -342,9 +342,10 @@ impl Handler {
 
                 if pending_hashes.is_empty() {
                     // If we got everything we wanted, let the internal client know.
+                    let source = transient_addr.map(PeerSource::LegacySocket);
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block, source.clone())));
                     Handler::Finished(Ok(Response::Blocks(available.collect())))
                 } else {
                     // Keep on waiting for all the blocks we wanted, until we get them or time out.
@@ -388,9 +389,10 @@ impl Handler {
                     Handler::Finished(Err(PeerError::NotFoundResponse(missing_block_hashes)))
                 } else {
                     // If we got some of what we wanted, let the internal client know.
+                    let source = transient_addr.map(PeerSource::LegacySocket);
                     let available = blocks
                         .into_iter()
-                        .map(|block| InventoryResponse::Available((block, transient_addr)));
+                        .map(|block| InventoryResponse::Available((block, source.clone())));
                     let missing = pending_hashes.into_iter().map(InventoryResponse::Missing);
 
                     Handler::Finished(Ok(Response::Blocks(available.chain(missing).collect())))

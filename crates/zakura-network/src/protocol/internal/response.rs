@@ -7,7 +7,11 @@ use zakura_chain::{
     transaction::{UnminedTx, UnminedTxId},
 };
 
-use crate::{meta_addr::MetaAddr, protocol::internal::InventoryResponse, PeerSocketAddr};
+use crate::{
+    meta_addr::MetaAddr,
+    protocol::internal::{InventoryResponse, PeerSource},
+    PeerSocketAddr,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -72,7 +76,11 @@ pub enum Response {
     /// `zcashd` sometimes sends no response, and sometimes sends `notfound`.
     //
     // TODO: make this into a HashMap<block::Hash, InventoryResponse<Arc<Block>, ()>> - a unique list (#2244)
-    Blocks(Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>),
+    /// Available entries carry the transport peer that supplied the block, when known.
+    /// Legacy TCP responses use [`PeerSource::LegacySocket`]; Zakura compatibility
+    /// responses use [`PeerSource::Zakura`]. Locally served inventory remains
+    /// unattributed (`None`).
+    Blocks(Vec<InventoryResponse<(Arc<Block>, Option<PeerSource>), block::Hash>>),
 
     /// A list of found unmined transactions, and missing unmined transaction IDs.
     ///

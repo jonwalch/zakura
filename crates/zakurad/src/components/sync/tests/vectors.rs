@@ -24,7 +24,7 @@ use zakura_chain::{
 use zakura_consensus::{
     Config as ConsensusConfig, RouterError, VerifyBlockError, VerifyCheckpointError,
 };
-use zakura_network::{InventoryResponse, PeerSocketAddr};
+use zakura_network::{InventoryResponse, PeerSocketAddr, PeerSource};
 use zakura_state::Config as StateConfig;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -1355,7 +1355,7 @@ async fn should_restart_sync_returns_false() {
         error: router_error,
         height: block::Height(42),
         hash: block::Hash::from([0xAA; 32]),
-        advertiser_addr: None,
+        advertiser: None,
     };
 
     let restart = ChainSync::<
@@ -1404,7 +1404,7 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
         error: parent_error,
         height: Height(42),
         hash: parent_hash,
-        advertiser_addr: Some(parent_advertiser),
+        advertiser: Some(PeerSource::LegacySocket(parent_advertiser)),
     };
 
     assert!(chain_sync
@@ -1426,7 +1426,7 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
         error: child_error,
         height: Height(43),
         hash: child_hash,
-        advertiser_addr: Some(child_advertiser),
+        advertiser: Some(PeerSource::LegacySocket(child_advertiser)),
     };
 
     assert!(chain_sync
@@ -1518,6 +1518,7 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
         state_service,
         mock_chain_tip,
         misbehavior_tx,
+        None,
     );
 
     tokio::time::timeout(Duration::from_secs(2), chain_sync.request_genesis())
@@ -1555,7 +1556,7 @@ fn duplicate_finalized_checkpoint_block_does_not_restart_sync() -> Result<(), cr
         error: router_error,
         height: Height(1),
         hash: block1_hash,
-        advertiser_addr: None,
+        advertiser: None,
     };
 
     let restart = TestChainSync::should_restart_sync(&err, false);
@@ -1575,7 +1576,7 @@ async fn above_lookahead_does_not_restart_sync() {
     let err = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
         height: block::Height(60_000),
         hash: block::Hash::from([0xBB; 32]),
-        advertiser_addr: None,
+        advertiser: None,
     };
 
     let restart = ChainSync::<
@@ -1592,14 +1593,14 @@ async fn above_lookahead_does_not_restart_sync() {
 }
 
 /// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now
-/// carries `advertiser_addr` so the offending peer can be scored.
+/// carries advertiser attribution so the offending peer can be scored.
 #[tokio::test]
 async fn above_lookahead_has_peer_attribution() {
     let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let err = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
         height: block::Height(60_000),
         hash: block::Hash::from([0xCC; 32]),
-        advertiser_addr: Some(addr),
+        advertiser: Some(PeerSource::LegacySocket(addr)),
     };
 
     assert_eq!(
@@ -1622,7 +1623,7 @@ async fn both_height_limits_do_not_restart_sync() {
     let above = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
         height: block::Height(60_000),
         hash: block::Hash::from([0xEE; 32]),
-        advertiser_addr: None,
+        advertiser: None,
     };
 
     let restart_below = ChainSync::<
@@ -1650,13 +1651,13 @@ async fn both_height_limits_do_not_restart_sync() {
 }
 
 /// Verifies fix for GHSA-rj6c-83wx-jxf2: `InvalidHeight` does not trigger
-/// sync restart and carries `advertiser_addr` for peer scoring.
+/// sync restart and carries advertiser attribution for peer scoring.
 #[tokio::test]
 async fn invalid_height_does_not_restart_sync() {
     let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
     let err = BlockDownloadVerifyError::InvalidHeight {
         hash: block::Hash::from([0xFF; 32]),
-        advertiser_addr: Some(addr),
+        advertiser: Some(PeerSource::LegacySocket(addr)),
     };
 
     let restart = ChainSync::<
@@ -1675,6 +1676,64 @@ async fn invalid_height_does_not_restart_sync() {
         err.advertiser_addr(),
         Some(addr),
         "InvalidHeight should carry advertiser_addr for peer scoring"
+    );
+}
+
+/// Zakura-supplied invalid blocks retain authenticated attribution and are
+/// scored through the Zakura peer-id sink, not the legacy IP ban channel.
+#[test]
+fn zakura_advertiser_is_scored_without_legacy_ip_report() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(2);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+    let (zakura_tx, mut zakura_rx) = tokio::sync::mpsc::channel(2);
+    chain_sync.zakura_misbehavior =
+        Some(zn::zakura::ZakuraMisbehaviorHandle::from_sender(zakura_tx));
+
+    let peer_id =
+        zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+    let advertiser = PeerSource::Zakura(peer_id.clone());
+    let hash = block::Hash([0xC3; 32]);
+
+    let invalid = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+                actual: [2; 32],
+            },
+        ),
+    ));
+    let invalid = RouterError::Block {
+        source: Box::new(VerifyBlockError::Commit(invalid)),
+    };
+    let response = BlockDownloadVerifyError::Invalid {
+        error: invalid,
+        height: Height(42),
+        hash,
+        advertiser: Some(advertiser.clone()),
+    };
+
+    assert_eq!(response.advertiser(), Some(&advertiser));
+    assert_eq!(
+        response.advertiser_addr(),
+        None,
+        "Zakura peers are not convertible to legacy socket scores"
+    );
+    assert!(chain_sync.handle_block_response(Err(response)).is_err());
+    assert!(
+        misbehavior_rx.try_recv().is_err(),
+        "Zakura attribution must not emit legacy IP misbehavior reports"
+    );
+    assert_eq!(
+        zakura_rx.try_recv(),
+        Ok((peer_id, 100)),
+        "Zakura-supplied invalid blocks must be scored against the peer id"
     );
 }
 
@@ -2643,6 +2702,7 @@ fn setup_chain_sync_with_options(
         state_service.clone(),
         mock_chain_tip,
         misbehavior_tx,
+        None,
     );
 
     (
