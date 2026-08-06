@@ -483,7 +483,10 @@ impl Service<zn::Request> for Inbound {
                     // the two decisions are the same decision.
                     if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
                         if let Some(advertiser_addr) = advertiser_addr {
-                            let _ = misbehavior_sender.try_send((advertiser_addr, 100));
+                            let _ = misbehavior_sender.try_send((
+                                advertiser_addr,
+                                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+                            ));
                         }
 
                         // The outcome, including a replacement refused by the queue bounds, is

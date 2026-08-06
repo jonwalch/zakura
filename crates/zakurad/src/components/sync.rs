@@ -2159,7 +2159,9 @@ where
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+                let _ = self
+                    .misbehavior_sender
+                    .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
             }
 
             Err(BlockDownloadVerifyError::InvalidHeight {
@@ -2236,7 +2238,9 @@ where
                 // to route back to it. The peer set batches misbehavior updates, so the ban may
                 // not have landed yet; the retry budget bounds the loop if it hasn't.
                 if let Some(advertiser_addr) = advertiser_addr {
-                    let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+                    let _ = self
+                        .misbehavior_sender
+                        .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
                 }
 
                 info!(
