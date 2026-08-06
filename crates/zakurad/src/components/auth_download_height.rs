@@ -1,40 +1,18 @@
-//! Authenticates the claimed coinbase height of a downloaded block against our chain tip.
-//!
-//! Shared by the syncer ([`crate::components::sync::downloads`]) and the gossip path
-//! ([`crate::components::inbound::downloads`]), which both read a block's coinbase height
-//! before verification and must not disagree about when that height can be trusted.
+//! Authenticates a downloaded block's claimed coinbase height when it builds on our chain tip.
 //!
 //! # Security
 //!
-//! A V5+ coinbase `scriptSig` carries the block height as *authorizing* data. Authorizing data
-//! is excluded from the mined transaction ID, so it is also excluded from the transaction
-//! merkle root and from the block header's merkle root commitment — and therefore from the
-//! block hash.
-//!
-//! A peer can take a canonical block, rewrite only its coinbase height, and return a body that
-//! still matches the hash we requested or that it advertised. Full consensus validation rejects
-//! that body via the header's authorizing-data commitment, but both block download paths read
-//! the coinbase height *before* verification, to decide whether a block is worth verifying at
-//! all. A rewritten height can steer those decisions: a height far behind the tip is discarded
-//! as a benign old block, which satisfies the request without delivering a usable block.
-//!
-//! There is exactly one case where the real height is knowable without consulting the state: a
-//! block whose parent is our own best tip must be at `tip + 1`. That is also the case that
-//! matters most, because it is the block a miner is waiting for. This module is the single
-//! implementation of that check, shared by the syncer and the gossip path so the two cannot
-//! drift apart.
+//! A V5+ coinbase height is authorizing data and is not committed by the block hash. Download and
+//! gossip paths inspect it before full validation, so a peer could rewrite it to influence their
+//! height policies. A block whose parent is our best tip has one authenticated height: `tip + 1`.
+//! This module centralizes that check for both paths.
 
 use zakura_chain::block::{self, Height};
 
-/// Returns the height `block_height` should have been, if the block is a child of `best_tip`
-/// and its claimed coinbase height contradicts that.
+/// Returns the expected height when a child of `best_tip` claims a different coinbase height.
 ///
-/// Returns `None` when the block is not a tip child — including when we have no tip — or when
-/// its claimed height agrees with the tip. Those blocks are unaffected: their height cannot be
-/// authenticated from the tip alone, so the caller's existing height policies still apply.
-///
-/// A `Some` result is proof of a poisoned body, not a heuristic. The caller should attribute it
-/// to the supplying peer rather than dropping it as an ordinary out-of-range block.
+/// Returns `None` without a tip, for a different parent, or when the claimed height matches.
+/// A mismatch identifies an invalid body and should be attributed to its supplying peer.
 pub(crate) fn tip_child_mismatch(
     previous_block_hash: block::Hash,
     block_height: Height,
@@ -46,23 +24,14 @@ pub(crate) fn tip_child_mismatch(
         return None;
     }
 
-    // The tip comes from our own committed state, so it is at most `Height::MAX`, which is
-    // `u32::MAX / 2` — this addition cannot overflow. `saturating_add` is used rather than
-    // `Height + 1` because the latter is fallible, and answering `None` on overflow would
-    // silently skip the check instead of reporting a mismatch. This fails closed: a saturated
-    // value could never equal a valid `block_height`, so it still reports a mismatch.
+    // Committed heights are at most `Height::MAX`, so this cannot saturate. Saturating arithmetic
+    // keeps the comparison fail-closed if that invariant changes.
     let expected_height = Height(tip_height.0.saturating_add(1));
 
     (block_height != expected_height).then_some(expected_height)
 }
 
-/// Builds a copy of `canonical` with only its coinbase height rewritten, as a peer performing
-/// this attack would.
-///
-/// For a V5+ coinbase the height lives in the transparent input's `scriptSig`, which is
-/// authorizing data. It is therefore excluded from the mined transaction ID, the transaction
-/// merkle root, and the block hash — so this mutation produces a body that still answers a
-/// request for, or an advertisement of, the canonical hash.
+/// Clones `canonical` and rewrites its V5+ coinbase height without changing its block hash.
 #[cfg(test)]
 pub(crate) fn poison_coinbase_height(
     canonical: &zakura_chain::block::Block,
