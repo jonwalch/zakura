@@ -32,6 +32,35 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+#[test]
+fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {
+    let shared = block::Hash([1; 32]);
+    let body_fork = block::Hash([2; 32]);
+    let selected_fork = block::Hash([3; 32]);
+    let anchor = super::highest_common_body_header_frontier(
+        block::Height(2),
+        block::Height(0),
+        |height| match height.0 {
+            1 => Some(shared),
+            2 => Some(body_fork),
+            _ => None,
+        },
+        |height| {
+            Ok(match height.0 {
+                1 => Some(shared),
+                2 => Some(selected_fork),
+                _ => None,
+            })
+        },
+    )
+    .expect("the selected and full-state forks share height one");
+
+    assert_eq!(
+        anchor,
+        zakura_header_chain::Frontier::new(block::Height(1), shared)
+    );
+}
+
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
 ) -> Result<()> {
@@ -300,12 +329,15 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     let max_checkpoint_height = blocks[1].coinbase_height().unwrap();
     let mut config = Config::ephemeral();
     config.enable_zakura_header_seed_from_committed_blocks = true;
-    let (mut state_service, _read, _tip, _tip_change) =
+    // The state-only fixture commits bodies directly.
+    // The fixture has no network-supplied auxiliary root.
+    config.vct_fast_sync = false;
+    let (mut state_service, read, _tip, _tip_change) =
         StateService::new(config, &network, max_checkpoint_height, 0).await;
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
     // finalized tip catches up to the maximum checkpoint height and the last block hash we sent.
-    for block in &blocks[0..=1] {
+    for (index, block) in blocks[0..=1].iter().enumerate() {
         let checkpoint = CheckpointVerifiedBlock::from(block.clone());
         let result = state_service
             .queue_and_commit_to_finalized_state(checkpoint)
@@ -314,6 +346,31 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
             matches!(result, Ok(Ok(_))),
             "checkpoint verified block should commit: {result:?}",
         );
+
+        let expected_height = block.coinbase_height().expect("test block has a height");
+        let expected_hash = block.hash();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = read.subscribe_header_chain_snapshots().borrow().clone();
+                if snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.frontiers.finalized.height == expected_height
+                        && snapshot.frontiers.finalized.hash == expected_hash
+                        && snapshot.frontiers.verified_best == snapshot.frontiers.finalized
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("checkpoint commits atomically advance the durable header runtime");
+        if index == 0 {
+            assert!(
+                state_service.block_write_sender.finalized.is_some(),
+                "the header runtime must become ready after genesis while checkpoint writes remain open",
+            );
+            assert!(read.subscribe_header_runtime_status().borrow().is_ready());
+        }
     }
 
     let last_finalized_hash = blocks[1].hash();
