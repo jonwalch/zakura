@@ -3039,7 +3039,7 @@ fn sapling_binding_verification_key_rejects_invalid_lazy_commitments() {
                 cv: ValueCommitment(cv),
                 per_spend_anchor: sapling::tree::Root::default(),
                 nullifier: sapling::Nullifier::from([0u8; 32]),
-                rk,
+                rk: rk.clone(),
                 zkproof: Groth16Proof([0u8; 192]),
                 spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
             }],

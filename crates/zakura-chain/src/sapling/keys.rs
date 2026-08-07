@@ -368,7 +368,11 @@ impl ZcashDeserialize for EphemeralPublicKey {
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretereddsa
 /// [`ValueCommitment`]: crate::sapling::ValueCommitment
 /// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+//
+// Deliberately not `Copy`, unlike its sibling deferred-point types: adding `Copy` to an already
+// published type is a major semver break, and it would buy nothing here — every consumer takes
+// the bytes through `From<&ValidatingKey>`.
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValidatingKey(pub(crate) [u8; 32]);
 
 impl ValidatingKey {

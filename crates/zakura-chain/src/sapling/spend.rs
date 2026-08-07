@@ -158,7 +158,7 @@ impl ZcashSerialize for Spend<PerSpendAnchor> {
         writer.write_all(&self.cv.0)?;
         self.per_spend_anchor.zcash_serialize(&mut writer)?;
         writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk)[..])?;
+        writer.write_all(&<[u8; 32]>::from(&self.rk)[..])?;
         self.zkproof.zcash_serialize(&mut writer)?;
         writer.write_all(&<[u8; 64]>::from(self.spend_auth_sig)[..])?;
         Ok(())
@@ -239,7 +239,7 @@ impl ZcashSerialize for SpendPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         writer.write_all(&self.cv.0)?;
         writer.write_32_bytes(&self.nullifier.into())?;
-        writer.write_all(&<[u8; 32]>::from(self.rk)[..])?;
+        writer.write_all(&<[u8; 32]>::from(&self.rk)[..])?;
         Ok(())
     }
 }
