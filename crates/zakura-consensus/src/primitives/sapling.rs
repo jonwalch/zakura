@@ -2,9 +2,11 @@
 
 use core::fmt;
 use std::{
+    collections::HashSet,
     future::Future,
     mem,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -220,16 +222,15 @@ pub fn verify_single(
     .boxed()
 }
 
+/// The batch-and-fallback stack that actually verifies Sapling bundles.
+type SaplingBatchFallback = Fallback<
+    Batch<Verifier, Item>,
+    ServiceFn<fn(Item) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+>;
+
 /// Global batch verification context for Sapling shielded data.
-pub static VERIFIER: Lazy<
-    Fallback<
-        Batch<Verifier, Item>,
-        ServiceFn<
-            fn(Item) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-        >,
-    >,
-> = Lazy::new(|| {
-    Fallback::new(
+pub static VERIFIER: Lazy<BenchMemoized<SaplingBatchFallback>> = Lazy::new(|| {
+    BenchMemoized::new(Fallback::new(
         Batch::new(
             Verifier::default(),
             super::MAX_BATCH_SIZE,
@@ -237,8 +238,157 @@ pub static VERIFIER: Lazy<
             super::MAX_BATCH_LATENCY,
         ),
         tower::service_fn(verify_single),
-    )
+    ))
 });
+
+// ---------------------------------------------------------------------------
+// NOT FOR MERGE — measurement prototype only.
+//
+// This exists to answer one question: what is the *ceiling* on what a Sapling memo could
+// buy? It is off unless `ZAKURA_BENCH_ENABLE_SAPLING_MEMO=1`, so the default build behaves
+// exactly as it did before.
+//
+// It is deliberately not production-quality. The key encoder below is hand-written, and a
+// hand-written encoder that silently omits a field is precisely the failure mode that makes
+// a memo unsafe — see the module docs on `primitives::halo2::memo`. Shipping this would
+// require the encoder to come from `zcash_primitives` (whose `write_v5_bundle` for Sapling
+// is `pub(crate)`), plus a discriminant separating the v4 per-spend-anchor encoding from
+// the v5 shared-anchor one. Neither is done here, because neither changes the timing.
+// ---------------------------------------------------------------------------
+
+/// Whether the prototype Sapling memo is active. Read once.
+static BENCH_ENABLE_SAPLING_MEMO: Lazy<bool> = Lazy::new(|| {
+    std::env::var("ZAKURA_BENCH_ENABLE_SAPLING_MEMO")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
+/// Personalization for the prototype Sapling memo key.
+const SAPLING_MEMO_PERSONALIZATION: &[u8; 16] = b"ZakuraSapngMemo1";
+
+impl Item {
+    /// Derives a memo key committing to this bundle's encoding and its sighash.
+    ///
+    /// See the NOT FOR MERGE banner above: this encoder is for cost measurement, not for
+    /// consensus use.
+    fn bench_cache_key(&self) -> [u8; 32] {
+        let Item { bundle, sighash } = self;
+
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(SAPLING_MEMO_PERSONALIZATION)
+            .to_state();
+
+        hasher.update(&sighash.0);
+
+        for spend in bundle.shielded_spends() {
+            hasher.update(&spend.cv().to_bytes());
+            hasher.update(&spend.anchor().to_bytes());
+            hasher.update(spend.nullifier().as_ref());
+            hasher.update(&<[u8; 32]>::from(*spend.rk()));
+            hasher.update(spend.zkproof());
+            hasher.update(&<[u8; 64]>::from(*spend.spend_auth_sig()));
+        }
+
+        for output in bundle.shielded_outputs() {
+            hasher.update(&output.cv().to_bytes());
+            hasher.update(&output.cmu().to_bytes());
+            hasher.update(output.ephemeral_key().as_ref());
+            hasher.update(output.enc_ciphertext());
+            hasher.update(output.out_ciphertext());
+            hasher.update(output.zkproof());
+        }
+
+        hasher.update(&i64::from(*bundle.value_balance()).to_le_bytes());
+        hasher.update(&<[u8; 64]>::from(bundle.authorization().binding_sig));
+
+        hasher
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .expect("hash_length(32) produces exactly 32 bytes")
+    }
+}
+
+/// A prototype memo over Sapling bundle verification, mirroring the Halo2 one.
+pub struct BenchMemoized<S> {
+    inner: S,
+    verified: Arc<Mutex<HashSet<[u8; 32]>>>,
+}
+
+impl<S: Clone> Clone for BenchMemoized<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            verified: self.verified.clone(),
+        }
+    }
+}
+
+impl<S> BenchMemoized<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            verified: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Returns the wrapped verification stack.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S> Service<Item> for BenchMemoized<S>
+where
+    S: Service<Item, Response = (), Error = BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = ();
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<(), BoxError>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, item: Item) -> Self::Future {
+        if !*BENCH_ENABLE_SAPLING_MEMO {
+            return self.inner.call(item).boxed();
+        }
+
+        let key = item.bench_cache_key();
+
+        if self
+            .verified
+            .lock()
+            .expect("prototype sapling memo mutex should not be poisoned")
+            .contains(&key)
+        {
+            metrics::counter!("zakura.consensus.sapling.bench_memo.hit").increment(1);
+            return std::future::ready(Ok(())).boxed();
+        }
+
+        metrics::counter!("zakura.consensus.sapling.bench_memo.miss").increment(1);
+
+        let verified = self.verified.clone();
+        let response = self.inner.call(item);
+
+        async move {
+            let result = response.await;
+
+            if result.is_ok() {
+                verified
+                    .lock()
+                    .expect("prototype sapling memo mutex should not be poisoned")
+                    .insert(key);
+            }
+
+            result
+        }
+        .boxed()
+    }
+}
 
 #[cfg(test)]
 mod tests {

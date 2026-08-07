@@ -44,11 +44,26 @@ use std::{
 };
 
 use futures::{future::BoxFuture, FutureExt};
+use once_cell::sync::Lazy;
 use tower::Service;
 
 use crate::BoxError;
 
 use super::Item;
+
+/// Whether to bypass the memo entirely, so every item reaches the inner verifier.
+///
+/// Benchmark support, not a production knob: it exists so one binary can measure the
+/// memoized and unmemoized paths on identical inputs, which is the only way to attribute a
+/// wall-clock difference to the memo rather than to a build or corpus difference. Read once,
+/// so flipping it mid-process has no effect.
+///
+/// This is not on the `feat/memoize-halo2-verification` branch and must not merge with it.
+static BENCH_DISABLE_MEMO: Lazy<bool> = Lazy::new(|| {
+    std::env::var("ZAKURA_BENCH_DISABLE_HALO2_MEMO")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
 
 /// The number of verified-proof keys retained per Orchard circuit era.
 ///
@@ -169,6 +184,10 @@ where
     }
 
     fn call(&mut self, item: Item) -> Self::Future {
+        if *BENCH_DISABLE_MEMO {
+            return self.inner.call(item).boxed();
+        }
+
         // Derived once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
 
