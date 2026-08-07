@@ -45,6 +45,21 @@ fn first_tx_of_version(block: &Block, version: u32) -> Option<Vec<u8>> {
         .map(|tx| tx.zcash_serialize_to_vec().expect("valid transaction"))
 }
 
+/// Returns the serialized transaction in the mainnet vectors that maximises `weight`.
+///
+/// Returns `None` if no transaction has a non-zero weight, so a corpus without the pool in
+/// question drops the sample instead of silently benchmarking a coinbase.
+fn heaviest_tx(weight: impl Fn(&Transaction) -> usize) -> Option<Vec<u8>> {
+    zakura_test::vectors::MAINNET_BLOCKS
+        .values()
+        .filter_map(|block_bytes| Block::zcash_deserialize(Cursor::new(*block_bytes)).ok())
+        .flat_map(|block| block.transactions.clone())
+        .map(|tx| (weight(&tx), tx))
+        .filter(|(weight, _)| *weight > 0)
+        .max_by_key(|(weight, _)| *weight)
+        .map(|(_, tx)| tx.zcash_serialize_to_vec().expect("valid transaction"))
+}
+
 /// Extracts the first Orchard-only v5 transaction from a block.
 fn first_v5_orchard_only_tx(block: &Block) -> Option<Arc<Transaction>> {
     block
@@ -127,6 +142,19 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
     .expect("valid block");
     if let Some(bytes) = first_tx_of_version(&block, 5) {
         tx_samples.push(("V5 orchard", bytes));
+    }
+
+    // The per-version samples above are whichever transaction of that version comes first in
+    // its block, which on these heights is the transparent coinbase — 164 and 201 bytes, with
+    // no shielded data at all. Deserialization cost is dominated by the shielded sections, so
+    // add the heaviest Sapling and Orchard transactions in the vectors as well.
+    if let Some(sample) = heaviest_tx(|tx| {
+        tx.sapling_spends_per_anchor().count() + tx.sapling_outputs().count()
+    }) {
+        tx_samples.push(("Sapling heavy", sample));
+    }
+    if let Some(sample) = heaviest_tx(|tx| tx.orchard_actions().count()) {
+        tx_samples.push(("Orchard heavy", sample));
     }
 
     // Sizes matter for reading these results: deserialization and any hash over the same
