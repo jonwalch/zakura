@@ -84,6 +84,16 @@ const BENCHMARK_CASES: &[BenchmarkCase] = &[
         tokio_worker_threads: 4,
         target: BenchmarkTarget::MaxSaplingSpends,
     },
+    // The pool-pure cases above bound each verifier's cost in isolation, which makes any
+    // memo over that verifier look maximally good. This case is the one that decides
+    // whether memoizing a given check is worth its complexity: an ordinary block's pool
+    // mix, where a check's share of the work is what it actually is.
+    BenchmarkCase {
+        name: "natural_mainnet_mix",
+        rayon_threads: 4,
+        tokio_worker_threads: 4,
+        target: BenchmarkTarget::NaturalMainnetMix,
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -98,7 +108,11 @@ struct BenchmarkCase {
 enum BenchmarkTarget {
     MaxSaplingOutputs,
     MaxSaplingSpends,
-    ActionLimits { action_limits: ActionLimits },
+    ActionLimits {
+        action_limits: ActionLimits,
+    },
+    /// Fill the block from mainnet candidates without steering the shielded pool mix.
+    NaturalMainnetMix,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,6 +441,17 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
                     "max_sapling_spends_under_max_block_bytes",
                 )
             }
+            BenchmarkTarget::NaturalMainnetMix => {
+                let selected =
+                    select_natural_mainnet_mix(ZIP1271_GLOBAL_SHIELDED_BUDGET, candidates)?;
+
+                (
+                    action_counts_for_selection(&selected, candidates).shielded_pool_actions(),
+                    Some(ZIP1271_GLOBAL_SHIELDED_BUDGET),
+                    selected,
+                    "natural_mainnet_pool_mix_under_zip1271_global_limit_and_max_block_bytes",
+                )
+            }
             BenchmarkTarget::ActionLimits { action_limits } => {
                 let selected = select_candidates_for_limits(action_limits, candidates)?;
                 let tx_bytes = selected_tx_bytes(&selected, candidates);
@@ -474,6 +499,16 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
     stats.modeled_block_bytes = modeled_block_bytes(stats.serialized_bytes, selected.len());
 
     match case.target {
+        // The realised mix is a property of the test vectors, not a target, so only the
+        // consensus limits are asserted here. The mix itself is reported by
+        // `print_workload_metadata`.
+        BenchmarkTarget::NaturalMainnetMix => {
+            assert_within_global_shielded_budget(
+                &stats,
+                target_global_shielded_budget,
+                "natural mainnet mix",
+            );
+        }
         BenchmarkTarget::ActionLimits { .. } => {
             let actual_counts = stats.action_counts.shielded_pool_actions();
 
@@ -483,11 +518,10 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
                     "selected workload must not exceed the requested shielded pool action limits",
                 );
             }
-            assert!(
-                stats.action_counts.global_shielded_budget()
-                    <= target_global_shielded_budget
-                        .expect("ZIP 1271 action-limit workloads have a global budget"),
-                "selected workload must not exceed the requested global shielded budget",
+            assert_within_global_shielded_budget(
+                &stats,
+                target_global_shielded_budget,
+                "ZIP 1271 action-limit",
             );
         }
         BenchmarkTarget::MaxSaplingOutputs | BenchmarkTarget::MaxSaplingSpends => {
@@ -596,6 +630,78 @@ fn select_sapling_spend_heavy_workload(candidates: &[CandidateTx]) -> Option<Vec
     let (_, _, _, index, repeats) = best?;
 
     Some(vec![index; repeats])
+}
+
+/// Asserts a built workload stayed inside the global shielded budget it was built under.
+///
+/// A case that reaches here without a budget is an inconsistent case table, which should fail
+/// loudly rather than silently skip the case — so this panics instead of returning `None`.
+/// Kept out of [`build_workload`] so the panic is not an unwrap inside a function returning
+/// `Option`.
+fn assert_within_global_shielded_budget(
+    stats: &WorkloadStats,
+    target_global_shielded_budget: Option<usize>,
+    case_kind: &str,
+) {
+    let budget = target_global_shielded_budget
+        .unwrap_or_else(|| panic!("{case_kind} workloads carry a global shielded budget"));
+
+    assert!(
+        stats.action_counts.global_shielded_budget() <= budget,
+        "selected workload must not exceed the {case_kind} global shielded budget",
+    );
+}
+
+/// Fills a block from mainnet candidates in chain order, preserving their natural pool mix.
+///
+/// Candidates are cycled so the block fills to the same size as the pool-targeted cases,
+/// which keeps the wall-clock numbers comparable across cases. Selection stops at the ZIP
+/// 1271 global shielded budget as well as the block size limit, so the result stays a block
+/// that consensus would actually accept — an unbounded pack would overstate shielded work
+/// and flatter every shielded memo.
+///
+/// The realised mix is printed with the case rather than asserted, because it is a property
+/// of the test vectors, not a target. See the corpus note in the module header: these
+/// vectors stop below the NU6.3 activation height, so the mix contains no Ironwood bundles.
+fn select_natural_mainnet_mix(
+    global_shielded_budget: usize,
+    candidates: &[CandidateTx],
+) -> Option<Vec<usize>> {
+    let mut selected = Vec::new();
+    let mut selected_counts = ActionCounts::default();
+    let mut tx_bytes = 0_usize;
+
+    loop {
+        let mut added_in_pass = false;
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            let next_tx_bytes = tx_bytes.saturating_add(candidate.serialized_len);
+            let next_budget = selected_counts
+                .global_shielded_budget()
+                .saturating_add(candidate.counts.global_shielded_budget());
+
+            if next_budget > global_shielded_budget {
+                continue;
+            }
+
+            if modeled_block_bytes(next_tx_bytes, selected.len().saturating_add(1))
+                > max_block_bytes()
+            {
+                continue;
+            }
+
+            tx_bytes = next_tx_bytes;
+            selected_counts += candidate.counts;
+            selected.push(index);
+            added_in_pass = true;
+        }
+
+        if !added_in_pass {
+            break;
+        }
+    }
+
+    (!selected.is_empty()).then_some(selected)
 }
 
 fn select_candidates_for_limits(
@@ -767,6 +873,12 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
         BenchmarkTarget::MaxSaplingSpends => {
             println!(
                 "worst_case_tx_verification: case={} requested_workload_goal sapling_spends=max",
+                case.name,
+            );
+        }
+        BenchmarkTarget::NaturalMainnetMix => {
+            println!(
+                "worst_case_tx_verification: case={} requested_workload_goal pool_mix=natural_from_test_vectors",
                 case.name,
             );
         }

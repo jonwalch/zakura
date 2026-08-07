@@ -139,6 +139,32 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
 
     group.finish();
 
+    // The cost of the cache *key* a deserialization memo would need, measured on the same
+    // bytes as the deserialization it would replace.
+    //
+    // A memo can only skip parsing a transaction it recognizes, and the only identifier
+    // available before parsing is a hash of the wire bytes: ZIP-244 txids are computed from
+    // parsed fields, so looking one up presupposes the work being skipped. This group is
+    // therefore the lower bound on a lookup, against `deserialize` as the upper bound on the
+    // saving.
+    let mut group = c.benchmark_group("Deserialization Memo Key");
+
+    for (label, tx_bytes) in &tx_samples {
+        group.bench_with_input(
+            BenchmarkId::new("blake2b_256_of_wire_bytes", label),
+            tx_bytes,
+            |b, bytes| {
+                b.iter(|| {
+                    blake2b_simd::Params::new()
+                        .hash_length(32)
+                        .hash(black_box(bytes))
+                })
+            },
+        );
+    }
+
+    group.finish();
+
     let mut group = c.benchmark_group("Transaction Serialization");
 
     for (label, tx_bytes) in &tx_samples {
