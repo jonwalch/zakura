@@ -129,6 +129,20 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
         tx_samples.push(("V5 orchard", bytes));
     }
 
+    // Sizes matter for reading these results: deserialization and any hash over the same
+    // bytes are both linear in tx size, so a ratio taken on an unrepresentative sample does
+    // not transfer.
+    for (label, tx_bytes) in &tx_samples {
+        let tx = Transaction::zcash_deserialize(Cursor::new(tx_bytes)).expect("valid transaction");
+        eprintln!(
+            "sample {label}: {} bytes, {} sapling spends, {} sapling outputs, {} orchard actions",
+            tx_bytes.len(),
+            tx.sapling_spends_per_anchor().count(),
+            tx.sapling_outputs().count(),
+            tx.orchard_actions().count(),
+        );
+    }
+
     for (label, tx_bytes) in &tx_samples {
         group.bench_with_input(
             BenchmarkId::new("deserialize", label),
