@@ -32,6 +32,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use zakura_chain::{
     block::{Block, Height},
     parameters::NetworkUpgrade,
+    sapling::keys::ValidatingKey,
     serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::{LockTime, Transaction},
 };
@@ -148,9 +149,9 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
     // its block, which on these heights is the transparent coinbase — 164 and 201 bytes, with
     // no shielded data at all. Deserialization cost is dominated by the shielded sections, so
     // add the heaviest Sapling and Orchard transactions in the vectors as well.
-    if let Some(sample) = heaviest_tx(|tx| {
-        tx.sapling_spends_per_anchor().count() + tx.sapling_outputs().count()
-    }) {
+    if let Some(sample) =
+        heaviest_tx(|tx| tx.sapling_spends_per_anchor().count() + tx.sapling_outputs().count())
+    {
         tx_samples.push(("Sapling heavy", sample));
     }
     if let Some(sample) = heaviest_tx(|tx| tx.orchard_actions().count()) {
@@ -220,6 +221,41 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
     group.finish();
 }
 
+/// Attributes Sapling's outsized per-byte deserialization cost.
+///
+/// A Sapling transaction parses about thirty times slower per byte than an Orchard one, which
+/// is too large to be field copying. Every Spend description decodes an `rk`, and
+/// [`ValidatingKey::try_from`] decompresses that point twice: once inside
+/// `redjubjub::VerificationKey::try_from`, and again to run the small-order check. Point
+/// decompression needs a square root in the base field, so a redundant one is not free.
+fn bench_sapling_rk_decoding(c: &mut Criterion) {
+    // The `rk` of the first Spend in the heaviest Sapling transaction in the vectors.
+    let Some(tx_bytes) = heaviest_tx(|tx| tx.sapling_spends_per_anchor().count()) else {
+        return;
+    };
+    let tx = Transaction::zcash_deserialize(Cursor::new(&tx_bytes)).expect("valid transaction");
+    let rk: [u8; 32] = tx
+        .sapling_spends_per_anchor()
+        .next()
+        .expect("the heaviest Sapling transaction has a Spend")
+        .rk
+        .into();
+
+    let mut group = c.benchmark_group("Sapling rk Decoding");
+
+    group.bench_function("verification_key_only", |b| {
+        b.iter(|| {
+            redjubjub::VerificationKey::<redjubjub::SpendAuth>::try_from(*black_box(&rk)).unwrap()
+        })
+    });
+
+    group.bench_function("validating_key_with_small_order_check", |b| {
+        b.iter(|| ValidatingKey::try_from(*black_box(&rk)).unwrap())
+    });
+
+    group.finish();
+}
+
 fn bench_zip244_digests(c: &mut Criterion) {
     let nu5_blocks = [
         zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
@@ -267,6 +303,6 @@ fn bench_zip244_digests(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().noise_threshold(0.1).sample_size(50);
-    targets = bench_transaction_deserialize, bench_zip244_digests
+    targets = bench_transaction_deserialize, bench_sapling_rk_decoding, bench_zip244_digests
 }
 criterion_main!(benches);
