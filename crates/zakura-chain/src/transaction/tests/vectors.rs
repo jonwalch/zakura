@@ -2695,6 +2695,11 @@ fn sapling_small_order_rk_deferred_but_caught_by_librustzcash() {
         "to_librustzcash must reject an off-curve rk at read",
     );
 
+    // `check_spend`'s own rejection of the small-order rk is pinned separately, over a real
+    // mainnet bundle, by `librustzcash_check_spend_rejects_a_small_order_rk` — it cannot be
+    // pinned here because this crafted fixture carries an all-zero proof, which
+    // `check_bundle` rejects on its own regardless of `rk`.
+
     // Byte-identity: the lazy representation must not perturb the encoding, since
     // the txid and merkle root hash these bytes.
     let bytes_in = build(off_curve)
@@ -2708,6 +2713,94 @@ fn sapling_small_order_rk_deferred_but_caught_by_librustzcash() {
         bytes_in,
         bytes_out.zcash_serialize_to_vec().expect("re-serializes"),
         "a lazy rk must round-trip byte-for-byte",
+    );
+}
+
+/// librustzcash rejects a small-order `rk` at verify, which is the backstop the deferral leans
+/// on for the semantic and mempool paths.
+///
+/// This drives `sapling_crypto`'s own `BatchValidator` over a **real mainnet Sapling bundle**
+/// rather than re-stating the rule. Re-stating it would be worthless: `check_spend` tests
+/// `jubjub::AffinePoint::from_bytes(..).is_small_order()`, which is character for character what
+/// [`ValidatingKey::is_valid_not_small_order`] runs, so an assertion written that way is
+/// tautologically true and could never detect a divergence. `sapling-crypto` exposes no
+/// byte-level entry point for that half, so the only independent evidence is the library's
+/// observable behaviour on a bundle.
+///
+/// A real bundle is required: `check_bundle` runs every synchronous consensus check before
+/// batching, so a crafted fixture with a placeholder proof is rejected whatever its `rk` is, and
+/// the test would pass for the wrong reason. The accept leg guards exactly that.
+///
+/// Signature and proof validity are *batched*, not checked by `check_bundle`, so replacing `rk`
+/// — which invalidates the spend authorization signature — does not disturb the accept leg.
+///
+/// [`ValidatingKey::is_valid_not_small_order`]: crate::sapling::keys::ValidatingKey::is_valid_not_small_order
+#[test]
+fn librustzcash_check_spend_rejects_a_small_order_rk() {
+    use crate::{
+        parameters::Network,
+        sapling::{self, keys::ValidatingKey},
+        serialization::AtLeastOne,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+
+    let (height, transaction) = arbitrary::test_transactions(&network)
+        .find(|(_, tx)| {
+            matches!(tx.as_ref(), Transaction::V4 { .. })
+                && tx.sapling_spends_per_anchor().next().is_some()
+                && tx.inputs().is_empty()
+        })
+        .expect("mainnet test vectors must contain a V4 Sapling transaction with spends");
+
+    let nu = NetworkUpgrade::current(&network, height);
+
+    // Any sighash gives the same synchronous verdict — `check_bundle` only queues the signature
+    // batch items — but use the real one so the accept leg is a faithful bundle.
+    let sighash = transaction
+        .sighasher(nu, Arc::new(Vec::new()))
+        .expect("the transaction has no transparent inputs")
+        .sighash(HashType::ALL, None);
+
+    let check_bundle_accepts = |tx: &Transaction| -> bool {
+        let bundle = tx
+            .to_librustzcash(nu)
+            .expect("librustzcash reads this mainnet transaction")
+            .into_data()
+            .sapling_bundle()
+            .expect("the transaction has a Sapling bundle")
+            .clone();
+
+        sapling_crypto::BatchValidator::new().check_bundle(bundle, sighash.into())
+    };
+
+    assert!(
+        check_bundle_accepts(&transaction),
+        "check_bundle must accept the unmodified mainnet bundle, or the rejection below proves \
+         nothing",
+    );
+
+    let mut small_order_rk = transaction.as_ref().clone();
+    let Transaction::V4 {
+        sapling_shielded_data: Some(shielded_data),
+        ..
+    } = &mut small_order_rk
+    else {
+        panic!("the fixture was selected for being V4 with Sapling data")
+    };
+    let sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } = &mut shielded_data.transfers
+    else {
+        panic!("the fixture was selected for having spends")
+    };
+    let mut spends_vec = spends.as_slice().to_vec();
+    spends_vec[0].rk = ValidatingKey(jubjub::AffinePoint::identity().to_bytes());
+    *spends = AtLeastOne::from_vec(spends_vec).expect("replacing a field keeps at least one spend");
+
+    assert!(
+        !check_bundle_accepts(&small_order_rk),
+        "check_spend must reject a small-order rk",
     );
 }
 
@@ -3305,6 +3398,16 @@ fn sapling_point_checks_match_librustzcash_predicates() {
     // The exact predicate librustzcash applies to an `rk`: decode with
     // `read_rk` (i.e. `redjubjub::VerificationKey::try_from`), then reject a
     // small-order point (as `check_spend` does).
+    //
+    // Only the *decode* half of this is an independent model. `check_spend` rejects with
+    // `jubjub::AffinePoint::from_bytes(..).is_small_order()`, which is character for character
+    // what `ValidatingKey::is_valid_not_small_order` runs, so re-stating it here could not
+    // detect a divergence — `sapling-crypto` exposes no byte-level entry point for that half to
+    // call instead. What this arm genuinely pins is that `reddsa`'s decoder and `jubjub`'s
+    // decoder agree on acceptance, which is not obvious and would break the conjunction if it
+    // stopped holding. The behaviour of `check_spend` itself is pinned separately and
+    // non-tautologically, by driving the real `sapling_crypto::BatchValidator` in
+    // `sapling_small_order_rk_deferred_but_caught_by_librustzcash`.
     let librustzcash_rk_valid = |bytes: [u8; 32]| -> bool {
         redjubjub::VerificationKey::<SpendAuth>::try_from(bytes).is_ok()
             && !bool::from(
