@@ -250,6 +250,13 @@ fn spawn_action_driver(
                         .send(BlockSyncEvent::ScopedNeededBlocks {
                             query_id,
                             scope,
+                            body_anchor: {
+                                let frontiers = apply.frontiers();
+                                zakura_header_chain::Frontier::new(
+                                    frontiers.verified_block_tip,
+                                    frontiers.verified_block_hash,
+                                )
+                            },
                             blocks: metas,
                         })
                         .await

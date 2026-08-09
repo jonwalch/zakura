@@ -785,8 +785,8 @@ impl StartCmd {
         }
         let syncer_task_handle = if use_zakura_block_sync(&config.network) {
             info!(
-                "legacy ChainSync will bootstrap checkpoint handoff before Zakura block sync \
-                 takes ownership"
+                "legacy-compatible genesis fetch will complete before Zakura block sync takes \
+                 ownership at height 1"
             );
             // Only dual-stack nodes (Zakura + legacy peers) fall back to legacy ChainSync on a
             // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. The
@@ -1558,11 +1558,12 @@ mod zakura_header_sync_driver_tests {
         abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
         block_roots_cover_range, block_sync_missing_body_window,
         block_sync_needed_blocks_from_state, block_verify_error_class,
-        coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
-        commit_block_sync_body, drive_block_sync_actions, query_block_sync_frontiers,
-        query_block_sync_needed_blocks, root_covered_query_best_header_tip,
-        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        block_verify_error_diagnostic, coalesce_ready_needed_block_queries,
+        coalesce_stale_needed_block_queries, commit_block_sync_body, drive_block_sync_actions,
+        query_block_sync_frontiers, query_block_sync_needed_blocks,
+        root_covered_query_best_header_tip, verified_block_tip_from_state, BlockApplyClass,
+        BlocksyncThroughputProbe, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn needed_blocks_query(
@@ -2227,6 +2228,17 @@ mod zakura_header_sync_driver_tests {
             block_verify_error_class(&invalid_block_error),
             BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("block.no_transactions"))
         );
+
+        let missing_context_error = zakura_consensus::RouterError::Block {
+            source: Box::new(zakura_consensus::VerifyBlockError::Commit(
+                zakura_state::CommitBlockError::HeaderChainError {
+                    error: "diagnostic sentinel".to_string(),
+                },
+            )),
+        };
+        let diagnostic = block_verify_error_diagnostic(&missing_context_error)
+            .expect("known verifier errors have a concise diagnostic chain");
+        assert!(diagnostic.contains("diagnostic sentinel"), "{diagnostic}");
     }
 
     #[tokio::test]
@@ -2355,7 +2367,7 @@ mod zakura_header_sync_driver_tests {
                                 .lock()
                                 .expect("request capture mutex is not poisoned")
                                 .push(("metadata", from, limit));
-                            let metadata = (0..limit)
+                            let blocks = (0..limit)
                                 .filter_map(|offset| {
                                     from.0
                                         .checked_add(offset)
@@ -2363,7 +2375,15 @@ mod zakura_header_sync_driver_tests {
                                 })
                                 .collect();
                             Ok::<_, zakura_state::BoxError>(
-                                zakura_state::ReadResponse::MissingBlockBodyMetadata(metadata),
+                                zakura_state::ReadResponse::MissingBlockBodyMetadata(
+                                    zakura_state::BlockSyncBodyMetadata {
+                                        anchor: zakura_header_chain::Frontier::new(
+                                            block::Height(0),
+                                            block::Hash([0; 32]),
+                                        ),
+                                        blocks,
+                                    },
+                                ),
                             )
                         }
                         request => panic!("unexpected read request: {request:?}"),
@@ -2373,7 +2393,7 @@ mod zakura_header_sync_driver_tests {
         };
         let count = zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 2;
 
-        let needed = query_block_sync_needed_blocks(read_state, block::Height(1), count)
+        let (_anchor, needed) = query_block_sync_needed_blocks(read_state, block::Height(1), count)
             .await
             .expect("mock read state succeeds");
 
@@ -2741,7 +2761,13 @@ mod zakura_header_sync_driver_tests {
                         assert_eq!(from, block::Height(1));
                         assert_eq!(limit, 2);
                         Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
-                            (*read_metadata).clone(),
+                            zakura_state::BlockSyncBodyMetadata {
+                                anchor: zakura_header_chain::Frontier::new(
+                                    block::Height(0),
+                                    block::Hash([0; 32]),
+                                ),
+                                blocks: (*read_metadata).clone(),
+                            },
                         ))
                     }
                     zakura_state::ReadRequest::FinalizedTip => {
@@ -2897,10 +2923,18 @@ mod zakura_header_sync_driver_tests {
                     zakura_state::ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                         assert_eq!(from, block::Height(1));
                         assert_eq!(limit, 3);
-                        Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(vec![
-                            (block::Height(1), read_block1.hash(), None),
-                            (block::Height(2), read_block2.hash(), None),
-                        ]))
+                        Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
+                            zakura_state::BlockSyncBodyMetadata {
+                                anchor: zakura_header_chain::Frontier::new(
+                                    block::Height(0),
+                                    block::Hash([0; 32]),
+                                ),
+                                blocks: vec![
+                                    (block::Height(1), read_block1.hash(), None),
+                                    (block::Height(2), read_block2.hash(), None),
+                                ],
+                            },
+                        ))
                     }
                     request => panic!("unexpected read request in throughput probe: {request:?}"),
                 }
@@ -4472,7 +4506,15 @@ mod zakura_header_sync_driver_tests {
                             let _ = query_seen_tx.send(());
                         }
                         Ok::<_, zakura_state::BoxError>(
-                            zakura_state::ReadResponse::MissingBlockBodyMetadata(Vec::new()),
+                            zakura_state::ReadResponse::MissingBlockBodyMetadata(
+                                zakura_state::BlockSyncBodyMetadata {
+                                    anchor: zakura_header_chain::Frontier::new(
+                                        block::Height(0),
+                                        block::Hash([0; 32]),
+                                    ),
+                                    blocks: Vec::new(),
+                                },
+                            ),
                         )
                     }
                     zakura_state::ReadRequest::FinalizedTip => {

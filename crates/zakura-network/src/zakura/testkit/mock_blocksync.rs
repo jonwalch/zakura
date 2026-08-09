@@ -564,6 +564,21 @@ async fn drive_mock_block_sync_actions(
                         .send(BlockSyncEvent::ScopedNeededBlocks {
                             query_id,
                             scope,
+                            body_anchor: apply.as_ref().map_or_else(
+                                || {
+                                    zakura_header_chain::Frontier::new(
+                                        block::Height(0),
+                                        mainnet_genesis_hash(),
+                                    )
+                                },
+                                |apply| {
+                                    let frontiers = apply.frontiers();
+                                    zakura_header_chain::Frontier::new(
+                                        frontiers.verified_block_tip,
+                                        frontiers.verified_block_hash,
+                                    )
+                                },
+                            ),
                             blocks: metas,
                         })
                         .await;

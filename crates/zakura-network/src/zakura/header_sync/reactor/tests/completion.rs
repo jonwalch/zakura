@@ -309,6 +309,56 @@ fn durable_prefix_headroom_accounts_for_staged_headers_at_exact_limits() {
     );
 }
 
+#[test]
+fn integrated_request_headroom_refills_at_checkpoint_low_water_and_admits_the_final_prefix() {
+    let anchor =
+        zakura_header_chain::Frontier::new(block::Height(10), regtest_genesis_block().hash());
+    let mut snapshot = committed_snapshot(anchor);
+    let remote_tip = block::Height(20_000);
+
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
+        MAX_HS_RANGE
+    );
+
+    snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + MAX_HS_RANGE - 1);
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
+        0,
+        "a nearly full window does not cause one-header durable transitions"
+    );
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(
+            &snapshot,
+            0,
+            block::Height(snapshot.frontiers.header_best.height.0 + 1),
+        ),
+        1,
+        "the exact final partial target remains reachable"
+    );
+
+    snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + 750);
+    snapshot.frontiers.verified_best.height = block::Height(anchor.height.0 + 400);
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
+        MAX_HS_RANGE - 350,
+        "a partial native admission cannot starve the next checkpoint range"
+    );
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 1, remote_tip),
+        MAX_HS_RANGE - 351,
+        "staged entries consume the already-open low-water refill"
+    );
+
+    snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + 802);
+    snapshot.frontiers.verified_best.height = block::Height(anchor.height.0 + 400);
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
+        0,
+        "one block above checkpoint low water remains closed"
+    );
+}
+
 #[tokio::test]
 async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     let shutdown = CancellationToken::new();
@@ -329,6 +379,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         ),
         block::Hash([0x51; 32]),
     );
+    snapshot.frontiers.verified_best = snapshot.frontiers.header_best;
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
     startup.committed_snapshots = Some(snapshots_rx);
     let (handle, mut actions, task) =

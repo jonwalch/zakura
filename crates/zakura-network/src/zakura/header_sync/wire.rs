@@ -474,7 +474,7 @@ impl TreeAuxWire for TreeAuxRecordV1 {
             .activation_height(network)
             .is_none_or(|height| expected_height < height)
         {
-            if self.orchard_root != orchard::tree::Root::default() {
+            if self.orchard_root != orchard::tree::NoteCommitmentTree::default().root() {
                 return Err(HeaderSyncWireError::InvalidTreeAuxDefault {
                     height: expected_height,
                     field: "orchard_root",
@@ -494,11 +494,11 @@ impl TreeAuxWire for TreeAuxRecordV1 {
             }
         }
 
-        if NetworkUpgrade::Nu7
+        if NetworkUpgrade::Nu6_3
             .activation_height(network)
             .is_none_or(|height| expected_height < height)
         {
-            if self.ironwood_root != ironwood::tree::Root::default() {
+            if self.ironwood_root != ironwood::tree::NoteCommitmentTree::default().root() {
                 return Err(HeaderSyncWireError::InvalidTreeAuxDefault {
                     height: expected_height,
                     field: "ironwood_root",

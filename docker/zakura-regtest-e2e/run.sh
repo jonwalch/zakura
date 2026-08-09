@@ -567,10 +567,9 @@ trace_rows_after() {
   awk -v lines_before="${lines_before}" 'NR > lines_before' "${file}"
 }
 
-# The checkpoint verifier intentionally runs before native header/body sync.
-# Follow the append-only legacy trace from this restart so the long checkpoint
-# phase reports real progress, then validate the exact durable handoff boundary.
-wait_for_checkpoint_handoff() {
+# The compatibility downloader fetches only genesis. Follow the append-only
+# legacy trace from this restart and validate the exact durable handoff boundary.
+wait_for_genesis_handoff() {
   local expected_height="$1" lines_before="$2" timeout="$3"
   local file="${ZAKURA_E2E_TRACE_DIR}/node2/legacy_sync.jsonl"
   local deadline=$((SECONDS + timeout)) summary verified_height handoff_count
@@ -599,7 +598,7 @@ wait_for_checkpoint_handoff() {
         ')
     verified_height=$(printf '%s' "${summary}" | jq -r '.verified_height')
     handoff_count=$(printf '%s' "${summary}" | jq -r '.handoff_count')
-    printf '  node2 checkpoint bootstrap legacy_verified=%s handoffs=%s (target %s)\n' \
+    printf '  node2 genesis bootstrap legacy_verified=%s handoffs=%s (target %s)\n' \
       "${verified_height}" "${handoff_count}" "${expected_height}"
     if (( handoff_count >= 1 )); then
       handoff_row=$(printf '%s' "${summary}" | jq -c '.handoff')
@@ -609,9 +608,9 @@ wait_for_checkpoint_handoff() {
   done
 
   [[ -n "${handoff_row:-}" ]] \
-    || fail "node2 did not emit checkpoint handoff at height ${expected_height} within ${timeout}s"
+    || fail "node2 did not emit genesis handoff at height ${expected_height} within ${timeout}s"
   [[ "${handoff_count}" == "1" ]] \
-    || fail "node2 emitted ${handoff_count} checkpoint handoffs at height ${expected_height} during one catch-up"
+    || fail "node2 emitted ${handoff_count} genesis handoffs at height ${expected_height} during one catch-up"
   printf '%s' "${handoff_row}" \
     | jq -e --argjson expected "${expected_height}" '
         .checkpoint_height == $expected
@@ -619,7 +618,7 @@ wait_for_checkpoint_handoff() {
         and ((.process_trace_id | strings | length) > 0)
         and (.ts | type == "number")
       ' >/dev/null \
-    || fail "node2 checkpoint handoff did not match the exact expected state boundary ${expected_height}"
+    || fail "node2 genesis handoff did not match the exact expected state boundary ${expected_height}"
 
   CHECKPOINT_HANDOFF_PROCESS_TRACE_ID=$(printf '%s' "${handoff_row}" | jq -r '.process_trace_id')
   CHECKPOINT_HANDOFF_TS=$(printf '%s' "${handoff_row}" | jq -r '.ts')
@@ -649,8 +648,8 @@ wait_for_checkpoint_handoff() {
     | jq -e --argjson expected "${expected_height}" '
         .first == 0 and .last == $expected and .count == ($expected + 1)
       ' >/dev/null \
-    || fail "node2 legacy checkpoint trace did not verify every height 0..${expected_height} before handoff"
-  log "node2 checkpoint bootstrap verified legacy heights 0..${expected_height} and handed off at the exact boundary"
+    || fail "node2 compatibility trace did not verify only genesis before handoff"
+  log "node2 compatibility bootstrap verified genesis and handed height 1 onward to native sync"
 }
 
 # Native header/body work can prefetch while the checkpoint verifier owns the
@@ -1527,7 +1526,7 @@ snapshot_timeline "pre-reset-catch-up"
 # Keep the highest checkpoint strictly below the tip so the trailing tip reorg later is never
 # blocked by a final (immutable) checkpoint.
 checkpoint_ceiling=$(( catchup_target - 2 ))
-checkpoint_handoff_height=-1
+checkpoint_handoff_height=0
 if [[ "${ZAKURA_E2E_DISABLE_CHECKPOINTS}" == "1" ]]; then
   log "node2 Regtest checkpoints are disabled; catch-up verifies through the full verifier after genesis"
 elif (( CHECKPOINT_INTERVAL > 0 && checkpoint_ceiling >= CHECKPOINT_INTERVAL )); then
@@ -1562,8 +1561,8 @@ elif (( CHECKPOINT_INTERVAL > 0 && checkpoint_ceiling >= CHECKPOINT_INTERVAL ));
     "${CONFIG_DIR}/node2.toml"
   grep -q '^network = { params = ' "${CONFIG_DIR}/node2.toml" \
     || fail "failed to inject derived checkpoints into node2 config"
-  checkpoint_handoff_height=$(( h - CHECKPOINT_INTERVAL ))
-  log "node2 will legacy checkpoint-bootstrap through height ${checkpoint_handoff_height} using ${cp_count} derived checkpoint(s) (selection ceiling ${checkpoint_ceiling}), then hand off to native sync"
+  native_checkpoint_height=$(( h - CHECKPOINT_INTERVAL ))
+  log "node2 will hand off to native sync after genesis; native checkpoint verification uses ${cp_count} derived checkpoint(s) through height ${native_checkpoint_height} (selection ceiling ${checkpoint_ceiling})"
 else
   log "chain too short (tip ${catchup_target}, interval ${CHECKPOINT_INTERVAL}); node2 catches up with the genesis-only checkpoint list"
 fi
@@ -1578,11 +1577,9 @@ snapshot_timeline "post-reset-catch-up-started"
 # verifier owns the prefix. Observe that phase directly and require its explicit
 # handoff before waiting for native block-sync activity.
 if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
-  (( checkpoint_handoff_height >= 0 )) \
-    || fail "${ZAKURA_E2E_MODE} requires a checkpoint handoff, but no derived checkpoint boundary was configured"
   (( checkpoint_handoff_height < catchup_target )) \
     || fail "checkpoint handoff height ${checkpoint_handoff_height} leaves no native suffix below target ${catchup_target}"
-  wait_for_checkpoint_handoff \
+  wait_for_genesis_handoff \
     "${checkpoint_handoff_height}" "${node2_legacy_lines_before}" "${CATCHUP_TIMEOUT}"
 fi
 
@@ -1610,7 +1607,7 @@ if ! awk "BEGIN{exit !(${after_node1_served} > ${before_node1_served})}"; then
 fi
 assert_block_sync_budget_empty "post-catch-up"
 if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
-  log "node2 checkpoint-bootstrapped legacy heights 0..${checkpoint_handoff_height}, handed off, then downloaded native kind-6 suffix $(( checkpoint_handoff_height + 1 ))..${catchup_target}"
+  log "node2 compatibility-fetched genesis, handed off, then downloaded native kind-6 heights 1..${catchup_target}"
 else
   log "node2 completed its from-scratch catch-up to height ${catchup_target} with native kind-6 activity"
 fi

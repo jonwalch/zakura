@@ -432,6 +432,7 @@ impl HeaderChainWriter {
             )?,
         )?;
         let restored_path = verified_path(non_finalized_state);
+        let restored_side_paths = verified_side_paths(non_finalized_state, &restored_path);
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
         let runtime = if store.is_initialized()? {
             let persisted_finalized = store.snapshot()?.frontiers.finalized;
@@ -471,6 +472,7 @@ impl HeaderChainWriter {
         } else {
             initialize_header_chain_reconciled(&finalized_state.db, &config, restored_path)?.0
         };
+        restore_verified_side_paths(&runtime, &config, restored_side_paths)?;
         Ok(Self::new(runtime, config))
     }
 
@@ -481,6 +483,105 @@ impl HeaderChainWriter {
             full_state_authority: None,
             retention_references: &[],
         }
+    }
+
+    fn commit_checkpoint_finalized(
+        &self,
+        block: &CheckpointVerifiedBlock,
+        full_state_batch: DiskWriteBatch,
+        authentication: Option<TransitionRequest>,
+    ) -> Result<(), HeaderChainStoreError> {
+        let accepted = Frontier::new(block.height, block.hash);
+        let snapshot = self.runtime.publisher().snapshot();
+        if accepted.height <= snapshot.frontiers.finalized.height {
+            return (accepted == snapshot.frontiers.finalized)
+                .then_some(())
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "checkpoint full state conflicts with durable header finality",
+                ));
+        }
+        if accepted.height
+            != snapshot
+                .frontiers
+                .verified_best
+                .height
+                .next()
+                .map_err(|_| {
+                    HeaderChainStoreError::Incoherent(
+                        "checkpoint full-state height does not extend the verified header frontier",
+                    )
+                })?
+            || block.block.header.previous_block_hash != snapshot.frontiers.verified_best.hash
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "checkpoint full state does not extend the verified header frontier",
+            ));
+        }
+
+        let path = vec![VerifiedHeaderRef {
+            height: block.height,
+            hash: block.hash,
+            header: block.block.header.clone(),
+        }];
+        let evidence = full_state_evidence(
+            b"checkpoint-grow",
+            snapshot.state_version,
+            block.hash,
+            &path,
+        );
+        let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip: snapshot.frontiers.verified_best,
+            new_path: path,
+            cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+        });
+        let checkpoint_authority = PreparedAuthority::for_event(&checkpoint_event)?;
+        let checkpoint_context = TransitionContext {
+            config: &self.config,
+            clock: &self.clock,
+            full_state_authority: Some(&checkpoint_authority),
+            retention_references: &[],
+        };
+        let checkpoint_request = TransitionRequest {
+            expected_version: snapshot.state_version,
+            event: checkpoint_event,
+        };
+        let result = if let Some(authentication) = authentication {
+            let authentication_authority = PreparedAuthority::for_event(&authentication.event)?;
+            let authentication_context = TransitionContext {
+                config: &self.config,
+                clock: &self.clock,
+                full_state_authority: Some(&authentication_authority),
+                retention_references: &[],
+            };
+            self.runtime.apply_aux_then_checkpoint_combined(
+                authentication,
+                &authentication_context,
+                checkpoint_request,
+                &checkpoint_context,
+                full_state_batch,
+                || {},
+            )?
+        } else {
+            self.runtime.apply_combined(
+                checkpoint_request,
+                &checkpoint_context,
+                full_state_batch,
+                || {},
+            )?
+        };
+        match result {
+            ApplyResult::Stale(receipt) => {
+                return Err(HeaderChainStoreError::StaleFullStateTransition {
+                    current_version: receipt.current_version,
+                });
+            }
+            ApplyResult::ResourceStalled(receipt) => {
+                return Err(HeaderChainStoreError::FullStateResourceStalled { receipt });
+            }
+            ApplyResult::Committed | ApplyResult::NoChange(_) => {}
+        }
+        Ok(())
     }
 
     fn apply_deferred_reevaluation(&self) -> Result<(), HeaderChainStoreError> {
@@ -669,6 +770,87 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .collect()
 }
 
+fn verified_side_paths(
+    state: &NonFinalizedState,
+    selected: &[VerifiedHeaderRef],
+) -> Vec<Vec<VerifiedHeaderRef>> {
+    let selected_tip = selected.last().map(|header| header.hash);
+    let mut paths = state
+        .chain_iter()
+        .map(|chain| {
+            chain
+                .blocks
+                .values()
+                .map(|block| VerifiedHeaderRef {
+                    height: block.height,
+                    hash: block.hash,
+                    header: block.block.header.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|path| {
+            path.last()
+                .is_some_and(|header| Some(header.hash) != selected_tip)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable_by_key(|path| {
+        path.last()
+            .map(|header| (header.height, header.hash.0))
+            .expect("empty full-state paths were filtered out")
+    });
+    paths.dedup();
+    paths
+}
+
+fn restore_verified_side_paths(
+    runtime: &HeaderChainRuntime,
+    config: &EngineConfig,
+    paths: Vec<Vec<VerifiedHeaderRef>>,
+) -> Result<(), HeaderChainStoreError> {
+    for path in paths {
+        let snapshot = runtime.publisher().snapshot();
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-full-state-startup-side-path-v1");
+        hasher.update(config.trust_anchor_digest());
+        hasher.update(snapshot.frontiers.finalized.height.0.to_be_bytes());
+        hasher.update(snapshot.frontiers.finalized.hash.0);
+        for header in &path {
+            hasher.update(header.height.0.to_be_bytes());
+            hasher.update(header.hash.0);
+        }
+        let evidence = EvidenceId::from_digest(hasher.finalize().into());
+        let event = TransitionEvent::VerifiedBlockAccepted(VerifiedBlockAccepted {
+            full_state_transition_id: evidence,
+            path,
+        });
+        let authority = PreparedAuthority::for_event(&event)?;
+        let result = runtime.apply(
+            TransitionRequest {
+                expected_version: snapshot.state_version,
+                event,
+            },
+            &TransitionContext {
+                config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )?;
+        match result {
+            ApplyResult::Stale(receipt) => {
+                return Err(HeaderChainStoreError::StaleFullStateTransition {
+                    current_version: receipt.current_version,
+                });
+            }
+            ApplyResult::ResourceStalled(receipt) => {
+                return Err(HeaderChainStoreError::FullStateResourceStalled { receipt });
+            }
+            ApplyResult::Committed | ApplyResult::NoChange(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn verified_path_through(
     state: &NonFinalizedState,
     accepted: Frontier,
@@ -762,6 +944,7 @@ fn verified_request(
         let evidence = full_state_evidence(
             match cause {
                 VerifiedChangeCause::Grow => b"grow",
+                VerifiedChangeCause::CheckpointFinalizedGrow => b"checkpoint-grow",
                 VerifiedChangeCause::Reset => b"reset",
             },
             snapshot.state_version,
@@ -1478,6 +1661,102 @@ fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
     }
 }
 
+fn handle_header_chain_control_message(
+    header_chain: Option<&HeaderChainWriter>,
+    message: NonFinalizedWriteMessage,
+) -> Result<(), NonFinalizedWriteMessage> {
+    match message {
+        NonFinalizedWriteMessage::ApplyHeaderChainInsert { prepared, rsp_tx } => {
+            let result = header_chain
+                .ok_or(HeaderChainStoreError::Uninitialized)
+                .and_then(|writer| {
+                    let insert =
+                        prepared
+                            .into_insert()
+                            .ok_or(HeaderChainStoreError::Transition(
+                                zakura_header_chain::TransitionFailure::Authority,
+                            ))?;
+                    let authority = PreparedHeaderCompletionAuthority(insert.clone());
+                    let mut context = writer.context();
+                    context.full_state_authority = Some(&authority);
+                    writer.runtime.apply(
+                        TransitionRequest {
+                            // Insertions carry typed asynchronous authority; the global
+                            // version coordinate is intentionally irrelevant.
+                            expected_version: StateVersion::default(),
+                            event: TransitionEvent::InsertHeaders(insert),
+                        },
+                        &context,
+                    )
+                });
+            let _ = rsp_tx.send(result);
+            Ok(())
+        }
+        NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { prepared, rsp_tx }
+        | NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid { prepared, rsp_tx }
+        | NonFinalizedWriteMessage::RestartHeaderChainBodyAvailability { prepared, rsp_tx } => {
+            let result = header_chain
+                .ok_or(HeaderChainStoreError::Uninitialized)
+                .and_then(|writer| writer.apply_prepared_body_evidence(prepared));
+            let _ = rsp_tx.send(result);
+            Ok(())
+        }
+        NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability { prepared, rsp_tx } => {
+            let result = header_chain
+                .ok_or(HeaderChainStoreError::Uninitialized)
+                .and_then(|writer| writer.retry_body_availability(prepared));
+            let _ = rsp_tx.send(result);
+            Ok(())
+        }
+        message => Err(message),
+    }
+}
+
+fn attach_header_chain_if_genesis_is_committed(
+    header_chain: &mut Option<HeaderChainWriter>,
+    attach_header_chain: bool,
+    finalized_state: &FinalizedState,
+    non_finalized_state: &NonFinalizedState,
+    observers: &HeaderChainObservers,
+) -> Result<bool, BlockWriteTaskExit> {
+    if !attach_header_chain || observers.runtime_status_sender.borrow().is_ready() {
+        return Ok(false);
+    }
+    if header_chain.is_none() && finalized_state.db.header_by_height(Height(0)).is_none() {
+        return Ok(false);
+    }
+
+    let epoch = observers
+        .begin_reconstruction()
+        .map_err(BlockWriteTaskExit::HeaderChainAttachmentFailed)?;
+    if header_chain.is_none() {
+        let writer = HeaderChainWriter::attach_at_semantic_handoff_with_progress(
+            finalized_state,
+            non_finalized_state,
+            |progress| observers.progress(epoch, progress),
+        )
+        .map_err(|error| {
+            observers.failed(epoch, &error);
+            BlockWriteTaskExit::HeaderChainAttachmentFailed(error)
+        })?;
+        *header_chain = Some(writer);
+    }
+    let writer = header_chain
+        .as_ref()
+        .expect("header runtime exists after successful attachment");
+    observers
+        .reader_sender
+        .send_replace(Some(writer.runtime.reader()));
+    writer
+        .runtime
+        .publisher()
+        .mirror_to(observers.snapshot_sender.clone());
+    observers
+        .ready(epoch)
+        .map_err(BlockWriteTaskExit::HeaderChainAttachmentFailed)?;
+    Ok(true)
+}
+
 impl WriteBlockWorkerTask {
     /// Reads blocks from the channels, writes them to the `finalized_state` or `non_finalized_state`,
     /// sends any errors on the `invalid_block_reset_sender`, then updates the `chain_tip_sender` and
@@ -1517,11 +1796,27 @@ impl WriteBlockWorkerTask {
         // See [`VctWriteManager`].
         let mut vct_write_manager = VctWriteManager::new(vct_root_repair_sender.clone());
 
+        if let Err(exit) = attach_header_chain_if_genesis_is_committed(
+            header_chain,
+            *attach_header_chain_at_handoff,
+            finalized_state,
+            non_finalized_state,
+            header_chain_observers,
+        ) {
+            return exit;
+        }
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
             match non_finalized_block_write_receiver.try_recv() {
-                Ok(msg) => deferred_non_finalized_messages.push_back(msg),
+                Ok(msg) => {
+                    if let Err(msg) =
+                        handle_header_chain_control_message(header_chain.as_ref(), msg)
+                    {
+                        deferred_non_finalized_messages.push_back(msg);
+                    }
+                }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {}
             }
@@ -1666,9 +1961,10 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
             let vct_aux_for_outcome = vct_aux_window.clone();
-            let commit_height = ordered_block.0.height;
             let vct_authentication_window = vct_aux_window.clone();
             let vct_authentication_writer = header_chain.clone();
+            let checkpoint_header_writer = header_chain.clone();
+            let checkpoint_block = ordered_block.0.clone();
 
             // Try committing the block
             match finalized_state.commit_finalized_with_aux_and(
@@ -1676,50 +1972,26 @@ impl WriteBlockWorkerTask {
                 prev_note_commitment_trees,
                 vct_aux_window,
                 |db, batch, proof| {
-                    let authentication = vct_authentication_writer.as_ref().and_then(|writer| {
+                    let authentication = vct_authentication_writer.as_ref().and_then(|_writer| {
                         vct_authentication_window
                             .as_ref()
                             .and_then(|window| {
                                 HeaderChainWriter::vct_authentication_request(window, proof)
                             })
-                            .map(|(evidence, request)| (writer, evidence, request))
+                            .map(|(_evidence, request)| request)
                     });
-                    let Some((writer, _evidence, request)) = authentication else {
+                    if let Some(writer) = checkpoint_header_writer.as_ref() {
+                        writer
+                            .commit_checkpoint_finalized(&checkpoint_block, batch, authentication)
+                            .map_err(|error| CommitBlockError::HeaderChainError {
+                                error: error.to_string(),
+                            })?;
+                    } else {
                         db.header_chain_disk_db()
                             .write(batch)
                             .expect("unexpected rocksdb error while writing block");
-                        return Ok(());
-                    };
-                    let authority = PreparedAuthority::for_event(&request.event)
-                        .expect("VCT authentication requests always carry stable evidence");
-                    let mut context = writer.context();
-                    context.full_state_authority = Some(&authority);
-                    match writer
-                        .runtime
-                        .apply_combined(request, &context, batch, || {})
-                    {
-                        Ok(ApplyResult::Committed | ApplyResult::NoChange(_)) => Ok(()),
-                        Ok(ApplyResult::ResourceStalled(_)) => {
-                            Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
-                                height: commit_height,
-                            }
-                            .into())
-                        }
-                        Ok(ApplyResult::Stale(receipt)) => {
-                            tracing::debug!(
-                                ?receipt,
-                                "VCT: exact auxiliary authentication became stale before commit"
-                            );
-                            Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
-                                height: commit_height,
-                            }
-                            .into())
-                        }
-                        Err(error) => Err(CommitBlockError::HeaderChainError {
-                            error: error.to_string(),
-                        }
-                        .into()),
                     }
+                    Ok(())
                 },
             ) {
                 Ok((finalized, note_commitment_trees)) => {
@@ -1734,6 +2006,16 @@ impl WriteBlockWorkerTask {
                     // A successful commit clears any VCT root stall: log recovery and reset
                     // the stalled-height gauge if it had been raised.
                     vct_write_manager.on_commit_success();
+
+                    if let Err(exit) = attach_header_chain_if_genesis_is_committed(
+                        header_chain,
+                        *attach_header_chain_at_handoff,
+                        finalized_state,
+                        non_finalized_state,
+                        header_chain_observers,
+                    ) {
+                        return exit;
+                    }
 
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
@@ -1857,44 +2139,23 @@ impl WriteBlockWorkerTask {
             return BlockWriteTaskExit::Completed;
         }
 
-        let runtime_epoch = if header_chain.is_some() || *attach_header_chain_at_handoff {
-            match header_chain_observers.begin_reconstruction() {
-                Ok(epoch) => Some(epoch),
-                Err(error) => return BlockWriteTaskExit::HeaderChainAttachmentFailed(error),
-            }
-        } else {
-            None
-        };
-        if *attach_header_chain_at_handoff && header_chain.is_none() {
-            let epoch = runtime_epoch.expect("runtime attachment has an explicit lifecycle epoch");
-            let writer = match HeaderChainWriter::attach_at_semantic_handoff_with_progress(
-                finalized_state,
-                non_finalized_state,
-                |progress| header_chain_observers.progress(epoch, progress),
-            ) {
-                Ok(writer) => writer,
-                Err(error) => {
-                    header_chain_observers.failed(epoch, &error);
-                    return BlockWriteTaskExit::HeaderChainAttachmentFailed(error);
-                }
-            };
-            *header_chain = Some(writer);
+        if let Err(exit) = attach_header_chain_if_genesis_is_committed(
+            header_chain,
+            *attach_header_chain_at_handoff,
+            finalized_state,
+            non_finalized_state,
+            header_chain_observers,
+        ) {
+            return exit;
         }
-        if let Some(writer) = header_chain {
-            // Publish the coherent reader before the snapshot that enables header-sync negotiation,
-            // so every negotiated requester can immediately obtain its exact locator.
-            header_chain_observers
-                .reader_sender
-                .send_replace(Some(writer.runtime.reader()));
-            writer
-                .runtime
-                .publisher()
-                .mirror_to(header_chain_observers.snapshot_sender.clone());
-            if let Err(error) = header_chain_observers
-                .ready(runtime_epoch.expect("an attached runtime has an explicit lifecycle epoch"))
-            {
-                return BlockWriteTaskExit::HeaderChainAttachmentFailed(error);
-            }
+        if *attach_header_chain_at_handoff && header_chain.is_none() {
+            let epoch = match header_chain_observers.begin_reconstruction() {
+                Ok(epoch) => epoch,
+                Err(error) => return BlockWriteTaskExit::HeaderChainAttachmentFailed(error),
+            };
+            let error = HeaderChainAttachmentError::MissingGenesis;
+            header_chain_observers.failed(epoch, &error);
+            return BlockWriteTaskExit::HeaderChainAttachmentFailed(error);
         }
 
         // Track rejected ancestors so queued descendants can be rejected without
