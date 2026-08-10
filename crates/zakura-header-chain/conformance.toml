@@ -1,8 +1,7 @@
 spec_version = "1.4"
 
-# Phase 0 registers the complete rule catalog without inventing implementation
-# claims. Later checkpoints change each status only when its real owner and
-# deterministic tests can be recorded here.
+# Phase 0 registers the complete rule catalog without implementation claims.
+# Later checkpoints change a status after the manifest can name its owner and tests.
 
 [[rule]]
 id = "LC-SCOPE-01"
