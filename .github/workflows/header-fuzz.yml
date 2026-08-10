@@ -1,7 +1,8 @@
 name: Header-chain fuzzing
 
 on:
-  # Run the normative budgets Monday through Saturday and a longer campaign on Sunday.
+  # Run the normative budgets Monday through Saturday.
+  # Run the longer campaign on Sunday.
   schedule:
     - cron: "13 5 * * 1-6"
     - cron: "13 5 * * 0"
@@ -55,8 +56,8 @@ jobs:
             rss_mb: 4096
             max_len: 256
             # RocksDB retains process-global allocations after each temporary database closes.
-            # AddressSanitizer remains enabled for the recovery target, but its exit-time leak
-            # detector cannot distinguish those allocations from harness leaks.
+            # AddressSanitizer remains enabled for the recovery target.
+            # Its exit-time leak detector cannot distinguish those allocations from harness leaks.
             detect_leaks: 0
 
     steps:
