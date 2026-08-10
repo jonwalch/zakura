@@ -247,6 +247,127 @@ fn monotone_finality_makes_an_ordinary_apply_completion_inert() {
     ));
 }
 
+#[test]
+fn monotone_finality_sends_exact_prepared_header_work_to_state_for_rebase() {
+    let mut startup = startup(CancellationToken::new());
+    let network = startup.network.clone();
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let initial = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the monotone preparation fixture builds");
+    let peer = peer();
+    let (source, owner, _) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+    let active = reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the exact header attempt is registered");
+    active.phase = HeaderTargetPhase::Preparing;
+    let common_ancestor = active
+        .common_ancestor
+        .expect("the prepared target has a fixed common ancestor");
+    let target = zakura_header_chain::Frontier::new(
+        active.target.status.selected_tip_height,
+        active.target.status.selected_tip_hash,
+    );
+    let headers: Vec<_> = active
+        .entries
+        .iter()
+        .map(|entry| entry.header.clone())
+        .collect();
+    let lease = zakura_header_chain::ValidationLease::new(
+        common_ancestor,
+        vec![zakura_header_chain::HeaderContextFact {
+            frontier: common_ancestor,
+            header: regtest_genesis_block().header.clone(),
+        }],
+        network,
+        [9; 32],
+    );
+    let rules = zakura_header_chain::HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated regtest policy is valid");
+    let batch = zakura_header_chain::prepare_headers(
+        zakura_header_chain::HeaderBatchInput::new(&headers),
+        &lease,
+        &rules,
+        &zakura_header_chain::SystemClock,
+    )
+    .expect("the exact held header target prepares");
+    let adapter_key = zakura_node_services::header_chain::HeaderChainAdapterKey::new();
+    let prepared = zakura_node_services::header_chain::PreparedHeaderTarget::from_insert(
+        &adapter_key,
+        Box::new(zakura_header_chain::InsertHeaders {
+            owner,
+            source,
+            parent_hash: common_ancestor.hash,
+            target_tip_hash: target.hash,
+            completion: zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor },
+            batch,
+            aux: Vec::new(),
+        }),
+    );
+
+    let mut committed = initial;
+    committed.state_version = committed
+        .state_version
+        .checked_next()
+        .expect("the fixture version advances");
+    committed.header_generation = committed
+        .header_generation
+        .checked_next()
+        .expect("the fixture header generation advances");
+    committed.verified_generation = committed
+        .verified_generation
+        .checked_next()
+        .expect("the fixture verified generation advances");
+    committed.frontiers.finalized = target;
+    committed.frontiers.header_best = target;
+    committed.frontiers.verified_best = target;
+    reactor.observe_latest_committed_snapshot(committed);
+
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .map(|active| active.owner),
+        Some(owner),
+        "ordinary preparation remains registered for state-side rebase"
+    );
+    reactor.handle_event(HeaderSyncEvent::HeaderTargetPrepared {
+        peer: peer.clone(),
+        source,
+        owner,
+        result: HeaderTargetPreparationResult::Prepared(prepared),
+    });
+
+    let HeaderPortOperation::ApplyHeaderTarget {
+        peer: applied_peer,
+        source: applied_source,
+        owner: applied_owner,
+        ..
+    } = actions
+        .try_recv()
+        .expect("the rebase candidate reaches the serialized state planner")
+    else {
+        panic!("the held preparation must produce one apply operation");
+    };
+    assert_eq!(applied_peer, peer);
+    assert_eq!(applied_source, source);
+    assert_eq!(applied_owner, owner);
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .map(|active| active.phase),
+        Some(HeaderTargetPhase::Applying)
+    );
+    assert!(
+        actions.try_recv().is_err(),
+        "one exact preparation produces only one state apply"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score() {
     let mut startup = startup(CancellationToken::new());
