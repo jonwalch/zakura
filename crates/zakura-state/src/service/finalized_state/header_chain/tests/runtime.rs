@@ -103,6 +103,63 @@ fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
     );
 }
 
+#[test]
+fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the empty schema initializes");
+
+    let genesis = VerifiedHeaderRef {
+        height: anchor.height,
+        hash: anchor.hash,
+        header: anchor.header.clone(),
+    };
+    let mut parent = genesis.clone();
+    let mut restored = Vec::new();
+    for height in 1_u32..=4_000 {
+        let mut header = *parent.header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[..4].copy_from_slice(&height.to_le_bytes());
+        let header = Arc::new(header);
+        let child = VerifiedHeaderRef {
+            height: block::Height(height),
+            hash: header.hash(),
+            header,
+        };
+        parent = child.clone();
+        restored.push(child);
+    }
+
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            Frontier::new(genesis.height, genesis.hash),
+            Vec::new(),
+            restored.clone(),
+        )
+        .expect("the genesis-finalized scratch path reconciles");
+    let selected = runtime
+        .reader()
+        .selected_hashes(block::Height(1), 4_000)
+        .expect("the full block-sync window is one coherent projection read");
+
+    assert_eq!(selected.len(), 4_000);
+    assert_eq!(
+        selected.first().copied(),
+        Some(Frontier::new(restored[0].height, restored[0].hash))
+    );
+    assert_eq!(
+        selected.last().copied(),
+        restored
+            .last()
+            .map(|header| Frontier::new(header.height, header.hash))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     let db_config = Config::ephemeral();
@@ -750,8 +807,11 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         assert!(Arc::ptr_eq(&active_references, &cached_references));
         active_references
     };
-    assert!(active_references.contains(&anchor.hash));
-    assert!(active_references.contains(&child.hash));
+    assert_eq!(
+        active_references.as_ref(),
+        [child.hash],
+        "each lease contributes only its target; retaining that target protects its whole ancestry"
+    );
 
     tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
     assert!(runtime

@@ -611,6 +611,15 @@ fn chain_identity_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
     assert_eq!(state.db.hash(tip_height), Some(tip_hash));
     assert_eq!(state.db.height(tip_hash), Some(tip_height));
 
+    let initial_tip = crate::service::finalized_chain_tip(&state.db)
+        .expect("a bodyless pruned finalized tip still initializes chain sync");
+    assert_eq!(
+        (initial_tip.height, initial_tip.hash),
+        (tip_height, tip_hash)
+    );
+    assert!(initial_tip.transactions.is_empty());
+    assert!(initial_tip.transaction_hashes.is_empty());
+
     let no_chain = Option::<Arc<Chain>>::None;
     assert_eq!(
         hash_by_height(no_chain.clone(), &state.db, tip_height),
