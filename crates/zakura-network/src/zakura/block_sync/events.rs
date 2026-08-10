@@ -55,6 +55,8 @@ pub enum BlockSyncEvent {
         query_id: NonZeroU64,
         /// Durable generation and branch coordinates echoed from the query.
         scope: zakura_header_chain::BodyWorkAuthority,
+        /// Highest full-state block shared with the selected header chain.
+        body_anchor: zakura_header_chain::Frontier,
         /// Header-known bodies missing under `scope`.
         blocks: Vec<BlockSyncBlockMeta>,
     },
