@@ -20,6 +20,21 @@ fn peer() -> ZakuraPeerId {
     ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length")
 }
 
+#[test]
+fn repeated_snapshot_refresh_traces_are_sampled() {
+    let now = Instant::now();
+
+    assert!(snapshot_refresh_trace_due(None, now));
+    assert!(!snapshot_refresh_trace_due(
+        Some(now),
+        now + std::time::Duration::from_secs(9)
+    ));
+    assert!(snapshot_refresh_trace_due(
+        Some(now),
+        now + std::time::Duration::from_secs(10)
+    ));
+}
+
 fn stale_failure(
     owner: zakura_header_chain::HeaderSyncWorkOwner,
 ) -> Arc<zakura_header_chain::HeaderChainError> {
