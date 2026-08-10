@@ -186,6 +186,8 @@ pub struct ReadHeaderPath {
     pub after_hash: block::Hash,
     /// Maximum number of returned headers.
     pub max_header_count: u32,
+    /// Whether the caller requested schema-v1 commitment roots.
+    pub want_tree_aux: bool,
 }
 
 /// One raw page from an immutable retained header path.
@@ -201,6 +203,11 @@ pub struct RetainedHeaderPathPage {
     pub headers: Vec<Arc<block::Header>>,
     /// Parallel auxiliary deliveries for each retained header.
     pub aux_deliveries: Vec<Vec<AuxDelivery>>,
+    /// Authoritative commitment roots loaded from finalized state, parallel to `headers`.
+    ///
+    /// These roots do not have peer-delivery provenance, so they are kept separate from
+    /// `aux_deliveries`. A serving adapter may use them for finalized historical pages.
+    pub finalized_tree_aux: Vec<Option<zakura_header_chain::TreeAuxRecordV1>>,
     /// Whether this page reaches the immutable target.
     pub complete: bool,
 }
