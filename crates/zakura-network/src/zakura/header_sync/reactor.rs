@@ -37,13 +37,14 @@ use crate::zakura::{
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const LEASE_RELEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-/// Keep one maximum wire page ahead of integrated full state, then refill at checkpoint low water.
+/// Keep one maximum wire page ahead of integrated full state, then refill at half-window low water.
 ///
 /// Every integrated full-state advance also reanchors the durable header DAG. Bounding that DAG
 /// during initial sync keeps those consensus transitions proportional to useful pipeline work,
-/// while low-water refills avoid one header transition per committed body without starving a
-/// partial checkpoint range.
+/// while half-window refills leave enough admitted work to overlap proof validation and durable
+/// admission with body application without starving a partial checkpoint range.
 const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
+const INTEGRATED_HEADER_REFILL_LOW_WATER_V1: u32 = INTEGRATED_HEADER_BODY_WINDOW_V1 / 2;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
@@ -2185,9 +2186,10 @@ impl HeaderSyncReactor {
 
     /// Return requester headroom after both the durable DAG limit and the integrated body window.
     ///
-    /// Away from the advertised target, a partial window remains closed until the remaining body
-    /// lag reaches one maximum checkpoint range. This hysteresis avoids one-header transitions
-    /// while guaranteeing enough header headroom to resolve a checkpoint verifier window. The
+    /// Away from the advertised target, a partial window remains closed until half of the admitted
+    /// body lag remains. This hysteresis avoids small header transitions while leaving enough work
+    /// to overlap the next proof-validation batch with body application. The checkpoint bound is a
+    /// floor so a future smaller protocol window still admits a complete checkpoint range. The
     /// final partial page is admitted so a node can still reach an exact target whose remaining
     /// suffix is shorter than one page.
     fn request_header_prefix_remaining(
@@ -2206,11 +2208,12 @@ impl HeaderSyncReactor {
         let target_remaining = target_tip_height
             .0
             .saturating_sub(snapshot.frontiers.header_best.height.0);
-        let refill_low_water = u32::try_from(
+        let checkpoint_low_water = u32::try_from(
             zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP,
         )
         .expect("the consensus checkpoint height gap fits a block height")
         .saturating_add(1);
+        let refill_low_water = checkpoint_low_water.max(INTEGRATED_HEADER_REFILL_LOW_WATER_V1);
         if body_lag > refill_low_water && target_remaining > body_window {
             return 0;
         }
