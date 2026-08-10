@@ -37,6 +37,13 @@ use crate::zakura::{
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const LEASE_RELEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Keep one maximum wire page ahead of integrated full state, then refill at checkpoint low water.
+///
+/// Every integrated full-state advance also reanchors the durable header DAG. Bounding that DAG
+/// during initial sync keeps those consensus transitions proportional to useful pipeline work,
+/// while low-water refills avoid one header transition per committed body without starving a
+/// partial checkpoint range.
+const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
@@ -369,15 +376,20 @@ fn assemble_port_header_path_page(
     page: zakura_node_services::header_chain::RetainedHeaderPathPage,
     requested_schema: AuxSchema,
 ) -> Option<HeaderPathPage> {
-    if page.headers.len() != page.aux_deliveries.len() {
+    if page.headers.len() != page.aux_deliveries.len()
+        || page.headers.len() != page.finalized_tree_aux.len()
+    {
         return None;
     }
     let tree_aux_schema = if requested_schema == AuxSchema::V1
         && page
             .aux_deliveries
             .iter()
-            .all(|deliveries| selected_port_aux_delivery(deliveries, AuxSchema::V1).is_some())
-    {
+            .zip(&page.finalized_tree_aux)
+            .all(|(deliveries, finalized_tree_aux)| {
+                finalized_tree_aux.is_some()
+                    || selected_port_aux_delivery(deliveries, AuxSchema::V1).is_some()
+            }) {
         AuxSchema::V1
     } else {
         AuxSchema::None
@@ -386,8 +398,15 @@ fn assemble_port_header_path_page(
         .headers
         .into_iter()
         .zip(page.aux_deliveries)
-        .map(|(header, deliveries)| {
-            let delivery = selected_port_aux_delivery(&deliveries, tree_aux_schema);
+        .zip(page.finalized_tree_aux)
+        .map(|((header, deliveries), finalized_tree_aux)| {
+            let delivery_schema =
+                if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
+                    AuxSchema::V1
+                } else {
+                    AuxSchema::None
+                };
+            let delivery = selected_port_aux_delivery(&deliveries, delivery_schema);
             HeaderEntry {
                 header,
                 body_size: delivery.map_or(0, |delivery| match delivery.body_size {
@@ -395,7 +414,7 @@ fn assemble_port_header_path_page(
                     zakura_header_chain::BodySizeHint::Known(size) => size.get(),
                 }),
                 tree_aux: (tree_aux_schema == AuxSchema::V1)
-                    .then(|| delivery.and_then(|delivery| delivery.tree_aux))
+                    .then(|| finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux)))
                     .flatten(),
             }
         })
@@ -1111,6 +1130,7 @@ impl HeaderSyncReactor {
         active.common_ancestor.get_or_insert(returned_ancestor);
         active.entries.extend(response.entries);
         let staged_entry_count = active.entries.len();
+        let target_tip_height = active.target.status.selected_tip_height;
         let Some(staged_tip) = active.staged_tip() else {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
@@ -1127,9 +1147,10 @@ impl HeaderSyncReactor {
         // reduced to the remaining capacity, so one peer cannot force tiny prefix commits by
         // returning pages much smaller than requested.
         let durable_prefix_full = self.committed_snapshot.as_ref().is_some_and(|snapshot| {
-            Self::durable_header_prefix_remaining(
+            Self::request_header_prefix_remaining(
                 snapshot,
                 self.peer_work_queue.claimed_header_count(),
+                target_tip_height,
             ) == 0
         });
         let bounded_prefix =
@@ -1225,15 +1246,17 @@ impl HeaderSyncReactor {
         let negotiated_header_count = active.max_header_count;
         let tree_aux_schema = active.tree_aux_schema;
         let target_tip_hash = active.target.status.selected_tip_hash;
+        let target_tip_height = active.target.status.selected_tip_height;
         let request_scope = active.owner.header_authority();
         let _ = active;
         let max_header_count = self
             .peer_work_queue
             .reservable_header_count(negotiated_header_count)
             .min(self.committed_snapshot.as_ref().map_or(0, |snapshot| {
-                Self::durable_header_prefix_remaining(
+                Self::request_header_prefix_remaining(
                     snapshot,
                     self.peer_work_queue.claimed_header_count(),
+                    target_tip_height,
                 )
             }));
         debug_assert!(
@@ -2054,9 +2077,10 @@ impl HeaderSyncReactor {
             .min(self.serving_limits.max_headers_per_response())
             .min(byte_limited_count)
             .min(MAX_HS_RANGE);
-        let max_header_count = max_header_count.min(Self::durable_header_prefix_remaining(
+        let max_header_count = max_header_count.min(Self::request_header_prefix_remaining(
             &local,
             self.peer_work_queue.claimed_header_count(),
+            target.status.selected_tip_height,
         ));
         let max_header_count = self
             .peer_work_queue
@@ -2157,6 +2181,41 @@ impl HeaderSyncReactor {
             .saturating_sub(selected_non_finalized)
             .saturating_sub(claimed);
         u32::try_from(remaining).unwrap_or(u32::MAX)
+    }
+
+    /// Return requester headroom after both the durable DAG limit and the integrated body window.
+    ///
+    /// Away from the advertised target, a partial window remains closed until the remaining body
+    /// lag reaches one maximum checkpoint range. This hysteresis avoids one-header transitions
+    /// while guaranteeing enough header headroom to resolve a checkpoint verifier window. The
+    /// final partial page is admitted so a node can still reach an exact target whose remaining
+    /// suffix is shorter than one page.
+    fn request_header_prefix_remaining(
+        snapshot: &zakura_header_chain::EngineSnapshot,
+        claimed: usize,
+        target_tip_height: block::Height,
+    ) -> u32 {
+        let durable = Self::durable_header_prefix_remaining(snapshot, claimed);
+        let body_lag = snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.verified_best.height.0);
+        let body_window = INTEGRATED_HEADER_BODY_WINDOW_V1.saturating_sub(body_lag);
+        let target_remaining = target_tip_height
+            .0
+            .saturating_sub(snapshot.frontiers.header_best.height.0);
+        let refill_low_water = u32::try_from(
+            zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP,
+        )
+        .expect("the consensus checkpoint height gap fits a block height")
+        .saturating_add(1);
+        if body_lag > refill_low_water && target_remaining > body_window {
+            return 0;
+        }
+        let claimed = u32::try_from(claimed).unwrap_or(u32::MAX);
+        durable.min(body_window.saturating_sub(claimed))
     }
 
     fn observe_latest_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
@@ -3326,6 +3385,7 @@ impl HeaderSyncReactor {
                                 port::ReadHeaderPath {
                                     after_hash,
                                     max_header_count,
+                                    want_tree_aux: tree_aux_schema == AuxSchema::V1,
                                 },
                             )
                             .await
