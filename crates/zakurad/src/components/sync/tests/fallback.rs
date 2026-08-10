@@ -20,26 +20,26 @@ use super::super::{
 };
 
 #[test]
-fn legacy_checkpoint_bootstrap_transfers_apply_ownership_once() {
+fn genesis_bootstrap_transfers_apply_ownership_once() {
     let handoff = crate::commands::start::zakura::SyncCoordinator::new_legacy_bootstrap();
 
     assert!(
         handoff.clone().begin_apply().is_none(),
-        "native applies must stay disabled while legacy checkpoint bootstrap owns the verifier"
+        "native applies must stay disabled while the genesis fetch owns the verifier"
     );
 
     handoff
         .finish_legacy_bootstrap()
-        .expect("checkpoint bootstrap transfers ownership exactly once");
+        .expect("genesis bootstrap transfers ownership exactly once");
     let permit = handoff
         .clone()
         .begin_apply()
-        .expect("native applies start after the durable checkpoint handoff");
+        .expect("native applies start after the durable genesis handoff");
     drop(permit);
 
     handoff
         .finish_legacy_bootstrap()
-        .expect_err("a duplicate checkpoint handoff is an explicit invalid transition");
+        .expect_err("a duplicate genesis handoff is an explicit invalid transition");
     assert!(
         handoff.clone().begin_apply().is_some(),
         "repeating the one-way bootstrap signal must leave Zakura as owner"
@@ -52,10 +52,10 @@ fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
     futures::executor::block_on(
         bootstrap_handoff.acquire_legacy_fallback(std::time::Duration::from_secs(1)),
     )
-    .expect_err("fallback recovery must not bypass initial checkpoint bootstrap ownership");
+    .expect_err("fallback recovery must not bypass initial genesis bootstrap ownership");
     assert!(
         bootstrap_handoff.begin_apply().is_none(),
-        "fallback recovery must not bypass initial checkpoint bootstrap ownership"
+        "fallback recovery must not bypass initial genesis bootstrap ownership"
     );
 
     let handoff = crate::commands::start::zakura::SyncCoordinator::new();
