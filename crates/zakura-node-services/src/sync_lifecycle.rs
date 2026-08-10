@@ -45,9 +45,9 @@ pub enum ApplyPhase {
         /// Native ownership generation.
         epoch: LifecycleEpoch,
     },
-    /// Native admission is closed while previously authorized applies drain.
+    /// The coordinator closes native admission while previously authorized applies drain.
     FallbackDraining {
-        /// Native generation being drained.
+        /// Native generation that the coordinator drains.
         epoch: LifecycleEpoch,
     },
     /// One fully drained legacy fallback lease owns applies.
@@ -55,7 +55,7 @@ pub enum ApplyPhase {
         /// Drained generation owned by the fallback lease.
         epoch: LifecycleEpoch,
     },
-    /// New bulk applies are permanently fail-closed.
+    /// The coordinator permanently rejects new bulk applies.
     Failed {
         /// Last valid generation before failure.
         epoch: LifecycleEpoch,
@@ -164,7 +164,7 @@ pub enum ApplyTransition {
     },
     /// Drop/cancel the exact fallback lease and advance native ownership.
     ResumeNative {
-        /// Exact fallback generation being released.
+        /// Exact fallback generation that the transition releases.
         expected_epoch: LifecycleEpoch,
     },
     /// Fail the exact active generation closed while retaining its epoch for diagnosis.
@@ -177,9 +177,9 @@ pub enum ApplyTransition {
 /// Rejected lifecycle transition.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum LifecycleTransitionError {
-    /// The requested edge is not legal from the current phase.
+    /// The current phase rejects the requested edge.
     IllegalPhase,
-    /// The request was issued for an obsolete lifecycle generation.
+    /// The caller issued the request for an obsolete lifecycle generation.
     StaleEpoch {
         /// Requested generation.
         expected: LifecycleEpoch,
@@ -231,7 +231,7 @@ pub struct HeaderReconstructionProgress {
     pub last_committed: Option<Frontier>,
 }
 
-/// Why the durable header runtime is not attached yet.
+/// Condition that keeps the node from attaching the durable header runtime.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeaderRuntimeDetachedReason {
     /// Fresh state must first receive checkpoint-verified blocks through semantic sync.
@@ -261,21 +261,22 @@ pub enum HeaderRuntimeStatus {
         /// Explicit startup condition that determines whether callers may bootstrap.
         reason: HeaderRuntimeDetachedReason,
     },
-    /// One attachment generation is auditing or reconciling durable state.
+    /// One attachment generation audits or reconciles durable state.
     Reconstructing {
         /// Exact attachment generation.
         epoch: LifecycleEpoch,
         /// Latest bounded progress report.
         progress: HeaderReconstructionProgress,
     },
-    /// The coherent reader and committed snapshot publisher are both live.
+    /// The coherent reader and committed snapshot publisher are running.
     Ready {
         /// Ready attachment generation.
         epoch: LifecycleEpoch,
     },
     /// Attachment failed closed with its root-cause message.
     ///
-    /// This state is process-terminal because its producer has exited the state write worker.
+    /// The producer exited the state write worker.
+    /// The producer exit makes this state process-terminal.
     /// Recovery reopens and audits durable state during a node restart.
     Failed {
         /// Failed attachment generation.

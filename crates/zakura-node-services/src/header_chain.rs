@@ -15,7 +15,8 @@ pub type HeaderChainFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>
 /// Process-local capability that authenticates values sealed by one header-chain adapter.
 ///
 /// An adapter keeps this key private and uses clones only inside its own asynchronous tasks.
-/// Values sealed by a different key cannot be opened or used as retained-path handles.
+/// The adapter cannot open values that a different key sealed.
+/// The adapter cannot use those values as retained-path handles.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct AdapterKey(Arc<()>);
@@ -48,7 +49,7 @@ impl fmt::Debug for AdapterKey {
 pub enum HeaderChainPortError {
     /// The adapter's operation deadline elapsed.
     Timeout,
-    /// The backing service was unavailable or returned an invalid reply.
+    /// The backing service became unavailable or returned an invalid reply.
     Unavailable {
         /// Original failure, when the backing service supplied one.
         source: Option<Arc<dyn Error + Send + Sync + 'static>>,
@@ -164,13 +165,13 @@ impl Eq for RetainedHeaderPath {}
 /// Result of acquiring an immutable retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AcquireHeaderPathReply {
-    /// The requested target path is retained.
+    /// The adapter retains the requested target path.
     Acquired(Box<RetainedHeaderPath>),
-    /// The target is no longer retained.
+    /// The adapter no longer retains the target.
     TargetNotRetained,
     /// No requester locator lies on the retained target path.
     NoLocatorIntersection,
-    /// Required target history has been pruned.
+    /// Pruning removed the required target history.
     HistoryPruned,
     /// State cannot currently retain another path.
     Busy,
@@ -202,8 +203,9 @@ pub struct RetainedHeaderPathPage {
     pub aux_deliveries: Vec<Vec<AuxDelivery>>,
     /// Authoritative commitment roots loaded from finalized state, parallel to `headers`.
     ///
-    /// These roots do not have peer-delivery provenance, so they are kept separate from
-    /// `aux_deliveries`. A serving adapter may use them for finalized historical pages.
+    /// These roots do not have peer-delivery provenance.
+    /// The page keeps the roots separate from `aux_deliveries`.
+    /// A serving adapter may use the roots for finalized historical pages.
     pub finalized_tree_aux: Vec<Option<zakura_header_chain::TreeAuxRecordV1>>,
     /// Whether this page reaches the immutable target.
     pub complete: bool,
@@ -223,7 +225,8 @@ pub enum ReadHeaderPathReply {
 pub struct HeaderTargetEntry {
     /// Canonical Zcash block header.
     pub header: Arc<block::Header>,
-    /// Serialized-body-size hint; zero means unknown.
+    /// Serialized-body-size hint.
+    /// Zero means unknown.
     pub body_size: u32,
     /// Optional schema-1 commitment record.
     pub tree_aux: Option<zakura_header_chain::TreeAuxRecordV1>,
@@ -382,8 +385,8 @@ pub enum ApplyHeaderTargetOutcome {
 
 /// Header-chain operations needed by header-sync policy.
 ///
-/// Each request and its typed reply share one future. Implementations own local
-/// deadlines and translation to any backing service protocol.
+/// Each request and its typed reply share one future.
+/// Implementations own local deadlines and translations to backing service protocols.
 pub trait HeaderChainPort: Send + Sync + 'static {
     /// Read one coherent selected-path continuation locator.
     fn continuation_locator(
@@ -435,7 +438,7 @@ impl std::fmt::Debug for dyn HeaderChainPort {
     }
 }
 
-/// Explicit unavailable port used when no durable header-chain state is attached.
+/// Nodes use this explicit unavailable port when they have no durable header-chain state.
 #[derive(Debug, Default)]
 pub struct UnavailableHeaderChainPort;
 
