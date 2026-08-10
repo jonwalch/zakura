@@ -986,4 +986,12 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
         implementation.contains("restore_transition_engine_after_staging_error"),
         "pre-commit staging errors must restore the unchanged durable engine"
     );
+    assert!(
+        implementation.contains("checkpoint_headers_are_retained"),
+        "already admitted checkpoint headers must not rebuild predecessor leases per block"
+    );
+    assert!(
+        implementation.contains("transition_engine.graph().node(header.hash).is_some()"),
+        "the predecessor-lease fast path must be justified by the coherent retained graph"
+    );
 }
