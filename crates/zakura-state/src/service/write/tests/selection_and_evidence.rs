@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn startup_restores_a_missing_full_state_side_path_idempotently() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("the fixture finalized state opens");
+    let anchor = regtest_genesis_block();
+    let anchor_height = anchor
+        .coinbase_height()
+        .expect("the anchor has a coinbase height");
+    let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+    let lease = writer
+        .runtime
+        .reader()
+        .validation_context(anchor.hash())
+        .expect("the anchor context read succeeds")
+        .expect("the anchor context exists");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the regtest validation policy is coherent");
+    let mut side_header = *anchor.header;
+    side_header.previous_block_hash = anchor.hash();
+    side_header.time += chrono::Duration::seconds(1);
+    let side_header = Arc::new(side_header);
+    let prepared = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&side_header)),
+        &lease,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the full-state side header passes shared validation");
+    let side = prepared
+        .headers()
+        .first()
+        .expect("the prepared side path contains its header");
+    let path = vec![VerifiedHeaderRef {
+        height: side.height,
+        hash: side.hash,
+        header: side_header,
+    }];
+
+    restore_verified_side_paths(&writer.runtime, &writer.config, vec![path.clone()])
+        .expect("startup restores the authenticated full-state side path");
+    let restored = writer.runtime.publisher().snapshot();
+    assert!(writer
+        .runtime
+        .reader()
+        .validation_context(side.hash)
+        .expect("the restored side context reads")
+        .is_some());
+
+    restore_verified_side_paths(&writer.runtime, &writer.config, vec![path])
+        .expect("replaying the same startup repair is idempotent");
+    assert_eq!(writer.runtime.publisher().snapshot(), restored);
+}
+
+#[test]
 fn same_lower_forward_resets_use_identical_branch_path() {
     let header = regtest_genesis_block().header.clone();
     let reference = |height: u32, hash: u8| VerifiedHeaderRef {
