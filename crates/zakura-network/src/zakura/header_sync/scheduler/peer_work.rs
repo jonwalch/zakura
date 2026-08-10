@@ -430,6 +430,7 @@ impl PeerWorkPriority {
 pub(in crate::zakura::header_sync) enum QueueWorkResult {
     NeedsLocator,
     AlreadyActive,
+    TargetAlreadyAssigned,
     AtCapacity,
 }
 
@@ -567,6 +568,32 @@ impl PeerWorkQueue {
             },
         );
         QueueWorkResult::NeedsLocator
+    }
+
+    /// Stage one ordinary branch target only when no other peer already owns it.
+    ///
+    /// A locator is derived from shared local state, so two peers pursuing the same generation,
+    /// anchor, and target would download and authenticate the same prefix. The alternate peer's
+    /// status remains in the reactor and can be reconsidered as soon as the owner retires.
+    pub(in crate::zakura::header_sync) fn stage_distinct_target(
+        &mut self,
+        peer: ZakuraPeerId,
+        target: AdvertisedHeaderTarget,
+        priority: PeerWorkPriority,
+    ) -> QueueWorkResult {
+        let owned_by_other_peer = self.work_by_peer.iter().any(|(owner, work)| {
+            owner != &peer
+                && match work {
+                    PeerWorkState::AwaitingLocator { target, .. } => target.scope,
+                    PeerWorkState::Active(request) => request.target.scope,
+                } == target.scope
+        });
+        if owned_by_other_peer {
+            self.remove_unstarted(&peer);
+            return QueueWorkResult::TargetAlreadyAssigned;
+        }
+
+        self.stage(peer, target, priority)
     }
 
     pub(in crate::zakura::header_sync) fn awaiting(
@@ -1078,6 +1105,72 @@ mod tests {
         assert!(queue
             .awaiting(&peer(17), 7, hash(17), expected.scope)
             .is_some());
+    }
+
+    #[test]
+    fn ordinary_target_has_one_peer_owner_with_failover_after_retirement() {
+        let local = snapshot();
+        let mut queue = PeerWorkQueue::default();
+        let target = advertisement(1);
+
+        assert_eq!(
+            queue.stage_distinct_target(peer(1), target.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert_eq!(
+            queue.stage_distinct_target(
+                peer(2),
+                target.clone(),
+                PeerWorkPriority::HigherComparableWork
+            ),
+            QueueWorkResult::TargetAlreadyAssigned
+        );
+        assert_eq!(queue.len(), 1);
+
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start(active_request(1, target.clone(), &local, Vec::new())));
+        assert_eq!(
+            queue.stage_distinct_target(peer(2), target.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::TargetAlreadyAssigned
+        );
+
+        queue.remove(&peer(1));
+        assert_eq!(
+            queue.stage_distinct_target(peer(2), target, PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator,
+            "the alternate peer becomes eligible immediately after owner retirement"
+        );
+    }
+
+    #[test]
+    fn duplicate_target_retires_different_unstarted_work_for_that_peer() {
+        let mut queue = PeerWorkQueue::default();
+        let owned = advertisement(1);
+        let superseded = advertisement(2);
+
+        assert_eq!(
+            queue.stage_distinct_target(peer(1), owned.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert_eq!(
+            queue.stage_distinct_target(peer(2), superseded.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert_eq!(
+            queue.stage_distinct_target(peer(2), owned, PeerWorkPriority::Normal),
+            QueueWorkResult::TargetAlreadyAssigned
+        );
+        assert!(
+            queue
+                .awaiting(
+                    &peer(2),
+                    superseded.session_id,
+                    superseded.status.selected_tip_hash,
+                    superseded.scope,
+                )
+                .is_none(),
+            "a stale locator result cannot resurrect superseded work"
+        );
     }
 
     #[test]

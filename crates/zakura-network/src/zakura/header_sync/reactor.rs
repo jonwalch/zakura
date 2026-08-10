@@ -824,7 +824,7 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.covered").increment(1);
             return;
         }
-        match self.peer_work_queue.stage(
+        match self.peer_work_queue.stage_distinct_target(
             peer.clone(),
             target,
             PeerWorkPriority::from_work_order(work_order),
@@ -841,6 +841,9 @@ impl HeaderSyncReactor {
             }
             QueueWorkResult::AlreadyActive => {
                 metrics::counter!("sync.header.target.already_active").increment(1);
+            }
+            QueueWorkResult::TargetAlreadyAssigned => {
+                metrics::counter!("sync.header.target.duplicate_suppressed").increment(1);
             }
             QueueWorkResult::AtCapacity => {
                 metrics::counter!("sync.header.target.capacity_refused").increment(1);
