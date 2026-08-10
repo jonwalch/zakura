@@ -93,6 +93,17 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
+fn finalized_chain_tip(db: &ZakuraDb) -> Option<ChainTipBlock> {
+    let (height, hash) = db.tip()?;
+    if let Some(block) = db.tip_block() {
+        return Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(block)));
+    }
+
+    let header = db.block_header(height.into())?;
+    (header.hash() == hash)
+        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header))
+}
+
 /// A read-write service for Zebra's cached blockchain state.
 ///
 /// This service modifies and provides access to:
@@ -384,7 +395,7 @@ impl StateService {
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
-                let finalized_tip = finalized_state.db.tip_block();
+                let finalized_tip = finalized_chain_tip(&finalized_state.db);
 
                 (finalized_state, finalized_tip, timer)
             })
@@ -404,7 +415,7 @@ impl StateService {
         // otherwise, unless checkpoint sync is disabled in the zakura-consensus configuration,
         // Zebra will be unable to commit checkpoint verified blocks, and its chain sync will stall.
         let is_finalized_tip_past_max_checkpoint = if let Some(tip) = &finalized_tip {
-            tip.coinbase_height().expect("valid block must have height") >= max_checkpoint_height
+            tip.height >= max_checkpoint_height
         } else {
             false
         };
@@ -424,9 +435,9 @@ impl StateService {
         let initial_tip = non_finalized_state
             .best_tip_block()
             .map(|cv_block| cv_block.block.clone())
-            .or(finalized_tip)
             .map(CheckpointVerifiedBlock::from)
-            .map(ChainTipBlock::from);
+            .map(ChainTipBlock::from)
+            .or(finalized_tip);
 
         tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
 
@@ -1656,65 +1667,138 @@ impl Service<Request> for StateService {
     }
 }
 
+fn highest_common_body_header_frontier(
+    mut height: block::Height,
+    minimum_height: block::Height,
+    mut body_hash: impl FnMut(block::Height) -> Option<block::Hash>,
+    mut selected_hash: impl FnMut(
+        block::Height,
+    ) -> Result<
+        Option<block::Hash>,
+        finalized_state::header_chain::HeaderChainStoreError,
+    >,
+) -> Result<zakura_header_chain::Frontier, finalized_state::header_chain::HeaderChainStoreError> {
+    loop {
+        let body_hash = body_hash(height);
+        let selected_hash = selected_hash(height)?;
+        if let (Some(body_hash), Some(selected_hash)) = (body_hash, selected_hash) {
+            if body_hash == selected_hash {
+                return Ok(zakura_header_chain::Frontier::new(height, body_hash));
+            }
+        }
+        if height <= minimum_height {
+            return Err(
+                finalized_state::header_chain::HeaderChainStoreError::Incoherent(
+                    "selected headers and full state have no common ancestor",
+                ),
+            );
+        }
+        height = block::Height(height.0.saturating_sub(1));
+    }
+}
+
 fn missing_block_body_metadata<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     from: block::Height,
     limit: u32,
-) -> Result<
-    Vec<(block::Height, block::Hash, Option<u32>)>,
-    finalized_state::header_chain::HeaderChainStoreError,
->
+) -> Result<crate::BlockSyncBodyMetadata, finalized_state::header_chain::HeaderChainStoreError>
 where
     C: AsRef<Chain> + Clone,
 {
-    let verified_block_tip = read::tip_height(chain.clone(), db);
+    let verified_block_tip = read::tip(chain.clone(), db);
     let best_header_tip = match header_chain {
-        Some(reader) => Some(reader.selected_tip()?.height),
-        None => verified_block_tip,
+        Some(reader) => Some(reader.selected_tip()?),
+        None => verified_block_tip
+            .map(|(height, hash)| zakura_header_chain::Frontier::new(height, hash)),
     };
     let Some(best_header_tip) = best_header_tip else {
-        return Ok(Vec::new());
+        return Err(
+            finalized_state::header_chain::HeaderChainStoreError::Incoherent(
+                "block sync has no selected or full-state frontier",
+            ),
+        );
     };
 
-    let start = verified_block_tip
-        .and_then(|tip| tip.next().ok())
-        .map_or(from, |first_missing| first_missing.max(from));
+    let anchor = match (verified_block_tip, header_chain) {
+        (Some((verified_height, _verified_hash)), Some(reader)) => {
+            highest_common_body_header_frontier(
+                verified_height.min(best_header_tip.height),
+                db.finalized_tip_height().unwrap_or(block::Height(0)),
+                |height| read::hash_by_height(chain.clone(), db, height),
+                |height| reader.selected_hash(height),
+            )?
+        }
+        (Some((height, hash)), None) => zakura_header_chain::Frontier::new(height, hash),
+        (None, Some(_)) => {
+            return Err(
+                finalized_state::header_chain::HeaderChainStoreError::Incoherent(
+                    "selected headers exist without a full-state anchor",
+                ),
+            );
+        }
+        (None, None) => unreachable!("the absent-frontier case returned above"),
+    };
 
-    if start > best_header_tip {
-        return Ok(Vec::new());
+    let first_selected = anchor.height.next().unwrap_or(anchor.height);
+    let repairing_fork = verified_block_tip.is_some_and(|tip| tip != (anchor.height, anchor.hash));
+    let verified_successor = verified_block_tip.and_then(|(height, _)| height.next().ok());
+    let start = if repairing_fork && verified_successor == Some(from) {
+        first_selected
+    } else {
+        first_selected.max(from)
+    };
+
+    if start > best_header_tip.height {
+        return Ok(crate::BlockSyncBodyMetadata {
+            anchor,
+            blocks: Vec::new(),
+        });
     }
 
-    let count = limit
-        .min(MAX_HEADER_SYNC_HEIGHT_RANGE)
-        .min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
+    let count = limit.min(MAX_HEADER_SYNC_HEIGHT_RANGE).min(
+        best_header_tip
+            .height
+            .0
+            .saturating_sub(start.0)
+            .saturating_add(1),
+    );
     let size_hints: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
         .into_iter()
         .collect();
+    let selected_hashes: HashMap<_, _> = match header_chain {
+        Some(reader) => reader
+            .selected_hashes(start, count)?
+            .into_iter()
+            .map(|frontier| (frontier.height, frontier.hash))
+            .collect(),
+        None => HashMap::new(),
+    };
 
     let mut metadata = Vec::new();
     for offset in 0..count {
         let Some(height) = start.0.checked_add(offset).map(block::Height) else {
             break;
         };
-        if db.contains_body_at_height(height) {
+        let body_hash = read::hash_by_height(chain.clone(), db, height);
+        let selected_hash = match header_chain {
+            Some(_) => selected_hashes.get(&height).copied(),
+            None => body_hash,
+        };
+        let Some(hash) = selected_hash else {
+            continue;
+        };
+        if db.contains_body_at_height(height) && body_hash == Some(hash) {
             continue;
         }
-        let hash = match read::hash_by_height(chain.clone(), db, height) {
-            Some(hash) => Some(hash),
-            None => header_chain
-                .map(|reader| reader.selected_hash(height))
-                .transpose()?
-                .flatten(),
-        };
-        let Some(hash) = hash else {
-            continue;
-        };
         metadata.push((height, hash, size_hints.get(&height).copied().flatten()));
     }
 
-    Ok(metadata)
+    Ok(crate::BlockSyncBodyMetadata {
+        anchor,
+        blocks: metadata,
+    })
 }
 
 fn block_roots_by_height_range<C>(

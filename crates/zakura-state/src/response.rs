@@ -379,6 +379,15 @@ impl PartialEq for NonFinalizedBlocksListener {
 
 impl Eq for NonFinalizedBlocksListener {}
 
+/// Selected-chain body anchor and missing-body metadata for one block-sync query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockSyncBodyMetadata {
+    /// Highest full-state block shared with the selected header chain.
+    pub anchor: zakura_header_chain::Frontier,
+    /// Selected-header bodies that must be downloaded after `anchor`.
+    pub blocks: Vec<(block::Height, block::Hash, Option<u32>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
@@ -509,7 +518,7 @@ pub enum ReadResponse {
     MissingBlockBodies(Vec<block::Height>),
 
     /// Response to [`ReadRequest::MissingBlockBodyMetadata`].
-    MissingBlockBodyMetadata(Vec<(block::Height, block::Hash, Option<u32>)>),
+    MissingBlockBodyMetadata(BlockSyncBodyMetadata),
 
     /// Response to [`ReadRequest::BlockSizeHints`].
     BlockSizeHints(Vec<(block::Height, Option<u32>)>),
