@@ -104,6 +104,31 @@ fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
 }
 
 #[test]
+fn body_refill_snapshot_holds_the_complete_transition_barrier() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the empty schema initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initialized store audits");
+    let reader = runtime.reader();
+
+    let (full_state, selected_projection) = reader
+        .with_selected_projection(|| {
+            assert!(reader.store.writer.try_lock().is_err());
+            assert!(reader.transition_engine.try_lock().is_err());
+            Frontier::new(anchor.height, anchor.hash)
+        })
+        .expect("the body refill snapshot is coherent");
+
+    assert_eq!(full_state, Frontier::new(anchor.height, anchor.hash));
+    assert_eq!(selected_projection, vec![full_state]);
+}
+
+#[test]
 fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

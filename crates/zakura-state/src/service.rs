@@ -1698,7 +1698,7 @@ fn highest_common_body_header_frontier(
 }
 
 fn missing_block_body_metadata<C>(
-    chain: Option<C>,
+    latest_chain: impl FnOnce() -> Option<C>,
     db: &ZakuraDb,
     header_chain: Option<&finalized_state::header_chain::HeaderChainReader>,
     from: block::Height,
@@ -1707,9 +1707,24 @@ fn missing_block_body_metadata<C>(
 where
     C: AsRef<Chain> + Clone,
 {
-    let verified_block_tip = read::tip(chain.clone(), db);
-    let best_header_tip = match header_chain {
-        Some(reader) => Some(reader.selected_tip()?),
+    let (chain, verified_block_tip, selected_projection) = match header_chain {
+        Some(reader) => {
+            let ((chain, verified_block_tip), selected_projection) = reader
+                .with_selected_projection(|| {
+                    let chain = latest_chain();
+                    let verified_block_tip = read::tip(chain.clone(), db);
+                    (chain, verified_block_tip)
+                })?;
+            (chain, verified_block_tip, Some(selected_projection))
+        }
+        None => {
+            let chain = latest_chain();
+            let verified_block_tip = read::tip(chain.clone(), db);
+            (chain, verified_block_tip, None)
+        }
+    };
+    let best_header_tip = match &selected_projection {
+        Some(selected_projection) => selected_projection.last().copied(),
         None => verified_block_tip
             .map(|(height, hash)| zakura_header_chain::Frontier::new(height, hash)),
     };
@@ -1721,13 +1736,22 @@ where
         );
     };
 
-    let anchor = match (verified_block_tip, header_chain) {
-        (Some((verified_height, _verified_hash)), Some(reader)) => {
+    let anchor = match (verified_block_tip, selected_projection.as_deref()) {
+        (Some((verified_height, _verified_hash)), Some(selected_projection)) => {
+            let minimum_height = selected_projection
+                .first()
+                .expect("the selected projection has a best header")
+                .height;
             highest_common_body_header_frontier(
                 verified_height.min(best_header_tip.height),
-                db.finalized_tip_height().unwrap_or(block::Height(0)),
+                minimum_height,
                 |height| read::hash_by_height(chain.clone(), db, height),
-                |height| reader.selected_hash(height),
+                |height| {
+                    Ok(selected_projection
+                        .binary_search_by_key(&height, |frontier| frontier.height)
+                        .ok()
+                        .map(|index| selected_projection[index].hash))
+                },
             )?
         }
         (Some((height, hash)), None) => zakura_header_chain::Frontier::new(height, hash),
@@ -1767,10 +1791,13 @@ where
     let size_hints: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
         .into_iter()
         .collect();
-    let selected_hashes: HashMap<_, _> = match header_chain {
-        Some(reader) => reader
-            .selected_hashes(start, count)?
-            .into_iter()
+    let selected_hashes: HashMap<_, _> = match selected_projection.as_deref() {
+        Some(selected_projection) => selected_projection
+            .iter()
+            .copied()
+            .filter(|frontier| {
+                frontier.height >= start && frontier.height <= best_header_tip.height
+            })
             .map(|frontier| (frontier.height, frontier.hash))
             .collect(),
         None => HashMap::new(),
@@ -2294,7 +2321,7 @@ impl Service<ReadRequest> for ReadStateService {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 Ok(ReadResponse::MissingBlockBodyMetadata(
                     missing_block_body_metadata(
-                        state.latest_best_chain(),
+                        || state.latest_best_chain(),
                         &state.db,
                         reader.as_ref(),
                         from,
