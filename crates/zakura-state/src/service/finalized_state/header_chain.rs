@@ -402,7 +402,7 @@ fn restore_transition_engine_after_staging_error(
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderChainReader {
     store: HeaderChainStore,
-    config: EngineConfig,
+    config: Arc<EngineConfig>,
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
     transition_engine: Arc<Mutex<HeaderChainEngine>>,
 }
@@ -1269,28 +1269,35 @@ impl HeaderChainReader {
             reservation_id,
             active: true,
         };
-        let snapshot = self.store.snapshot()?;
-        if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
-            return Ok(RetainedPathLeaseOutcome::Busy);
-        }
-        let Some(target_node) = self.retained_path_node(target_tip_hash)? else {
-            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
-        };
-        let target = Frontier::new(target_node.height, target_tip_hash);
-        let mut reverse_path = vec![target];
-        let mut current = target_node;
-        while current.height > snapshot.frontiers.finalized.height {
-            let Some(parent) = self.retained_path_node(current.parent_hash)? else {
-                return Ok(RetainedPathLeaseOutcome::HistoryPruned);
-            };
-            if parent.height.next().ok() != Some(current.height) {
-                return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
-                    "retained target path has non-contiguous heights",
-                )));
+        let (snapshot, target, mut reverse_path) = {
+            let engine = self
+                .transition_engine
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let snapshot = engine.snapshot();
+            if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
+                return Ok(RetainedPathLeaseOutcome::Busy);
             }
-            reverse_path.push(Frontier::new(parent.height, parent.hash));
-            current = parent;
-        }
+            let Some(target_node) = engine.graph().node(target_tip_hash) else {
+                return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
+            };
+            let target = Frontier::new(target_node.height, target_tip_hash);
+            let mut reverse_path = vec![target];
+            let mut current = target_node;
+            while current.height > snapshot.frontiers.finalized.height {
+                let Some(parent) = engine.graph().node(current.parent_hash) else {
+                    return Ok(RetainedPathLeaseOutcome::HistoryPruned);
+                };
+                if parent.height.next().ok() != Some(current.height) {
+                    return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                        "retained target path has non-contiguous heights",
+                    )));
+                }
+                reverse_path.push(Frontier::new(parent.height, parent.hash));
+                current = parent;
+            }
+            (snapshot, target, reverse_path)
+        };
         if reverse_path.last().copied() != Some(snapshot.frontiers.finalized) {
             return Ok(RetainedPathLeaseOutcome::HistoryPruned);
         }
@@ -1345,7 +1352,11 @@ impl HeaderChainReader {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let current_snapshot = self.store.snapshot()?;
+        let current_snapshot = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .snapshot();
         if current_snapshot.state_version != snapshot.state_version
             || scope != HeaderWorkAuthority::for_target(&current_snapshot, target_tip_hash)
         {
@@ -1655,7 +1666,7 @@ impl HeaderChainRuntime {
     pub(crate) fn reader(&self) -> HeaderChainReader {
         HeaderChainReader {
             store: self.store.clone(),
-            config: self.config.clone(),
+            config: Arc::new(self.config.clone()),
             leases: self.leases.clone(),
             transition_engine: self.transition_engine.clone(),
         }
@@ -1828,13 +1839,25 @@ impl HeaderChainRuntime {
                 ));
             }
         };
-        let validation_context = self
-            .store
-            .validation_context(checkpoint_parent.hash, &self.config.network)?;
-        let validation_leases = [validation_context];
+        let checkpoint_headers_are_retained = match &checkpoint_request.event {
+            TransitionEvent::VerifiedChainChanged(event) => event
+                .new_path
+                .iter()
+                .all(|header| transition_engine.graph().node(header.hash).is_some()),
+            _ => false,
+        };
+        // Native checkpoint growth normally promotes headers already admitted by header sync.
+        // Only a missing header can enter contextual header validation and require a lease.
+        let validation_leases = if checkpoint_headers_are_retained {
+            Vec::new()
+        } else {
+            vec![self
+                .store
+                .validation_context(checkpoint_parent.hash, &self.config.network)?]
+        };
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
-            validation_leases: &validation_leases,
+            validation_leases: validation_leases.as_slice(),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
