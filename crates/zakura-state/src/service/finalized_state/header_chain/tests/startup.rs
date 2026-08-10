@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let previous_state_version = metadata.state_version;
+    let updated_config = EngineConfig::new(
+        engine_config.mode,
+        engine_config.network.clone(),
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([0x93; 32]))])
+            .expect("the extension checkpoint is unique"),
+    )
+    .expect("the updated engine configuration is coherent");
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor)
+        .expect("the old manifest initializes the fixture");
+
+    let (runtime, report) = store
+        .startup(&updated_config)
+        .expect("startup rebinds a fully audited checkpoint extension");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+    );
+    assert_eq!(
+        report.current.state_version,
+        previous_state_version
+            .checked_next()
+            .expect("the fixture state version can advance")
+    );
+    drop(runtime);
+
+    let (_, reopened) = HeaderChainStore::new(db)
+        .startup(&updated_config)
+        .expect("the rebound manifest persists atomically");
+    assert!(reopened.repairs.is_empty());
+}
+
+#[test]
 fn startup_reconciles_restored_full_state_before_first_publication() {
     let cache = tempfile::tempdir().expect("the test cache directory is created");
     let db_config = Config {
