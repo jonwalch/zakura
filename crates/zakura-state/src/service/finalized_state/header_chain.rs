@@ -2151,6 +2151,7 @@ impl HeaderChainRuntime {
                     .increment(1);
             }
             TransitionCause::Event
+            | TransitionCause::CheckpointFinality
             | TransitionCause::ResourceStalled
             | TransitionCause::HeadersOnlyFinality
             | TransitionCause::Recovery => {}
