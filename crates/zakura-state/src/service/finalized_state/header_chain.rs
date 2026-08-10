@@ -2904,7 +2904,8 @@ impl HeaderChainStore {
         changes: &ChangeSet,
         mut batch: DiskWriteBatch,
     ) -> Result<DiskWriteBatch, HeaderChainStoreError> {
-        if self.metadata_row()?.is_some_and(|metadata| {
+        let current_metadata = self.metadata_row()?;
+        if current_metadata.as_ref().is_some_and(|metadata| {
             metadata.frontiers.finalized != changes.metadata.frontiers.finalized
         }) {
             let staged_nodes: HashMap<_, _> = changes
@@ -2945,7 +2946,7 @@ impl HeaderChainStore {
                     .as_bytes(),
                 )?;
                 self.delete_deferred_for(&mut batch, &node)?;
-                self.delete_reason_rows(&mut batch, *hash)?;
+                self.delete_reason_rows(&mut batch, &node)?;
             }
             for (key, _) in self.scan_prefix(HEADER_CHILD, &hash.0)? {
                 self.delete_raw(&mut batch, HEADER_CHILD, key)?;
@@ -2957,6 +2958,7 @@ impl HeaderChainStore {
                 HeaderChainStoreError::Incoherent("replaced node could not be decoded")
             })? {
                 self.delete_deferred_for(&mut batch, &old)?;
+                self.delete_reason_rows(&mut batch, &old)?;
             }
             self.put_value(
                 &mut batch,
@@ -2986,14 +2988,35 @@ impl HeaderChainStore {
                 .map_err(|_| HeaderChainStoreError::Incoherent("invalid deferred timestamp"))?;
                 self.put_empty(&mut batch, HEADER_DEFERRED, key.as_bytes())?;
             }
-            self.delete_reason_rows(&mut batch, node.hash)?;
             for reason in &node.eligibility.direct_reasons {
                 self.put_reason(&mut batch, node.hash, reason)?;
             }
         }
 
-        self.apply_projection(&mut batch, HEADER_SELECTED, &changes.selected_projection)?;
-        self.apply_projection(&mut batch, HEADER_VERIFIED, &changes.verified_projection)?;
+        let selected_bounds = current_metadata.as_ref().map(|metadata| {
+            (
+                metadata.frontiers.finalized.height,
+                metadata.frontiers.header_best.height,
+            )
+        });
+        let verified_bounds = current_metadata.as_ref().map(|metadata| {
+            (
+                metadata.frontiers.finalized.height,
+                metadata.frontiers.verified_best.height,
+            )
+        });
+        self.apply_projection(
+            &mut batch,
+            HEADER_SELECTED,
+            &changes.selected_projection,
+            selected_bounds,
+        )?;
+        self.apply_projection(
+            &mut batch,
+            HEADER_VERIFIED,
+            &changes.verified_projection,
+            verified_bounds,
+        )?;
 
         for delta in &changes.aux_changes {
             match delta {
@@ -3156,15 +3179,15 @@ impl HeaderChainStore {
     fn delete_reason_rows(
         &self,
         batch: &mut DiskWriteBatch,
-        hash: block::Hash,
+        node: &HeaderNode,
     ) -> Result<(), HeaderChainStoreError> {
-        for tag in 0..=4 {
-            let mut prefix = Vec::with_capacity(33);
-            prefix.push(tag);
-            prefix.extend(hash.0);
-            for (key, _) in self.scan_prefix(HEADER_ELIGIBILITY_ROOT, &prefix)? {
-                self.delete_raw(batch, HEADER_ELIGIBILITY_ROOT, key)?;
-            }
+        for reason in &node.eligibility.direct_reasons {
+            let key = HeaderEligibilityRootKey {
+                kind: reason_kind(reason),
+                root: node.hash,
+                evidence: reason_evidence(reason),
+            };
+            self.delete_raw(batch, HEADER_ELIGIBILITY_ROOT, key.as_bytes())?;
         }
         Ok(())
     }
@@ -3210,27 +3233,39 @@ impl HeaderChainStore {
         batch: &mut DiskWriteBatch,
         family: &'static str,
         delta: &zakura_header_chain::ProjectionDelta,
+        existing_bounds: Option<(block::Height, block::Height)>,
     ) -> Result<(), HeaderChainStoreError> {
-        if let Some(remove_before) = delta.remove_before {
-            let upper = HeaderHeightKey(remove_before).as_bytes();
-            for (key, _) in self.scan_range(family, &[], Some(&upper))? {
-                if key.len() != 4 {
-                    return Err(HeaderChainStoreError::Incoherent(
-                        "invalid projection key width",
-                    ));
-                }
-                self.delete_raw(batch, family, key)?;
+        if delta.remove_before.is_some() || delta.remove_from.is_some() {
+            let Some((first, last)) = existing_bounds else {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "projection deletion has no existing bounds",
+                ));
+            };
+            if first > last {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "existing projection bounds are reversed",
+                ));
             }
-        }
-        if let Some(remove_from) = delta.remove_from {
-            let lower = HeaderHeightKey(remove_from).as_bytes();
-            for (key, _) in self.scan_range(family, &lower, None)? {
-                if key.len() != 4 {
+            if let Some(remove_before) = delta.remove_before {
+                if remove_before < first {
                     return Err(HeaderChainStoreError::Incoherent(
-                        "invalid projection key width",
+                        "projection prefix deletion precedes its existing bounds",
                     ));
                 }
-                self.delete_raw(batch, family, key)?;
+                if remove_before > first {
+                    let end = block::Height(remove_before.0 - 1).min(last);
+                    self.delete_projection_rows(batch, family, first, end)?;
+                }
+            }
+            if let Some(remove_from) = delta.remove_from {
+                if remove_from < first {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "projection suffix deletion precedes its existing bounds",
+                    ));
+                }
+                if remove_from <= last {
+                    self.delete_projection_rows(batch, family, remove_from, last)?;
+                }
             }
         }
         for frontier in &delta.put {
@@ -3239,6 +3274,38 @@ impl HeaderChainStore {
                 family,
                 HeaderHeightKey(frontier.height).as_bytes(),
                 frontier.hash.0,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn delete_projection_rows(
+        &self,
+        batch: &mut DiskWriteBatch,
+        family: &'static str,
+        start: block::Height,
+        end: block::Height,
+    ) -> Result<(), HeaderChainStoreError> {
+        let count = end
+            .0
+            .checked_sub(start.0)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "projection deletion bounds are reversed",
+            ))?;
+        if usize::try_from(count)
+            .ok()
+            .is_none_or(|count| count > zakura_header_chain::MAX_NON_FINALIZED_NODES_V1)
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "projection deletion exceeds the retained-node bound",
+            ));
+        }
+        for height in start.0..=end.0 {
+            self.delete_raw(
+                batch,
+                family,
+                HeaderHeightKey(block::Height(height)).as_bytes(),
             )?;
         }
         Ok(())
