@@ -23,7 +23,8 @@ use zakura_network::{
         ADDR_RESPONSE_LIMIT_DENOMINATOR, DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK,
     },
     types::{MetaAddr, PeerServices},
-    AddressBook, InventoryResponse, Request, Response,
+    zakura::ZakuraPeerId,
+    AddressBook, InventoryResponse, PeerSource, Request, Response,
 };
 use zakura_node_services::mempool;
 use zakura_rpc::SubmitBlockChannel;
@@ -987,6 +988,54 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // TODO: check that the block is not queued in the checkpoint verifier or non-finalized state
 
     // check that nothing unexpected happened
+    peer_set.expect_no_requests().await;
+    tx_verifier.expect_no_requests().await;
+
+    let sync_gossip_result = sync_gossip_task_handle.now_or_never();
+    assert!(
+        sync_gossip_result.is_none(),
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
+    );
+
+    let tx_gossip_result = tx_gossip_task_handle.now_or_never();
+    assert!(
+        tx_gossip_result.is_none(),
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
+    );
+
+    Ok(())
+}
+
+/// Zakura block advertisements are only a freshness signal. Native header/body sync owns their
+/// block bodies, so the legacy-compatible inbound downloader must not fetch them by hash.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn zakura_block_advertisement_does_not_start_legacy_block_download(
+) -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("32 bytes is a valid Zakura peer id");
+
+    let response = inbound_service
+        .clone()
+        .oneshot(Request::AdvertiseBlock(
+            block.hash(),
+            Some(PeerSource::Zakura(peer_id)),
+        ))
+        .await?;
+    assert_eq!(response, Response::Nil);
+
     peer_set.expect_no_requests().await;
     tx_verifier.expect_no_requests().await;
 
