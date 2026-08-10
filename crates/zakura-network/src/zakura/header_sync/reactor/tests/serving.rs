@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn port_page_serves_finalized_tree_aux_without_peer_delivery_provenance() {
+    let header = regtest_genesis_block().header.clone();
+    let hash = header.hash();
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+    let tree_aux = TreeAuxRecordV1 {
+        height: block::Height(0),
+        sapling_root: Default::default(),
+        orchard_root: zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [0; 32].into(),
+    };
+    let page = zakura_node_services::header_chain::RetainedHeaderPathPage {
+        common_ancestor: frontier,
+        target: frontier,
+        scope: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(hash, hash),
+        },
+        headers: vec![header],
+        aux_deliveries: vec![Vec::new()],
+        finalized_tree_aux: vec![Some(tree_aux)],
+        complete: true,
+    };
+
+    let served = assemble_port_header_path_page(1, page, AuxSchema::V1)
+        .expect("the finalized-state page is coherent");
+
+    assert_eq!(served.tree_aux_schema, AuxSchema::V1);
+    assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
+    assert_eq!(served.entries[0].body_size, 0);
+}
+
+#[test]
 fn serving_count_reserves_bytes_for_the_requested_aux_schema() {
     let mut startup = startup(CancellationToken::new());
     startup.max_frame_bytes = 1_000;
@@ -326,8 +362,8 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     let tree_aux = TreeAuxRecordV1 {
         height: block::Height(2),
         sapling_root: Default::default(),
-        orchard_root: Default::default(),
-        ironwood_root: Default::default(),
+        orchard_root: zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
         sapling_tx_count: 0,
         orchard_tx_count: 0,
         ironwood_tx_count: 0,

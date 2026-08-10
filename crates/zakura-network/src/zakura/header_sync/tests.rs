@@ -163,8 +163,8 @@ fn empty_aux(height: block::Height) -> TreeAuxRecordV1 {
     TreeAuxRecordV1 {
         height,
         sapling_root: sapling::tree::Root::default(),
-        orchard_root: orchard::tree::Root::default(),
-        ironwood_root: ironwood::tree::Root::default(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
         sapling_tx_count: 0,
         orchard_tx_count: 0,
         ironwood_tx_count: 0,
@@ -568,6 +568,15 @@ fn body_hints_completion_and_aux_defaults_are_enforced() {
         .previous()
         .expect("NU5 activates above genesis");
     let mut aux = empty_aux(pre_nu5);
+    aux.orchard_root = orchard::tree::Root::default();
+    assert!(matches!(
+        aux.validate_for(pre_nu5, &network),
+        Err(HeaderSyncWireError::InvalidTreeAuxDefault {
+            field: "orchard_root",
+            ..
+        })
+    ));
+    let mut aux = empty_aux(pre_nu5);
     aux.orchard_tx_count = 1;
     assert!(matches!(
         aux.validate_for(pre_nu5, &network),
@@ -576,13 +585,24 @@ fn body_hints_completion_and_aux_defaults_are_enforced() {
             ..
         })
     ));
-    let before_unconfigured_nu7 = NetworkUpgrade::Nu5
+    let before_nu6_3 = NetworkUpgrade::Nu6_3
         .activation_height(&network)
-        .expect("mainnet has NU5");
-    let mut aux = empty_aux(before_unconfigured_nu7);
+        .expect("mainnet has NU6.3")
+        .previous()
+        .expect("NU6.3 activates above genesis");
+    let mut aux = empty_aux(before_nu6_3);
+    aux.ironwood_root = ironwood::tree::Root::default();
+    assert!(matches!(
+        aux.validate_for(before_nu6_3, &network),
+        Err(HeaderSyncWireError::InvalidTreeAuxDefault {
+            field: "ironwood_root",
+            ..
+        })
+    ));
+    let mut aux = empty_aux(before_nu6_3);
     aux.ironwood_tx_count = 1;
     assert!(matches!(
-        aux.validate_for(before_unconfigured_nu7, &network),
+        aux.validate_for(before_nu6_3, &network),
         Err(HeaderSyncWireError::InvalidTreeAuxDefault {
             field: "ironwood_tx_count",
             ..

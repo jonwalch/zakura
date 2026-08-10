@@ -714,6 +714,14 @@ mod tests {
                             .send(BlockSyncEvent::ScopedNeededBlocks {
                                 query_id,
                                 scope,
+                                body_anchor: {
+                                    let height = block::Height(from.0.saturating_sub(1));
+                                    let hash = by_height
+                                        .get(&height)
+                                        .map(|block| block.hash())
+                                        .unwrap_or_else(mainnet_genesis_hash);
+                                    zakura_header_chain::Frontier::new(height, hash)
+                                },
                                 blocks: metas,
                             })
                             .await;
