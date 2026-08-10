@@ -16,20 +16,20 @@ pub struct BlockSyncBlockMeta {
 
 /// Facts accepted by the block-sync scaffold and later reactor.
 ///
-/// The inbound data flow is inverted: a peer's stream-6 frames are decoded and
-/// the download logic runs in the per-peer pipe-routine
-/// ([`PeerRoutine`](super::peer_routine)). Inbound messages no longer flow
-/// through the reactor as a `WireMessage`; the routine forwards only shared
-/// concerns to the reactor over [`RoutineToReactor`].
+/// [`PeerRoutine`](super::peer_routine) decodes each peer's stream-6 frames.
+/// It also runs the download logic.
+/// The routine forwards only shared concerns to the reactor through [`RoutineToReactor`].
 #[derive(Clone, Debug)]
 pub enum BlockSyncEvent {
     /// A peer became available for stream-6 block sync.
     PeerConnected(BlockSyncPeerSession),
-    /// A peer disconnected; all of its outstanding work is dropped.
+    /// A peer disconnected.
+    /// The routine drops all work owned by that peer.
     PeerDisconnected(ZakuraPeerId),
     /// An authenticated local operator requested a fresh retry of one persistent alarm.
     RetryBodyAvailability {
-        /// Exact alarmed selected header; stale requests fail closed.
+        /// Exact selected header with an alarm.
+        /// The state layer rejects stale requests.
         hash: block::Hash,
     },
     /// Test-only direct header-target injection.
@@ -305,14 +305,14 @@ pub enum BlockSyncAction {
     },
     /// Persist changed supplier evidence without clearing the current alarm episode.
     RestartBodyAvailability {
-        /// Durable version whose selected alarm is being restarted.
+        /// Durable version that owns the selected alarm restart.
         expected_version: zakura_header_chain::StateVersion,
         /// Authenticated supplier-set evidence preserving the alarm's age and attempts.
         discovery: zakura_header_chain::BodySupplierDiscovered,
     },
     /// Persist a fresh episode after an authenticated operator request.
     RetryBodyAvailability {
-        /// Durable version whose selected alarm is being retried.
+        /// Durable version that owns the selected alarm retry.
         expected_version: zakura_header_chain::StateVersion,
         /// Authenticated operator evidence and fresh summary.
         retry: zakura_header_chain::OperatorBodyRetry,

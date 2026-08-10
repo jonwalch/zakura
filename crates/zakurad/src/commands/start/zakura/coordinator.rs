@@ -51,7 +51,8 @@ struct BlockApplyOperationRecord {
     state_tx: watch::Sender<BlockApplyOperationState>,
 }
 
-/// Driver-owned queued operation; dropping it acknowledges queued cancellation.
+/// The driver owns this queued operation.
+/// Dropping the operation acknowledges queued cancellation.
 #[derive(Debug)]
 pub(crate) struct BlockApplyOperation {
     coordinator: Arc<SyncCoordinator>,
@@ -202,9 +203,9 @@ impl SyncCoordinator {
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        // Reserve before rechecking the complete phase+epoch. Concurrent fallback
-        // either observes this permit in the drain count or makes this reservation
-        // self-reject and release here.
+        // Reserve before rechecking the complete phase and epoch.
+        // Concurrent fallback either observes this permit in the drain count or changes the phase.
+        // A phase change makes this reservation reject and release itself here.
         if self.apply_phase() != initial {
             self.release_apply();
             return None;
@@ -503,8 +504,8 @@ impl SyncCoordinator {
         self.phase_tx.send_replace(phase);
         self.phase_changed.notify_waiters();
         self.publish_service_demand();
-        // This diagnostic gauge may round epochs above f64's exact integer range;
-        // lifecycle authority always uses the original checked u64 value.
+        // This diagnostic gauge may round epochs above the exact `f64` integer range.
+        // Lifecycle authority always uses the original checked `u64` value.
         metrics::gauge!("sync.zakura.apply.epoch").set(phase.epoch().get() as f64);
         metrics::gauge!("sync.zakura.apply.phase").set(match phase {
             ApplyPhase::LegacyBootstrap { .. } => 0.0,

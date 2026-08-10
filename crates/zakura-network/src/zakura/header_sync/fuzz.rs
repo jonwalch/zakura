@@ -76,7 +76,8 @@ pub struct HeaderPursuitReplaySummary {
     pub released_state_failures: usize,
     /// Equivalent response-page partition matrices completed.
     pub partition_checks: usize,
-    /// Downstream effects admitted by current completions; stale scenarios require all zero.
+    /// Downstream effects admitted by current completions.
+    /// Stale scenarios require zero effects.
     pub completion_effects: NoEffectsProbe,
 }
 
@@ -1106,8 +1107,8 @@ mod tests {
     }
 
     #[test]
-    // AUD-05: releasing a held response after branch reset exercises every
-    // downstream-effect sentinel and proves stale network work is inert.
+    // AUD-05: release a held response after a branch reset.
+    // Verify every downstream-effect sentinel remains unchanged.
     fn retired_network_completion_has_no_effects() {
         let input = [
             0, 0, 42, 0, // advertise session 1, target 42
@@ -1128,8 +1129,8 @@ mod tests {
     }
 
     #[test]
-    // AUD-06: a successful database result is held across retirement, then
-    // released to prove it cannot publish, cover, or schedule new work.
+    // AUD-06: hold a successful database result across retirement.
+    // Release it and verify that it cannot publish, cover, or schedule work.
     fn retired_state_success_has_no_downstream_effects() {
         let held_success = [
             0, 0, 42, 0, // advertise session 1, target 42
@@ -1163,8 +1164,8 @@ mod tests {
     }
 
     #[test]
-    // AUD-07: the matching failure path checks retry, repair, attribution, and
-    // scoring counters, which are all forbidden after ownership retirement.
+    // AUD-07: exercise the matching failure path after ownership retirement.
+    // Verify that it does not change retry, repair, attribution, or scoring counters.
     fn retired_state_failure_has_no_retry_or_peer_effects() {
         let held_failure = [
             0, 0, 42, 0, // advertise session 1, target 42

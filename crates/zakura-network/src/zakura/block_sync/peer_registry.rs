@@ -176,7 +176,7 @@ pub(super) struct OutstandingMeta {
     pub(super) deadline: Instant,
 }
 
-/// Reactor-visible claim that can be force-cancelled by the floor watchdog.
+/// A claim that the floor watchdog can cancel through the reactor.
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingClaim {
     pub(super) peer: ZakuraPeerId,
@@ -230,8 +230,8 @@ impl PeerRegistry {
 
     /// Install the exact current set of supplier-specific retry deferrals for one body.
     ///
-    /// Replacing this set removes departed suppliers' deferrals while preserving
-    /// the separate durable all-supplier alarm gate.
+    /// Replacing this set removes deferrals for departed suppliers.
+    /// The replacement preserves the durable all-supplier alarm gate.
     pub(super) fn defer_body_retry(
         &self,
         sources: impl IntoIterator<Item = zakura_header_chain::SourceId>,
@@ -501,7 +501,8 @@ impl PeerRegistry {
             return SessionAdmission::Parked;
         }
 
-        // `try_update` replaces this API in Rust 1.97, but Zakura's MSRV is 1.91.
+        // Rust 1.97 replaces this API with `try_update`.
+        // Zakura supports Rust 1.91.
         #[allow(deprecated)]
         let generation = self
             .next_generation

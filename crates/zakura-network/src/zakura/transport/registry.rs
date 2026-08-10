@@ -453,9 +453,9 @@ impl ServiceRegistry {
 
 /// Select exactly one mutually negotiated version of each stream kind.
 ///
-/// Version alternatives are declared as distinct capability bits. Selecting the
-/// highest matching version before opening the prelude makes decoding
-/// version-scoped and keeps older peers on their existing stream.
+/// Each capability bit declares one version alternative.
+/// Select the highest matching version before opening the prelude.
+/// This selection scopes decoding and preserves existing streams for older peers.
 fn selected_streams(streams: &[Stream], negotiated: u64, mode: StreamMode) -> Vec<Stream> {
     let mut selected = Vec::<Stream>::new();
     for stream in streams

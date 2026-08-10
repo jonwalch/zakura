@@ -215,7 +215,7 @@ pub enum HeaderSyncEvent {
         /// Decoded message.
         msg: HeaderSyncMessage,
     },
-    /// A correlated response decoded with the exact scope reserved before its request was sent.
+    /// A correlated response that the reactor decoded under the request's reserved scope.
     SessionResponse {
         /// Sending peer.
         peer: ZakuraPeerId,
@@ -237,7 +237,8 @@ pub enum HeaderSyncEvent {
         target_tip_hash: block::Hash,
         /// Durable generation and exact branch that scheduled the locator read.
         scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Coherent locator, absent when state is unavailable.
+        /// Coherent locator.
+        /// State returns `None` when it is unavailable.
         locator: Option<zakura_header_chain::HeaderLocator>,
     },
     /// State resolved one branch-owned VCT repair against the exact selected projection.
@@ -307,9 +308,9 @@ pub enum HeaderSyncEvent {
 /// Result of resolving one branch-owned VCT repair against durable state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VctRepairContextResult {
-    /// The owner is current and the exact selected request was resolved.
+    /// State resolved the exact selected request for the current owner.
     Resolved(zakura_header_chain::VctRepairContext),
-    /// The owner or requested selected height is no longer current.
+    /// State found a stale owner or selected height.
     Stale,
     /// Local state or driver capacity prevented the read.
     Unavailable,
@@ -342,7 +343,7 @@ impl HeaderSyncEvent {
 /// Network-facing state result for one exact retained target lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeaderPathLeaseResult {
-    /// The immutable target path was acquired.
+    /// State acquired the immutable target path.
     Acquired(HeaderPathLease),
     /// State mapped the request to one explicit non-data protocol outcome.
     Outcome(HeadersOutcomeCode),
@@ -381,7 +382,8 @@ pub struct HeaderPathPage {
     pub target: zakura_header_chain::Frontier,
     /// Exact generation and branch fixed by the lease.
     pub scope: zakura_header_chain::HeaderWorkAuthority,
-    /// Requested schema when every parallel record was available, otherwise none.
+    /// Requested schema when the server found every parallel record.
+    /// The server otherwise returns no schema.
     pub tree_aux_schema: AuxSchema,
     /// Canonical headers and parallel advisory metadata.
     pub entries: Vec<HeaderEntry>,
@@ -403,7 +405,8 @@ pub enum HeaderTargetAdmissionResult {
 /// Sealed complete-target insertion returned by off-reactor validation.
 #[derive(Clone, Debug)]
 pub enum HeaderTargetPreparationResult {
-    /// All deterministic rules passed and the target is ready for the completion gate.
+    /// Validation passed all deterministic rules.
+    /// The completion gate can now process the target.
     Prepared(zakura_node_services::header_chain::PreparedHeaderTarget),
     /// Exact typed failure preserved from the validation/driver boundary.
     Failed(Arc<zakura_header_chain::HeaderChainError>),
@@ -485,7 +488,8 @@ pub enum HeaderPortOperation {
         owner: zakura_header_chain::HeaderSyncWorkOwner,
         /// Exact initial locator intersection.
         common_ancestor: zakura_header_chain::Frontier,
-        /// Exact admitted target, which can be a bounded prefix of the advertised target.
+        /// Exact admitted target.
+        /// The admitted target can be a bounded prefix of the advertised target.
         target: zakura_header_chain::Frontier,
         /// Proof that this batch completes either the advertised target or a bounded prefix.
         completion: zakura_header_chain::TargetCompletion,
@@ -514,15 +518,16 @@ pub enum HeaderPortOperation {
     },
     /// Close one exact header-sync session that stopped making progress.
     ///
-    /// Deliberately distinct from [`Misbehavior`](Self::Misbehavior): an unresponsive peer
-    /// is not a protocol violator, and conflating the two would feed a future ban score.
+    /// An unresponsive peer does not violate the protocol.
+    /// This action therefore remains distinct from [`Misbehavior`](Self::Misbehavior).
+    /// Conflating the actions would feed a future ban score.
     DropPeer {
-        /// Peer whose session is being closed.
+        /// Peer whose session the reactor closes.
         peer: ZakuraPeerId,
-        /// Ordered-stream generation being closed, so a strike recorded against a
-        /// superseded session can never close the session that replaced it.
+        /// Ordered-stream generation that the reactor closes.
+        /// A strike against a superseded session cannot close its replacement.
         session_id: u64,
-        /// Stable metrics and trace label for why the session was closed.
+        /// Stable metrics and trace label for the session-close reason.
         reason: &'static str,
     },
 }
@@ -534,7 +539,7 @@ pub type HeaderSyncAction = HeaderPortOperation;
 /// Header-sync peer-accounting violations.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeaderSyncMisbehavior {
-    /// A wire payload was malformed.
+    /// The codec rejected a malformed wire payload.
     MalformedMessage,
     /// A header failed protocol or consensus validation.
     InvalidHeader,

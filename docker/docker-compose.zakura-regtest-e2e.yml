@@ -1,10 +1,8 @@
-# Lightweight Zakura dual-stack regtest e2e — a smoke test, deliberately small.
+# Lightweight Zakura dual-stack Regtest smoke test.
 #
-# Three zakurad nodes on a fresh Regtest chain. The key cost-saving choice: there
-# is NO in-container compilation. Each node runs the HOST-built `zakurad` binary
-# bind-mounted into a stock `debian:trixie-slim` (which already ships glibc 2.41,
-# libstdc++, and libgcc — everything the binary needs). The previous e2e did a
-# full `cargo build --release` per service, which is what exhausted disk/CPU.
+# Four zakurad nodes use a fresh Regtest chain.
+# Each node runs the host-built `zakurad` binary in `debian:trixie-slim`.
+# The container image provides glibc 2.41, libstdc++, and libgcc.
 #
 # Build the binary once on the host, then bring the cluster up:
 #
@@ -12,16 +10,15 @@
 #   ZAKURAD_BIN=$(pwd)/target/debug/zakurad \
 #     docker compose -f docker/docker-compose.zakura-regtest-e2e.yml up -d
 #
-# Or just run docker/zakura-regtest-e2e/run.sh, which does all of the above and
-# asserts legacy compatibility, Zakura propagation, and block sync.
+# `docker/zakura-regtest-e2e/run.sh` builds the binary and starts the cluster.
+# The script verifies compatibility, Zakura propagation, and block sync.
 #
-# Host networking is required: Regtest only accepts localhost initial peers
-# (crates/zakura-network/src/config.rs: initial_peers filters to is_localhost), so the
-# nodes share 127.0.0.1 on distinct ports. State is ephemeral by default and
-# traces/temp live on tmpfs, so a run leaves nothing on disk. Node2 has a
-# dedicated named mount below so restart-matrix runs can deliberately preserve
-# or reset its database without losing it when the container is recreated.
-# Per-node CPU/memory/swap caps keep the cluster responsive under failure.
+# Regtest accepts only localhost initial peers.
+# The nodes therefore use host networking.
+# The nodes share 127.0.0.1 and use distinct ports.
+# Each node keeps temporary state and traces in tmpfs by default.
+# Node2 uses a named mount for restart-matrix runs.
+# Resource limits keep the cluster responsive after a failure.
 
 name: zakura-regtest-e2e
 

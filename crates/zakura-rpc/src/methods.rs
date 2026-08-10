@@ -3776,7 +3776,7 @@ pub struct HeaderChainAlarmInfo {
     resource_stalled: bool,
     /// The selected header exhausted its current body-supplier retry episode.
     header_best_body_unavailable: Option<HeaderChainBodyUnavailableInfo>,
-    /// An imported headers-only trust pin was refuted by deterministic body validation.
+    /// Deterministic body validation refuted an imported headers-only trust pin.
     migrated_pin_refuted: Option<HeaderChainFrontierInfo>,
 }
 
@@ -3790,7 +3790,8 @@ pub struct HeaderChainInfo {
     state_version: u64,
     /// Meaning and validity boundary of `header_best`.
     header_best_semantics: String,
-    /// Best locally header-valid frontier; this is not a body-validity claim.
+    /// Best locally header-valid frontier.
+    /// This frontier does not claim body validity.
     header_best: HeaderChainFrontierInfo,
     /// Best fully body-verified frontier on the selected path.
     verified_best: HeaderChainFrontierInfo,

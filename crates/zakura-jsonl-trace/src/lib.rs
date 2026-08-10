@@ -255,9 +255,10 @@ pub fn node_id() -> &'static str {
 
 /// Returns an opaque identifier shared by every JSONL emitter in this process.
 ///
-/// The identifier disambiguates appended trace rows across process restarts,
-/// where emitter-local monotonic timestamps restart from zero. It is only a
-/// correlation label, not a random value or security identity.
+/// The identifier disambiguates appended trace rows across process restarts.
+/// Emitter-local monotonic timestamps restart from zero after each restart.
+/// The identifier provides only a correlation label.
+/// The identifier does not provide randomness or security identity.
 pub fn process_trace_id() -> &'static str {
     static PROCESS_TRACE_ID: OnceLock<String> = OnceLock::new();
     PROCESS_TRACE_ID

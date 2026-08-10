@@ -1191,7 +1191,8 @@ where
                 // not invent local budget on failure.
                 let restore_replenishment_demand =
                     remaining_replenishment_demand.load(Ordering::Relaxed) > 0;
-                // `try_update` replaces this API in Rust 1.97, but Zakura's MSRV is 1.91.
+                // Rust 1.97 replaces this API with `try_update`.
+                // Zakura supports Rust 1.91.
                 #[allow(deprecated)]
                 let _ = remaining_replenishment_demand.fetch_update(
                     Ordering::Relaxed,

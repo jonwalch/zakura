@@ -1600,9 +1600,8 @@ mod tests {
         let (peer_send, service_recv) = framed_channel(16);
         let (service_send, mut peer_recv) = framed_channel(16);
         let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
-        // Connection ownership is claimed by the owning service, not inferred
-        // from the negotiated capability bits: stand in for the header-sync
-        // service that owns this connection in production.
+        // The owning service claims the connection directly.
+        // This test owner represents the production header-sync service.
         service.set_connection_owners(vec![Arc::new(TestConnectionOwner {
             peer: peer_id.clone(),
             conn_id: 0,
@@ -1618,9 +1617,8 @@ mod tests {
         wait_for_discovery_inbound_peers(&discovery_handle, 1).await;
         complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
             .await?;
-        // While another service owns the connection the exchange refreshes on an
-        // interval instead of releasing after one round, so discovery keeps its
-        // session admitted rather than dropping back to zero.
+        // Another service owns the connection.
+        // Discovery therefore refreshes the exchange instead of releasing its session.
         wait_for_discovery_inbound_peers(&discovery_handle, 1).await;
         assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
         assert!(
@@ -1661,20 +1659,13 @@ mod tests {
         (sink, recv)
     }
 
-    /// The `DiscoverySink` session guard must drop inbound messages decoded by a
-    /// superseded stream generation.
+    /// The `DiscoverySink` session guard must drop messages from a superseded stream generation.
     ///
-    /// A replacement discovery stream on the same connection re-admits the peer
-    /// under a higher `session_id`, but the previous sink is still live and can
-    /// be holding a frame it decoded before the swap. Without the guard that
-    /// retired sink still acts on the shared connection's behalf: a hello it
-    /// decoded is imported as the peer's current record, and a malformed one
-    /// returns a protocol reject that tears down a connection the retired
-    /// stream no longer speaks for.
+    /// A replacement discovery stream re-admits the peer under a higher `session_id`.
+    /// The previous sink can still hold a frame that it decoded before replacement.
+    /// The guard prevents that sink from changing the peer record or rejecting the connection.
     ///
-    /// Main's coverage for this guard lives in tests built on its header-sync
-    /// advisory fixture, which does not compile against the rewritten
-    /// header-sync API. This drives the guard directly instead.
+    /// This test drives the guard directly because the previous fixture uses a retired API.
     #[tokio::test]
     async fn superseded_discovery_session_cannot_act_on_the_connection(
     ) -> Result<(), crate::BoxError> {
@@ -1701,8 +1692,7 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         let conn_id: ZakuraConnId = 0;
 
-        // Session 1 is admitted, then superseded by session 2 on the same
-        // connection — exactly what a reopened ordered stream does.
+        // Admit session 1 and then replace it with session 2 on the same connection.
         assert_eq!(
             handle
                 .admit_peer_session(conn_id, 1, peer_id.clone(), ServicePeerDirection::Inbound)
@@ -1720,8 +1710,8 @@ mod tests {
         let (live_sink, _live_recv) =
             discovery_sink_for_session(&handle, &peer_id, peer_node_id, conn_id, 2);
 
-        // A hello authored by anyone other than the stream's own peer is a
-        // protocol violation, so the sink's response is directly observable.
+        // A hello from another peer violates the protocol.
+        // The sink exposes that rejection directly.
         let imposter_secret = SecretKey::from_bytes(&[46u8; 32]);
         let imposter_record = signed_discovery_record(&imposter_secret, &handshake)?;
 
@@ -2567,8 +2557,8 @@ mod tests {
                 .is_err(),
             "discovery releases only its own session while header sync owns the connection"
         );
-        // The refresh loop still owns this session, so the handler must keep
-        // the stream eligible instead of retiring it for the connection.
+        // The refresh loop still owns this session.
+        // The handler must keep the stream eligible.
         assert!(!matches!(
             service.ordered_session_demand(
                 0,

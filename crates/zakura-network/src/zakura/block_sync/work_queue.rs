@@ -130,10 +130,10 @@ impl WorkQueue {
             .expect("work queue mutex is never poisoned")
     }
 
-    /// Add scoped `(height, hash, size)` items to `pending`. Each is inserted iff its
-    /// height is `> floor` and not already in `pending` or `in_flight`
-    /// (idempotent — already-buffered/fetched heights are never re-queued).
-    /// Returns the number of newly-inserted heights and wakes waiters if any.
+    /// Add scoped `(height, hash, size)` items to `pending`.
+    /// Insert a height above `floor` only when no pending or in-flight item owns it.
+    /// Return the number of inserted heights.
+    /// Wake waiters after inserting any height.
     pub(super) fn extend(
         &self,
         scope: zakura_header_chain::BodyWorkAuthority,
@@ -171,8 +171,8 @@ impl WorkQueue {
 
     /// Retire every item not owned by `current`, returning still-reserved bytes.
     ///
-    /// This is applied before scheduling from a newly committed snapshot, so a
-    /// height from an obsolete branch/generation cannot suppress its replacement.
+    /// The scheduler calls this method before it processes a newly committed snapshot.
+    /// Retirement prevents obsolete work from suppressing its replacement.
     pub(super) fn retire_obsolete_scope(
         &self,
         current: zakura_header_chain::BodyWorkAuthority,

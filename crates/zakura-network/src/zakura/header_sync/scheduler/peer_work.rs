@@ -230,7 +230,7 @@ impl Drop for HeaderCapacityLeaseInner {
 /// One peer's exact, session-bound target claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedHeaderTarget {
-    /// Durable generation and exact branch captured before locator work is scheduled.
+    /// Durable generation and branch that own the scheduled locator work.
     pub scope: HeaderWorkAuthority,
     /// Ordered-stream generation that supplied this status.
     pub session_id: u64,
@@ -279,7 +279,7 @@ pub struct ActiveHeaderRequest {
     pub peer: ZakuraPeerId,
     /// Stable source identity used by completion ownership.
     pub source: SourceId,
-    /// Exact status snapshot being pursued.
+    /// Exact status snapshot that the request pursues.
     pub target: AdvertisedHeaderTarget,
     /// Exact coherent state locator sent in the request.
     pub sent_locator: HeaderLocator,
@@ -336,11 +336,12 @@ impl HeaderTargetPurpose {
 /// Reactor-owned phase that permits each target preparation and state submission once.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeaderTargetPhase {
-    /// Response pages are still being received and staged.
+    /// The reactor receives and stages response pages.
     Receiving,
-    /// The complete target is being validated outside the reactor.
+    /// A worker validates the complete target outside the reactor.
     Preparing,
-    /// Sealed evidence has passed the gate and one state call is pending.
+    /// Sealed evidence passed the gate.
+    /// One state call remains pending.
     Applying,
 }
 
@@ -408,7 +409,8 @@ enum PeerWorkState {
     Active(Box<ActiveHeaderRequest>),
 }
 
-/// Advisory discovery priority. Incomparable claims deliberately map to normal.
+/// Advisory discovery priority.
+/// The scheduler maps incomparable claims to normal priority.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::zakura::header_sync) enum PeerWorkPriority {
     LowerComparableWork,
@@ -451,7 +453,7 @@ impl PeerWorkQueue {
 
     /// Retire locator work captured from an obsolete committed snapshot.
     ///
-    /// Active requests are retired separately so their network request can be canceled.
+    /// Retire active requests separately so the reactor can cancel their network requests.
     pub(in crate::zakura::header_sync) fn retire_obsolete_unstarted(
         &mut self,
         current: &EngineSnapshot,
@@ -572,10 +574,9 @@ impl PeerWorkQueue {
 
     /// Stage one ordinary branch target only when no other peer already owns it.
     ///
-    /// A locator is derived from shared local state, so two peers pursuing the same exact target
-    /// would download and authenticate overlapping prefixes even when intervening body commits
-    /// give their work different finality authorities. The alternate peer's status remains in the
-    /// reactor and can be reconsidered as soon as the owner retires.
+    /// All peers derive locators from shared local state.
+    /// Two peers pursuing one target would download and authenticate overlapping prefixes.
+    /// The reactor retains the alternate peer's status until the owner retires.
     pub(in crate::zakura::header_sync) fn stage_distinct_target(
         &mut self,
         peer: ZakuraPeerId,

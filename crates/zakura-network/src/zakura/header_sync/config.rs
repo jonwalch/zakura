@@ -26,15 +26,15 @@ pub struct ZakuraHeaderSyncConfig {
     pub peer_limits: ServicePeerLimits,
     /// Consecutive unproductive header requests before this node drops the peer's session.
     ///
-    /// A request is unproductive when its deadline expires. A peer that reports it is already
-    /// at our selected tip has answered correctly and is never charged. Set to `0` to never
-    /// drop a peer.
+    /// A deadline marks its request as unproductive.
+    /// Do not charge a peer that reports the selected tip.
+    /// Set this value to `0` to keep all peers.
     pub max_unproductive_header_requests: u32,
-    /// How long a peer dropped for being unproductive is refused header-sync readmission.
+    /// How long the node refuses header-sync readmission to an unproductive peer.
     ///
-    /// Discovery's dial backoff keys on dial *failure*, and a drop follows a dial that
-    /// succeeded, so without this window an evicted peer is redialled immediately. Set to
-    /// zero to readmit without delay.
+    /// Discovery applies dial backoff only after a failed dial.
+    /// This window prevents an immediate redial after a successful dial ends in eviction.
+    /// Set this value to zero to allow immediate readmission.
     #[serde(with = "humantime_serde")]
     pub unproductive_peer_cooldown: Duration,
     /// Optional trusted header-sync anchor height.

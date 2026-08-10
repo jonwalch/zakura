@@ -97,8 +97,8 @@ fn committed_resource_stall_is_terminal_without_retry_or_peer_fault() {
 }
 
 #[test]
-// AUD-06/AUD-07: committing a newer snapshot is the production retirement
-// boundary; both held successes and failures must be inert after it.
+// AUD-06/AUD-07: committing a newer snapshot creates the production retirement boundary.
+// Held successes and failures must remain inert after that boundary.
 fn committed_snapshot_retires_in_flight_state_results() {
     {
         let mut startup = startup(CancellationToken::new());
@@ -498,8 +498,8 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
 }
 
 #[test]
-// AUD-14: preparation and admission straddle the durable boundary, so
-// holding both across restart covers the reactor's local completion paths.
+// AUD-14: preparation and admission straddle the durable boundary.
+// Hold both across restart to cover the reactor's local completion paths.
 fn restart_drops_old_preparation_and_admission_completions() {
     let shutdown = CancellationToken::new();
     let mut old_startup = startup(shutdown);

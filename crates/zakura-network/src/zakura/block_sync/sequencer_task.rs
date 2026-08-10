@@ -672,10 +672,10 @@ impl SequencerTask {
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
-    /// Handle a verifier apply completion: release its verifier slot and, on a
-    /// rejection, roll the floor back below the bad block so its range is
-    /// re-requestable. Committed frontier changes arrive only through the
-    /// authoritative snapshot watch.
+    /// Handle a verifier apply completion.
+    /// Release the verifier slot.
+    /// After a rejection, move the floor below the bad block so peers can request its range again.
+    /// The authoritative snapshot watch supplies committed frontier changes.
     #[allow(clippy::too_many_arguments)]
     async fn handle_apply_finished(
         &mut self,
@@ -763,9 +763,9 @@ impl SequencerTask {
             .await;
         }
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
-            // A duplicate for a height not yet present in the committed snapshot
-            // stays attached until that snapshot advances. The driver has released
-            // its decoded copy, so release the token-aware decode-window charge now.
+            // Keep a duplicate attached until the committed snapshot includes its height.
+            // The driver already released its decoded copy.
+            // Release the token-aware decode-window charge now.
             self.sequencer
                 .finish_attached_submission(owner, source, token, height, hash);
             return (false, true);
@@ -798,9 +798,9 @@ impl SequencerTask {
                 let released = self.work.reset_above(self.sequencer.floor());
                 self.budget.release(released);
                 let _ = self.sequencer.drop_reorder_from(height);
-                // A `Rejected` result is a peer-attributable bad body delivery.
-                // Attribute it to the delivering peer. `Unavailable` and `TimedOut`
-                // are local/transient failures, so they are not scored.
+                // A `Rejected` result identifies a bad body from a peer.
+                // Attribute it to the delivering peer.
+                // Do not score local `Unavailable` or `TimedOut` failures.
                 if matches!(result, BlockApplyResult::Rejected) && attribution_matches {
                     let reason = match outcome.verification() {
                         zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
@@ -1678,8 +1678,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // IN-02: a consensus-invalid result must be durable and blame only the
-    // authenticated supplier; this checks both effects in one submission.
+    // IN-02: persist a consensus-invalid result.
+    // Attribute it only to the authenticated supplier.
     async fn consensus_invalidity_persists_and_scores_only_exact_supplier() {
         for attribution_matches in [true, false] {
             let frontiers = BlockSyncFrontiers {

@@ -40,8 +40,9 @@ const LEASE_RELEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::f
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Minimum interval between unchanged header-snapshot refresh trace rows.
 ///
-/// Frontier advances and reanchors are always traced. Metrics and the committed snapshot remain
-/// exact; only identical refresh diagnostics are sampled to keep long-running JSONL traces bounded.
+/// The trace records every frontier advance and reanchor.
+/// Metrics and the committed snapshot remain exact.
+/// The trace samples identical refresh diagnostics to bound long-running JSONL traces.
 const SNAPSHOT_REFRESH_TRACE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
@@ -49,10 +50,10 @@ fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
 }
 /// Keep one maximum wire page ahead of integrated full state, then refill at half-window low water.
 ///
-/// Every integrated full-state advance also reanchors the durable header DAG. Bounding that DAG
-/// during initial sync keeps those consensus transitions proportional to useful pipeline work,
-/// while half-window refills leave enough admitted work to overlap proof validation and durable
-/// admission with body application without starving a partial checkpoint range.
+/// Each integrated full-state advance reanchors the durable header DAG.
+/// This bound keeps initial-sync consensus transitions proportional to pipeline work.
+/// Half-window refills overlap proof validation and durable admission with body application.
+/// The refills also preserve enough work for a partial checkpoint range.
 const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
 const INTEGRATED_HEADER_REFILL_LOW_WATER_V1: u32 = INTEGRATED_HEADER_BODY_WINDOW_V1 / 2;
 
@@ -251,11 +252,11 @@ struct HeaderSyncReactor {
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
     vct_repair_status: zakura_header_chain::VctRootRepairStatus,
     peer_state: HashMap<ZakuraPeerId, PeerState>,
-    /// Instants before which a dropped peer is refused header-sync readmission.
+    /// Deadlines until which the reactor refuses header-sync readmission to dropped peers.
     ///
-    /// Bounded by admission: every entry costs the peer one admitted session that survived
-    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts, and
-    /// expired entries are pruned whenever one is added and on every maintenance pass.
+    /// Each entry represents one admitted session that survived
+    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts.
+    /// The reactor prunes expired entries during insertion and maintenance.
     unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     peer_work_queue: PeerWorkQueue,
     request_deadlines: HashMap<ZakuraPeerId, Instant>,
@@ -1158,10 +1159,10 @@ impl HeaderSyncReactor {
             staged_entry_count,
             "every staged header retains exactly one owned budget unit",
         );
-        // A target can be arbitrarily far ahead, but response staging is deliberately bounded.
-        // Admit a validated prefix when the aggregate cap is full. Continuations below are
-        // reduced to the remaining capacity, so one peer cannot force tiny prefix commits by
-        // returning pages much smaller than requested.
+        // A target can be arbitrarily far ahead. Response staging remains bounded.
+        // Admit a validated prefix when the aggregate cap is full. Limit continuations
+        // to the remaining capacity. This limit prevents one peer from forcing small
+        // prefix commits by returning pages smaller than requested.
         let durable_prefix_full = self.committed_snapshot.as_ref().is_some_and(|snapshot| {
             Self::request_header_prefix_remaining(
                 snapshot,
@@ -2200,11 +2201,10 @@ impl HeaderSyncReactor {
 
     /// Bound ordinary target prefixes by shared selected-path space in the durable DAG.
     ///
-    /// Retention must protect the complete selected path, so downloading more entries than this
-    /// lower-bound headroom can only produce a committed resource refusal. All response
-    /// reservations and staged entries share that headroom so concurrent peers cannot each claim
-    /// the same slots. Side forks are normally evictable; an independently protected side path can
-    /// still make state return the authoritative refusal at apply time.
+    /// Retention protects the complete selected path.
+    /// Downloading more entries than this headroom can only cause a resource refusal.
+    /// All response reservations and staged entries share the headroom.
+    /// A protected side path can still make state refuse the insertion during application.
     fn durable_header_prefix_remaining(
         snapshot: &zakura_header_chain::EngineSnapshot,
         claimed: usize,
@@ -2225,12 +2225,10 @@ impl HeaderSyncReactor {
 
     /// Return requester headroom after both the durable DAG limit and the integrated body window.
     ///
-    /// Away from the advertised target, a partial window remains closed until half of the admitted
-    /// body lag remains. This hysteresis avoids small header transitions while leaving enough work
-    /// to overlap the next proof-validation batch with body application. The checkpoint bound is a
-    /// floor so a future smaller protocol window still admits a complete checkpoint range. The
-    /// final partial page is admitted so a node can still reach an exact target whose remaining
-    /// suffix is shorter than one page.
+    /// A partial window remains closed until half of the admitted body lag remains.
+    /// This hysteresis avoids small header transitions and preserves work for body application.
+    /// The checkpoint bound lets a smaller protocol window admit a complete checkpoint range.
+    /// The final partial page lets a node reach a target with a suffix shorter than one page.
     fn request_header_prefix_remaining(
         snapshot: &zakura_header_chain::EngineSnapshot,
         claimed: usize,
@@ -3939,9 +3937,10 @@ impl HeaderSyncReactor {
 
     /// Keep exact ordinary header work alive across a monotone full-state finality advance.
     ///
-    /// This gate grants no durable authority: the serialized state planner still authenticates
-    /// the finality path, proves ancestry, trims any finalized prefix, and either rebases or
-    /// rejects the insertion. Body-authorized VCT repair work remains bound to every generation.
+    /// This gate grants no durable authority.
+    /// The serialized state planner authenticates the finality path and proves ancestry.
+    /// The planner trims any finalized prefix and then rebases or rejects the insertion.
+    /// Body-authorized VCT repair work remains bound to each generation.
     fn preparation_has_authority(
         &self,
         peer: &ZakuraPeerId,
@@ -3983,9 +3982,9 @@ impl HeaderSyncReactor {
     /// Charges one unproductive request against `peer`'s exact session, dropping that
     /// session once it reaches the configured limit.
     ///
-    /// Session-scoped by construction: a strike raised for a session that has already been
-    /// replaced is discarded rather than charged to its replacement. Returns whether the
-    /// session was dropped.
+    /// Charge a strike only to the session that raised it.
+    /// Discard a strike when a replacement session already exists.
+    /// Return whether the reactor dropped the session.
     fn charge_unproductive_request(
         &mut self,
         peer: &ZakuraPeerId,

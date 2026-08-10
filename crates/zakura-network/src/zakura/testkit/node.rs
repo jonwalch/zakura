@@ -641,11 +641,8 @@ mod tests {
 
     #[test]
     fn default_test_node_uses_production_per_ip_cap() {
-        // The supervisor's admission behavior is covered by the production
-        // handler tests. This regression only needs to pin the testkit wiring:
-        // a default builder must inherit the production cap. Driving the cap by
-        // opening one more live connection than the limit races the transport's
-        // independent global connection budget and can evict an incumbent.
+        // Production handler tests cover supervisor admission.
+        // This regression verifies that the default test builder inherits the production cap.
         let builder = ZakuraTestNode::builder(9001);
         let production_cap = Config::default().zakura.max_connections_per_ip();
 
@@ -655,10 +652,8 @@ mod tests {
 
     #[tokio::test]
     async fn per_ip_cap_opt_out_admits_multiple_same_ip_peers() {
-        // Multi-peer loopback harnesses (clusters, gossip meshes) intentionally
-        // admit several same-IP peers and do not exercise the per-IP gate. The
-        // explicit builder opt-out restores that ergonomics on top of the
-        // production-faithful default.
+        // Multi-peer loopback harnesses intentionally admit several peers from one IP.
+        // The explicit builder override disables the production per-IP limit.
         let peer1 = ZakuraTestNode::builder(9101)
             .spawn()
             .await
@@ -705,11 +700,9 @@ mod tests {
     async fn outbound_dial_charges_confirmed_path_not_advertised_decoy() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        // Regression for the per-IP cap bypass in `serve_native_dial_connection`:
-        // it used to charge the connection to the first *advertised* direct
-        // address instead of the path iroh actually confirmed. A record could
-        // then list an unreachable decoy first and escape the per-IP cap while
-        // being served over a different (shared) address.
+        // `serve_native_dial_connection` previously charged the first advertised address.
+        // Iroh can confirm a different path.
+        // An unreachable first address could therefore bypass the per-IP cap.
         let peer1 = ZakuraTestNode::builder(9201)
             .spawn()
             .await
@@ -720,16 +713,12 @@ mod tests {
             .await
             .expect("dialer spawns");
 
-        // Advertise peer1 with an unreachable decoy ahead of its real loopback
-        // address. The dial is served over loopback, so the connection must be
-        // charged to 127.0.0.1, not the decoy.
+        // Advertise an unreachable address before peer1's loopback address.
+        // Charge the confirmed loopback path instead of the advertised address.
         //
-        // `NodeAddr::direct_addresses` is a `BTreeSet`, so "first advertised"
-        // means lowest-sorting, not insertion order. The decoy must therefore
-        // sort *below* 127.0.0.1 or it is never the address a pre-fix charge
-        // would pick, and the test cannot fail. RFC 6598 shared address space
-        // (100.64.0.0/10) is both non-routable and below the loopback range;
-        // RFC 5737 TEST-NET ranges all sort above it and do not work here.
+        // `NodeAddr::direct_addresses` stores addresses in a `BTreeSet`.
+        // The decoy must sort below 127.0.0.1 to expose the previous behavior.
+        // RFC 6598 shared address space meets that requirement and is not routable.
         let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
         let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
         let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
@@ -744,12 +733,10 @@ mod tests {
             .await
             .expect("peer1 registers over its reachable loopback path despite the decoy");
 
-        // Assert on the per-IP bucket directly rather than on a second dial's
-        // outcome. `serve_native_dial_connection` returns `Ok` both when it
-        // rejects a peer and when it finishes serving one, and it deregisters
-        // before returning — so a post-serve `registered_ids()` count is the
-        // same with and without the fix and proves nothing. The bucket state is
-        // what the fix actually changes.
+        // Assert the per-IP bucket directly.
+        // `serve_native_dial_connection` returns `Ok` after rejection or service completion.
+        // It also deregisters the peer before returning.
+        // Only the bucket state distinguishes the fixed behavior.
         let supervisor = node.supervisor();
         assert!(
             !supervisor

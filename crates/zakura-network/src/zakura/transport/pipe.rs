@@ -92,11 +92,9 @@ pub(crate) type PipeEntry<S, Env> = fn(&mut PipeCx<'_, S, Env>, Frame) -> Flow<(
 
 /// A node kind in a [`PipeShape`] DAG.
 ///
-/// `Validate`/`Outcome`-style effect nodes and the `Stage`/`branch!`/`Outcome`
-/// scaffolding for them are deliberately absent: today every service forwards a
-/// decoded `WireMessage` to its owning reactor, so the live shapes only
-/// use these variants. The effect-returning `Core` migration (see the pipelines
-/// plan) reintroduces exactly what it needs when it lands.
+/// Current services forward each decoded `WireMessage` to their reactor.
+/// The live shapes therefore omit `Validate`, `Stage`, `branch!`, and `Outcome` effects.
+/// The effect-returning `Core` migration will add the variants that it needs.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum NodeKind {
     /// The shared protection stage.

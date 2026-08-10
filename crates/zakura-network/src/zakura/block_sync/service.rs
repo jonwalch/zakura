@@ -578,11 +578,9 @@ impl Service for BlockSyncService {
                 return;
             }
 
-            // A peer that is already registered for this direction may *replace*
-            // its session (the connection-symmetry collision where both sides
-            // opened a block-sync stream resolves to the winner's stream by
-            // replacing the loser's already-counted session); only genuinely new
-            // peers are held to the per-direction cap.
+            // A peer registered for this direction may replace its session.
+            // A connection-symmetry collision replaces the losing session with the winning stream.
+            // Apply the per-direction cap only to a new peer.
             let already_counted = active_peers
                 .get(&peer_id)
                 .is_some_and(|record| record.direction == peer.direction);
@@ -749,11 +747,9 @@ impl Service for BlockSyncService {
             return true;
         }
 
-        // A transiently exited session leaves a gap claim while the transport
-        // backs off before reopening the stream. Honor it only while this
-        // service would re-admit the peer right now: a park, full slots, or the
-        // useless-work gate releases the connection exactly like a rejected
-        // stream, preserving the discovery-only close semantics.
+        // A transient session exit leaves a gap claim during transport backoff.
+        // Honor the claim only while this service would admit the peer.
+        // A park, full slots, or useless-work gate releases the connection like a rejected stream.
         let Some(direction) = self
             .inner
             .session_gap_claims

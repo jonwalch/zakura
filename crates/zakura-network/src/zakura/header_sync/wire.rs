@@ -19,7 +19,8 @@ use super::{header_sync_header_bytes_for_network, Frame, HeaderSyncRequestId};
 pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// The sole supported header-sync stream version.
 ///
-/// This is a transport compatibility barrier, not a codec selector.
+/// The stream version provides a transport compatibility barrier.
+/// The stream version does not select the codec.
 pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 8;
 /// Maximum encoded header-sync message bytes.
 pub const MAX_HS_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -54,7 +55,7 @@ pub enum HeaderSyncWireError {
         /// Effective negotiated and hard maximum.
         max: usize,
     },
-    /// An unknown message discriminator was received.
+    /// The decoder received an unknown message discriminator.
     #[error("unknown Zakura header-sync message type {0}")]
     UnknownMessageType(u8),
     /// A frame message type did not fit the one-byte application discriminator.
@@ -71,13 +72,13 @@ pub enum HeaderSyncWireError {
     /// Header sync defines no frame flags.
     #[error("unsupported Zakura header-sync frame flags {0:#06x}")]
     UnsupportedFlags(u16),
-    /// A request ID was zero.
+    /// The decoder found a zero request ID.
     #[error("Zakura header-sync {0} request ID must be non-zero")]
     ZeroRequestId(&'static str),
     /// A height exceeded the locally supported block-height range.
     #[error("Zakura header-sync height {0} exceeds the supported range")]
     HeightOutOfRange(u32),
-    /// A boolean byte was not its canonical zero or one encoding.
+    /// The decoder found a noncanonical boolean byte.
     #[error("Zakura header-sync {field} boolean has invalid value {value}")]
     InvalidBool {
         /// Field containing the marker.
@@ -85,7 +86,7 @@ pub enum HeaderSyncWireError {
         /// Rejected marker value.
         value: u8,
     },
-    /// A count was outside its wire or negotiated bound.
+    /// The decoder found a count outside its wire or negotiated bound.
     #[error("Zakura header-sync {field} count {actual} is outside 1..={max}")]
     CountOutOfRange {
         /// Count field being validated.
@@ -98,7 +99,8 @@ pub enum HeaderSyncWireError {
     /// A body-size hint exceeded the consensus block-size ceiling.
     #[error("Zakura header-sync body-size hint {0} exceeds 2,000,000 bytes")]
     BodySizeHintOutOfRange(u32),
-    /// A schema selector was unknown or was not advertised by the receiver.
+    /// The decoder did not recognize the schema selector.
+    /// The receiver did not advertise the schema selector.
     #[error("unsupported Zakura header-sync tree-aux schema {0}")]
     UnsupportedTreeAuxSchema(u8),
     /// A response selector did not match the matching request.
@@ -111,7 +113,7 @@ pub enum HeaderSyncWireError {
         /// Schema selected by the response.
         actual: u8,
     },
-    /// A `Headers` response was decoded without matching request bounds.
+    /// The decoder received a `Headers` response without matching request bounds.
     #[error("unsolicited Zakura header-sync Headers response")]
     UnsolicitedHeaders,
     /// Parallel in-memory vectors did not have the same length.
@@ -140,7 +142,7 @@ pub enum HeaderSyncWireError {
         /// Height encoded in the record.
         actual: block::Height,
     },
-    /// Activation-dependent schema-1 defaults were violated.
+    /// A schema-1 record violated activation-dependent defaults.
     #[error("invalid Zakura header-sync tree-aux defaults at height {height:?}: {field}")]
     InvalidTreeAuxDefault {
         /// Record height.
@@ -148,13 +150,13 @@ pub enum HeaderSyncWireError {
         /// Field that violated its activation-dependent default.
         field: &'static str,
     },
-    /// An outcome discriminator was outside the fixed 1 through 4 range.
+    /// The decoder found an outcome discriminator outside the fixed 1 through 4 range.
     #[error("unknown Zakura header-sync HeadersOutcome value {0}")]
     UnknownOutcome(u8),
     /// Checked message-size or height arithmetic overflowed.
     #[error("numeric overflow while handling Zakura header-sync {0}")]
     NumericOverflow(&'static str),
-    /// Bytes remained after the selected message was decoded.
+    /// Bytes remained after the decoder read the selected message.
     #[error("trailing bytes in Zakura header-sync payload")]
     TrailingBytes,
     /// An I/O error occurred while handling the message.
@@ -169,7 +171,8 @@ pub enum HeaderSyncWireError {
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum AuxSchema {
-    /// No tree auxiliary records are requested or returned.
+    /// The request asks for no tree auxiliary records.
+    /// The response returns no tree auxiliary records.
     #[default]
     None = 0,
     /// The immutable 156-byte schema defined by protocol version 8.
@@ -346,7 +349,8 @@ pub struct GetHeaders {
 pub struct HeaderEntry {
     /// Canonical Zcash block header.
     pub header: Arc<block::Header>,
-    /// Unauthenticated serialized-body-size hint; zero means unknown.
+    /// Unauthenticated serialized-body-size hint.
+    /// Zero means unknown.
     pub body_size: u32,
     /// Parallel schema-1 record when the response selects schema 1.
     pub tree_aux: Option<TreeAuxRecordV1>,
@@ -375,13 +379,13 @@ pub struct Headers {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum HeadersOutcomeCode {
-    /// The exact requested target is no longer retained.
+    /// The server no longer retains the requested target.
     TargetNotRetained = 1,
     /// No sent locator hash lies on the target path.
     NoLocatorIntersection = 2,
-    /// Required target-path history has been pruned.
+    /// The server pruned required target-path history.
     HistoryPruned = 3,
-    /// The server is temporarily unable to serve the request.
+    /// The server cannot serve the request yet.
     Busy = 4,
 }
 

@@ -31,14 +31,14 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 /// depending upward on `zakura-state`.
 const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
 
-/// Let a far-ahead empty-state header bootstrap settle before starting checkpoint
-/// body applies. Each selected-header page advances the exact body-work scope;
-/// starting applies between pages lets newer duplicate checkpoint requests replace
-/// the older requests before the first complete checkpoint can be committed.
+/// Delay checkpoint body application until a far-ahead empty-state header bootstrap settles.
+/// Each selected-header page advances the body-work scope. Applying bodies between
+/// pages lets newer duplicate requests replace older requests before the node commits
+/// the first complete checkpoint.
 pub(super) const EMPTY_STATE_HEADER_QUIET_PERIOD: Duration = Duration::from_secs(30);
 
-/// One complete maximum checkpoint gap. Smaller startup windows can complete a
-/// checkpoint without being starved by successive selected-header page commits.
+/// One complete maximum checkpoint gap.
+/// This minimum lets a small startup window complete a checkpoint between header-page commits.
 pub(super) const EMPTY_STATE_HEADER_QUIET_MIN_LAG: u32 = 400;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -102,8 +102,7 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
     }
 }
 
-/// Return true when a committed snapshot only advances body progress beneath
-/// the same exact selected-header target.
+/// Return whether a committed snapshot only advances body progress under the same header target.
 ///
 /// The target hash fixes the branch for already-issued body downloads. A
 /// target change or any frontier retreat still takes the destructive scope
@@ -353,16 +352,15 @@ pub(super) struct BlockSyncReactor {
     /// download floor, but it is not verified state and must not be used for
     /// serving/status advertisement.
     request_floor: block::Height,
-    /// Exact identity and scope of the dispatched state query whose response has
-    /// not come back yet.
+    /// Identity and scope of the state query awaiting a response.
     pending_needed_query: Option<PendingNeededQuery>,
     /// Supplier-set restart submitted against the current durable version.
     pending_body_supplier_restart:
         Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
     /// Operator retry submitted against the current durable version.
     pending_operator_body_retry: Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
-    /// Next reactor-local identity assigned to a body-work state query. `None`
-    /// means the identifier space is exhausted and scheduling fails closed.
+    /// Next reactor-local identity for a body-work state query.
+    /// `None` means the reactor exhausted the identifier space and stops scheduling.
     next_needed_query_id: Option<NonZeroU64>,
     /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
     /// a destructive reset.
@@ -2048,10 +2046,9 @@ impl BlockSyncReactor {
             self.state.pending_status_refresh && status != self.state.last_advertised_status;
         let status_changed = status_needs_refresh && self.state.status_refresh.try_take(now);
 
-        // Keep a rate-limited change pending so the periodic tick advertises the
-        // latest coalesced status once the debounce window opens. Clearing it here
-        // loses a serving-tip advance forever when several commits land inside one
-        // refresh interval.
+        // Keep a rate-limited change pending until the periodic tick advertises the
+        // latest status. Clearing the change here can lose a serving-tip advance
+        // when several commits occur during one refresh interval.
         self.state.pending_status_refresh = status_needs_refresh && !status_changed;
         if status_changed {
             self.state.last_advertised_status = status;

@@ -758,8 +758,9 @@ fn cap_checkpoint_bootstrap_hashes(
         })
         .count();
 
-    // A refreshed locator response repeats blocks parked in the checkpoint verifier. Remove those
-    // hashes before truncating, so they do not consume both the pending and new-download budgets.
+    // A refreshed locator response repeats blocks parked in the checkpoint verifier.
+    // Remove those hashes before truncating the response.
+    // This order prevents repeated hashes from consuming both budgets.
     hashes.retain(|hash| !pending.contains_key(hash));
 
     let limit = checkpoint_bootstrap_hash_limit(
@@ -767,8 +768,9 @@ fn cap_checkpoint_bootstrap_hashes(
         max_checkpoint_height,
         pending_checkpoint_work,
     );
-    // Unknown tasks reserve download capacity, but only an overlapping hash gives them a position
-    // in this ordered response. Do not turn unrelated unknown work into boundary evidence.
+    // Unknown tasks reserve download capacity.
+    // Only an overlapping hash gives a task a position in this ordered response.
+    // Do not treat unrelated work as boundary evidence.
     let evidenced_limit = checkpoint_bootstrap_hash_limit(
         Some(state_tip),
         max_checkpoint_height,
@@ -1086,26 +1088,24 @@ where
         }
     }
 
-    /// Downloads and verifies genesis, then hands body sync to native Zakura
-    /// while watching for progress, optionally
-    /// falling back to the legacy syncer if Zakura makes none.
+    /// Download and verify genesis.
+    /// Hand body sync to native Zakura and watch for progress.
+    /// On a dual-stack node, optionally run a compatibility recovery round after a stall.
     ///
-    /// Genesis is the one special block that the legacy-compatible downloader
-    /// fetches. Once its commit publishes the durable header runtime, native
-    /// Zakura owns every body apply from height 1 onward.
+    /// The legacy-compatible downloader fetches only genesis.
+    /// The genesis commit publishes the durable header runtime.
+    /// Native Zakura owns every body apply from height 1 onward.
     ///
-    /// After genesis, native Zakura sync is expected to drive body downloads. But
-    /// it cannot always: a node whose reachable peers are legacy-only (no
-    /// `NODE_P2P_V2`) — or one eclipsed by non-upgrading peers — would have no usable
-    /// Zakura body-sync peers, and parking forever there leaves it stuck at genesis.
+    /// Native Zakura normally drives body downloads after genesis.
+    /// A dual-stack node can lack usable Zakura peers when all reachable peers are legacy-only.
+    /// An eclipse by non-upgrading peers can cause the same condition.
     ///
-    /// `legacy_fallback` (set when the node runs both stacks, `v2_p2p && legacy_p2p`)
-    /// controls the recovery path. When `true`, a Zakura stall runs one legacy
-    /// body-sync recovery round while Zakura keeps serving peers and following local
-    /// commits through the chain-tip mirror, then returns apply ownership to Zakura. When `false`
-    /// (a Zakura-only node, where falling back to absent legacy peers is pointless),
-    /// the watchdog never switches: it parks and warns (once per stall window) so a
-    /// stalled, eclipsed, or peerless node is visible in the logs.
+    /// `legacy_fallback` controls the recovery path when the node runs both stacks.
+    /// A true value runs one legacy body-sync recovery round after a Zakura stall.
+    /// Zakura continues serving peers and following local commits during that round.
+    /// The recovery round then returns apply ownership to Zakura.
+    /// A false value keeps a Zakura-only node on native sync because it has no legacy peers.
+    /// The watchdog parks and logs one warning per stall window.
     ///
     /// `read_state` answers
     /// [`ReadRequest::BestHeaderTip`](zs::ReadRequest::BestHeaderTip)
@@ -2105,9 +2105,8 @@ where
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
     }
 
-    /// Limits compatibility downloads to the final checkpoint while it owns
-    /// initial block applies. Hashes above that boundary are left for native
-    /// Zakura block sync after the durable snapshot transfers ownership.
+    /// Limit compatibility downloads to the final checkpoint during initial block-apply ownership.
+    /// Native Zakura block sync handles hashes above that boundary after ownership transfer.
     fn cap_checkpoint_bootstrap_downloads(
         &self,
         hashes: &mut IndexSet<block::Hash>,

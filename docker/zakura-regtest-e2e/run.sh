@@ -25,12 +25,11 @@
 #      pure-Zakura propagation,
 #   6. Zakura v2 nodes reach sync.block.verified_tip.height ==
 #      sync.block.best_header_tip.height after gossip propagation,
-#   7. after a from-scratch reset of the pure-Zakura node2 (empty state while
-#      node1 sits idle at the tip), node2 downloads the configured checkpoint
-#      prefix through legacy requests, explicitly hands off to native header
-#      sync, and downloads the remaining suffix over kind-6 block sync. Gossip
-#      cannot help because node1 re-advertises nothing, so this exercises the
-#      production Mainnet-from-0 / catch-up path,
+#   7. Reset pure-Zakura node2 from scratch while node1 remains idle at tip.
+#      Node2 downloads the configured checkpoint prefix through compatibility requests.
+#      Node2 hands ownership to native header sync.
+#      Kind-6 block sync downloads the remaining suffix.
+#      Node1 does not advertise the old blocks again.
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
 #
 # Each container runs a zakurad binary bind-mounted into debian:trixie-slim.
@@ -57,10 +56,9 @@ sed_in_place() {
     || { rm -f "${tmp}"; return 1; }
 }
 
-# Rewrite a bind-mounted config without replacing its inode. Restart-matrix
-# debug-stop containers are restarted rather than recreated after the stop.
-# Keeping the inode lets that existing container observe the restored config
-# through its file bind mount.
+# Rewrite a bind-mounted config without replacing its inode.
+# The restart matrix restarts the debug-stop container after the stop.
+# Preserving the inode lets that container observe the restored config.
 rewrite_mounted_config_in_place() {
   local script="$1"
   local file="$2"
@@ -73,9 +71,9 @@ rewrite_mounted_config_in_place() {
 
 ZAKURA_E2E_MODE="${ZAKURA_E2E_MODE:-smoke}"
 
-# Keep the dedicated long lanes deep, but scale the restart matrix to the
-# checkpoint boundaries it needs. An explicit ZAKURA_E2E_LONG_BLOCKS overrides
-# the mode-specific total in either lane.
+# Keep the dedicated long lanes deep.
+# Scale the restart matrix to its checkpoint boundaries.
+# `ZAKURA_E2E_LONG_BLOCKS` overrides the mode-specific total.
 case "${ZAKURA_E2E_MODE}" in
   smoke)
     DEFAULT_GENERATE_BLOCKS=3
@@ -150,22 +148,17 @@ ZAKURA_E2E_REQUIRE_V7_IDS="${ZAKURA_E2E_REQUIRE_V7_IDS:-0}"
 
 (( DEFAULT_CATCHUP_BLOCKS >= 0 )) || fail "ZAKURA_E2E_LONG_BLOCKS must be >= ${DEFAULT_GENERATE_BLOCKS}"
 
-# Generate at least three blocks. Zebra's syncer intentionally discards locator
-# responses that extend only one block, so a one-block run can fail even when
-# the Zakura request path is working. Three blocks also avoids leaving a
-# one-block remainder if the tiny regtest topology drops an early response.
+# Generate at least three blocks.
+# Zebra discards locator responses that extend only one block.
+# Three blocks also prevent a one-block remainder after a dropped response.
 GENERATE_BLOCKS="${GENERATE_BLOCKS:-${DEFAULT_GENERATE_BLOCKS}}"
-# Extra blocks mined on node1 after the propagation assertions and before the
-# from-scratch reset, so the kind-6 catch-up re-downloads a real burst of bodies
-# rather than a handful. Hundreds of blocks is what fills the inbound wire queue
-# and exercises the body-flood path that wedged in production; a 3-block catch-up
-# never gets near it. Set to 0 to skip the deepening and keep the legacy 3-block
-# catch-up.
+# Mine extra blocks on node1 before the from-scratch reset.
+# The kind-6 catch-up then downloads enough bodies to fill the inbound wire queue.
+# Set this value to 0 to keep the three-block catch-up.
 CATCHUP_BLOCKS="${CATCHUP_BLOCKS:-${DEFAULT_CATCHUP_BLOCKS}}"
 READY_TIMEOUT="${READY_TIMEOUT:-120}"
-# A hard-stopped QUIC peer is retired by Zakura's 150s application idle
-# reaper. Allow that retirement plus the JSONL writer's ~17s flush interval;
-# the ordinary readiness timeout intentionally remains tighter for startup.
+# Zakura's application idle reaper retires a hard-stopped QUIC peer after 150 seconds.
+# This timeout also includes the JSONL writer's approximately 17-second flush interval.
 NODE4_DISCONNECT_TIMEOUT="${NODE4_DISCONNECT_TIMEOUT:-210}"
 # Propagation to the Zakura peer can take a little while: the dual-stack tries
 # the (empty) legacy peer set first, and the legacy->Zakura upgrade re-dials a
@@ -255,8 +248,8 @@ if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
   grep -q '^debug_skip_non_finalized_state_backup_task = true$' "${CONFIG_DIR}/node2.toml" \
     || fail "failed to make restart-matrix non-finalized backups synchronous"
 fi
-# Header sync has no block-relay toggle. Kind-6 block sync is exercised by the
-# from-scratch reset phase below, which removes gossip as a body source entirely.
+# Header sync has no block-relay toggle.
+# The from-scratch reset removes gossip and exercises kind-6 block sync.
 export ZAKURA_NODE1_CONFIG="${CONFIG_DIR}/node1.toml"
 export ZAKURA_NODE2_CONFIG="${CONFIG_DIR}/node2.toml"
 export ZAKURA_NODE3_CONFIG="${CONFIG_DIR}/node3.toml"
@@ -652,10 +645,9 @@ wait_for_genesis_handoff() {
   log "node2 compatibility bootstrap verified genesis and handed height 1 onward to native sync"
 }
 
-# Native header/body work can prefetch while the checkpoint verifier owns the
-# prefix. Require a complete, matching header lifecycle rooted at the checkpoint
-# boundary before kind-6 requests cover the suffix, but gate every committed
-# native apply on the durable checkpoint handoff.
+# Native header and body work can prefetch during checkpoint verification.
+# Require a complete header lifecycle rooted at the checkpoint boundary.
+# Gate each native commit on the durable checkpoint handoff.
 wait_for_native_suffix_coverage() {
   local suffix_start="$1" suffix_end="$2" block_lines_before="$3"
   local header_lines_before="$4" timeout="$5"
@@ -948,9 +940,8 @@ configure_node2_debug_stop() {
   grep -q '^trace_dir = "/traces/node2"$' "${config}" \
     || fail "node2 trace directory is not in its normal configuration"
 
-  # Create the bind-mounted destination as the host user before the container
-  # tracer writes into it, so the harness can also preserve docker.log and the
-  # exit code beside the raw intentional-stop traces.
+  # Create the bind-mounted destination as the host user.
+  # The harness can then preserve the container log, exit code, and raw traces.
   mkdir -p "${evidence_dir}" \
     || fail "could not create node2 debug-stop evidence directory at height ${height}"
   [[ -w "${evidence_dir}" ]] \
@@ -1240,9 +1231,9 @@ restart_node2_at_height_then_catch_up() {
   configure_node2_debug_stop "${restart_height}"
   docker compose -f "${COMPOSE_FILE}" up -d zakura-node-2 \
     || fail "could not recreate node2 for restart-matrix ${label} debug stop"
-  # Do not wait for RPC readiness: height 0 can commit and stop before the RPC
-  # server is observable. The clean container exit and exact state-writer log
-  # are the debug-stop contract proving the durable pre-restart height.
+  # Do not wait for RPC readiness.
+  # Height 0 can commit before the RPC server becomes observable.
+  # The clean exit and state-writer log prove the durable pre-restart height.
   wait_for_node2_debug_stop "${restart_height}" "restart-matrix ${label}" "${CATCHUP_TIMEOUT}"
 
   # Restore the config through the existing bind mount, then restart this same
@@ -1495,16 +1486,15 @@ if (( CATCHUP_BLOCKS > 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-# Exercise the production checkpoint-to-native sync transition via a
-# from-scratch reset of the pure-Zakura node.
+# Exercise the production checkpoint-to-native sync transition.
 #
-# Above, node2 reached the initial tip through inbound gossip, then was stopped
-# and its state discarded before node1 deepened the chain. On reconnect node2
-# has a real, gossip-unfillable gap (node1 re-advertises nothing). With derived
-# checkpoints enabled it downloads the checkpoint prefix through legacy
-# requests, hands off to the native header engine, then downloads only the
-# post-checkpoint suffix over the dedicated block-sync stream. This is the
-# production Mainnet-from-0 / restart-catch-up path.
+# Reset the pure-Zakura node from scratch.
+# Node2 previously reached the initial tip through inbound gossip.
+# The reset discards node2's state before node1 deepens the chain.
+# Node1 does not advertise the old blocks again.
+# Node2 downloads the checkpoint prefix through compatibility requests.
+# It then hands ownership to the native header engine.
+# Native block sync downloads the post-checkpoint suffix.
 log "starting pure-Zakura node2 for a from-scratch kind-6 catch-up"
 catchup_target=$(block_count 18232)
 [[ "${catchup_target}" -ge 1 ]] || fail \
@@ -1513,16 +1503,11 @@ before_node1_served=$(metric 19001 sync_block_body_served)
 snapshot_timeline "pre-reset-catch-up"
 
 # ---------------------------------------------------------------------------
-# Derive a Regtest checkpoint list from node1's chain and rewrite node2's config before the
-# restart, so the from-scratch catch-up below verifies through real checkpoint ranges
-# (batch-commit). That is the production path Regtest's genesis-only checkpoint list cannot
-# exercise, and the exact shape of the "drop-through" wedge: a body missing inside a
-# checkpoint range stalls that range's indefinite-wait commit. Hashes are only known once
-# mined, so this runs after the deepening. Only `checkpoints` is overridden — Regtest
-# genesis/magic/PoW are preserved (see build_regtest_params in zakura-network), so node2 still
-# peers with node1; checkpoint_sync defaults to true, so node2 verifies the whole range. The
-# config shape is locked by zakura-network's
-# `configured_regtest_checkpoints_preserve_regtest_identity` unit test.
+# Derive Regtest checkpoints from node1 after mining the blocks.
+# Rewrite node2's config before the restart.
+# The checkpoints exercise batch verification that the genesis-only list cannot reach.
+# Override only `checkpoints` to preserve the Regtest identity.
+# The `configured_regtest_checkpoints_preserve_regtest_identity` test fixes this config shape.
 # Keep the highest checkpoint strictly below the tip so the trailing tip reorg later is never
 # blocked by a final (immutable) checkpoint.
 checkpoint_ceiling=$(( catchup_target - 2 ))
@@ -1583,8 +1568,9 @@ if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     "${checkpoint_handoff_height}" "${node2_legacy_lines_before}" "${CATCHUP_TIMEOUT}"
 fi
 
-# node2's counters restart from zero, so assert absolute native activity, not a
-# delta. With node1 idle, the post-checkpoint gap can only arrive over kind-6.
+# Node2 restarts its counters at zero.
+# Assert absolute native activity instead of a delta.
+# With node1 idle, only kind-6 can supply the post-checkpoint gap.
 wait_metric_at_least 19002 sync_block_request_sent 1 "node2 catch-up" "${CATCHUP_TIMEOUT}"
 wait_metric_at_least 19002 sync_block_body_received 1 "node2 catch-up" "${CATCHUP_TIMEOUT}"
 wait_block_count_at_least 18332 "${catchup_target}" "node2 catch-up" "${CATCHUP_TIMEOUT}"

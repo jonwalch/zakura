@@ -65,10 +65,10 @@ pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
 /// Bit `1 << 4` belonged to the retired predecessor protocol and remains unused.
 pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 5;
 
-// Bit `1 << 1` is retired: it advertised the pre-request-id header-sync stream, which
-// correlated responses by arrival order and is no longer spoken. Do not lease it to a new
-// service. (`1 << 3` is block sync, declared in `block_sync::wire`; `1 << 4` is
-// the retired predecessor header-sync protocol.)
+// Bit `1 << 1` advertised the retired header-sync stream that correlated responses by order.
+// Do not assign it to another service.
+// Bit `1 << 3` identifies block sync in `block_sync::wire`.
+// Bit `1 << 4` identifies the retired predecessor header-sync protocol.
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;

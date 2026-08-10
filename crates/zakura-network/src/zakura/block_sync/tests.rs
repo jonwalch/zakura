@@ -2020,8 +2020,8 @@ fn work_queue_first_unclaimed_above_is_floor_anchored_not_frontier_anchored() {
         Some(block::Height(6)),
     );
 
-    // A gap-free claimed run: the cursor is the height after it, and stays there
-    // across the pending -> in_flight transition.
+    // Place the cursor after a gap-free claimed range.
+    // Keep it there when pending work becomes in-flight work.
     let queue = work_queue_with(
         5,
         (6..=9).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
@@ -2036,9 +2036,8 @@ fn work_queue_first_unclaimed_above_is_floor_anchored_not_frontier_anchored() {
         Some(block::Height(10)),
     );
 
-    // A height dropped from the claimed set while higher heights stay claimed is
-    // what a destructive `reset_above` racing an unreceived request leaves behind.
-    // The cursor must fall back to it, not stay above the frontier.
+    // A destructive `reset_above` can remove a height while higher heights remain claimed.
+    // Move the cursor back to the removed height.
     queue.reset_above(block::Height(5));
     queue.extend(
         test_work_scope(),
@@ -3804,8 +3803,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 
 #[tokio::test]
 async fn block_liveness_parks_silent_peer_and_traces_reason() {
-    // A first no-progress deadline must retire only the block-sync session, preserving
-    // the shared connection while making the peer ineligible during its cooldown.
+    // The first no-progress deadline must retire only the block-sync session.
+    // Preserve the shared connection and make the peer ineligible during its cooldown.
     let mut capture = TraceCapture::for_test("block_liveness_parks_silent_peer_and_traces_reason")
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
@@ -3914,8 +3913,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
 
 #[tokio::test]
 async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
-    // A body delivered after its request ownership expires cannot count as progress;
-    // observing both no submission and a local park covers the ownership and liveness gates.
+    // A body cannot count as progress after its request ownership expires.
+    // Verify both the missing submission and the local park.
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -3989,8 +3988,8 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
     // queue and, being unproven, the peer is now gated at its one-probe cap.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // The body arrives after its request owner was retired. It must not become an
-    // unowned verifier submission or prove this peer made timely progress.
+    // The body arrives after retirement of its request owner.
+    // Do not submit it to the verifier or count it as timely progress.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -7569,8 +7568,9 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
         "the byte-capped request must cover only height 1",
     );
 
-    // Height 2's body arrives without a matching outstanding request. A pending
-    // height has no request owner, so it must not enter the commit pipeline.
+    // Height 2 arrives without a matching request.
+    // A pending height has no request owner.
+    // Do not enter that body into the commit pipeline.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[1].clone())
@@ -7580,7 +7580,8 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
         .await
         .expect("unmatched queued block queues");
 
-    // Deliver height 1 on its live request; only that owned body may submit.
+    // Deliver height 1 through its live request.
+    // Only that owned body may enter verification.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -7615,15 +7616,10 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
     reactor_task.abort();
 }
 
-// Removed by the per-peer routine design: `reactor_accepts_queued_body_from_
-// recently_disconnected_peer` exercised the reactor's "late body" path — a body
-// arriving for a peer with no live routine, demuxed by the reactor's
-// `handle_late_body`/`accept_unmatched_queued_body`. The inverted data flow removes
-// that path entirely: a peer's frames are decoded by its own per-peer pipe-routine,
-// so once the peer disconnects its stream is closed and the routine has exited —
-// there is no transport over which a late body could arrive, and no reactor inbound
-// demux to accept one. The live-peer case is covered above and now proves an
-// ownerless queued body is rejected before the commit pipeline.
+// The per-peer routine design removes the reactor's late-body path.
+// Each routine decodes frames from its peer's stream.
+// Disconnect closes that stream and exits the routine.
+// The live-peer test above verifies rejection of an ownerless body before commit.
 
 #[tokio::test]
 async fn reactor_queries_needed_blocks_above_submitted_floor() {
@@ -11595,7 +11591,7 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
         .await
         .expect("block frame queues");
 
-    // The commitment-matching body is buffered and submitted to consensus.
+    // Buffer the commitment-matching body and submit it to consensus.
     let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {

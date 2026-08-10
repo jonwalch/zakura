@@ -62,9 +62,8 @@ pub(crate) async fn run_scenario(
     let initial_header = scenario.initial_best_header.min(target);
     let initial_header_hash = corpus_hash(&corpus, initial_header);
 
-    // One shared mock commit frontier: the commit driver advances it as bodies apply;
-    // the timeline driver rolls it back on a verified reset so the node's reorg and
-    // the committer stay consistent.
+    // The commit driver advances one shared mock frontier as bodies apply.
+    // The timeline driver rolls it back after a verified reset.
     let apply = MockApplyFrontier::new(corpus.clone());
     let initial = fuzz_snapshot(
         1,

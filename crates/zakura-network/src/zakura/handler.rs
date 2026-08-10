@@ -550,7 +550,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
-    /// Durable header snapshots, whose value is absent until semantic handoff succeeds.
+    /// Durable header snapshots.
+    /// The watch value remains absent until semantic handoff succeeds.
     pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     /// Coordinator-owned capability and ordered-service demand epochs.
     pub service_demand: watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
@@ -1796,11 +1797,10 @@ fn native_connection_transcript_hash(
     *initiator.as_bytes()
 }
 
-/// Whether the local node is the proactive opener for symmetric ordered streams
-/// against `remote_node_id`. The lexicographically smaller node id opens, and
-/// the other endpoint accepts that stream. The result is also the collision
-/// tiebreak for compatibility with older peers that race their own offer. The
-/// two ends compute complementary answers from the same distinct node ids.
+/// Whether the local node proactively opens symmetric ordered streams to `remote_node_id`.
+/// The endpoint with the smaller node ID opens the stream.
+/// The other endpoint accepts the stream.
+/// Older peers also use this result to resolve simultaneous offers.
 fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
     local_node_id.as_bytes() < remote_node_id.as_bytes()
 }
@@ -2975,9 +2975,8 @@ impl ZakuraProtocolHandler {
         remote_ip: Option<IpAddr>,
         context: ConnectionServeContext,
     ) -> Result<(), ZakuraHandlerError> {
-        // Bound the precheck by the demand-narrowed set of service sessions this
-        // connection can admit. This counts a symmetric session regardless of
-        // which endpoint is its deterministic proactive opener.
+        // Bound the precheck by the demanded service sessions that this connection can admit.
+        // Count each symmetric session regardless of which endpoint opens it.
         let ordered_stream_count = self
             .registry
             .ordered_streams_for_escalation(
@@ -3198,13 +3197,11 @@ impl HeaderCapabilityEpochs {
     }
 }
 
-/// Enable header sync for new handshakes and disconnect connections that were
-/// negotiated before the capability became available.
+/// Enable header sync for new handshakes.
+/// Disconnect connections negotiated before the capability became available.
 ///
-/// Negotiated capabilities are immutable for a connection. Keeping an
-/// existing connection alive after checkpoint bootstrap would therefore leave
-/// it permanently unable to open a header-sync stream, even though subsequent
-/// handshakes advertise the capability.
+/// A connection has immutable negotiated capabilities.
+/// A connection established before checkpoint bootstrap cannot open a header-sync stream.
 async fn enable_header_sync_and_renegotiate(
     handler: &ZakuraProtocolHandler,
     supervisor: &ZakuraSupervisorHandle,
@@ -5146,30 +5143,23 @@ mod tests {
     use zakura_test::vectors::{BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_141042_BYTES};
 
     /// Regression for the mainnet dual-stack body-sync stall on
-    /// `temp-zakura-sync-test-7` (2026-07-14, run
-    /// `20260714T073939Z-cca353fd1287`): body sync froze at height 2,725,606 for
-    /// 10 minutes with 54,670 blocks of pending work and 6.4 GB of free download
-    /// budget, while header sync happily tracked the tip at 3,411,947. Block sync
-    /// had decayed to `peers: 0` -- permanently.
+    /// `temp-zakura-sync-test-7` during run `20260714T073939Z-cca353fd1287`.
+    /// Body sync stopped at height 2,725,606 with available download capacity.
+    /// Header sync continued to tip while block sync lost all peers.
     ///
-    /// The cause is entirely in the transport. Block sync evicts a peer that
-    /// missed its no-progress liveness deadline and parks it for
-    /// `no_progress_peer_cooldown` (180s). The transport knows nothing about that
-    /// park and redials the peer ~30s later, well inside the cooldown. At
-    /// connection setup the transport asks block sync once whether it wants the
-    /// peer; it is still parked, so the block-sync stream is withheld -- and that
-    /// decision was never revisited. The connection itself stays up and healthy
-    /// (header sync and discovery keep riding it, which is exactly why headers
-    /// kept reaching the tip), so no redial follows, so there is no new setup to
-    /// ask again; and when the park lapsed nothing re-offered the stream. Every
-    /// block-sync peer was eventually evicted this way, so block sync ended at
-    /// zero peers on a node holding live connections to those very peers.
+    /// The transport caused the stall. Block sync parks a peer that misses its
+    /// no-progress liveness deadline. The transport redials the peer before the
+    /// `no_progress_peer_cooldown` expires. The transport asks block sync for
+    /// demand only during connection setup.
+    /// Block sync refuses the parked peer.
+    /// Header sync and discovery keep the connection healthy.
+    /// The transport therefore does not redial it after the cooldown.
+    /// Repeating this sequence reduced the block-sync peer count to zero.
+    /// The node still retained healthy connections.
     ///
-    /// This drives the real `serve_connection` over a real local QUIC connection
-    /// with the real `BlockSyncService`, parking the peer exactly as the liveness
-    /// deadline does. The park must defer the stream, not lose it: once the
-    /// cooldown lapses on a still-live connection, block sync must get its stream
-    /// without waiting for a redial that is never coming.
+    /// The test drives `serve_connection` and `BlockSyncService` over a local QUIC connection.
+    /// It parks the peer through the liveness path.
+    /// After the cooldown, block sync must receive a stream on the existing connection.
     #[tokio::test]
     async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
     {
@@ -5198,23 +5188,23 @@ mod tests {
             .block_sync()
             .expect("the header-sync driver spawns the block-sync reactor");
 
-        // The peer just missed its no-progress liveness deadline: block sync
-        // evicts and parks it. The transport's redial lands inside the cooldown.
+        // Block sync evicts and parks the peer after its no-progress deadline.
+        // The transport redials during the cooldown.
         block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
         dialer
             .connect_native(&listener, Duration::from_secs(10))
             .await?;
 
-        // The park is in force, so block sync is withheld from this connection.
+        // The park remains active.
+        // Withhold block sync from this connection.
         assert_eq!(
             block_sync.peer_snapshot().outbound_peers,
             0,
             "a parked peer must not be given a block-sync stream while its cooldown runs",
         );
 
-        // The cooldown lapses while the connection stays up. Nothing will redial
-        // -- the connection is healthy -- so the only way block sync ever gets
-        // this peer back is for the transport to re-check its demand.
+        // The connection stays healthy after the cooldown.
+        // The transport must recheck demand to restore the block-sync peer.
         await_until(
             "block sync opens a stream to the peer whose park expired",
             Duration::from_secs(30),
@@ -6053,9 +6043,10 @@ mod tests {
 
     #[test]
     fn ordered_stream_collision_winner_is_mirror_stable() {
-        // Both ends compute the collision winner from the same pair of node ids
-        // and must reach complementary answers, so exactly one side keeps its
-        // own opened stream while the other adopts the peer's.
+        // Both endpoints compute the collision winner from the same node IDs.
+        // Their answers must be complementary.
+        // One endpoint keeps its opened stream.
+        // The other endpoint adopts the peer's stream.
         let node_a = LocalEndpointFactory::secret_key(1).public();
         let node_b = LocalEndpointFactory::secret_key(2).public();
         assert_ne!(node_a, node_b);
@@ -6898,10 +6889,8 @@ mod tests {
         Ok(())
     }
 
-    /// Reopen exists because a header-sync stream can die while its connection is
-    /// healthy (the responder parks it at capacity or with no demand). It is not tied
-    /// to any particular header-sync version.
-    /// Reopen policy follows the transport's opening roles.
+    /// Reopen a header-sync stream after the responder parks it on a healthy connection.
+    /// The transport opening roles determine the reopen policy.
     #[test]
     fn ordered_session_reopen_follows_transport_opening_policy() {
         let initiator_opened = Stream {

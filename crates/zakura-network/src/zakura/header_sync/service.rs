@@ -23,8 +23,7 @@ use crate::zakura::{
     ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
 
-/// Conservative re-offer delay for a peer header sync has advised itself to back
-/// off from, used when no explicit backoff deadline is published for the node.
+/// Conservative re-offer delay when header sync publishes no peer backoff deadline.
 const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 const HEADER_SYNC_FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
@@ -363,7 +362,7 @@ pub(super) struct ExpectedHeadersResponse {
     pub(super) context: HeaderSyncDecodeContext,
 }
 
-/// Pump actions that can be satisfied without the production state driver.
+/// Process actions that do not require the production state driver.
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) async fn drive_header_sync_actions(
     mut actions: mpsc::Receiver<HeaderSyncAction>,
@@ -548,9 +547,8 @@ impl Service for HeaderSyncService {
             .backed_off_node_ids
             .contains(&node_id)
         {
-            // The reactor publishes the backed-off set but no per-node expiry, so
-            // re-offer after a conservative full backoff window rather than
-            // spinning the transport against a peer we just advised away from.
+            // The reactor publishes the backed-off set without per-node deadlines.
+            // Re-offer after one conservative backoff window.
             return OrderedSessionDemand::RetryAt(
                 std::time::Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF,
             );
@@ -881,7 +879,7 @@ impl Sink for HeaderSyncPassthroughSink {
     }
 }
 
-/// The iroh node identity behind a header-sync peer id, if it is well-formed.
+/// Return the iroh node identity for a valid header-sync peer ID.
 fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<iroh::NodeId> {
     let bytes = <[u8; 32]>::try_from(peer.as_bytes()).ok()?;
     iroh::NodeId::from_bytes(&bytes).ok()

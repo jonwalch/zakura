@@ -1,25 +1,23 @@
 //! Per-peer pipe-routine for Zakura block sync.
 //!
-//! per-peer routines inverts the inbound data flow. One task per connected peer owns its
-//! `FramedRecv` (the transport read), decodes each stream-6 frame, AND runs the
-//! download logic as a direct continuation in the **same task** — there is no
-//! reactor inbound demux and no per-peer `PeerInput` channel. Data flows
-//! pipe-routine → reactor (over [`RoutineToReactor`]) for shared concerns only:
-//! serving (`GetBlocks`), status advertisement, the producer re-query ping, and
-//! serving-side misbehavior. The routine owns its `BlockSyncPeerSession` clone,
-//! `outstanding`, the adaptive outbound window + timeout-recovery slots,
-//! `received_status`/servable caps, and the want-work fill loop.
+//! A per-peer routine inverts the inbound data flow. One task owns each connected
+//! peer's `FramedRecv`. The task decodes each stream-6 frame and runs the download
+//! logic directly. The reactor does not demultiplex inbound frames or create a
+//! per-peer `PeerInput` channel. The routine sends only shared concerns to the
+//! reactor through [`RoutineToReactor`]. These concerns include `GetBlocks`
+//! serving, status advertisements, producer re-query pings, and serving-side
+//! misbehavior. The routine owns its `BlockSyncPeerSession`, outstanding requests,
+//! adaptive outbound window, timeout-recovery slots, servable caps, and fill loop.
 //!
-//! The one throughput-critical effect: the matched-body `sequencer_input.send(..).await`
-//! runs in this per-peer task, so a slow verifier (Sequencer backpressure)
-//! stalls only one routine, not the whole fleet. The download decision gates only
-//! on the byte budget + per-peer slots: `take_in_range(servable_low,
-//! servable_high, n)` uses `servable_high` as the upper bound.
+//! The per-peer task runs the throughput-critical matched-body
+//! `sequencer_input.send(..).await`. Sequencer backpressure therefore stalls only
+//! one routine. The download decision uses the byte budget and per-peer slots.
+//! `take_in_range(servable_low, servable_high, n)` uses `servable_high` as its
+//! upper bound.
 //!
-//! All per-peer download state lives routine-local or in the shared
-//! [`PeerRegistry`], and inbound traffic arrives as decoded frames from this
-//! task's own `FramedRecv`: a want-work fill loop, the matched-body tail, and the
-//! unmatched-body fallthroughs all run in this one task.
+//! The routine or shared [`PeerRegistry`] owns all per-peer download state. The
+//! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
+//! matched-body path, and unmatched-body paths run in the same task.
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
@@ -54,26 +52,20 @@ use zakura_chain::{block, serialization::ZcashSerialize};
 
 mod trace;
 
-/// How long a routine avoids re-taking a height it just returned on a failure
-/// (RangeUnavailable / timeout / send-failure / disconnect-retry) before it will
-/// contest that height again. The window only has to be long enough that, on the
-/// single-threaded test runtime, the other routines woken by the same failure
-/// `return_items` get a chance to take the contested work first — a peer-local
-/// bias away from work this routine just failed. It is negligible against real
-/// sync timescales, and the height stays `pending` and fully contestable by every
-/// other peer throughout.
+/// How long a routine avoids a height after returning it because of a failure.
+/// The delay lets another routine take the height first on the single-threaded
+/// test runtime. The queue keeps the height pending for every other peer.
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// Cadence of the per-peer BBR heartbeat trace (`block_peer_bbr`). Observability only:
-/// emits controller state on a fixed interval so a trace can spot oscillation even while
-/// the peer is idle between deliveries.
+/// Cadence of the per-peer BBR heartbeat trace (`block_peer_bbr`).
+/// The trace records controller state while a peer is idle between deliveries.
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 /// Minimum interval between repeated fill-stop trace rows for the same peer and reason.
 ///
-/// The counter remains exact, while the JSONL trace samples steady-state refusal details.
-/// Without this bound, idle peers can emit a row on every wake and consume hundreds of
-/// megabytes per minute during an initial sync.
+/// The counter remains exact. The JSONL trace samples steady-state refusal details.
+/// Without this bound, idle peers can emit a row on every wake and consume hundreds
+/// of megabytes per minute during initial sync.
 const FILL_STOP_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 
 fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
@@ -143,13 +135,11 @@ fn no_progress_response(allow_no_progress_park: bool) -> NoProgressResponse {
     }
 }
 
-/// Whether a due block-liveness deadline gets one bounded grace instead of disconnecting.
-/// Granted only for *our own* transient outbound write congestion: outbound full **and**
-/// continuously full for less than `request_timeout`. A peer that stopped reading holds
-/// our outbound full indefinitely, so once the full stretch reaches `request_timeout` the
-/// grace is denied and the peer is disconnected — it can no longer dodge the timer by
-/// refusing to read (the previous unbounded `outbound_capacity() == 0 → extend` escape let
-/// a wedged peer survive to the ~180 s transport idle timeout).
+/// Whether the routine grants one bounded delay at a block-liveness deadline.
+/// The routine grants the delay only for transient outbound write congestion that
+/// lasts less than `request_timeout`. A peer that stops reading keeps the outbound
+/// queue full. The routine disconnects that peer when the interval reaches
+/// `request_timeout`.
 fn liveness_grace_allowed(
     outbound_full: bool,
     outbound_full_since: Option<Instant>,
@@ -305,22 +295,20 @@ pub(super) struct PeerRoutine {
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     actions: mpsc::Sender<BlockSyncAction>,
-    /// Shared routine→reactor channel for serving / status-advertise / re-query /
-    /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
-    /// cannot backpressure this decode loop into stalling the transport.
+    /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
+    /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
     sequencer_view: watch::Receiver<SequencerView>,
-    /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
-    /// a destructive reset (in-place clear of outstanding) from a plain advance.
+    /// Last `reset_epoch` that this routine processed.
+    /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
     last_reset_epoch: u64,
-    /// When our outbound queue to this peer *first* filled in the current continuous full
-    /// stretch (`None` while it has capacity). Lets the liveness check tell transient local
-    /// write congestion (just filled) from a peer that stopped reading for `request_timeout`
-    /// — the latter is disconnected at the liveness deadline rather than excused indefinitely.
+    /// Start of the current interval in which this peer's outbound queue stayed full.
+    /// The liveness check uses the interval to distinguish congestion from a peer that stopped reading.
     outbound_full_since: Option<Instant>,
 
-    /// Cancellation: the peer's service session token. Fires on disconnect, park,
-    /// or local shutdown; the routine exits and its `Drop` guard returns work.
+    /// Cancellation token for the peer's service session.
+    /// Disconnect, park, or shutdown triggers the token.
+    /// The routine then exits and its `Drop` guard returns work.
     cancel: CancellationToken,
     trace: ZakuraTrace,
 }
@@ -1366,8 +1354,8 @@ impl PeerRoutine {
     }
 
     /// Free request slots after the central queue retires their exact owners.
-    /// Queue retirement already released their reservations, so this path only
-    /// drops routine-local and registry bookkeeping.
+    /// Queue retirement already released their reservations.
+    /// This path drops only routine-local and registry bookkeeping.
     fn gc_obsolete_outstanding(&mut self) {
         let mut removed = false;
         let mut index = 0;
@@ -1700,9 +1688,9 @@ impl PeerRoutine {
             return false;
         }
         let Some(owner) = self.work.owner_for_height(height) else {
-            // Pending work has no active request owner. Accepting a body here
-            // would create an unowned completion, so leave it to the normal
-            // unsolicited/stale classification path.
+            // Pending work has no active request owner.
+            // Accepting a body here would create an unowned completion.
+            // Leave it to the unsolicited or stale classification path.
             return false;
         };
 
@@ -1974,9 +1962,9 @@ impl PeerRoutine {
         self.finish_detached(outstanding, disposition);
     }
 
-    /// Drop a locally tracked request whose work scope was centrally retired.
-    /// Its queue reservation was already released by retirement, so this path
-    /// must not touch a replacement item at the same height.
+    /// Drop a local request after the central queue retires its work scope.
+    /// The central queue already released the reservation.
+    /// This path must preserve any replacement item at the same height.
     fn drop_obsolete_outstanding(&mut self, index: usize) {
         if index >= self.window.outstanding.len() {
             return;
@@ -2450,7 +2438,7 @@ mod tests {
         let now = Instant::now();
         let request_timeout = Duration::from_secs(8);
 
-        // Outbound just filled (1 s ago): plausibly our own write congestion — grace.
+        // Grant a delay when the outbound queue filled one second ago.
         let fresh = now - Duration::from_secs(1);
         assert!(super::liveness_grace_allowed(
             true,
@@ -2459,8 +2447,7 @@ mod tests {
             request_timeout
         ));
 
-        // Outbound has been full for a full `request_timeout` (the peer has stopped
-        // reading): NO grace — the peer is disconnected at the liveness deadline.
+        // Disconnect when the outbound queue stays full for `request_timeout`.
         let sustained = now - request_timeout;
         assert!(!super::liveness_grace_allowed(
             true,
@@ -2476,14 +2463,14 @@ mod tests {
             request_timeout
         ));
 
-        // Outbound has capacity (not full): the escape does not apply — disconnects normally.
+        // Disconnect normally when the outbound queue has capacity.
         assert!(!super::liveness_grace_allowed(
             false,
             Some(fresh),
             now,
             request_timeout
         ));
-        // Full but no recorded start (defensive, shouldn't happen while full): no grace.
+        // Refuse a delay when a full queue has no recorded start time.
         assert!(!super::liveness_grace_allowed(
             true,
             None,

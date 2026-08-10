@@ -1197,10 +1197,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_stream_kind_is_reset_and_never_delivered() -> Result<(), BoxError> {
-        // FLUP-015: a peer-controlled prelude naming an unknown kind must be
-        // reset before the stream's frame reaches the inbound sink, while a
-        // known kind on the same connection is still delivered. Asserted on
-        // recorder state, not metrics.
+        // FLUP-015: reset an unknown stream kind before its frame reaches the inbound sink.
+        // Continue delivering known stream kinds on the same connection.
+        // Assert the recorder state instead of metrics.
         let _guard = zakura_test::init();
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_node(1).await?;
@@ -1212,9 +1211,9 @@ mod tests {
 
         let known_payload = b"known-kind-frame".to_vec();
         let unknown_payload = b"unknown-kind-frame".to_vec();
-        // Unknown kind 9: must be reset and dropped.
+        // Reset and drop unknown kind 9.
         hostile.send_frame(9, unknown_payload.clone()).await?;
-        // Known kind 2 (gossip): must be delivered.
+        // Deliver known gossip kind 2.
         hostile.send_frame(2, known_payload.clone()).await?;
 
         await_until("known-kind frame delivered", Duration::from_secs(5), || {
@@ -1222,8 +1221,8 @@ mod tests {
         })
         .await?;
 
-        // The known frame arrived; the unknown one must never have been delivered
-        // under any kind label.
+        // The recorder received the known frame.
+        // It must not receive the unknown frame under any kind label.
         let delivered = recorder.drain();
         assert!(
             delivered
@@ -1243,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_stream_version_is_reset_and_never_delivered() -> Result<(), BoxError> {
-        // FLUP-015: a known kind at an unsupported version is rejected too.
+        // FLUP-015: reject a known stream kind at an unsupported version.
         let _guard = zakura_test::init();
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_node(3).await?;
@@ -1273,9 +1272,9 @@ mod tests {
 
         hostile.shutdown().await;
 
-        // Header sync speaks exactly one version. The retired version 6 is now just
-        // another unsupported version: its stream is reset, while the current version
-        // is delivered on the same connection.
+        // Header sync supports one version.
+        // Reset the stream for retired version 6.
+        // Deliver the current version on the same connection.
         let victim = cluster.node(victim_idx);
         let recorder = victim.recorder();
         let hostile = HostilePeer::connect_native_with_capabilities(
@@ -1622,8 +1621,7 @@ mod tests {
         let flooding =
             HostilePeer::connect_native_with_capabilities(&victim, 30, ZAKURA_CAP_DISCOVERY)
                 .await?;
-        // Exceeding the per-kind message rate is traced at transport ingress
-        // before the ordered stream is disconnected.
+        // The transport traces a per-kind rate violation before it disconnects the stream.
         flooding
             .flood_stream(ZAKURA_STREAM_DISCOVERY, 'd', 16)
             .await?;
@@ -1680,25 +1678,23 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_ordered_stream_uses_message_budget() -> Result<(), BoxError> {
-        // P2: a long-lived ordered stream spends the transport-owned per-kind
-        // message-rate budget before frames reach the service. A peer that
-        // floods past the budget is disconnected (we never drop a solicited
-        // frame), so no more than ~one budget of frames is ever delivered.
+        // P2: a long-lived ordered stream spends the per-kind message budget at the transport.
+        // The transport disconnects a peer that exceeds the budget.
+        // The service therefore receives at most approximately one budget of frames.
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
             "persistent_ordered_stream_uses_message_budget",
             false,
         )?;
 
-        // Small, deterministic message budget so the aggregate cap is observable
-        // without sending hundreds of frames.
+        // Use a small deterministic message budget to expose the aggregate cap.
         let mut limits = ZakuraLocalLimits::from_config(&Config::default());
         limits.max_connections = 16;
         limits.max_pending_handshakes = 8;
         limits.max_open_streams = 16;
         limits.max_inbound_queue_depth = 256;
         limits.message_rate_per_second = 4;
-        // Allow the stream opens themselves (open-rate is a separate limiter).
+        // Allow stream opens because a separate limiter controls their rate.
         limits.stream_open_rate_per_second = 64;
         let message_budget = limits.message_rate_per_second as usize;
 
@@ -1714,8 +1710,8 @@ mod tests {
 
         let sent = message_budget * 8;
         for index in 0..sent {
-            // Once the budget is exceeded the victim disconnects, so later
-            // sends race the teardown and may error -- that is expected.
+            // The victim disconnects after the sender exceeds the budget.
+            // Later sends can race the teardown and return an error.
             if hostile
                 .send_frame(2, format!("a-{index}").into_bytes())
                 .await

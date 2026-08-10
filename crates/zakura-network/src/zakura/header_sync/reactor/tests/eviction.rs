@@ -124,7 +124,8 @@ impl EvictionFixture {
             .set_capacity_for_test(&self.peer, 0, 1);
         self.reactor
             .handle_headers(self.peer.clone(), session_id, scope, response);
-        // The completed target is handed to the port; clear it so the next request can stage.
+        // The port owns the completed target.
+        // Clear the request so the next request can enter staging.
         self.reactor.clear_peer_work_for_test(&self.peer);
     }
 
@@ -140,8 +141,8 @@ impl EvictionFixture {
             active.target.status.selected_tip_height,
             active.target.status.selected_tip_hash,
         );
-        // The already-known reply names the target itself as the common ancestor, so the
-        // request must have offered it in its locator for the reply to be well formed.
+        // The already-known reply names the target as the common ancestor.
+        // The request must include that target in its locator.
         active.sent_locator = zakura_header_chain::HeaderLocator::for_continuation(target);
         active.entries.clear();
         let response = Headers {
@@ -273,7 +274,8 @@ fn a_peer_at_our_tip_is_not_charged_a_strike() {
 
 #[test]
 fn a_strike_from_a_superseded_session_cannot_drop_its_replacement() {
-    // One strike is enough to drop, so a mis-scoped charge would evict immediately.
+    // One strike causes eviction.
+    // A mis-scoped charge would therefore evict the replacement immediately.
     let mut fixture = eviction_fixture(1, 7);
     let replacement = CancellationToken::new();
     let (send, _replacement_outbound) = framed_channel(8);
