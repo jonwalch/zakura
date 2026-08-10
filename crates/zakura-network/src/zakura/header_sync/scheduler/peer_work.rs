@@ -572,9 +572,10 @@ impl PeerWorkQueue {
 
     /// Stage one ordinary branch target only when no other peer already owns it.
     ///
-    /// A locator is derived from shared local state, so two peers pursuing the same generation,
-    /// anchor, and target would download and authenticate the same prefix. The alternate peer's
-    /// status remains in the reactor and can be reconsidered as soon as the owner retires.
+    /// A locator is derived from shared local state, so two peers pursuing the same exact target
+    /// would download and authenticate overlapping prefixes even when intervening body commits
+    /// give their work different finality authorities. The alternate peer's status remains in the
+    /// reactor and can be reconsidered as soon as the owner retires.
     pub(in crate::zakura::header_sync) fn stage_distinct_target(
         &mut self,
         peer: ZakuraPeerId,
@@ -582,11 +583,11 @@ impl PeerWorkQueue {
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
         let owned_by_other_peer = self.work_by_peer.iter().any(|(owner, work)| {
-            owner != &peer
-                && match work {
-                    PeerWorkState::AwaitingLocator { target, .. } => target.scope,
-                    PeerWorkState::Active(request) => request.target.scope,
-                } == target.scope
+            let owned_target = match work {
+                PeerWorkState::AwaitingLocator { target, .. } => target.status.selected_tip_hash,
+                PeerWorkState::Active(request) => request.target.status.selected_tip_hash,
+            };
+            owner != &peer && owned_target == target.status.selected_tip_hash
         });
         if owned_by_other_peer {
             self.remove_unstarted(&peer);
@@ -1140,6 +1141,35 @@ mod tests {
             QueueWorkResult::NeedsLocator,
             "the alternate peer becomes eligible immediately after owner retirement"
         );
+    }
+
+    #[test]
+    fn body_finality_reanchor_does_not_duplicate_the_same_wire_target() {
+        let local = snapshot();
+        let mut queue = PeerWorkQueue::default();
+        let target = advertisement(1);
+        let mut reanchored = target.clone();
+        reanchored.scope.header_generation = reanchored
+            .scope
+            .header_generation
+            .checked_next()
+            .expect("the fixture header generation advances");
+        reanchored.scope.branch.anchor_hash = hash(99);
+
+        assert_ne!(target.scope, reanchored.scope);
+        assert_eq!(
+            queue.stage_distinct_target(peer(1), target.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start(active_request(1, target, &local, Vec::new())));
+
+        assert_eq!(
+            queue.stage_distinct_target(peer(2), reanchored, PeerWorkPriority::Normal),
+            QueueWorkResult::TargetAlreadyAssigned,
+            "body-only finality movement cannot create duplicate work for one target hash"
+        );
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
