@@ -819,7 +819,8 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     );
 
     let mut pin_conflict = plan;
-    pin_conflict.trust_pins = vec![Frontier::new(checkpoint.height, block::Hash([0xff; 32]))];
+    pin_conflict.trust_pins =
+        vec![Frontier::new(checkpoint.height, block::Hash([0xff; 32]))].into();
     assert_eq!(
         verify_plan(&test_engine(&store), &pin_conflict),
         Err(InvariantViolation::TrustPin(checkpoint.height))

@@ -1,6 +1,10 @@
 //! The sole pure mutation algorithm for durable header-chain state.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use thiserror::Error;
 use zakura_chain::block;
@@ -25,7 +29,7 @@ pub struct TransitionPlan {
     #[cfg(any(test, feature = "fuzz-impl"))]
     pub(super) projected: MemHeaderStore,
     pub(super) cause: TransitionCause,
-    pub(super) trust_pins: Vec<Frontier>,
+    pub(super) trust_pins: Arc<[Frontier]>,
     pub(super) limits: EngineLimits,
 }
 
@@ -170,9 +174,9 @@ pub(super) fn apply_transition_engine(
         return Ok(plan);
     }
     let mut graph = GraphOverlay::new(engine.graph());
-    let old_selected = engine.selected_projection().to_vec();
-    let old_verified = engine.verified_projection().to_vec();
-    let mut verified = old_verified.clone();
+    let old_selected = engine.selected_projection();
+    let old_verified = engine.verified_projection();
+    let mut verified = Cow::Borrowed(old_verified);
     let mut aux_changes = Vec::new();
     let mut finality = None;
     let mut operator_reason_changed = false;
@@ -182,7 +186,7 @@ pub(super) fn apply_transition_engine(
         durable,
         transition: context,
         before: &before,
-        old_selected: &old_selected,
+        old_selected,
         migrated_pin_refuted,
     };
 
@@ -198,7 +202,7 @@ pub(super) fn apply_transition_engine(
         metadata.alarms.migrated_pin_refuted = Some(pin);
     }
     if operator_reason_changed {
-        verified = select_fully_verified_path(&graph)?;
+        verified = Cow::Owned(select_fully_verified_path(&graph)?);
     }
     let (mut header_best, _) = graph.view_select_header_best()?;
 
@@ -268,6 +272,7 @@ pub(super) fn apply_transition_engine(
             let previous = graph.view_finalized();
             let epoch = metadata.finality_epoch.checked_next()?;
             graph.edit_advance_finalized(new_finalized)?;
+            let verified = verified.to_mut();
             verified.retain(|frontier| frontier.height >= new_finalized.height);
             if verified.first().copied() != Some(new_finalized) {
                 verified.insert(0, new_finalized);
@@ -286,7 +291,7 @@ pub(super) fn apply_transition_engine(
     }
 
     if context.config.mode == EngineMode::HeadersOnly {
-        verified = vec![graph.view_finalized()];
+        verified = Cow::Owned(vec![graph.view_finalized()]);
     }
     let verified_best = verified.last().copied().unwrap_or(graph.view_finalized());
     let retention = crate::retention::enforce_retention(
@@ -302,9 +307,33 @@ pub(super) fn apply_transition_engine(
         return Ok(plan);
     }
     header_best = graph.view_select_header_best()?.0;
-    let selected = path(&graph, header_best)?;
+    let selected = if cause == TransitionCause::CheckpointFinality
+        && header_best == before.frontiers.header_best
+        && finality_append.is_some_and(|record| {
+            old_selected
+                .binary_search_by_key(&record.current.height, |frontier| frontier.height)
+                .ok()
+                .is_some_and(|index| old_selected[index] == record.current)
+        }) {
+        let Some(record) = finality_append else {
+            return Err(TransitionFailure::InvalidEvidence(
+                "checkpoint finality has no finality record",
+            ));
+        };
+        let index = old_selected
+            .binary_search_by_key(&record.current.height, |frontier| frontier.height)
+            .map_err(|_| {
+                TransitionFailure::InvalidEvidence(
+                    "checkpoint finality left the selected projection",
+                )
+            })?;
+        Cow::Borrowed(&old_selected[index..])
+    } else {
+        Cow::Owned(path(&graph, header_best)?)
+    };
     let verified = trim_projection(&graph, verified)?;
-    let evicted: HashSet<_> = graph.delta().delete_nodes.into_iter().collect();
+    let graph_delta = graph.delta();
+    let evicted: HashSet<_> = graph_delta.delete_nodes.iter().copied().collect();
     aux_changes.retain(|change| match change {
         crate::AuxDelta::Put(delivery) => graph.view_node(delivery.header_hash).is_some(),
         crate::AuxDelta::Delete { .. } => true,
@@ -322,6 +351,7 @@ pub(super) fn apply_transition_engine(
         metadata,
         engine.graph(),
         graph,
+        graph_delta,
         old_selected,
         old_verified,
         selected,
@@ -864,7 +894,7 @@ fn validate_full_state_header<G: HeaderGraphView>(
 
 fn apply_event<G: HeaderGraphEdit>(
     graph: &mut G,
-    verified: &mut Vec<Frontier>,
+    verified: &mut Cow<'_, [Frontier]>,
     aux_changes: &mut Vec<crate::AuxDelta>,
     operator_reason_changed: &mut bool,
     event: &TransitionEvent,
@@ -1078,6 +1108,7 @@ fn apply_event<G: HeaderGraphEdit>(
                 crate::VerifiedChangeCause::Reset => graph.view_finalized(),
             };
             if matches!(event.cause, crate::VerifiedChangeCause::Reset) {
+                let verified = verified.to_mut();
                 verified.clear();
                 verified.push(parent);
             }
@@ -1116,7 +1147,7 @@ fn apply_event<G: HeaderGraphEdit>(
                     )?;
                 }
                 parent = Frontier::new(header.height, header.hash);
-                verified.push(parent);
+                verified.to_mut().push(parent);
             }
         }
         TransitionEvent::VerifiedBlockAccepted(event) => {
@@ -1458,19 +1489,19 @@ fn derive_plan(
     mut metadata: EngineMetadata,
     base_graph: &MemHeaderStore,
     graph: GraphOverlay<'_>,
-    old_selected: Vec<Frontier>,
-    old_verified: Vec<Frontier>,
-    selected: Vec<Frontier>,
-    verified: Vec<Frontier>,
+    graph_delta: GraphDelta,
+    old_selected: &[Frontier],
+    old_verified: &[Frontier],
+    selected: Cow<'_, [Frontier]>,
+    verified: Cow<'_, [Frontier]>,
     aux_changes: Vec<crate::AuxDelta>,
     finality_append: Option<FinalityRecord>,
     retention: RetentionPlan,
     fingerprint: Option<crate::TransitionFingerprint>,
     cause: TransitionCause,
-    trust_pins: Vec<Frontier>,
+    trust_pins: Arc<[Frontier]>,
     limits: EngineLimits,
 ) -> Result<TransitionPlan, TransitionFailure> {
-    let graph_delta = graph.delta();
     let put_nodes = graph_delta.put_nodes.clone();
     let delete_nodes = graph_delta.delete_nodes.clone();
     let mut eligibility_changes: Vec<_> = put_nodes
@@ -1485,8 +1516,8 @@ fn derive_plan(
         })
         .collect();
     eligibility_changes.sort_unstable_by_key(|delta| delta.hash.0);
-    let selected_changed = selected != old_selected;
-    let verified_changed = verified != old_verified;
+    let selected_changed = selected.as_ref() != old_selected;
+    let verified_changed = verified.as_ref() != old_verified;
     let header_topology_changed = !delete_nodes.is_empty()
         || put_nodes
             .iter()
@@ -1572,8 +1603,8 @@ fn derive_plan(
             inserted,
             deleted: delete_nodes,
         },
-        selected_projection: projection_delta(&old_selected, &selected),
-        verified_projection: projection_delta(&old_verified, &verified),
+        selected_projection: projection_delta(old_selected, &selected),
+        verified_projection: projection_delta(old_verified, &verified),
         eligibility_changes,
         aux_changes,
         finality_append,
@@ -1656,19 +1687,8 @@ fn resource_stalled(
     })
 }
 
-fn invariant_pins(context: &TransitionContext<'_>) -> Vec<Frontier> {
-    let mut pins: Vec<_> = context.config.local_checkpoints().iter().collect();
-    if let Some(pin) = context
-        .config
-        .settled_manifest()
-        .pin_for_network(&context.config.network)
-    {
-        let key = (pin.activation.height, pin.activation.hash.0);
-        if let Err(index) = pins.binary_search_by_key(&key, |pin| (pin.height, pin.hash.0)) {
-            pins.insert(index, pin.activation);
-        }
-    }
-    pins
+fn invariant_pins(context: &TransitionContext<'_>) -> Arc<[Frontier]> {
+    context.config.trust_pins()
 }
 
 #[cfg(any(test, feature = "fuzz-impl"))]
@@ -1696,12 +1716,21 @@ fn path<G: HeaderGraphView>(graph: &G, tip: Frontier) -> Result<Vec<Frontier>, T
     Ok(path)
 }
 
-fn trim_projection<G: HeaderGraphView>(
+fn trim_projection<'a, G: HeaderGraphView>(
     graph: &G,
-    projection: Vec<Frontier>,
-) -> Result<Vec<Frontier>, TransitionFailure> {
+    projection: Cow<'a, [Frontier]>,
+) -> Result<Cow<'a, [Frontier]>, TransitionFailure> {
+    let requires_trim = projection.first().copied() != Some(graph.view_finalized())
+        || projection.iter().any(|frontier| {
+            frontier.height < graph.view_finalized().height
+                || graph.view_node(frontier.hash).is_none()
+        });
+    if !requires_trim {
+        return Ok(projection);
+    }
     let mut result: Vec<_> = projection
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|frontier| {
             frontier.height >= graph.view_finalized().height
                 && graph.view_node(frontier.hash).is_some()
@@ -1721,7 +1750,7 @@ fn trim_projection<G: HeaderGraphView>(
             ));
         }
     }
-    Ok(result)
+    Ok(Cow::Owned(result))
 }
 
 fn projection_delta(old: &[Frontier], new: &[Frontier]) -> ProjectionDelta {
