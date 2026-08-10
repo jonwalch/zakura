@@ -513,36 +513,28 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn add_references(&mut self, cursor: &CanonicalHeaderPathCursor) {
-        for hash in cursor
-            .retained_ancestor
-            .into_iter()
-            .chain(cursor.retained_path.iter().copied())
-        {
-            *self.reference_counts.entry(hash).or_default() += 1;
-        }
+        // Retention walks from each target to finality, so one target hash protects the complete
+        // immutable suffix. Expanding a lease into every path hash makes this bounded owner list
+        // grow with chain length and eventually rejects ordinary transitions.
+        *self.reference_counts.entry(cursor.target.hash).or_default() += 1;
         self.references_dirty = true;
     }
 
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
         let cursor = self.by_peer.remove(&peer)?;
-        for hash in cursor
-            .retained_ancestor
-            .into_iter()
-            .chain(cursor.retained_path.iter().copied())
-        {
-            let remove = {
-                let Some(count) = self.reference_counts.get_mut(&hash) else {
-                    panic!("every installed lease reference has a registry count");
-                };
-                let Some(next_count) = count.checked_sub(1) else {
-                    panic!("a lease reference count cannot underflow");
-                };
-                *count = next_count;
-                *count == 0
+        let hash = cursor.target.hash;
+        let remove = {
+            let Some(count) = self.reference_counts.get_mut(&hash) else {
+                panic!("every installed lease target has a registry count");
             };
-            if remove {
-                self.reference_counts.remove(&hash);
-            }
+            let Some(next_count) = count.checked_sub(1) else {
+                panic!("a lease target reference count cannot underflow");
+            };
+            *count = next_count;
+            *count == 0
+        };
+        if remove {
+            self.reference_counts.remove(&hash);
         }
         self.references_dirty = true;
         Some(cursor)
@@ -998,6 +990,32 @@ impl HeaderChainReader {
         self.coherent_selected_node(height)
             .map(|node| node.map(|node| node.hash))
             .map_err(HeaderChainStoreError::Store)
+    }
+
+    pub(crate) fn selected_hashes(
+        &self,
+        start: block::Height,
+        count: u32,
+    ) -> Result<Vec<Frontier>, HeaderChainStoreError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let selected_tip = self.store.snapshot()?.frontiers.header_best;
+        if start > selected_tip.height {
+            return Ok(Vec::new());
+        }
+        let end = block::Height(
+            start
+                .0
+                .saturating_add(count.saturating_sub(1))
+                .min(selected_tip.height.0),
+        );
+        self.store.projection_range(HEADER_SELECTED, start, end)
     }
 
     pub(crate) fn selected_successor(
@@ -1612,6 +1630,113 @@ impl HeaderChainRuntime {
         }
     }
 
+    /// Atomically apply auxiliary authentication followed by one checkpoint full-state advance.
+    ///
+    /// The checkpoint transition is planned against the projected auxiliary transition, but both
+    /// header-chain changes and the full-state block batch are committed in one RocksDB write.
+    pub(in crate::service) fn apply_aux_then_checkpoint_combined<M>(
+        &self,
+        first_request: TransitionRequest,
+        first_context: &TransitionContext<'_>,
+        mut checkpoint_request: TransitionRequest,
+        checkpoint_context: &TransitionContext<'_>,
+        full_state_batch: DiskWriteBatch,
+        memory_swap: M,
+    ) -> Result<ApplyResult, HeaderChainStoreError>
+    where
+        M: FnOnce(),
+    {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let mut transition_engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let lease_references = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .active_references(Instant::now());
+
+        let first_authority = StateIssuedAuthority {
+            inner: first_context.full_state_authority,
+            validation_leases: &[],
+        };
+        let first_context = TransitionContext {
+            config: first_context.config,
+            clock: first_context.clock,
+            full_state_authority: Some(&first_authority),
+            retention_references: lease_references.as_ref(),
+        };
+        let first =
+            transition_engine.apply(first_request, &first_context, DurableTransitionFacts::None)?;
+        if first.cause() == TransitionCause::ResourceStalled {
+            return Err(HeaderChainStoreError::Incoherent(
+                "checkpoint auxiliary authentication exhausted header resources",
+            ));
+        }
+
+        let mut projected = transition_engine.clone();
+        projected.apply_committed(first.clone())?;
+        checkpoint_request.expected_version = projected.snapshot().state_version;
+        let checkpoint_parent = match &checkpoint_request.event {
+            TransitionEvent::VerifiedChainChanged(event)
+                if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow =>
+            {
+                event.old_tip
+            }
+            _ => {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "combined checkpoint transition has the wrong event kind",
+                ));
+            }
+        };
+        let validation_context = self
+            .store
+            .validation_context(checkpoint_parent.hash, &self.config.network)?;
+        let validation_leases = [validation_context];
+        let checkpoint_authority = StateIssuedAuthority {
+            inner: checkpoint_context.full_state_authority,
+            validation_leases: &validation_leases,
+        };
+        let checkpoint_context = TransitionContext {
+            config: checkpoint_context.config,
+            clock: checkpoint_context.clock,
+            full_state_authority: Some(&checkpoint_authority),
+            retention_references: lease_references.as_ref(),
+        };
+        let checkpoint = projected.apply(
+            checkpoint_request,
+            &checkpoint_context,
+            DurableTransitionFacts::HeaderInsertion {
+                validation_contexts: validation_leases.to_vec(),
+                finality_path: Vec::new(),
+            },
+        )?;
+        if checkpoint.cause() == TransitionCause::ResourceStalled {
+            return Err(HeaderChainStoreError::Incoherent(
+                "checkpoint full-state advance exhausted header resources",
+            ));
+        }
+
+        let current = checkpoint.change_set().metadata.snapshot();
+        let batch = self
+            .store
+            .batch_for_combined(first.change_set(), full_state_batch)?;
+        let batch = self
+            .store
+            .batch_for_combined(checkpoint.change_set(), batch)?;
+        self.store.db.write(batch)?;
+        transition_engine.apply_committed(first)?;
+        transition_engine.apply_committed(checkpoint)?;
+        memory_swap();
+        self.publisher.publish(current);
+        Ok(ApplyResult::Committed)
+    }
+
     #[cfg(test)]
     fn apply_combined_with_fault<M, F>(
         &self,
@@ -1727,7 +1852,9 @@ impl HeaderChainRuntime {
             }
             TransitionEvent::VerifiedChainChanged(event) => {
                 let parent = match event.cause {
-                    VerifiedChangeCause::Grow => event.old_tip,
+                    VerifiedChangeCause::Grow | VerifiedChangeCause::CheckpointFinalizedGrow => {
+                        event.old_tip
+                    }
                     VerifiedChangeCause::Reset => before.frontiers.finalized,
                 };
                 DurableTransitionFacts::HeaderInsertion {
@@ -3589,6 +3716,50 @@ impl HeaderChainStore {
                     .map_err(|_| StoreError::Incoherent("invalid projection hash width"))
             })
             .transpose()
+    }
+
+    fn projection_range(
+        &self,
+        family: &'static str,
+        start: block::Height,
+        end: block::Height,
+    ) -> Result<Vec<Frontier>, HeaderChainStoreError> {
+        if start > end {
+            return Ok(Vec::new());
+        }
+        let lower = HeaderHeightKey(start).as_bytes();
+        let upper = end
+            .next()
+            .ok()
+            .map(|height| HeaderHeightKey(height).as_bytes());
+        let rows = self.scan_range(family, &lower, upper.as_ref().map(AsRef::as_ref))?;
+        let mut expected_height = start;
+        let mut projection = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            if key.len() != 4 || value.len() != 32 {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "invalid projection row width",
+                ));
+            }
+            let height = HeaderHeightKey::from_bytes(&key).0;
+            if height != expected_height {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "projection range is not contiguous",
+                ));
+            }
+            let hash =
+                block::Hash(value.as_slice().try_into().map_err(|_| {
+                    HeaderChainStoreError::Incoherent("invalid projection hash width")
+                })?);
+            projection.push(Frontier::new(height, hash));
+            expected_height = height.next().unwrap_or(height);
+        }
+        if projection.last().map(|frontier| frontier.height) != Some(end) {
+            return Err(HeaderChainStoreError::Incoherent(
+                "projection range ended before the requested height",
+            ));
+        }
+        Ok(projection)
     }
 }
 

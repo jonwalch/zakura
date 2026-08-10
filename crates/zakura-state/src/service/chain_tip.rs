@@ -86,6 +86,25 @@ impl fmt::Display for ChainTipBlock {
     }
 }
 
+impl ChainTipBlock {
+    /// Construct the initial tip from retained finalized identity when its raw
+    /// transactions were intentionally skipped by checkpoint pruning.
+    pub(crate) fn from_pruned_finalized_header(
+        hash: block::Hash,
+        height: block::Height,
+        header: Arc<block::Header>,
+    ) -> Self {
+        Self {
+            hash,
+            height,
+            time: header.time,
+            transactions: Vec::new(),
+            transaction_hashes: Arc::from([]),
+            previous_block_hash: header.previous_block_hash,
+        }
+    }
+}
+
 impl From<ContextuallyVerifiedBlock> for ChainTipBlock {
     fn from(contextually_valid: ContextuallyVerifiedBlock) -> Self {
         let ContextuallyVerifiedBlock {
