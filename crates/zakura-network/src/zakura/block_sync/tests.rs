@@ -17,7 +17,10 @@ use super::{
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     peer_registry::PeerRegistry,
-    reactor::node_id_from_block_peer_id,
+    reactor::{
+        body_progress_preserves_download_pipeline, node_id_from_block_peer_id,
+        EMPTY_STATE_HEADER_QUIET_MIN_LAG, EMPTY_STATE_HEADER_QUIET_PERIOD,
+    },
     reorder::*,
     request::*,
     sequencer::*,
@@ -275,6 +278,63 @@ fn test_committed_snapshot(
     )
 }
 
+#[test]
+fn monotone_body_progress_below_the_same_header_target_preserves_downloads() {
+    let target = block::Hash([0x80; 32]);
+    let old = test_committed_snapshot(
+        1,
+        2,
+        3,
+        (10, block::Hash([0x10; 32])),
+        (12, block::Hash([0x12; 32])),
+        (100, target),
+    );
+    let advanced = test_committed_snapshot(
+        2,
+        2,
+        4,
+        (11, block::Hash([0x11; 32])),
+        (13, block::Hash([0x13; 32])),
+        (100, target),
+    );
+
+    assert!(body_progress_preserves_download_pipeline(&old, &advanced));
+}
+
+#[test]
+fn target_changes_and_body_frontier_retreats_retire_downloads() {
+    let old = test_committed_snapshot(
+        1,
+        2,
+        3,
+        (10, block::Hash([0x10; 32])),
+        (12, block::Hash([0x12; 32])),
+        (100, block::Hash([0x80; 32])),
+    );
+    let changed_target = test_committed_snapshot(
+        2,
+        3,
+        4,
+        (10, block::Hash([0x10; 32])),
+        (13, block::Hash([0x13; 32])),
+        (100, block::Hash([0x81; 32])),
+    );
+    let retreated = test_committed_snapshot(
+        2,
+        2,
+        4,
+        (9, block::Hash([0x09; 32])),
+        (11, block::Hash([0x11; 32])),
+        (100, block::Hash([0x80; 32])),
+    );
+
+    assert!(!body_progress_preserves_download_pipeline(
+        &old,
+        &changed_target
+    ));
+    assert!(!body_progress_preserves_download_pipeline(&old, &retreated));
+}
+
 fn committed_block_sync_startup_at_heights(
     finalized: u32,
     verified: u32,
@@ -393,6 +453,76 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
         scope,
         zakura_header_chain::BodyWorkAuthority::for_snapshot(&second)
     );
+
+    reactor_task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
+    let finalized = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([1; 32]));
+    let first_header = zakura_header_chain::Frontier::new(
+        block::Height(EMPTY_STATE_HEADER_QUIET_MIN_LAG),
+        block::Hash([2; 32]),
+    );
+    let second_header = zakura_header_chain::Frontier::new(
+        block::Height(EMPTY_STATE_HEADER_QUIET_MIN_LAG + 250),
+        block::Hash([3; 32]),
+    );
+    let (snapshot_tx, snapshot_rx) = watch::channel(None);
+    let startup = BlockSyncStartup::new_with_committed_snapshots(
+        BlockSyncFrontiers {
+            finalized_height: finalized.height,
+            verified_block_tip: finalized.height,
+            verified_block_hash: finalized.hash,
+        },
+        (finalized.height, finalized.hash),
+        snapshot_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    snapshot_tx
+        .send(Some(committed_snapshot(
+            1,
+            1,
+            1,
+            finalized,
+            finalized,
+            first_header,
+        )))
+        .expect("the committed snapshot receiver is live");
+    time::advance(Duration::from_millis(1)).await;
+    if let Ok(action) = actions.try_recv() {
+        panic!("far-ahead empty-state bootstrap dispatched body work immediately: {action:?}");
+    }
+
+    time::advance(Duration::from_secs(10)).await;
+    snapshot_tx
+        .send(Some(committed_snapshot(
+            2,
+            2,
+            1,
+            finalized,
+            finalized,
+            second_header,
+        )))
+        .expect("the newer committed snapshot receiver is live");
+    time::advance(Duration::from_millis(1)).await;
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD - Duration::from_secs(1)).await;
+    if let Ok(action) = actions.try_recv() {
+        panic!("newer header page did not restart the body-work quiet period: {action:?}");
+    }
+
+    time::advance(Duration::from_secs(1)).await;
+    let action = next_action(&mut actions).await;
+    assert!(matches!(
+        action,
+        BlockSyncAction::QueryNeededBlocks {
+            from: block::Height(1),
+            best_header_tip,
+            ..
+        } if best_header_tip == second_header.height
+    ));
 
     reactor_task.abort();
 }
@@ -4650,6 +4780,206 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     })
     .await
     .expect("stale completions settle with a refilled checkpoint submission window");
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn detached_checkpoint_duplicates_refill_current_submission_window() {
+    const BLOCK_COUNT: u32 = 402;
+    const DETACHED_PREFIX: usize = 150;
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+    assert_eq!(submission_limit, 401);
+    let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("402 test bodies fit in usize");
+    let blocks = fake_sequential_blocks(BLOCK_COUNT);
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let task = SequencerTask::new(
+        Sequencer::new(block::Height(0), submission_limit),
+        ByteBudget::new(1),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(PeerRegistry::new()),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        body_rx,
+        control_rx,
+        body_input_bytes.clone(),
+        body_input_decoded_attributed_memory_bytes.clone(),
+        view_tx,
+        CHANNEL_TIMEOUT,
+        ZakuraTrace::noop(),
+    );
+    let task = tokio::spawn(task.run());
+
+    for (index, block) in blocks.iter().take(DETACHED_PREFIX).enumerate() {
+        let height =
+            block::Height(u32::try_from(index + 1).expect("detached prefix indices fit in u32"));
+        body_tx
+            .send(SequencedBody::new_queued(
+                test_work_owner(),
+                zakura_header_chain::SourceId::from_digest([1; 32]),
+                height,
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                u64::from(block_size(block)),
+                peer(1),
+                Instant::now(),
+                body_input_bytes.clone(),
+                body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("initial checkpoint bodies queue");
+    }
+
+    let mut detached_submissions = Vec::with_capacity(DETACHED_PREFIX);
+    while detached_submissions.len() < DETACHED_PREFIX {
+        let action = time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+            .await
+            .expect("initial checkpoint submission arrives")
+            .expect("sequencer action channel remains live");
+        match action {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => detached_submissions.push((owner, source, token, block)),
+            action => panic!("unexpected initial checkpoint action: {action:?}"),
+        }
+    }
+
+    control_tx
+        .send(SequencerControlInput::WorkScopeChanged {
+            scope: Some(test_work_scope()),
+        })
+        .expect("scope transition queues");
+    time::timeout(CHANNEL_TIMEOUT, async {
+        loop {
+            let view = *view_rx.borrow_and_update();
+            if view.applying_len == 0
+                && view.in_flight_submission_count
+                    == u64::try_from(DETACHED_PREFIX).expect("detached prefix fits u64")
+            {
+                break;
+            }
+            view_rx
+                .changed()
+                .await
+                .expect("sequencer view remains live");
+        }
+    })
+    .await
+    .expect("scope transition detaches the old verifier submissions");
+
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(u32::try_from(index + 1).expect("402 indices fit in u32"));
+        body_tx
+            .send(SequencedBody::new_queued(
+                test_work_owner(),
+                zakura_header_chain::SourceId::from_digest([1; 32]),
+                height,
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                u64::from(block_size(block)),
+                peer(1),
+                Instant::now(),
+                body_input_bytes.clone(),
+                body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("current checkpoint bodies queue");
+    }
+
+    let current_initial = submission_limit - DETACHED_PREFIX;
+    for expected_height in 1..=current_initial {
+        let action = time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+            .await
+            .expect("current checkpoint submission arrives")
+            .expect("sequencer action channel remains live");
+        let BlockSyncAction::SubmitBlock { block, .. } = action else {
+            panic!("unexpected current checkpoint action: {action:?}");
+        };
+        assert_eq!(
+            block.coinbase_height(),
+            Some(block::Height(
+                u32::try_from(expected_height).expect("submission height fits u32")
+            ))
+        );
+    }
+
+    for (owner, source, token, block) in detached_submissions {
+        let height = block.coinbase_height().expect("test block has height");
+        control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                owner: Box::new(owner),
+                source,
+                token,
+                height,
+                hash: block.hash(),
+                outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
+                eligible_sources: BTreeSet::new(),
+                persisted_availability: None,
+                semantic_current: false,
+            })
+            .expect("detached duplicate completion queues");
+    }
+
+    for expected_height in (current_initial + 1)..=submission_limit {
+        let action = time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+            .await
+            .expect("refill submission arrives")
+            .expect("sequencer action channel remains live");
+        let BlockSyncAction::SubmitBlock { block, .. } = action else {
+            panic!("unexpected refill action: {action:?}");
+        };
+        assert_eq!(
+            block.coinbase_height(),
+            Some(block::Height(
+                u32::try_from(expected_height).expect("refill height fits u32")
+            )),
+            "each stale duplicate completion must refill one current checkpoint slot",
+        );
+    }
+
+    time::timeout(CHANNEL_TIMEOUT, async {
+        loop {
+            let view = *view_rx.borrow_and_update();
+            if view.in_flight_submission_count
+                == u64::try_from(submission_limit).expect("submission limit fits u64")
+                && view.unsubmitted_applying_count == 1
+            {
+                break;
+            }
+            view_rx
+                .changed()
+                .await
+                .expect("sequencer view remains live");
+        }
+    })
+    .await
+    .expect("detached completions refill the full checkpoint submission window");
 
     task.abort();
 }
@@ -12071,6 +12401,108 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     reactor_task.abort();
 }
 
+/// A body commit below an unchanged selected-header target must not invalidate
+/// the rest of the native response that supplied it. Otherwise every commit
+/// cancels and rebuilds the download pipeline, reducing scratch sync to one
+/// useful body per authority generation.
+#[tokio::test]
+async fn committed_body_progress_preserves_same_target_native_response() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes =
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.request_timeout = Duration::from_secs(300);
+
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (0, block::Hash([0; 32])),
+        (3, blocks[2].hash()),
+    );
+    let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        68,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks.iter().map(block_meta).collect(),
+        ))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3)
+    );
+
+    snapshots
+        .send(Some(test_committed_snapshot(
+            2,
+            1,
+            2,
+            (0, block::Hash([0; 32])),
+            (1, blocks[0].hash()),
+            (3, blocks[2].hash()),
+        )))
+        .expect("the committed snapshot receiver is live");
+    await_until(
+        "committed frontier reaches height 1",
+        Duration::from_secs(1),
+        || handle.local_status().servable_high >= block::Height(1),
+    )
+    .await
+    .expect("committed frontier should advance");
+
+    for block in &blocks {
+        inbound_tx
+            .send(
+                BlockSyncMessage::Block(block.clone())
+                    .encode_frame()
+                    .expect("block frame encodes"),
+            )
+            .await
+            .expect("block frame queues");
+    }
+    inbound_tx
+        .send(
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 3,
+            }
+            .encode_frame()
+            .expect("BlocksDone frame encodes"),
+        )
+        .await
+        .expect("BlocksDone frame queues");
+
+    let mut submitted = Vec::new();
+    while submitted.len() < 2 {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
+                block
+                    .coinbase_height()
+                    .expect("submitted test block has height"),
+            ),
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action while preserving response: {action:?}"),
+        }
+    }
+    assert_eq!(submitted, vec![block::Height(2), block::Height(3)]);
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn committed_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
@@ -12296,6 +12728,56 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
 }
 
 #[tokio::test]
+async fn selected_body_fork_reanchors_before_scheduling_successors() {
+    let best_header_tip = block::Height(4);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([4; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(2),
+            verified_block_hash: block::Hash([0xf2; 32]),
+        },
+        (best_header_tip, block::Hash([4; 32])),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id,
+        scope,
+        from: block::Height(3),
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query above the stale full-state fork tip");
+    };
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            blocks: vec![BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: block::Hash([2; 32]),
+                size: BlockSizeEstimate::Unknown,
+            }],
+        })
+        .await
+        .expect("fork-aware metadata completion queues");
+
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            from: block::Height(2),
+            ..
+        }
+    ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
@@ -12346,6 +12828,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
         .send(BlockSyncEvent::ScopedNeededBlocks {
             query_id: first_query_id,
             scope: first_scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
             blocks: Vec::new(),
         })
         .await
@@ -12354,6 +12837,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
         .send(BlockSyncEvent::ScopedNeededBlocks {
             query_id: second_query_id,
             scope: second_scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
             blocks: vec![BlockSyncBlockMeta {
                 height: block::Height(1),
                 hash: block::Hash([1; 32]),
