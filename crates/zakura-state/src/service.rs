@@ -2158,7 +2158,9 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::HeaderLocator => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
-                let locator = reader.map(|reader| reader.selected_locator()).transpose()?;
+                let locator = reader
+                    .map(|reader| reader.committed_selected_locator())
+                    .transpose()?;
                 Ok(ReadResponse::HeaderLocator(locator))
             }
 
