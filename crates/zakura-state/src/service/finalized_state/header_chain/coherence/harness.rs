@@ -16,8 +16,8 @@ use zakura_header_chain::{
     FullStateEvidenceAuthority, FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId,
     StateVersion, StoreAuditRead, SuffixWork, SystemClock, TargetCompletion, TransitionContext,
-    TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
+    TransitionEvent, TransitionFailure, TransitionRequest, TrustedAnchor, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
 };
 
 use super::{
@@ -30,9 +30,10 @@ use super::{
             disk_format::{header_chain::HeaderHeightKey, IntoDisk},
             DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        HeaderChainRuntime, HeaderChainStore, HEADER_AUX_DELIVERY, HEADER_CHILD, HEADER_DEFERRED,
-        HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH,
-        HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+        HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY,
+        HEADER_CHILD, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META,
+        HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
+        HEADER_VERIFIED,
     },
     fabricate::{FabHeader, Universe},
 };
@@ -406,39 +407,52 @@ impl Harness {
             .next_request_id
             .checked_add(1)
             .expect("the bounded coherence sequence cannot exhaust request IDs");
-        let result = self
-            .runtime()
-            .apply(
-                TransitionRequest {
-                    expected_version: snapshot.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner: zakura_header_chain::HeaderWorkOwner {
-                            authority: zakura_header_chain::HeaderWorkAuthority::for_target(
-                                &snapshot,
-                                target.hash,
-                            ),
-                            session_id: 1,
-                            request_id,
-                        }
-                        .into(),
-                        source: SourceId::from_digest([0x51; 32]),
-                        parent_hash: anchor_hash,
-                        target_tip_hash: target.hash,
-                        completion: TargetCompletion::TargetComplete {
-                            common_ancestor: lease.parent(),
-                        },
-                        batch,
-                        aux: Vec::new(),
-                    })),
-                },
-                &TransitionContext {
-                    config: &self.config,
-                    clock: &SystemClock,
-                    full_state_authority: None,
-                    retention_references: &[],
-                },
-            )
-            .expect("a prepared current coherence range reaches the transition writer");
+        let result = self.runtime().apply(
+            TransitionRequest {
+                expected_version: snapshot.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: zakura_header_chain::HeaderWorkOwner {
+                        authority: zakura_header_chain::HeaderWorkAuthority::for_target(
+                            &snapshot,
+                            target.hash,
+                        ),
+                        session_id: 1,
+                        request_id,
+                    }
+                    .into(),
+                    source: SourceId::from_digest([0x51; 32]),
+                    parent_hash: anchor_hash,
+                    target_tip_hash: target.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: lease.parent(),
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            },
+            &TransitionContext {
+                config: &self.config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        );
+        if matches!(
+            result,
+            Err(HeaderChainStoreError::Transition(
+                TransitionFailure::ConflictingReplay
+            ))
+        ) {
+            assert_eq!(
+                self.logical_dump(),
+                before,
+                "a conflicting replay must not mutate any header family"
+            );
+            self.rejections += 1;
+            return;
+        }
+        let result =
+            result.expect("a prepared current coherence range reaches the transition writer");
         assert!(matches!(
             result,
             ApplyResult::Committed | ApplyResult::NoChange(_)
