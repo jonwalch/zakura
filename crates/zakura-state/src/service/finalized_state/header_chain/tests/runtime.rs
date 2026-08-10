@@ -115,6 +115,9 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
         .startup(&engine_config)
         .expect("the initialized store audits");
     let reader = runtime.reader();
+    let cloned_reader = reader.clone();
+
+    assert!(Arc::ptr_eq(&reader.config, &cloned_reader.config));
 
     let (full_state, selected_projection) = reader
         .with_selected_projection(|| {
