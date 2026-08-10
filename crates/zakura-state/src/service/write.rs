@@ -353,7 +353,7 @@ impl HeaderChainWriter {
         height: block::Height,
         hash: block::Hash,
     ) -> Result<VctAuxWindowRead, HeaderChainStoreError> {
-        let Some(window) = self.runtime.reader().selected_aux_window(height, hash)? else {
+        let Some(window) = self.runtime.selected_aux_window(height, hash)? else {
             return Ok(VctAuxWindowRead::Missing { height });
         };
         let Some(current) = select_vct_aux_delivery(window.current_deliveries) else {
