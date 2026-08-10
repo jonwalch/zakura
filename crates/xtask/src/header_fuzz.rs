@@ -139,7 +139,7 @@ fn render_regression(target: &str, bytes: &[u8]) -> Result<String, BoxError> {
     Ok(format!(
         "// Target: {target}\n\
          // SHA-256: {}\n\
-         // Fixed regtest configuration and manual/fixed clock are constructed by the replay helper.\n\
+         // The replay helper constructs the fixed regtest configuration and manual clock.\n\
          {operations}\
          const REGRESSION: &[u8] = &{};\n\
          let first = {replay}(REGRESSION);\n\
