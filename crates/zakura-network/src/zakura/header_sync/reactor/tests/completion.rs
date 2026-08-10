@@ -310,7 +310,7 @@ fn durable_prefix_headroom_accounts_for_staged_headers_at_exact_limits() {
 }
 
 #[test]
-fn integrated_request_headroom_refills_at_checkpoint_low_water_and_admits_the_final_prefix() {
+fn integrated_request_headroom_refills_at_half_window_and_admits_the_final_prefix() {
     let anchor =
         zakura_header_chain::Frontier::new(block::Height(10), regtest_genesis_block().hash());
     let mut snapshot = committed_snapshot(anchor);
@@ -350,12 +350,22 @@ fn integrated_request_headroom_refills_at_checkpoint_low_water_and_admits_the_fi
         "staged entries consume the already-open low-water refill"
     );
 
-    snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + 802);
+    snapshot.frontiers.finalized.height = block::Height(anchor.height.0 + 400);
+    snapshot.frontiers.header_best.height =
+        block::Height(anchor.height.0 + INTEGRATED_HEADER_REFILL_LOW_WATER_V1 + 400);
     snapshot.frontiers.verified_best.height = block::Height(anchor.height.0 + 400);
     assert_eq!(
         HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
+        MAX_HS_RANGE - INTEGRATED_HEADER_REFILL_LOW_WATER_V1,
+        "the half-window boundary opens enough headroom to refill the durable prefix"
+    );
+
+    snapshot.frontiers.header_best.height =
+        block::Height(anchor.height.0 + INTEGRATED_HEADER_REFILL_LOW_WATER_V1 + 400 + 1);
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
         0,
-        "one block above checkpoint low water remains closed"
+        "one block above half-window low water remains closed"
     );
 }
 
