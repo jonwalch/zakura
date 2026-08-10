@@ -79,3 +79,41 @@ where
             TransientBodyFailureKind::VerifierUnavailable,
         ))
 }
+
+pub(crate) fn block_verify_error_diagnostic<Error>(error: &Error) -> Option<String>
+where
+    Error: std::fmt::Debug + Send + Sync + 'static,
+{
+    fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+        let mut messages = Vec::new();
+        let mut current = Some(error);
+        while let Some(error) = current {
+            messages.push(error.to_string());
+            current = error.source();
+        }
+        messages.join(": ")
+    }
+
+    fn diagnose(error: &(dyn std::any::Any + Send + Sync)) -> Option<String> {
+        error
+            .downcast_ref::<zakura_consensus::RouterError>()
+            .map(|error| error_chain(error))
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyBlockError>()
+                    .map(|error| error_chain(error))
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<zakura_consensus::VerifyCheckpointError>()
+                    .map(|error| error_chain(error))
+            })
+    }
+
+    let error = error as &(dyn std::any::Any + Send + Sync);
+    diagnose(error).or_else(|| {
+        error
+            .downcast_ref::<zakura_consensus::BoxError>()
+            .map(|error| error_chain(error.as_ref()))
+    })
+}
