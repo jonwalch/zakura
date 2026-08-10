@@ -383,6 +383,7 @@ pub(crate) struct HeaderChainReader {
     store: HeaderChainStore,
     config: EngineConfig,
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
+    transition_engine: Arc<Mutex<HeaderChainEngine>>,
 }
 
 /// One atomically read selected-path window with exact auxiliary provenance.
@@ -1112,6 +1113,36 @@ impl HeaderChainReader {
         .map_err(HeaderChainStoreError::Store)
     }
 
+    pub(crate) fn committed_selected_locator(
+        &self,
+    ) -> Result<HeaderLocator, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let snapshot = engine.snapshot();
+        HeaderLocator::for_selected_path(&snapshot, |height| {
+            let index = engine
+                .selected_projection()
+                .binary_search_by_key(&height, |frontier| frontier.height)
+                .map_err(|_| StoreError::Incoherent("committed selected projection has a gap"))?;
+            let frontier = engine.selected_projection()[index];
+            let node = engine
+                .graph()
+                .node(frontier.hash)
+                .ok_or(StoreError::Incoherent(
+                    "committed selected projection references a missing node",
+                ))?;
+            if node.height != height || node.hash != frontier.hash {
+                return Err(StoreError::Incoherent(
+                    "committed selected projection disagrees with its node",
+                ));
+            }
+            Ok(Some(frontier.hash))
+        })
+        .map_err(HeaderChainStoreError::Store)
+    }
+
     /// Resolve an exact, still-current VCT repair owner to one selected header request.
     pub(crate) fn vct_repair_context(
         &self,
@@ -1577,6 +1608,7 @@ impl HeaderChainRuntime {
             store: self.store.clone(),
             config: self.config.clone(),
             leases: self.leases.clone(),
+            transition_engine: self.transition_engine.clone(),
         }
     }
 

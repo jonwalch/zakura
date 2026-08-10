@@ -89,12 +89,16 @@ fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
         .startup(&engine_config)
         .expect("the initialized store audits");
 
+    let reader = runtime.reader();
+    let durable = reader
+        .selected_locator()
+        .expect("the durable selected projection is coherent");
+    let committed = reader
+        .committed_selected_locator()
+        .expect("the committed selected projection is coherent");
+    assert_eq!(committed, durable);
     assert_eq!(
-        runtime
-            .reader()
-            .selected_locator()
-            .expect("the selected projection is coherent")
-            .entries(),
+        durable.entries(),
         &[Frontier::new(anchor.height, anchor.hash)]
     );
 }
