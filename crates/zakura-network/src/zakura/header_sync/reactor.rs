@@ -1519,7 +1519,7 @@ impl HeaderSyncReactor {
         {
             return;
         }
-        if !self.completion_is_current(&peer, source, &owner) {
+        if !self.preparation_has_authority(&peer, source, &owner, is_repair, active.entries.len()) {
             if is_repair {
                 self.retry_vct_repair(
                     owner
@@ -3862,14 +3862,73 @@ impl HeaderSyncReactor {
         ) {
             zakura_header_chain::CompletionDecision::Current => true,
             zakura_header_chain::CompletionDecision::Stale(reason) => {
-                metrics::counter!(
-                    "sync.header_chain.stale_completion.total",
-                    "kind" => format!("{reason:?}")
-                )
-                .increment(1);
+                Self::record_stale_completion(reason);
                 false
             }
         }
+    }
+
+    /// Keep exact ordinary header work alive across a monotone full-state finality advance.
+    ///
+    /// This gate grants no durable authority: the serialized state planner still authenticates
+    /// the finality path, proves ancestry, trims any finalized prefix, and either rebases or
+    /// rejects the insertion. Body-authorized VCT repair work remains bound to every generation.
+    fn preparation_has_authority(
+        &self,
+        peer: &ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: &zakura_header_chain::HeaderSyncWorkOwner,
+        is_repair: bool,
+        header_count: usize,
+    ) -> bool {
+        let Some(current) = self.committed_snapshot.as_ref() else {
+            return false;
+        };
+        let decision = zakura_header_chain::CompletionGate::check_registered(
+            current,
+            self.peer_work_queue.registered_attempt(peer),
+            source,
+            owner,
+        );
+        let outcome = match decision {
+            zakura_header_chain::CompletionDecision::Current => "current",
+            zakura_header_chain::CompletionDecision::Stale(reason) => {
+                let header = owner.header_authority();
+                let registered =
+                    self.peer_work_queue.registered_attempt(peer) == Some((source, *owner));
+                let rebase_candidate = !is_repair
+                    && owner.body_owner().is_none()
+                    && registered
+                    && header.header_generation.get() < current.header_generation.get()
+                    && header.branch.anchor_hash != current.frontiers.finalized.hash;
+                if !rebase_candidate {
+                    Self::record_stale_completion(reason);
+                    return false;
+                }
+                "rebase_candidate"
+            }
+        };
+        let header_count = u64::try_from(header_count)
+            .expect("the bounded header target count fits in a metric counter");
+        metrics::counter!(
+            "sync.header.target.preparation_gate.total",
+            "outcome" => outcome
+        )
+        .increment(1);
+        metrics::counter!(
+            "sync.header.target.preparation_gate.headers.total",
+            "outcome" => outcome
+        )
+        .increment(header_count);
+        true
+    }
+
+    fn record_stale_completion(reason: zakura_header_chain::StaleReason) {
+        metrics::counter!(
+            "sync.header_chain.stale_completion.total",
+            "kind" => format!("{reason:?}")
+        )
+        .increment(1);
     }
 
     /// Charges one unproductive request against `peer`'s exact session, dropping that
