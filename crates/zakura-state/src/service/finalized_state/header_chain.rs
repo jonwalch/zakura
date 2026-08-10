@@ -14,15 +14,16 @@ use thiserror::Error;
 use tokio::{sync::watch, time::Instant};
 use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
 use zakura_header_chain::{
-    audit_store, ApplyResult, AuxDelivery, AuxDelta, BodyWorkAuthority, BodyWorkOwner, ChangeSet,
-    CommittedStallReceipt, CounterExhausted, DurableTransitionFacts, EligibilityReason,
-    EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityRecord,
-    FinalitySource, Frontier, FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine,
-    HeaderLocator, HeaderNode, HeaderSyncWorkOwner, HeaderWorkAuthority, MemHeaderStore,
-    NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt,
-    StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionCause, TransitionContext,
-    TransitionEvent, TransitionFailure, TransitionRequest, ValidationContextRecord,
-    ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    audit_store, audit_store_for_trust_anchor_update, ApplyResult, AuxDelivery, AuxDelta,
+    BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedStallReceipt, CounterExhausted,
+    DurableTransitionFacts, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
+    EngineSnapshot, EvidenceId, FinalityRecord, FinalitySource, Frontier,
+    FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderLocator, HeaderNode,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
+    RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
+    SystemClock, TransitionCause, TransitionContext, TransitionEvent, TransitionFailure,
+    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -2369,7 +2370,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let plan = audit_store(&self, config)?;
+        let plan = audit_store_for_trust_anchor_update(&self, config)?;
         if let Some(pin) = plan.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -2423,7 +2424,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let source = audit_store(&self, &headers_only_config)?;
+        let source = audit_store_for_trust_anchor_update(&self, &headers_only_config)?;
         if let Some(pin) = source.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -2497,7 +2498,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let initial = audit_store(&self, config)?;
+        let initial = audit_store_for_trust_anchor_update(&self, config)?;
         if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -2579,7 +2580,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let initial = audit_store(&self, config)?;
+        let initial = audit_store_for_trust_anchor_update(&self, config)?;
         if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
