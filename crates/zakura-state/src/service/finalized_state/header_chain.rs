@@ -377,6 +377,27 @@ fn load_transition_engine(
     .map_err(|_| HeaderChainStoreError::Incoherent("audited engine state is invalid"))
 }
 
+fn restore_transition_engine_after_staging_error(
+    store: &HeaderChainStore,
+    engine: &mut HeaderChainEngine,
+    original: HeaderChainStoreError,
+) -> HeaderChainStoreError {
+    match load_transition_engine(store) {
+        Ok(restored) => {
+            *engine = restored;
+            original
+        }
+        Err(reload) => {
+            tracing::error!(
+                ?original,
+                ?reload,
+                "failed to restore the durable header engine after a staged transition error"
+            );
+            reload
+        }
+    }
+}
+
 /// Read-only coherent queries serialized against durable header transitions.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderChainReader {
@@ -1767,17 +1788,6 @@ impl HeaderChainRuntime {
             full_state_authority: Some(&first_authority),
             retention_references: lease_references.as_ref(),
         };
-        let first =
-            transition_engine.apply(first_request, &first_context, DurableTransitionFacts::None)?;
-        if first.cause() == TransitionCause::ResourceStalled {
-            return Err(HeaderChainStoreError::Incoherent(
-                "checkpoint auxiliary authentication exhausted header resources",
-            ));
-        }
-
-        let mut projected = transition_engine.clone();
-        projected.apply_committed(first.clone())?;
-        checkpoint_request.expected_version = projected.snapshot().state_version;
         let checkpoint_parent = match &checkpoint_request.event {
             TransitionEvent::VerifiedChainChanged(event)
                 if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow =>
@@ -1804,30 +1814,90 @@ impl HeaderChainRuntime {
             full_state_authority: Some(&checkpoint_authority),
             retention_references: lease_references.as_ref(),
         };
-        let checkpoint = projected.apply(
+
+        let first =
+            transition_engine.apply(first_request, &first_context, DurableTransitionFacts::None)?;
+        if first.cause() == TransitionCause::ResourceStalled {
+            return Err(HeaderChainStoreError::Incoherent(
+                "checkpoint auxiliary authentication exhausted header resources",
+            ));
+        }
+        let batch = self
+            .store
+            .batch_for_combined(first.change_set(), full_state_batch)?;
+        // The engine mutex is the coherent read boundary and the publisher remains on the
+        // durable snapshot, so the first transition can be staged here without exposing it.
+        // Any error before the atomic database write reloads the unchanged durable engine.
+        if let Err(error) = transition_engine.apply_committed(first) {
+            let error = restore_transition_engine_after_staging_error(
+                &self.store,
+                &mut transition_engine,
+                error.into(),
+            );
+            return Err(error);
+        }
+
+        checkpoint_request.expected_version = transition_engine.snapshot().state_version;
+        let checkpoint = match transition_engine.apply(
             checkpoint_request,
             &checkpoint_context,
             DurableTransitionFacts::HeaderInsertion {
                 validation_contexts: validation_leases.to_vec(),
                 finality_path: Vec::new(),
             },
-        )?;
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let error = restore_transition_engine_after_staging_error(
+                    &self.store,
+                    &mut transition_engine,
+                    error.into(),
+                );
+                return Err(error);
+            }
+        };
         if checkpoint.cause() == TransitionCause::ResourceStalled {
-            return Err(HeaderChainStoreError::Incoherent(
-                "checkpoint full-state advance exhausted header resources",
-            ));
+            let error = restore_transition_engine_after_staging_error(
+                &self.store,
+                &mut transition_engine,
+                HeaderChainStoreError::Incoherent(
+                    "checkpoint full-state advance exhausted header resources",
+                ),
+            );
+            return Err(error);
         }
 
         let current = checkpoint.change_set().metadata.snapshot();
-        let batch = self
+        let batch = match self
             .store
-            .batch_for_combined(first.change_set(), full_state_batch)?;
-        let batch = self
-            .store
-            .batch_for_combined(checkpoint.change_set(), batch)?;
-        self.store.db.write(batch)?;
-        transition_engine.apply_committed(first)?;
-        transition_engine.apply_committed(checkpoint)?;
+            .batch_for_combined(checkpoint.change_set(), batch)
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                let error = restore_transition_engine_after_staging_error(
+                    &self.store,
+                    &mut transition_engine,
+                    error,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.store.db.write(batch) {
+            let error = restore_transition_engine_after_staging_error(
+                &self.store,
+                &mut transition_engine,
+                error.into(),
+            );
+            return Err(error);
+        }
+        if let Err(error) = transition_engine.apply_committed(checkpoint) {
+            let error = restore_transition_engine_after_staging_error(
+                &self.store,
+                &mut transition_engine,
+                error.into(),
+            );
+            return Err(error);
+        }
         memory_swap();
         self.publisher.publish(current);
         Ok(ApplyResult::Committed)
