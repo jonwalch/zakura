@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
     future::Future,
     num::NonZeroU64,
@@ -37,6 +38,15 @@ use crate::zakura::{
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const LEASE_RELEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Minimum interval between unchanged header-snapshot refresh trace rows.
+///
+/// Frontier advances and reanchors are always traced. Metrics and the committed snapshot remain
+/// exact; only identical refresh diagnostics are sampled to keep long-running JSONL traces bounded.
+const SNAPSHOT_REFRESH_TRACE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= SNAPSHOT_REFRESH_TRACE_INTERVAL)
+}
 /// Keep one maximum wire page ahead of integrated full state, then refill at half-window low water.
 ///
 /// Every integrated full-state advance also reanchors the durable header DAG. Bounding that DAG
@@ -161,6 +171,7 @@ fn build_header_sync_reactor(
         served_path_deadlines: HashMap::new(),
         pending_lease_releases: VecDeque::new(),
         lease_release_retry_at: None,
+        last_snapshot_refresh_trace_at: Cell::new(None),
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
@@ -254,6 +265,7 @@ struct HeaderSyncReactor {
     served_path_deadlines: HashMap<ZakuraPeerId, Instant>,
     pending_lease_releases: VecDeque<PendingLeaseRelease>,
     lease_release_retry_at: Option<Instant>,
+    last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
 }
 
 type PendingPortOperation = Pin<Box<dyn Future<Output = PortOperationResult> + Send + 'static>>;
@@ -2308,6 +2320,13 @@ impl HeaderSyncReactor {
             }
             Some(_) => "refresh",
         };
+        if cause == "refresh" {
+            let now = Instant::now();
+            if !snapshot_refresh_trace_due(self.last_snapshot_refresh_trace_at.get(), now) {
+                return;
+            }
+            self.last_snapshot_refresh_trace_at.set(Some(now));
+        }
         self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
             row.insert(
                 hs_trace::EVENT.into(),

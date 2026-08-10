@@ -69,6 +69,16 @@ const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// emits controller state on a fixed interval so a trace can spot oscillation even while
 /// the peer is idle between deliveries.
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
+/// Minimum interval between repeated fill-stop trace rows for the same peer and reason.
+///
+/// The counter remains exact, while the JSONL trace samples steady-state refusal details.
+/// Without this bound, idle peers can emit a row on every wake and consume hundreds of
+/// megabytes per minute during an initial sync.
+const FILL_STOP_TRACE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= FILL_STOP_TRACE_INTERVAL)
+}
 
 /// Why a fill pass stopped issuing requests. Typed so every admission refusal is
 /// attributed exhaustively; the `as_str` labels feed the `sync.block.fill_stop`
@@ -276,6 +286,8 @@ pub(super) struct PeerRoutine {
     /// itself — the peer-local retry bias (see [`RETRY_AVOID_BACKOFF`]). Pruned on
     /// expiry each fill pass.
     retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Last sampled fill-stop time for each bounded reason label.
+    fill_stop_trace_at: BTreeMap<&'static str, Instant>,
 
     // ---- shared primitives (clones) ----
     /// Generation this routine was spawned with; gates its registry writes (and
@@ -369,6 +381,7 @@ impl PeerRoutine {
             status_reply_meter,
             inbound_status_meter,
             retry_avoid: BTreeMap::new(),
+            fill_stop_trace_at: BTreeMap::new(),
             generation,
             next_request_id: NonZeroU64::new(1),
             budget,
@@ -2211,6 +2224,21 @@ mod tests {
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
+
+    #[test]
+    fn repeated_fill_stop_traces_are_sampled() {
+        let now = Instant::now();
+
+        assert!(super::fill_stop_trace_due(None, now));
+        assert!(!super::fill_stop_trace_due(
+            Some(now),
+            now + Duration::from_secs(9)
+        ));
+        assert!(super::fill_stop_trace_due(
+            Some(now),
+            now + Duration::from_secs(10)
+        ));
+    }
 
     /// A floor request overdrafts a full in-flight budget by at most one request
     /// and is sent without a sequencer round trip.
