@@ -422,10 +422,15 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("an absent parent is a normal stale read"),
         None
     );
-    let window = reader
+    let durable_window = reader
         .selected_aux_window(child.height, child.hash)
         .expect("the exact selected auxiliary window is coherent")
         .expect("the selected child is retained");
+    let window = runtime
+        .selected_aux_window(child.height, child.hash)
+        .expect("the in-memory selected auxiliary window is coherent")
+        .expect("the selected child is retained in the committed engine");
+    assert_eq!(window, durable_window);
     assert_eq!(
         window.snapshot,
         runtime.publisher().snapshot(),

@@ -1478,6 +1478,70 @@ impl HeaderChainReader {
 }
 
 impl HeaderChainRuntime {
+    pub(crate) fn selected_aux_window(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<Option<SelectedAuxWindow>, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let Ok(index) = engine
+            .selected_projection()
+            .binary_search_by_key(&height, |frontier| frontier.height)
+        else {
+            return Ok(None);
+        };
+        let current_frontier = engine.selected_projection()[index];
+        if current_frontier.hash != hash {
+            return Ok(None);
+        }
+        let current =
+            engine
+                .graph()
+                .node(hash)
+                .cloned()
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "selected projection references a missing in-memory node",
+                ))?;
+        if current.height != height || current.hash != hash {
+            return Err(HeaderChainStoreError::Incoherent(
+                "selected projection disagrees with its in-memory node",
+            ));
+        }
+        let current_deliveries = coherent_engine_aux_deliveries(&engine, &current)?;
+        let successor = if let Some(frontier) = engine.selected_projection().get(index + 1) {
+            let expected_height = height.next().map_err(|_| {
+                HeaderChainStoreError::Incoherent("selected auxiliary successor height overflowed")
+            })?;
+            let node = engine.graph().node(frontier.hash).cloned().ok_or(
+                HeaderChainStoreError::Incoherent(
+                    "selected successor references a missing in-memory node",
+                ),
+            )?;
+            if frontier.height != expected_height
+                || node.height != expected_height
+                || node.hash != frontier.hash
+                || node.parent_hash != hash
+            {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "selected in-memory successor is not contiguous",
+                ));
+            }
+            let deliveries = coherent_engine_aux_deliveries(&engine, &node)?;
+            Some((node, deliveries))
+        } else {
+            None
+        };
+        Ok(Some(SelectedAuxWindow {
+            snapshot: engine.snapshot(),
+            current,
+            current_deliveries,
+            successor,
+        }))
+    }
+
     pub(in crate::service) fn operator_invalidation_evidence(
         &self,
         target: block::Hash,
@@ -2025,6 +2089,27 @@ impl HeaderChainRuntime {
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
     }
+}
+
+fn coherent_engine_aux_deliveries(
+    engine: &HeaderChainEngine,
+    node: &HeaderNode,
+) -> Result<Vec<AuxDelivery>, HeaderChainStoreError> {
+    let deliveries = engine.aux_deliveries(node.hash).to_vec();
+    let indexed: BTreeSet<_> = node.aux_delivery_ids.iter().copied().collect();
+    let stored: BTreeSet<_> = deliveries
+        .iter()
+        .map(|delivery| delivery.delivery_id)
+        .collect();
+    if indexed.len() != node.aux_delivery_ids.len()
+        || stored.len() != deliveries.len()
+        || indexed != stored
+    {
+        return Err(HeaderChainStoreError::Incoherent(
+            "in-memory node and auxiliary delivery index disagree",
+        ));
+    }
+    Ok(deliveries)
 }
 
 /// Deterministic state-writer and observer boundaries used by the crash harness.
