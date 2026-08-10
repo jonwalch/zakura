@@ -113,7 +113,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         anchor.hash,
     );
     let finality = FinalityRecord {
-        previous: config.bootstrap_anchor.frontier,
+        previous: config.bootstrap_anchor().frontier,
         current: anchor,
         source: match config.mode {
             EngineMode::Integrated => FinalitySource::FullState { evidence },
@@ -126,7 +126,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         mode: config.mode,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),
-        work_origin: config.bootstrap_anchor.frontier,
+        work_origin: config.bootstrap_anchor().frontier,
         state_version: StateVersion::new(1),
         header_generation: HeaderGeneration::new(1),
         verified_generation: VerifiedGeneration::new(1),
@@ -213,7 +213,7 @@ fn finalized_anchor(
     config: &EngineConfig,
     finalized: Frontier,
 ) -> Result<(Arc<block::Header>, WorkCoordinate), HeaderChainInitializationError> {
-    let bootstrap = config.bootstrap_anchor.frontier;
+    let bootstrap = config.bootstrap_anchor().frontier;
     if bootstrap.height > finalized.height {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
@@ -221,7 +221,7 @@ fn finalized_anchor(
         .header_by_height(bootstrap.height)
         .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
     if stored_bootstrap_hash != bootstrap.hash
-        || stored_bootstrap.as_ref() != config.bootstrap_anchor.header.as_ref()
+        || stored_bootstrap.as_ref() != config.bootstrap_anchor().header.as_ref()
     {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
