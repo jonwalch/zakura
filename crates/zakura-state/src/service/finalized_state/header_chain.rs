@@ -2152,6 +2152,7 @@ impl HeaderChainRuntime {
             }
             TransitionCause::Event
             | TransitionCause::CheckpointFinality
+            | TransitionCause::AuxAuthentication
             | TransitionCause::ResourceStalled
             | TransitionCause::HeadersOnlyFinality
             | TransitionCause::Recovery => {}
