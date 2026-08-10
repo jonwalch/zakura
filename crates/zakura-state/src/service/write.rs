@@ -69,7 +69,7 @@ pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 pub struct PreparedFullStateTransition {
     /// Stable identity authenticated by the state writer.
     transition_id: EvidenceId,
-    /// Verified frontier against which the mutation was prepared.
+    /// Verified frontier that the state writer used to prepare the mutation.
     old_frontier: Frontier,
     /// Exact new verified suffix, empty when the selected verified chain does not change.
     new_verified_path: Vec<VerifiedHeaderRef>,
@@ -1400,7 +1400,8 @@ impl HeaderChainObservers {
             zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed { .. } => 3.0,
         };
         self.runtime_status_sender.send_replace(status.clone());
-        // This diagnostic gauge may round very large epochs; authority retains the checked u64.
+        // This diagnostic gauge may round very large epochs.
+        // Lifecycle authority retains the checked `u64`.
         metrics::gauge!("state.header.runtime.epoch").set(epoch.get() as f64);
         metrics::gauge!("state.header.runtime.phase").set(phase);
         tracing::info!(?status, "header runtime lifecycle changed");
@@ -1415,12 +1416,12 @@ pub enum NonFinalizedWriteMessage {
         prepared: crate::PreparedHeaderChainInsert,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
-    /// One retryable body-availability result admitted by integrated full state.
+    /// One retryable body-availability result that integrated full state admitted.
     RecordHeaderChainBodyUnavailable {
         prepared: crate::PreparedHeaderChainBodyEvidence,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
     },
-    /// One commitment-matching deterministic body rejection admitted by the full verifier.
+    /// One commitment-matching deterministic body rejection that the full verifier admitted.
     RecordHeaderChainBodyInvalid {
         prepared: crate::PreparedHeaderChainBodyEvidence,
         rsp_tx: oneshot::Sender<Result<ApplyResult, HeaderChainStoreError>>,
@@ -1681,8 +1682,8 @@ fn handle_header_chain_control_message(
                     context.full_state_authority = Some(&authority);
                     writer.runtime.apply(
                         TransitionRequest {
-                            // Insertions carry typed asynchronous authority; the global
-                            // version coordinate is intentionally irrelevant.
+                            // Insertions carry typed asynchronous authority.
+                            // The global version coordinate does not authorize insertion work.
                             expected_version: StateVersion::default(),
                             event: TransitionEvent::InsertHeaders(insert),
                         },
@@ -1861,8 +1862,8 @@ impl WriteBlockWorkerTask {
                      Assuming a parent block failed, and dropping this block",
                 );
 
-                // The pipeline is broken; clear cached successor prevalidation
-                // so commit resumes from the real finalized tip.
+                // The failed pipeline invalidates cached successor prevalidation.
+                // Clear the cache so commit resumes from the real finalized tip.
                 vct_write_manager.reset(finalized_state);
 
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
@@ -2080,12 +2081,13 @@ impl WriteBlockWorkerTask {
                         }
                     }
 
-                    // Retryable VCT root stalls (an absent/evicted root, or one not yet
-                    // verifiable for lack of a stored successor header) park-and-retry the same
-                    // block in place rather than resetting the queue. An absent root can only
-                    // be filled by a re-delivery of its header range (roots are not
-                    // individually re-requested), so it polls slowly; an await-successor
-                    // stall just waits for the next header to be stored, so it polls faster.
+                    // Retryable VCT root stalls park and retry the same block.
+                    // The write loop does not reset the queue for these stalls.
+                    // A later delivery of the same header range can fill an absent root.
+                    // Header sync does not request individual roots.
+                    // The write loop therefore polls absent-root stalls slowly.
+                    // An await-successor stall waits only for state to store the next header.
+                    // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
                         let repair_height = rejected_aux_height.unwrap_or(height);
@@ -2204,8 +2206,8 @@ impl WriteBlockWorkerTask {
                             context.full_state_authority = Some(&authority);
                             writer.runtime.apply(
                                 TransitionRequest {
-                                    // Insertions carry typed asynchronous authority; the global
-                                    // version coordinate is intentionally irrelevant.
+                                    // Insertions carry typed asynchronous authority.
+                                    // The global version coordinate does not authorize insertion work.
                                     expected_version: StateVersion::default(),
                                     event: TransitionEvent::InsertHeaders(insert),
                                 },

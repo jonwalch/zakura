@@ -876,8 +876,8 @@ impl MappedRequest for ReconsiderBlockRequest {
     }
 }
 
-/// One body-evidence event sealed by the verifier or registered scheduler adapter before it
-/// reaches the serialized state writer.
+/// The verifier or registered scheduler adapter seals one body-evidence event.
+/// The serialized state writer then receives the sealed event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedHeaderChainBodyEvidence {
     expected_version: zakura_header_chain::StateVersion,
@@ -915,10 +915,11 @@ impl PartialEq for HeaderCompletionPermit {
 
 impl Eq for HeaderCompletionPermit {}
 
-/// Capability for sealing evidence produced by the full verifier or registered body scheduler.
+/// Capability that the full verifier or registered body scheduler uses to seal evidence.
 ///
-/// The ordinary state service does not expose this capability. Node orchestration receives it
-/// separately and passes it only to the adapter that consumes completion-gated body outcomes.
+/// The ordinary state service does not expose this capability.
+/// Node orchestration receives the capability separately.
+/// Node orchestration passes it only to the adapter that consumes completion-gated body outcomes.
 #[derive(Clone, Debug)]
 pub struct HeaderChainBodyEvidenceAuthority {
     _private: (),
@@ -1046,15 +1047,16 @@ pub enum Request {
     /// Atomically admit one complete, already prepared header target through the serialized
     /// fork-aware header-chain writer.
     ApplyHeaderChainInsert {
-        /// Sealed complete-target insertion; other transition authorities are unrepresentable.
+        /// Sealed complete-target insertion.
+        /// The type excludes other transition authorities.
         prepared: PreparedHeaderChainInsert,
     },
 
     /// Persist one retryable body-availability result through the serialized
     /// fork-aware header-chain writer.
     ///
-    /// This request deliberately accepts only transient evidence. Deterministic
-    /// consensus invalidity remains constructible only at the full verifier boundary.
+    /// This request accepts only transient evidence.
+    /// Only the full verifier boundary can construct deterministic consensus invalidity.
     RecordHeaderChainBodyUnavailable {
         /// One-shot evidence sealed by the registered body-attempt adapter.
         prepared: PreparedHeaderChainBodyEvidence,
@@ -1622,15 +1624,15 @@ pub enum ReadRequest {
 
     /// Return the exact immutable branch context for preparing children of `parent_hash`.
     HeaderValidationLease {
-        /// Retained parent fixed by the requester's initial locator intersection.
+        /// Retained parent that the requester's initial locator intersection fixes.
         parent_hash: block::Hash,
     },
 
     /// Resolve one current branch-owned VCT repair to its exact selected request context.
     VctRepairContext {
-        /// Complete owner captured when the repair was scheduled.
+        /// Complete owner that the scheduler captured when it scheduled the repair.
         owner: zakura_header_chain::BodyWorkOwner,
-        /// Exact selected height whose auxiliary metadata is unavailable.
+        /// Exact selected height that lacks auxiliary metadata.
         height: block::Height,
     },
 
@@ -1656,7 +1658,7 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact state-issued lease identity.
         lease_id: u64,
-        /// Exact generation and branch fixed by the lease.
+        /// Exact generation and branch that the lease fixes.
         scope: zakura_header_chain::HeaderWorkAuthority,
         /// Common ancestor or prior page tip.
         after_hash: block::Hash,
@@ -1672,7 +1674,7 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact state-issued lease identity.
         lease_id: u64,
-        /// Exact generation and branch fixed by the lease.
+        /// Exact generation and branch that the lease fixes.
         scope: zakura_header_chain::HeaderWorkAuthority,
     },
 

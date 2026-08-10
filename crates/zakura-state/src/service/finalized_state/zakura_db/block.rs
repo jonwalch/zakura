@@ -532,11 +532,10 @@ impl ZakuraDb {
 
     /// Returns the canonical hash for a full-state or header-only height.
     ///
-    /// Resolves from the consensus `hash_by_height` rows *ungated* by header-body
-    /// availability, then falls back to the provisional Zakura frontier. Gating this
-    /// on the header row as well would make a height whose hash is stored but whose
-    /// header row is absent read as unknown, which the durable frontier's coherence
-    /// checks report as a canonical-hash mismatch.
+    /// This method resolves the consensus `hash_by_height` rows without checking header-body
+    /// availability. The method then falls back to the provisional Zakura frontier. A header-row
+    /// check would hide a stored hash when the corresponding header row is absent. The durable
+    /// frontier coherence check would report that hidden hash as a canonical-hash mismatch.
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
         self.hash(height).or_else(|| {
@@ -1260,12 +1259,12 @@ fn should_log_prune_progress(
 /// The resolved raw-transaction retention decision for committing one finalized
 /// block.
 ///
-/// Computed once per block by
-/// [`FinalizedState::retention_plan`](super::super::FinalizedState::retention_plan)
-/// and applied by [`ZakuraDb::write_block_with`] without re-derivation.
+/// [`FinalizedState::retention_plan`](super::super::FinalizedState::retention_plan) computes this
+/// decision once per block.
+/// [`ZakuraDb::write_block_with`] applies the decision without re-derivation.
 ///
-/// Only [`RetentionPlan::Store`] occurs in archive mode; the other variants are
-/// only produced in pruned storage mode.
+/// Archive mode uses only [`RetentionPlan::Store`].
+/// Pruned storage mode can produce the other variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum RetentionPlan {
     /// Store this block's raw transactions and prune nothing in this commit.

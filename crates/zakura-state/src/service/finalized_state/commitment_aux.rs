@@ -434,8 +434,8 @@ impl CommitmentRootSource for FixtureSource {
 
 /// Embedded handoff frontiers for the production VCT path.
 ///
-/// Per-header roots come only from hash-scoped auxiliary deliveries in the header-chain
-/// store. This source intentionally has no height-keyed root lookup.
+/// Hash-scoped auxiliary deliveries in the header-chain store provide all per-header roots.
+/// This source intentionally provides no height-keyed root lookup.
 #[derive(Debug)]
 pub(super) struct EmbeddedFrontierSource {
     frontiers: FinalFrontiers,

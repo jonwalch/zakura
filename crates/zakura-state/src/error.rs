@@ -132,7 +132,7 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
-    /// The on-disk semantic format version could not be read or parsed.
+    /// State could not read or parse the on-disk semantic format version.
     #[error(
         "cannot read state database format version at {path:?}. Hint: check the cache directory permissions and version file contents"
     )]
@@ -230,7 +230,8 @@ pub enum CommitBlockError {
     /// The body mutation could not commit its matching fork-aware header transition.
     #[error("could not commit matching header-chain transition: {error}")]
     HeaderChainError {
-        /// Stable local error diagnostic; never peer-attributed.
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
         error: String,
     },
 
@@ -288,7 +289,7 @@ impl CommitBlockError {
         }
     }
 
-    /// Classify this commit result before supplier identity and stable evidence are attached.
+    /// Classify this commit result before the caller attaches supplier identity and stable evidence.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
@@ -434,7 +435,8 @@ pub enum InvalidateError {
     /// The staged state mutation disagreed with or could not commit its header transition.
     #[error("could not commit matching header-chain invalidation: {error}")]
     HeaderChain {
-        /// Stable local error diagnostic; never peer-attributed.
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
         error: String,
     },
 }
@@ -479,7 +481,8 @@ pub enum ReconsiderError {
     /// The staged state mutation disagreed with or could not commit its header transition.
     #[error("could not commit matching header-chain reconsideration: {error}")]
     HeaderChain {
-        /// Stable local error diagnostic; never peer-attributed.
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
         error: String,
     },
 }
@@ -968,11 +971,11 @@ impl ValidateContextError {
 
     /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
-    /// This is the subset of [`Self::vct_retryable_height`] where the supplied root itself is
-    /// missing: it was never delivered with its header range, or was evicted after failing
-    /// verification. It can only be filled by a later re-delivery of that header range (for
-    /// example another fanout peer's response); roots are not individually re-requested. An
-    /// await-successor stall ([`Self::vct_retryable_height`] but not this) already has its root
+    /// This method returns the subset of [`Self::vct_retryable_height`] where the supplied root is
+    /// missing. The peer either omitted the root from its header range or supplied a root that
+    /// verification later evicted. Only a later delivery of the same header range can fill the
+    /// missing root. Header sync does not request individual roots. An await-successor stall
+    /// ([`Self::vct_retryable_height`] but not this method) already has its root
     /// and only waits for the next header to be stored.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {

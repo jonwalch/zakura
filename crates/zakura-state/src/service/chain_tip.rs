@@ -87,8 +87,8 @@ impl fmt::Display for ChainTipBlock {
 }
 
 impl ChainTipBlock {
-    /// Construct the initial tip from retained finalized identity when its raw
-    /// transactions were intentionally skipped by checkpoint pruning.
+    /// Construct the initial tip from a retained finalized identity when checkpoint pruning
+    /// intentionally skipped its raw transactions.
     pub(crate) fn from_pruned_finalized_header(
         hash: block::Hash,
         height: block::Height,
@@ -233,8 +233,9 @@ impl ChainTipSender {
         let new_tip = new_tip.into();
         self.record_fields(&new_tip);
 
-        // Ignore `None`; an actual transition back to finalized publication must
-        // provide the exact finalized tip through `clear_best_non_finalized_tip`.
+        // Ignore `None`.
+        // A transition back to finalized publication must provide the exact finalized tip through
+        // `clear_best_non_finalized_tip`.
         if new_tip.is_some() {
             self.use_non_finalized_tip = true;
             self.update(new_tip)

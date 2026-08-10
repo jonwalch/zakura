@@ -851,9 +851,9 @@ impl FinalizedState {
                         .source()
                         .map(|v| v.vct_sync_last_checkpoint_height());
 
-                    // Exact hash-scoped roots below the handoff skip the per-block
-                    // note-commitment frontier recompute. Tests can inject an equivalent
-                    // local fixture through the source seam.
+                    // Exact hash-scoped roots below the handoff skip per-block note-commitment
+                    // frontier recomputation. Tests can inject an equivalent local fixture through
+                    // the source seam.
                     let exact_vct_roots = vct_aux_window
                         .as_ref()
                         .and_then(|window| window.current_roots(height, block.hash()));
@@ -889,12 +889,12 @@ impl FinalizedState {
                         let block_hash = block.hash();
 
                         // Defense in depth: only a witness that links to this block can
-                        // authenticate its roots — a non-successor's commitment binds a
-                        // different parent tree, so verifying against it would fail and
-                        // wrongly evict a good supplied root. Treat a non-linking witness
-                        // as absent, so the await-successor deferral below handles it. The
-                        // header-store lookup only returns direct successors, so this
-                        // should never fire in production.
+                        // authenticate its roots. A non-successor commitment binds a different
+                        // parent tree. Verification against that commitment would fail and evict
+                        // a valid supplied root. Treat a non-linking witness as absent. The
+                        // await-successor deferral below handles an absent witness. The header
+                        // store returns only direct successors, so production should not reach
+                        // this case.
                         let next_vct_block = next_vct_block.filter(|next_vct_block| {
                             let links = next_vct_block.header.previous_block_hash == block_hash;
                             let delivery_matches = next_vct_block.delivery.is_none_or(|delivery| {
@@ -1094,10 +1094,9 @@ impl FinalizedState {
                         if let Some(v) = self.vct.source() {
                             v.record_fast_block();
                         }
-                        // Observability: this block folded supplied roots and skipped the
-                        // note-commitment frontier recompute (the verified-commitment-trees
-                        // fast path). Paired with `state.vct.legacy.block.count` below, this
-                        // gives a live fast-vs-legacy ratio.
+                        // This block folded supplied roots and skipped note-commitment frontier
+                        // recomputation. This counter and `state.vct.legacy.block.count` provide a
+                        // live VCT-to-legacy ratio.
                         metrics::counter!("state.vct.fast.block.count").increment(1);
 
                         // When final frontiers are loaded, this is a persistent fast
@@ -1164,12 +1163,12 @@ impl FinalizedState {
                             self.vct.start_vct_sync_below_last_checkpoint();
                         }
                     } else if self.vct.is_below_last_checkpoint() {
-                        // Frozen-frontier safety: a fast sync has already frozen the
-                        // note-commitment frontier, but this height has no valid supplied root
-                        // (never fetched, or evicted after failing verification). Recomputing
-                        // here would fold a wrong root into the history MMR and corrupt state,
-                        // so refuse with a retryable error and leave the database untouched —
-                        // the block is committed once a verifiable root is fetched from a peer.
+                        // Frozen-frontier safety: fast sync already froze the note-commitment
+                        // frontier. This height has no valid supplied root because no peer supplied
+                        // one or verification evicted it. Local recomputation would fold an
+                        // incorrect root into the history MMR and corrupt state. Return a retryable
+                        // error and leave the database untouched. State commits the block after a
+                        // peer supplies a verifiable root.
                         metrics::counter!("state.vct.root.unavailable.count").increment(1);
                         tracing::warn!(
                             ?height,
@@ -1435,13 +1434,16 @@ impl FinalizedState {
 
     /// Reject a supplied fast-path root that failed verification for `height`.
     ///
-    /// Returns a typed, retryable error. In fast mode the note-commitment frontier is frozen, so the
-    /// committer cannot recompute the root locally (that would fold a wrong root into the
-    /// history MMR); it must refuse and leave the database untouched rather than persist
-    /// or corrupt state. Roots are not individually re-requested: the hole is only filled
-    /// if the same header range is re-delivered (for example by another fanout peer's
-    /// in-flight response), otherwise the commit stays parked and the §8 stall
-    /// metrics/logs surface it. A wrong root therefore never corrupts state, at the cost
+    /// This method returns a typed, retryable error.
+    /// Fast mode freezes the note-commitment frontier.
+    /// The committer therefore cannot recompute the root locally.
+    /// Local recomputation could fold an incorrect root into the history MMR.
+    /// The committer leaves the database untouched.
+    /// Header sync does not request individual roots.
+    /// A later delivery of the same header range can fill the missing root.
+    /// Another fanout peer's in-flight response can provide that delivery.
+    /// Otherwise, the commit remains parked and the section 8 stall metrics and logs report it.
+    /// An incorrect root therefore never corrupts state, at the cost
     /// of stalling the sync at this height.
     fn vct_reject_supplied_root(
         &self,

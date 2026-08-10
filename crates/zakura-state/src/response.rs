@@ -384,7 +384,7 @@ impl Eq for NonFinalizedBlocksListener {}
 pub struct BlockSyncBodyMetadata {
     /// Highest full-state block shared with the selected header chain.
     pub anchor: zakura_header_chain::Frontier,
-    /// Selected-header bodies that must be downloaded after `anchor`.
+    /// Selected-header bodies that block sync must download after `anchor`.
     pub blocks: Vec<(block::Height, block::Hash, Option<u32>)>,
 }
 
@@ -495,11 +495,12 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
     HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
 
-    /// Response to [`ReadRequest::HeaderValidationLease`], absent before attachment or after
-    /// the requested parent ceased to be retained.
+    /// Response to [`ReadRequest::HeaderValidationLease`].
+    /// State returns `None` before attachment or after it stops retaining the requested parent.
     HeaderValidationLease(Option<zakura_header_chain::ValidationLease>),
 
-    /// Response to [`ReadRequest::VctRepairContext`], absent when its owner is stale.
+    /// Response to [`ReadRequest::VctRepairContext`].
+    /// State returns `None` when the owner is stale.
     VctRepairContext(Option<zakura_header_chain::VctRepairContext>),
 
     /// Response to [`ReadRequest::AcquireRetainedHeaderPath`].

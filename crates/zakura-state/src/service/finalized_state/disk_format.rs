@@ -61,9 +61,10 @@ pub trait FromDisk: Sized {
 
 /// Stable disk-value encoding for corruption-facing data.
 ///
-/// Unlike [`IntoDisk`] and [`FromDisk`], this contract reports malformed input
-/// and encoding failures to the caller. Implementations are responsible for
-/// bounding allocations and rejecting bytes after the one expected value.
+/// Unlike [`IntoDisk`] and [`FromDisk`], this contract reports malformed input to the caller.
+/// The contract also reports encoding failures.
+/// Implementations must bound allocations.
+/// Implementations must reject bytes after the one expected value.
 pub trait FallibleDiskValue: Sized {
     /// Encoding and decoding failure.
     type Error;

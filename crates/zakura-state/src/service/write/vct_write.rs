@@ -23,13 +23,12 @@ const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
 /// stored, so a tighter poll keeps the one-block commit lag small.
 const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
 
-/// How long a single checkpoint height may stay stuck on a retryable VCT root stall before
-/// the committer escalates to an error-level log and a `state.vct.root.stalled.height` gauge.
-/// Transient waits (a successor header still downloading, a fanout re-delivery still in flight)
-/// clear well within this; staying stuck past it means no verifiable root is available for a
-/// height the frozen frontier requires, and — by design — the committer will not recompute
-/// against the stale frontier, so the node cannot advance. Surfacing that loudly is the
-/// operator's only signal.
+/// Maximum time a checkpoint height may remain in a retryable VCT root stall.
+/// The committer reports longer stalls through an error-level log and the
+/// `state.vct.root.stalled.height` gauge. Successor downloads and fanout deliveries should finish
+/// within this interval. A longer stall means the frozen frontier requires a height without a
+/// verifiable root. The committer will not recompute against the stale frontier. The node cannot
+/// advance until a peer supplies a verifiable root. The log and gauge notify the operator.
 const VCT_ROOT_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Root-stall tracking for the checkpoint write loop's

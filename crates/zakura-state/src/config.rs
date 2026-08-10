@@ -104,17 +104,19 @@ pub struct Config {
 
     /// Legacy compatibility switch for the retired opt-in header-store repair.
     ///
-    /// Native header-runtime attachment now performs its required startup audit and
-    /// reconstruction unconditionally. This field remains deserializable so configs
-    /// written by earlier Zakura releases keep working, but it is no longer emitted.
+    /// Native header-runtime attachment always performs its required startup audit.
+    /// Attachment also always performs reconstruction.
+    /// Earlier Zakura releases wrote this field to configuration files.
+    /// State keeps deserializing the field for compatibility.
+    /// State no longer serializes the field.
     #[serde(skip_serializing)]
     pub repair_zakura_header_store_on_startup: bool,
 
     /// Whether this process runs the native Zakura header runtime.
     ///
     /// `zakurad` enables this only when the selected P2P stack includes Zakura v2.
-    /// It is not a user-facing state option because `network.p2p_stack` owns that
-    /// choice.
+    /// `network.p2p_stack` owns this choice.
+    /// State does not expose a separate user-facing option.
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 

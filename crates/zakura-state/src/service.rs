@@ -322,8 +322,8 @@ impl Drop for ReadStateService {
                 // - drops the database, which cleans up any database tasks correctly.
                 self.db.shutdown(true);
 
-                // We are the last state with a reference to this thread, so we can
-                // wait until the block write task finishes, then check for panics (blocking).
+                // This state owns the last reference to the thread.
+                // The state can wait for the block write task and then check for panics.
                 // (We'd also like to abort the thread, but std::thread::JoinHandle can't do that.)
 
                 // This log is verbose during tests.
@@ -1561,9 +1561,10 @@ impl Service<Request> for StateService {
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
                 let timer = CodeTimer::start();
-                // The write task reports rejected bodies asynchronously. Drain those
-                // reports before consulting the sent set so a different body with the
-                // same header hash is not misclassified as a duplicate.
+                // The write task reports rejected bodies asynchronously.
+                // Drain those reports before consulting the sent set.
+                // This order prevents the sent set from classifying a different body with the
+                // same header hash as a duplicate.
                 self.drain_non_finalized_rejected_hashes();
                 let sent_hash_response = self.known_sent_hash(&hash);
                 let read_service = self.read_service.clone();
@@ -1951,7 +1952,7 @@ impl Service<ReadRequest> for ReadStateService {
             if block_write_task.is_finished() {
                 match Arc::try_unwrap(block_write_task) {
                     Ok(block_write_task) => {
-                        // We are the last state with a reference to this task, so we can propagate any panics
+                        // This state owns the last task reference and can propagate any panic.
                         match block_write_task.join() {
                             Err(thread_panic) => std::panic::resume_unwind(thread_panic),
                             Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {

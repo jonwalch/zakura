@@ -138,19 +138,20 @@ pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<Au
 /// Failure at the durable header-chain boundary.
 #[derive(Debug, Error)]
 pub enum HeaderChainStoreError {
-    /// The database has not yet been initialized by migration/bootstrap.
+    /// Migration or bootstrap has not initialized the database yet.
     #[error("header-chain metadata is not initialized")]
     Uninitialized,
-    /// A durable key or value was malformed or internally contradictory.
+    /// The decoder found a malformed or internally contradictory durable key or value.
     #[error("incoherent durable header-chain rows: {0}")]
     Incoherent(&'static str),
-    /// Stable value encoding failed before the batch was committed.
+    /// Stable value encoding failed before RocksDB committed the batch.
     #[error(transparent)]
     Codec(#[from] HeaderChainValueError),
     /// Pure transition planning rejected the request before commit.
     #[error(transparent)]
     Transition(#[from] TransitionFailure),
-    /// A committed transition could not be installed in memory, so the writer must fail closed.
+    /// The writer could not install a committed transition in memory.
+    /// The writer must fail closed.
     #[error(transparent)]
     CommittedTransition(#[from] zakura_header_chain::CommittedTransitionError),
     /// A runtime durable read failed before transition planning.
@@ -159,10 +160,10 @@ pub enum HeaderChainStoreError {
     /// RocksDB rejected the one atomic write batch.
     #[error("header-chain atomic write failed: {0}")]
     RocksDb(#[from] rocksdb::Error),
-    /// The serialized writer lock was poisoned by a prior panic.
+    /// A prior panic poisoned the serialized writer lock.
     #[error("header-chain serialized writer lock is poisoned")]
     WriterPoisoned,
-    /// Authenticated full state was missing a canonical header during reconstruction.
+    /// Authenticated full state lacked a canonical header during reconstruction.
     #[error("authenticated full state is missing canonical header {0:?}")]
     MissingCanonicalHeader(block::Height),
     /// A staged full-state value disagreed with the header plan derived from the same evidence.
@@ -178,7 +179,7 @@ pub enum HeaderChainStoreError {
         "staged full-state header {hash:?} is absent or incoherent in the projected header DAG"
     )]
     StagedPathMismatch {
-        /// Exact full-state header that was not preserved by the transition.
+        /// Exact full-state header that the transition did not preserve.
         hash: block::Hash,
     },
     /// A prepared full-state mutation lost its exact serialized header-chain authority.
@@ -198,10 +199,11 @@ pub enum HeaderChainStoreError {
     /// Exhaustive startup audit or deterministic reconstruction failed.
     #[error(transparent)]
     Recovery(#[from] RecoveryFailure),
-    /// A monotonic durable counter was exhausted during an explicit store migration.
+    /// An explicit store migration exhausted a monotonic durable counter.
     #[error(transparent)]
     Counter(#[from] CounterExhausted),
-    /// An imported headers-only trust pin was refuted; this store must be destroyed and resynced.
+    /// Deterministic body validation refuted an imported headers-only trust pin.
+    /// The operator must destroy and resync this store.
     #[error(
         "header_chain_migrated_pin_refuted at {pin:?}; delete the migrated header store and resync"
     )]
@@ -209,7 +211,7 @@ pub enum HeaderChainStoreError {
         /// Exact preserved pin contradicted by deterministic body validation.
         pin: Frontier,
     },
-    /// A test crash was injected at a named durable/publication boundary.
+    /// A test injected a crash at a named durable or publication boundary.
     #[cfg(test)]
     #[error("injected header-chain crash at {0:?}")]
     InjectedCrash(FaultPoint),
@@ -220,11 +222,11 @@ pub enum HeaderChainStoreError {
 pub struct StartupReport {
     /// Snapshot read before any reconstructible repair.
     pub previous: EngineSnapshot,
-    /// Audited snapshot that is safe to publish.
+    /// Snapshot that the startup audit approved for publication.
     pub current: EngineSnapshot,
     /// Exact reconstructible categories repaired in one batch.
     pub repairs: BTreeSet<RecoveryRepair>,
-    /// Publication is true only for a successful, fully audited startup.
+    /// Only a successful, fully audited startup permits publication.
     pub publication_allowed: bool,
 }
 
@@ -296,10 +298,12 @@ fn record_published_snapshot(snapshot: &EngineSnapshot) {
             .0
             .saturating_sub(snapshot.frontiers.verified_best.height.0),
     ));
-    // Metric gauges are approximate floating-point telemetry; the durable counters remain exact.
+    // Metric gauges provide approximate floating-point telemetry.
+    // The durable counters remain exact.
     metrics::gauge!("sync.header_chain.generation.header")
         .set(snapshot.header_generation.get() as f64);
-    // Metric gauges are approximate floating-point telemetry; the durable counters remain exact.
+    // Metric gauges provide approximate floating-point telemetry.
+    // The durable counters remain exact.
     metrics::gauge!("sync.header_chain.generation.verified")
         .set(snapshot.verified_generation.get() as f64);
     metrics::gauge!("sync.header_chain.alarm.resource_stalled").set(
@@ -536,9 +540,10 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn add_references(&mut self, cursor: &CanonicalHeaderPathCursor) {
-        // Retention walks from each target to finality, so one target hash protects the complete
-        // immutable suffix. Expanding a lease into every path hash makes this bounded owner list
-        // grow with chain length and eventually rejects ordinary transitions.
+        // Retention walks from each target to finality.
+        // One target hash therefore protects the complete immutable suffix.
+        // Expanding a lease into every path hash makes this bounded owner list grow with chain
+        // length. The expanded list eventually rejects ordinary transitions.
         *self.reference_counts.entry(cursor.target.hash).or_default() += 1;
         self.references_dirty = true;
     }
@@ -1789,8 +1794,8 @@ impl HeaderChainRuntime {
 
     /// Atomically apply auxiliary authentication followed by one checkpoint full-state advance.
     ///
-    /// The checkpoint transition is planned against the projected auxiliary transition, but both
-    /// header-chain changes and the full-state block batch are committed in one RocksDB write.
+    /// The planner creates the checkpoint transition against the projected auxiliary transition.
+    /// One RocksDB write commits both header-chain changes and the full-state block batch.
     pub(in crate::service) fn apply_aux_then_checkpoint_combined<M>(
         &self,
         first_request: TransitionRequest,
@@ -1877,8 +1882,9 @@ impl HeaderChainRuntime {
         let batch = self
             .store
             .batch_for_combined(first.change_set(), full_state_batch)?;
-        // The engine mutex is the coherent read boundary and the publisher remains on the
-        // durable snapshot, so the first transition can be staged here without exposing it.
+        // The engine mutex provides the coherent read boundary.
+        // The publisher remains on the durable snapshot.
+        // These boundaries let the writer stage the first transition without exposing it.
         // Any error before the atomic database write reloads the unchanged durable engine.
         if let Err(error) = transition_engine.apply_committed(first) {
             let error = restore_transition_engine_after_staging_error(
@@ -2966,7 +2972,7 @@ impl HeaderChainStore {
 
     /// Bootstrap an empty header schema with one already-authenticated anchor.
     ///
-    /// Migration calls this only while publication and normal writers are disabled.
+    /// Migration calls this only before enabling publication and normal writers.
     pub fn initialize(
         &self,
         metadata: EngineMetadata,
@@ -3211,7 +3217,7 @@ impl HeaderChainStore {
             )?;
         }
 
-        // The singleton logical root is deliberately enqueued last in the same atomic batch.
+        // The adapter deliberately enqueues the singleton logical root last in the atomic batch.
         self.put_value(
             &mut batch,
             HEADER_ENGINE_META,

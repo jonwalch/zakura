@@ -405,9 +405,9 @@ fn blocks_with_v5_transactions() -> Result<()> {
     Ok(())
 }
 
-/// Test if committing blocks from all upgrades work correctly, to make
-/// sure the contextual validation done by the finalized state works.
-/// Also test if a block with the wrong commitment is correctly rejected.
+/// This test commits blocks across all network upgrades.
+/// The commits exercise finalized-state contextual validation.
+/// The test also verifies that finalized state rejects an incorrect commitment.
 #[test]
 #[allow(clippy::print_stderr)]
 fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<()> {
@@ -415,10 +415,8 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
 
     let network = ParametersBuilder::default()
         .with_activation_heights(ConfiguredActivationHeights {
-            // These are dummy values. The particular values don't matter much,
-            // as long as the nu5 one is smaller than the chains being generated
-            // (MAX_PARTIAL_CHAIN_BLOCKS) to make sure that upgrade is exercised
-            // in the test below. (The test will fail if that does not happen.)
+            // These fixture values place NU5 within the generated chains.
+            // The test fails if a generated chain does not cross NU5.
             before_overwinter: Some(1),
             overwinter: Some(10),
             sapling: Some(15),
@@ -439,7 +437,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
 
-    // Use no_shrink() because we're ignoring _count and there is nothing to actually shrink.
+    // The test ignores `_count`, so the strategy disables shrinking.
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -527,13 +525,12 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
     Ok(())
 }
 
-/// Verified-commitment-trees fast path (`commit_finalized_direct` Checkpoint arm):
-/// committing with correct fixture roots produces the same consensus state (anchor
-/// sets + history root) as the legacy recompute path across all upgrade boundaries,
-/// and a wrong fixture root is rejected (verify-before-commit) rather than persisted.
-/// Exercises: a below-Heartwood seed, history-tree creation at Heartwood, the NU5
-/// V1->V2 transition, verify-ahead against the successor header, trusted fixture tip
-/// commits without a successor, and rejection of a corrupted root.
+/// This test compares the VCT fast path with legacy recomputation across upgrade boundaries.
+/// Correct fixture roots produce the same anchor sets and history root.
+/// Verify-before-commit rejects an incorrect fixture root.
+/// The test seeds below Heartwood and creates the history tree at Heartwood.
+/// The test crosses the NU5 V1-to-V2 transition.
+/// The test also covers successor-header verification and trusted fixture tip commits.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
 fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
@@ -571,10 +568,11 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
 
-            // Process a bounded prefix [0, last] spanning the Heartwood (history-tree
-            // creation) and NU5 (V1->V2) boundaries plus a couple of V2 blocks; `last` is
-            // the tip we compare at. Chains are far longer than this
-            // (MAX_PARTIAL_CHAIN_BLOCKS), so this is a plain assertion, not a discard.
+            // Process a bounded prefix that crosses Heartwood and NU5.
+            // The prefix includes two additional V2 blocks.
+            // `last` identifies the comparison tip.
+            // Generated chains exceed this prefix, so the test uses an assertion instead of a
+            // proptest discard.
             let last = (nu5 + 3) as usize;
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
@@ -606,10 +604,10 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let golden_anchors = legacy.db.vct_anchor_digest();
             let golden_history = legacy.db.history_tree().hash();
 
-            // Fast pass over [0, last] with the correct fixture: genesis..=seed recompute
-            // (no fixture entry); seed+1..=last verify-ahead against their buffered
-            // successor. Every fast-eligible block takes the fast path, and the result
-            // equals legacy.
+            // The fast pass recomputes genesis through `seed` because those heights lack fixtures.
+            // The pass verifies later blocks against their buffered successors.
+            // Every eligible block takes the fast path.
+            // The fast-path result matches legacy recomputation.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             enable_vct_test_fixture_source(&mut fast, fixture.clone());
             for i in 0..=last {
@@ -621,13 +619,14 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors must match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history must match legacy");
             prop_assert_eq!(fast.vct_fast_count(), (last - seed) as u64, "every fast-eligible block took the fast path");
-            // The dedup: each header commitment is checked once, not twice. Only the
-            // first fast block runs its own commitment check; every later fast block
-            // was already validated by its predecessor's look-ahead, so it is skipped.
+            // Deduplication checks each header commitment once.
+            // Only the first fast block runs its own commitment check.
+            // Each predecessor look-ahead validates the next fast block.
+            // The next block therefore skips a redundant check.
             prop_assert_eq!(fast.vct_prevalidated_count(), (last - seed - 1) as u64, "every fast block after the first skips its redundant own commitment check");
 
-            // Production does not have a height-keyed root source. Prove that the same
-            // consensus result is driven solely by exact hash-scoped auxiliary windows.
+            // Production does not have a height-keyed root source.
+            // This pass proves that exact hash-scoped auxiliary windows produce the same result.
             let mut exact = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             exact.enable_vct_fast_source(
                 Box::new(commitment_aux::FixtureSource::new(
@@ -748,15 +747,12 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
     Ok(())
 }
 
-/// A verified-commitment-trees fast sync must never legacy-recompute a height whose
-/// supplied root is missing once the note-commitment frontier is frozen: the running
-/// frontier is no longer the real one, so recomputing would fold a wrong root into the
-/// history MMR and silently corrupt consensus state (a peer that omits a height — see the
-/// driver's gap handling — could trigger this). Instead the committer must refuse with the
-/// retryable `VctSuppliedRootUnavailable` error and leave the database untouched, so the
-/// block can be committed later from a fetched root. This guards the liveness/no-corruption
-/// half of the untrusted fast path (the bad-root rejection half is covered by
-/// `vct_fast_path_matches_legacy_and_rejects_wrong_roots`).
+/// This test verifies that VCT fast sync never recomputes a missing supplied root after freezing
+/// the note-commitment frontier. The running frontier no longer represents the actual frontier.
+/// Recomputation could fold an incorrect root into the history MMR and corrupt consensus state.
+/// The committer must return `VctSuppliedRootUnavailable` and leave the database untouched.
+/// A later header-range delivery can then provide the missing root.
+/// `vct_fast_path_matches_legacy_and_rejects_wrong_roots` covers incorrect-root rejection.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and the fixture by height
 fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
@@ -814,10 +810,10 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
                 }
             }
 
-            // Punch a hole: drop a post-NU5 height's root from the fixture, simulating a
-            // peer that omitted it (or a root evicted after failing verification). Earlier
-            // fast blocks freeze the frontier, so this height has no real frontier to
-            // recompute against.
+            // Remove a post-NU5 root from the fixture.
+            // The missing root models a peer omission or a verification eviction.
+            // Earlier fast blocks freeze the frontier.
+            // This height therefore has no actual frontier for recomputation.
             let hole = (nu5 + 1) as usize;
             prop_assert!(hole > seed && hole < last, "the hole must be inside the fast range");
             fixture.remove(&(hole as u32));
@@ -953,16 +949,13 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
     Ok(())
 }
 
-/// An *untrusted* (peer) source must never commit a fast block whose own supplied root has
-/// no successor header to confirm it against the header chain. A block's roots are only
-/// committed by the next block's header (the one-block lag), so committing at the sync tip
-/// would persist a root checked only one block later — irreversibly, once on disk. A wrong
-/// tip root would then wedge the sync with no recovery (the failure surfaces at the next
-/// block and is mis-attributed to *its* root). So the committer defers: it refuses the tip
-/// block with the retryable `VctSuppliedRootAwaitingSuccessor`, leaves the database
-/// untouched, and commits the same height once a successor is buffered. A trusted local
-/// fixture is exempt (covered by `vct_fast_path_matches_legacy_and_rejects_wrong_roots`,
-/// whose tip commits on the in-arrears check); this guards the peer path specifically.
+/// This test prevents an untrusted peer source from committing a root without a successor header.
+/// The next block's header authenticates the current block's roots.
+/// A tip commit would otherwise persist an unauthenticated root irreversibly.
+/// An incorrect tip root could then stall sync at the next block.
+/// The committer returns `VctSuppliedRootAwaitingSuccessor` and leaves the database untouched.
+/// The committer accepts the same height after the test buffers a successor.
+/// A trusted local fixture remains exempt from this requirement.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
 fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result<()> {
@@ -1064,8 +1057,8 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
             Arc::make_mut(&mut Arc::make_mut(&mut target_successor).header).commitment_bytes =
                 target_history_root.bytes_in_serialized_order().into();
 
-            // An untrusted source pre-filled with the correct roots: the deferral is about
-            // the missing successor, not a bad root.
+            // This untrusted source contains the correct roots.
+            // A missing successor causes the deferral.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
             let roots = peer_roots
                 .into_iter()
@@ -1091,8 +1084,8 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
             let sprout_root_before_retries = sprout_tree_before_retries.root();
             let sprout_count_before_retries = sprout_tree_before_retries.count();
 
-            // The tip target with no successor header must defer, not commit: its own
-            // (correct) root is not yet confirmed, and the source is untrusted.
+            // The tip target lacks a successor header and must defer.
+            // The untrusted source cannot authenticate the correct root by itself.
             prop_assert!(
                 fast.vct_fast_needs_successor(Height(tip_target as u32), true),
                 "an untrusted peer tip root needs successor verification"
@@ -1172,9 +1165,9 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
                 "the forged-witness attempt still uses the predecessor look-ahead"
             );
 
-            // Once a successor is buffered, the very same height commits and the tip advances:
-            // the deferral was a wait, not a permanent stall — and the root survived the
-            // forged-witness attempt (it was never evicted).
+            // Buffering a successor lets the same height commit and advances the tip.
+            // The deferral represented a wait instead of a permanent stall.
+            // The forged-witness attempt did not evict the root.
             let cv = CheckpointVerifiedBlock::from(target_block);
             let next = next_vct_block(target_successor);
             fast.commit_finalized_direct(cv.into(), None, next, "vct defer tip with successor")
@@ -1205,8 +1198,9 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
     Ok(())
 }
 
-/// A wrong untrusted root must be recoverable at the same height: the committer rejects it,
-/// leaves the database parked below the height, then commits the same block with a replacement.
+/// This test verifies same-height recovery from an incorrect untrusted root.
+/// The committer rejects the root and leaves the database below the height.
+/// The committer then accepts the same block with a replacement root.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
 fn vct_untrusted_source_bad_root_replacement_commits_same_height() -> Result<()> {
@@ -1470,12 +1464,12 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 // Drop releases the database lock for the reopen below.
             }
 
-            // Session 2 (restart): reopen the same database, then punch a hole at the next
-            // height (a peer that omitted it, or a root evicted after failing verification).
-            // Skip the constructor-time interrupted-fast-sync resume guard: this configured
-            // network has no embedded frontiers, so `from_config` yields no source, but the
-            // test attaches a fixture source below the way a real (Mainnet) node's configured
-            // source is already present at open time.
+            // Session 2 reopens the same database.
+            // The session removes the next root to model peer omission or verification eviction.
+            // Skip the constructor-time interrupted-fast-sync resume guard.
+            // This configured network has no embedded frontiers, so `from_config` yields no source.
+            // The test attaches a fixture source below.
+            // A Mainnet node already has its configured source when it opens the database.
             let mut reopened = FinalizedState::new_with_debug_and_storage_validation(
                 &config,
                 &network,
@@ -2860,10 +2854,9 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
                 Height((seed + 1) as u32)..=Height(last as u32),
             );
 
-            // Consume the untrusted roots in a fresh fast-sync state. Each fast
-            // block is committed with its successor buffered, as the write loop does — the
-            // untrusted source defers a tip commit with no successor (covered by
-            // `vct_peer_source_defers_unverifiable_tip_root_until_successor`).
+            // Consume the untrusted roots in a fresh fast-sync state.
+            // The test buffers each fast block's successor before commit, as the write loop does.
+            // `vct_peer_source_defers_unverifiable_tip_root_until_successor` covers the tip case.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network).expect("opening an ephemeral database should succeed");
 
             let roots = produced_roots

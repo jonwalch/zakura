@@ -68,8 +68,8 @@ pub enum HeaderChainInitializationError {
 
 /// Initialize an absent DAG only from authenticated full-state facts.
 ///
-/// The predecessor overlay is checked before any DAG row is written. Its rows are
-/// never decoded, deleted, or reinterpreted.
+/// Initialization checks the predecessor overlay before it writes any DAG row.
+/// Initialization never decodes, deletes, or reinterprets predecessor overlay rows.
 pub(in crate::service) fn initialize_header_chain_reconciled(
     source: &ZakuraDb,
     config: &EngineConfig,

@@ -22,7 +22,7 @@ pub enum HeaderChainKeyError {
     /// An eligibility-reason key used an unassigned discriminant.
     #[error("unknown eligibility-reason key discriminant {0}")]
     UnknownReason(u8),
-    /// Deferred-time nanoseconds were outside `0..1_000_000_000`.
+    /// The decoder found deferred-time nanoseconds outside `0..1_000_000_000`.
     #[error("invalid deferred-time nanoseconds {0}")]
     InvalidNanoseconds(u32),
 }

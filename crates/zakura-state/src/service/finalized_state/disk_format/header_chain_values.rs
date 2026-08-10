@@ -33,7 +33,7 @@ const MAX_AUX_DELIVERY_IDS: usize = zakura_chain::parameters::MAX_NON_FINALIZED_
 /// Malformed, truncated, oversized, or unknown version-one value data.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum HeaderChainValueError {
-    /// A value ended before a complete field could be read.
+    /// The decoder reached the value's end before it read a complete field.
     #[error("truncated header-chain value")]
     Truncated,
     /// Bytes remained after decoding the one expected value.
@@ -47,7 +47,7 @@ pub enum HeaderChainValueError {
         /// Supplied byte count.
         length: usize,
     },
-    /// A stable enum discriminant was not assigned in version one.
+    /// Version one did not assign this stable enum discriminant.
     #[error("unknown {field} discriminant {value}")]
     UnknownDiscriminant {
         /// Stable enum name.
@@ -55,7 +55,7 @@ pub enum HeaderChainValueError {
         /// Supplied discriminant.
         value: u8,
     },
-    /// A boolean byte was neither zero nor one.
+    /// A boolean byte contained a value other than zero or one.
     #[error("invalid boolean byte {0}")]
     InvalidBoolean(u8),
     /// A nonzero field contained zero.
@@ -70,13 +70,13 @@ pub enum HeaderChainValueError {
     /// The singleton metadata used an unsupported disk format.
     #[error("unsupported header-chain disk format {0}")]
     UnsupportedDiskFormat(u32),
-    /// A UTC seconds/nanoseconds pair was outside chrono's supported range.
+    /// Chrono cannot represent the UTC seconds and nanoseconds pair.
     #[error("invalid UTC timestamp")]
     Timestamp,
-    /// A UTF-8 rule identifier was malformed.
+    /// A rule identifier contained malformed UTF-8.
     #[error("invalid UTF-8 rule identifier")]
     RuleId,
-    /// An auxiliary commitment-tree root was not canonically encoded.
+    /// The decoder found a noncanonical auxiliary commitment-tree root.
     #[error("invalid {0} auxiliary commitment-tree root")]
     TreeAuxRoot(&'static str),
 }
@@ -84,11 +84,12 @@ pub enum HeaderChainValueError {
 /// Durable phase of bounded full-state/header reconciliation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeaderReconstructionPhaseDisk {
-    /// Canonical finalized headers are being reconciled in bounded chunks.
+    /// Reconciliation processes canonical finalized headers in bounded chunks.
     FinalizedPath,
-    /// Restored non-finalized headers are being reconciled.
+    /// Reconciliation processes restored non-finalized headers.
     RestoredPath,
-    /// All paths are present and the final exhaustive audit remains.
+    /// Reconciliation restored all paths.
+    /// The final exhaustive audit remains.
     FinalAudit,
 }
 
@@ -610,7 +611,7 @@ impl HeaderNodeDisk {
         }
     }
 
-    /// Reconstruct one domain node after its direct-reason rows were decoded.
+    /// Reconstruct one domain node after the decoder reads its direct-reason rows.
     pub fn into_domain(
         self,
         direct_reasons: impl IntoIterator<Item = EligibilityReason>,
@@ -904,8 +905,9 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
 }
 
 fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
-    // Preserve the version-one byte layout. This field was never consulted when
-    // deciding whether asynchronous work was current, and is reserved as zero now.
+    // Preserve the version-one byte layout.
+    // Version one never consulted this field when deciding whether asynchronous work was current.
+    // The encoder now reserves the field as zero.
     encoder.u64(0);
     let header = owner.header_authority();
     encoder.u64(header.header_generation.get());
@@ -922,8 +924,9 @@ fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
 }
 
 fn get_owner(decoder: &mut Decoder<'_>) -> Result<HeaderSyncWorkOwner, HeaderChainValueError> {
-    // Legacy rows contain their former global state version here. It was not an
-    // authority coordinate, so decoding intentionally accepts and discards it.
+    // Legacy rows contain their former global state version here.
+    // The state version did not authorize work.
+    // The decoder therefore accepts and discards it.
     let _reserved_state_version = decoder.u64()?;
     let header_generation = HeaderGeneration::new(decoder.u64()?);
     let verified_generation =

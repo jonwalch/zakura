@@ -31,7 +31,7 @@ pub struct RetainedPathLease {
     pub target: Frontier,
     /// First requester-order locator intersection.
     pub common_ancestor: Frontier,
-    /// Exact generation and branch observed while the snapshot was acquired.
+    /// Exact generation and branch that state observed during snapshot acquisition.
     pub scope: HeaderWorkAuthority,
     /// Bounded inactivity deadline.
     pub idle_deadline: Instant,
@@ -40,9 +40,9 @@ pub struct RetainedPathLease {
 /// Result of attempting to acquire an exact retained target path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetainedPathLeaseOutcome {
-    /// The exact snapshot was acquired.
+    /// State acquired the exact snapshot.
     Acquired(Box<RetainedPathLease>),
-    /// The target was absent when state took the coherent snapshot.
+    /// State did not find the target in the coherent snapshot.
     TargetNotRetained,
     /// No locator hash lies on the exact target path.
     NoLocatorIntersection,
@@ -59,9 +59,9 @@ pub struct RetainedPathPage {
     pub lease_id: u64,
     /// Exact page ancestor: the initial intersection or previous page tip.
     pub common_ancestor: Frontier,
-    /// Exact target fixed when the lease was acquired.
+    /// Exact target that the lease fixed during acquisition.
     pub target: Frontier,
-    /// Exact generation and branch fixed by the lease.
+    /// Exact generation and branch that the lease fixes.
     pub scope: HeaderWorkAuthority,
     /// Canonical headers in path order.
     pub headers: Vec<Arc<block::Header>>,
@@ -74,8 +74,9 @@ pub struct RetainedPathPage {
 /// Result of reading or renewing an existing retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetainedPathReadOutcome {
-    /// A bounded page was read and the lease deadline renewed.
+    /// State read a bounded page and renewed the lease deadline.
     Page(Box<RetainedPathPage>),
-    /// The lease is absent, expired, or no longer owned by this session.
+    /// The lease is absent or expired.
+    /// This session might no longer own the lease.
     Unavailable,
 }
