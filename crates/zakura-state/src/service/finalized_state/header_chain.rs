@@ -3,7 +3,7 @@
 #![allow(dead_code)] // Constructed by the full-state migration and service wiring in PR-9.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -2905,29 +2905,39 @@ impl HeaderChainStore {
         mut batch: DiskWriteBatch,
     ) -> Result<DiskWriteBatch, HeaderChainStoreError> {
         let current_metadata = self.metadata_row()?;
-        if current_metadata.as_ref().is_some_and(|metadata| {
-            metadata.frontiers.finalized != changes.metadata.frontiers.finalized
-        }) {
+        if let Some(metadata) = current_metadata
+            .as_ref()
+            .filter(|metadata| metadata.frontiers.finalized != changes.metadata.frontiers.finalized)
+        {
             let staged_nodes: HashMap<_, _> = changes
                 .put_nodes
                 .iter()
                 .map(|node| (node.hash, node))
                 .collect();
-            let contexts = authenticated_context_headers(
+            let old_contexts: Vec<_> =
+                authenticated_context_headers(self, metadata.frontiers.finalized.hash, None)?
+                    .into_iter()
+                    .map(|context| (context.header.hash(), context))
+                    .collect();
+            let contexts: Vec<_> = authenticated_context_headers(
                 self,
                 changes.metadata.frontiers.finalized.hash,
                 Some(&staged_nodes),
-            )?;
-            for (key, _) in self.scan_raw(HEADER_VALIDATION_CONTEXT)? {
-                self.delete_raw(&mut batch, HEADER_VALIDATION_CONTEXT, key)?;
+            )?
+            .into_iter()
+            .map(|context| (context.header.hash(), context))
+            .collect();
+            let old_hashes: HashSet<_> = old_contexts.iter().map(|(hash, _)| *hash).collect();
+            let new_hashes: HashSet<_> = contexts.iter().map(|(hash, _)| *hash).collect();
+            for (hash, _) in old_contexts {
+                if !new_hashes.contains(&hash) {
+                    self.delete_raw(&mut batch, HEADER_VALIDATION_CONTEXT, hash.0)?;
+                }
             }
-            for context in contexts {
-                self.put_value(
-                    &mut batch,
-                    HEADER_VALIDATION_CONTEXT,
-                    context.header.hash().0,
-                    &context,
-                )?;
+            for (hash, context) in contexts {
+                if !old_hashes.contains(&hash) {
+                    self.put_value(&mut batch, HEADER_VALIDATION_CONTEXT, hash.0, &context)?;
+                }
             }
         }
 
