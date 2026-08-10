@@ -149,6 +149,10 @@ pub(super) enum SequencerControlInput {
     WorkScopeChanged {
         scope: Option<zakura_header_chain::BodyWorkAuthority>,
     },
+    /// Advance authority along the same exact selected target without retiring downloads.
+    WorkScopeAdvanced {
+        scope: zakura_header_chain::BodyWorkAuthority,
+    },
     /// Refresh the global CAS coordinate used only by synchronous state writes.
     StateVersionChanged(zakura_header_chain::StateVersion),
     /// A committed transition cleared the persistent alarm for this exact work.
@@ -268,6 +272,8 @@ pub(super) struct SequencerTask {
     reset_epoch: u64,
     reaction_epoch: u64,
     current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
+    /// Exact target whose older download owners remain valid across monotone body progress.
+    preserved_download_target: Option<block::Hash>,
     /// Global CAS coordinate for synchronous alarm writes, never body-work authority.
     current_state_version: Option<zakura_header_chain::StateVersion>,
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
@@ -330,6 +336,7 @@ impl SequencerTask {
             reset_epoch: 0,
             reaction_epoch: 0,
             current_scope,
+            preserved_download_target: None,
             current_state_version: current_scope
                 .map(|_| zakura_header_chain::StateVersion::default()),
             body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
@@ -418,6 +425,7 @@ impl SequencerTask {
         match input {
             SequencerControlInput::WorkScopeChanged { scope } => {
                 self.current_scope = scope;
+                self.preserved_download_target = None;
                 self.registry.retain_body_retry_scope(scope);
                 if let Some(scope) = scope {
                     self.body_retries
@@ -428,6 +436,17 @@ impl SequencerTask {
                 let verified_tip = self.sequencer.verified_tip();
                 let _ = self.sequencer.reset_to(verified_tip, false);
                 true
+            }
+            SequencerControlInput::WorkScopeAdvanced { scope } => {
+                debug_assert!(self.current_scope.is_some_and(|old| {
+                    old.branch.target_tip_hash == scope.branch.target_tip_hash
+                }));
+                self.current_scope = Some(scope);
+                self.preserved_download_target = Some(scope.branch.target_tip_hash);
+                self.registry.retain_body_retry_scope(Some(scope));
+                self.body_retries
+                    .retain_scope(scope.header_generation, scope.branch.anchor_hash);
+                false
             }
             SequencerControlInput::StateVersionChanged(state_version) => {
                 self.current_state_version = Some(state_version);
@@ -497,7 +516,10 @@ impl SequencerTask {
     /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
     /// ready contiguous prefix into applying.
     fn handle_accept_body(&mut self, body: SequencedBody) {
-        let scope_is_current = self.current_scope == Some(body.owner.authority());
+        let scope_is_current = self.current_scope == Some(body.owner.authority())
+            || self
+                .preserved_download_target
+                .is_some_and(|target| body.owner.authority().branch.target_tip_hash == target);
         #[cfg(test)]
         let scope_is_current = scope_is_current || self.current_scope.is_none();
         if !scope_is_current {
@@ -688,9 +710,16 @@ impl SequencerTask {
             || applying_hash != hash
             || applying_token != token
         {
-            self.sequencer
+            let released = self
+                .sequencer
                 .finish_submission(owner, source, token, height, hash);
-            return (false, false);
+            // A scope transition can detach an older checkpoint submission and
+            // install a newer submission for the same height. When the newer
+            // request makes the old verifier call finish as a duplicate, the
+            // exact old token frees a submission slot without removing the
+            // current applying body. Refill that slot or the checkpoint window
+            // can shrink below the range needed to resolve the next checkpoint.
+            return (false, released);
         }
         if !semantic_current {
             let _ = self.sequencer.remove_applying(height);
@@ -1382,6 +1411,65 @@ mod tests {
             task.current_state_version,
             Some(zakura_header_chain::StateVersion::new(9))
         );
+    }
+
+    #[tokio::test]
+    async fn same_target_scope_advance_preserves_downloaded_bodies() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let old_scope = super::test_work_scope();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(old_scope),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+        let mut advanced_scope = old_scope;
+        advanced_scope.header.header_generation = zakura_header_chain::HeaderGeneration::new(8);
+        advanced_scope.verified_generation = zakura_header_chain::VerifiedGeneration::new(9);
+        advanced_scope.header.branch.anchor_hash = block::Hash([8; 32]);
+
+        assert!(
+            !task
+                .handle_control_input(SequencerControlInput::WorkScopeAdvanced {
+                    scope: advanced_scope,
+                })
+                .await,
+            "a same-target authority advance does not require a destructive reaction"
+        );
+        assert_eq!(task.current_scope, Some(advanced_scope));
+        assert_eq!(
+            task.preserved_download_target,
+            Some(old_scope.branch.target_tip_hash)
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+
+        assert_eq!(task.sequencer.applying_len(), 1);
+        assert_eq!(task.sequencer.reorder_len(), 0);
     }
 
     #[tokio::test]
