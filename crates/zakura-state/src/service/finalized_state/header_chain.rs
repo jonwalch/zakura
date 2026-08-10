@@ -1000,6 +1000,34 @@ impl HeaderChainReader {
         Ok(self.store.snapshot()?.frontiers.header_best)
     }
 
+    /// Capture full-state data and the durable selected projection from one transition generation.
+    pub(crate) fn with_selected_projection<T>(
+        &self,
+        read_full_state: impl FnOnce() -> T,
+    ) -> Result<(T, Vec<Frontier>), HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let full_state = read_full_state();
+        let snapshot = engine.snapshot();
+        let projection = engine.selected_projection().to_vec();
+        if projection.first().copied() != Some(snapshot.frontiers.finalized)
+            || projection.last().copied() != Some(snapshot.frontiers.header_best)
+        {
+            return Err(StoreError::Incoherent(
+                "selected projection disagrees with its published bounds",
+            )
+            .into());
+        }
+        Ok((full_state, projection))
+    }
+
     pub(crate) fn selected_hash(
         &self,
         height: block::Height,
