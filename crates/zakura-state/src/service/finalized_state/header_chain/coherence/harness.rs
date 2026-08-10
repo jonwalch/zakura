@@ -431,7 +431,7 @@ impl Harness {
 
     fn verify(&mut self, source: Source, index: usize) {
         let path = self.path_rows(source, index);
-        let suffix_start = if self.finalized == self.config.bootstrap_anchor.frontier {
+        let suffix_start = if self.finalized == self.config.bootstrap_anchor().frontier {
             0
         } else {
             let Some(position) = path
