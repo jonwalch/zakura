@@ -2017,6 +2017,13 @@ impl HeaderChainRuntime {
             TransitionCause::HeaderWorkRebased => {
                 metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
                     .increment(1);
+                metrics::counter!(
+                    "state.header.work.rebase.headers.total",
+                    "outcome" => "rebased"
+                )
+                .increment(
+                    u64::try_from(transition.change_set().put_nodes.len()).unwrap_or(u64::MAX),
+                );
             }
             TransitionCause::HeaderWorkAlreadyApplied => {
                 metrics::counter!("state.header.work.rebase.total", "outcome" => "already_applied")
