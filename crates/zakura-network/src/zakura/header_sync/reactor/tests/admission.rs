@@ -188,7 +188,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
 }
 
 #[test]
-fn monotone_finality_makes_an_ordinary_apply_completion_inert() {
+fn monotone_finality_records_an_exact_rebased_apply_completion() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let initial = committed_snapshot(anchor);
@@ -220,6 +220,10 @@ fn monotone_finality_makes_an_ordinary_apply_completion_inert() {
     committed.frontiers.finalized = staged_tip;
     committed.frontiers.header_best = staged_tip;
     committed.frontiers.verified_best = staged_tip;
+    let completion_authority = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &committed,
+        owner.header_authority().branch.target_tip_hash,
+    );
     reactor.observe_latest_committed_snapshot(committed);
 
     assert_eq!(
@@ -239,11 +243,11 @@ fn monotone_finality_makes_an_ordinary_apply_completion_inert() {
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     assert!(
         actions.try_recv().is_err(),
-        "a stale normal completion makes no state call and emits no peer score"
+        "the completed state call emits no duplicate action or peer score"
     );
-    assert!(!reactor.completed_targets.contains(
-        owner.header_authority().header_generation,
-        owner.header_authority().branch,
+    assert!(reactor.completed_targets.contains(
+        completion_authority.header_generation,
+        completion_authority.branch,
     ));
 }
 
