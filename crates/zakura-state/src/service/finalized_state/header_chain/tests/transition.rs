@@ -965,3 +965,25 @@ fn mismatched_staged_frontier_writes_and_swaps_nothing() {
         None
     );
 }
+
+#[test]
+fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
+    let source = include_str!("../../header_chain.rs");
+    let start = source
+        .find("pub(in crate::service) fn apply_aux_then_checkpoint_combined")
+        .expect("the combined checkpoint implementation exists");
+    let end = source[start..]
+        .find("fn apply_combined_with_fault")
+        .map(|offset| start.saturating_add(offset))
+        .expect("the next runtime method bounds the combined checkpoint implementation");
+    let implementation = &source[start..end];
+
+    assert!(
+        !implementation.contains("transition_engine.clone()"),
+        "per-block VCT staging must not clone the retained header engine"
+    );
+    assert!(
+        implementation.contains("restore_transition_engine_after_staging_error"),
+        "pre-commit staging errors must restore the unchanged durable engine"
+    );
+}
