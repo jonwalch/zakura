@@ -1395,21 +1395,38 @@ impl HeaderSyncReactor {
         {
             return;
         }
-        if !self.completion_is_current(&peer, source, &owner) {
-            match active.purpose {
-                HeaderTargetPurpose::Normal => {
-                    self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
-                }
-                HeaderTargetPurpose::SelectedAuxiliaryRepair { .. } => self.retry_vct_repair(
-                    owner
-                        .body_owner()
-                        .expect("an auxiliary repair has body authority"),
-                    source,
-                    HeaderRequestTerminal::RepairObsolete,
-                ),
+        let is_repair = matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        );
+        let completion_authority = match self
+            .registered_completion_authority(&peer, source, &owner, is_repair)
+        {
+            Ok((authority, outcome)) => {
+                metrics::counter!(
+                    "sync.header.target.completion_gate.total",
+                    "outcome" => outcome
+                )
+                .increment(1);
+                authority
             }
-            return;
-        }
+            Err(reason) => {
+                Self::record_stale_completion(reason);
+                match active.purpose {
+                    HeaderTargetPurpose::Normal => {
+                        self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
+                    }
+                    HeaderTargetPurpose::SelectedAuxiliaryRepair { .. } => self.retry_vct_repair(
+                        owner
+                            .body_owner()
+                            .expect("an auxiliary repair has body authority"),
+                        source,
+                        HeaderRequestTerminal::RepairObsolete,
+                    ),
+                }
+                return;
+            }
+        };
         let repair_generation = match active.purpose {
             HeaderTargetPurpose::Normal => None,
             HeaderTargetPurpose::SelectedAuxiliaryRepair {
@@ -1489,9 +1506,10 @@ impl HeaderSyncReactor {
         }
         match result {
             HeaderTargetAdmissionResult::Applied => {
-                let authority = owner.header_authority();
-                self.completed_targets
-                    .mark(authority.header_generation, authority.branch);
+                self.completed_targets.mark(
+                    completion_authority.header_generation,
+                    completion_authority.branch,
+                );
                 metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::Failed(error) => {
@@ -1519,7 +1537,13 @@ impl HeaderSyncReactor {
         {
             return;
         }
-        if !self.preparation_has_authority(&peer, source, &owner, is_repair, active.entries.len()) {
+        if !self.preparation_has_authority(
+            &peer,
+            source,
+            &owner,
+            is_repair,
+            self.peer_work_queue.owned_header_count(&peer),
+        ) {
             if is_repair {
                 self.retry_vct_repair(
                     owner
@@ -3845,25 +3869,48 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn completion_is_current(
+    fn registered_completion_authority(
         &self,
         peer: &ZakuraPeerId,
         source: zakura_header_chain::SourceId,
         owner: &zakura_header_chain::HeaderSyncWorkOwner,
-    ) -> bool {
+        is_repair: bool,
+    ) -> Result<
+        (zakura_header_chain::HeaderWorkAuthority, &'static str),
+        zakura_header_chain::StaleReason,
+    > {
         let Some(current) = self.committed_snapshot.as_ref() else {
-            return false;
+            return Err(zakura_header_chain::StaleReason::MissingOwner);
         };
-        match zakura_header_chain::CompletionGate::check_registered(
+        let decision = zakura_header_chain::CompletionGate::check_registered(
             current,
             self.peer_work_queue.registered_attempt(peer),
             source,
             owner,
-        ) {
-            zakura_header_chain::CompletionDecision::Current => true,
+        );
+        match decision {
+            zakura_header_chain::CompletionDecision::Current => {
+                Ok((owner.header_authority(), "current"))
+            }
             zakura_header_chain::CompletionDecision::Stale(reason) => {
-                Self::record_stale_completion(reason);
-                false
+                let header = owner.header_authority();
+                let registered =
+                    self.peer_work_queue.registered_attempt(peer) == Some((source, *owner));
+                let rebase_candidate = !is_repair
+                    && owner.body_owner().is_none()
+                    && registered
+                    && header.header_generation.get() < current.header_generation.get()
+                    && header.branch.anchor_hash != current.frontiers.finalized.hash;
+                if !rebase_candidate {
+                    return Err(reason);
+                }
+                Ok((
+                    zakura_header_chain::HeaderWorkAuthority::for_target(
+                        current,
+                        header.branch.target_tip_hash,
+                    ),
+                    "rebase_candidate",
+                ))
             }
         }
     }
@@ -3881,31 +3928,11 @@ impl HeaderSyncReactor {
         is_repair: bool,
         header_count: usize,
     ) -> bool {
-        let Some(current) = self.committed_snapshot.as_ref() else {
-            return false;
-        };
-        let decision = zakura_header_chain::CompletionGate::check_registered(
-            current,
-            self.peer_work_queue.registered_attempt(peer),
-            source,
-            owner,
-        );
-        let outcome = match decision {
-            zakura_header_chain::CompletionDecision::Current => "current",
-            zakura_header_chain::CompletionDecision::Stale(reason) => {
-                let header = owner.header_authority();
-                let registered =
-                    self.peer_work_queue.registered_attempt(peer) == Some((source, *owner));
-                let rebase_candidate = !is_repair
-                    && owner.body_owner().is_none()
-                    && registered
-                    && header.header_generation.get() < current.header_generation.get()
-                    && header.branch.anchor_hash != current.frontiers.finalized.hash;
-                if !rebase_candidate {
-                    Self::record_stale_completion(reason);
-                    return false;
-                }
-                "rebase_candidate"
+        let outcome = match self.registered_completion_authority(peer, source, owner, is_repair) {
+            Ok((_, outcome)) => outcome,
+            Err(reason) => {
+                Self::record_stale_completion(reason);
+                return false;
             }
         };
         let header_count = u64::try_from(header_count)
