@@ -31,6 +31,16 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 /// depending upward on `zakura-state`.
 const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
 
+/// Let a far-ahead empty-state header bootstrap settle before starting checkpoint
+/// body applies. Each selected-header page advances the exact body-work scope;
+/// starting applies between pages lets newer duplicate checkpoint requests replace
+/// the older requests before the first complete checkpoint can be committed.
+pub(super) const EMPTY_STATE_HEADER_QUIET_PERIOD: Duration = Duration::from_secs(30);
+
+/// One complete maximum checkpoint gap. Smaller startup windows can complete a
+/// checkpoint without being starved by successive selected-header page commits.
+pub(super) const EMPTY_STATE_HEADER_QUIET_MIN_LAG: u32 = 400;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
     height: block::Height,
@@ -90,6 +100,25 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
         verified_block_tip: snapshot.frontiers.verified_best.height,
         verified_block_hash: snapshot.frontiers.verified_best.hash,
     }
+}
+
+/// Return true when a committed snapshot only advances body progress beneath
+/// the same exact selected-header target.
+///
+/// The target hash fixes the branch for already-issued body downloads. A
+/// target change or any frontier retreat still takes the destructive scope
+/// transition path.
+pub(super) fn body_progress_preserves_download_pipeline(
+    old: &zakura_header_chain::EngineSnapshot,
+    new: &zakura_header_chain::EngineSnapshot,
+) -> bool {
+    old.frontiers.header_best == new.frontiers.header_best
+        && new.frontiers.finalized.height >= old.frontiers.finalized.height
+        && new.frontiers.verified_best.height >= old.frontiers.verified_best.height
+        && (new.frontiers.finalized.height != old.frontiers.finalized.height
+            || new.frontiers.finalized.hash == old.frontiers.finalized.hash)
+        && (new.frontiers.verified_best.height != old.frontiers.verified_best.height
+            || new.frontiers.verified_best.hash == old.frontiers.verified_best.hash)
 }
 
 /// Spawn a block-sync reactor and return its handle plus action stream.
@@ -244,6 +273,12 @@ pub fn spawn_block_sync_reactor(
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
         published_body_alarm: None,
+        empty_state_body_sync_started: startup.committed_snapshots.is_none()
+            || startup.frontiers.verified_block_tip > block::Height(0),
+        empty_state_header_quiet_until: committed_snapshot.as_ref().and_then(|snapshot| {
+            empty_state_header_quiet_required(snapshot)
+                .then(|| Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD)
+        }),
         committed_snapshot,
         startup,
         state,
@@ -341,6 +376,21 @@ pub(super) struct BlockSyncReactor {
     last_view: SequencerView,
     /// Last labeled persistent alarm exported to metrics, for exact clearing.
     published_body_alarm: Option<zakura_header_chain::Frontier>,
+    /// True once this process has observed body progress above genesis.
+    empty_state_body_sync_started: bool,
+    /// Earliest body-query time after the latest far-ahead header bootstrap update.
+    empty_state_header_quiet_until: Option<Instant>,
+}
+
+fn empty_state_header_quiet_required(snapshot: &zakura_header_chain::EngineSnapshot) -> bool {
+    snapshot.frontiers.verified_best.height == block::Height(0)
+        && snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.verified_best.height.0)
+            >= EMPTY_STATE_HEADER_QUIET_MIN_LAG
 }
 
 impl BlockSyncReactor {
@@ -373,6 +423,8 @@ impl BlockSyncReactor {
             // completes, or advances the floor re-arms it to the next deadline.
             let floor_watchdog = self.earliest_floor_deadline_sleep();
             tokio::pin!(floor_watchdog);
+            let empty_state_header_quiet = self.empty_state_header_quiet_sleep();
+            tokio::pin!(empty_state_header_quiet);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
@@ -457,7 +509,20 @@ impl BlockSyncReactor {
                     self.run_floor_watchdog(Instant::now());
                     self.publish_metrics();
                 }
+                _ = &mut empty_state_header_quiet,
+                    if self.empty_state_header_quiet_until.is_some() =>
+                {
+                    self.empty_state_header_quiet_until = None;
+                    self.query_needed_blocks_with_options(true).await;
+                }
             }
+        }
+    }
+
+    fn empty_state_header_quiet_sleep(&self) -> time::Sleep {
+        match self.empty_state_header_quiet_until {
+            Some(deadline) => time::sleep_until(deadline.into()),
+            None => time::sleep(Duration::from_secs(3600)),
         }
     }
 
@@ -546,9 +611,10 @@ impl BlockSyncReactor {
             BlockSyncEvent::ScopedNeededBlocks {
                 query_id,
                 scope,
+                body_anchor,
                 blocks,
             } => {
-                self.handle_scoped_needed_blocks(query_id, scope, blocks)
+                self.handle_scoped_needed_blocks(query_id, scope, body_anchor, blocks)
                     .await;
             }
             #[cfg(test)]
@@ -747,6 +813,9 @@ impl BlockSyncReactor {
     async fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
         let previous = self.committed_snapshot.clone();
         let previous_scope = self.body_work_scope();
+        let preserves_download_pipeline = previous
+            .as_ref()
+            .is_some_and(|old| body_progress_preserves_download_pipeline(old, &snapshot));
         let previous_body_alarm = previous.as_ref().and_then(|snapshot| {
             snapshot
                 .alarms
@@ -788,16 +857,24 @@ impl BlockSyncReactor {
                 ));
         }
         if current_scope != previous_scope {
-            let released = match current_scope {
-                Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
-                None => self.state.work_queue.retire_all(),
-            };
-            self.state.budget.release(released);
-            let _ = self
-                .sequencer_control
-                .send(SequencerControlInput::WorkScopeChanged {
-                    scope: current_scope,
-                });
+            if preserves_download_pipeline {
+                if let Some(scope) = current_scope {
+                    let _ = self
+                        .sequencer_control
+                        .send(SequencerControlInput::WorkScopeAdvanced { scope });
+                }
+            } else {
+                let released = match current_scope {
+                    Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
+                    None => self.state.work_queue.retire_all(),
+                };
+                self.state.budget.release(released);
+                let _ = self
+                    .sequencer_control
+                    .send(SequencerControlInput::WorkScopeChanged {
+                        scope: current_scope,
+                    });
+            }
         }
 
         let header_changed = previous
@@ -806,6 +883,10 @@ impl BlockSyncReactor {
         if header_changed {
             self.state.best_header_tip = header_best.height;
             self.state.best_header_hash = header_best.hash;
+            if !self.empty_state_body_sync_started && empty_state_header_quiet_required(&snapshot) {
+                self.empty_state_header_quiet_until =
+                    Some(Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
+            }
         }
 
         match previous.as_ref() {
@@ -822,7 +903,7 @@ impl BlockSyncReactor {
             Some(_) => {}
         }
 
-        if header_changed || current_scope != previous_scope {
+        if header_changed || (current_scope != previous_scope && !preserves_download_pipeline) {
             self.query_needed_blocks_with_options(true).await;
         }
     }
@@ -952,6 +1033,11 @@ impl BlockSyncReactor {
         let reaction_advanced = view.reaction_epoch != self.last_reaction_epoch;
         let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
         let tip_advanced = view.verified_tip > self.verified_block_tip;
+
+        if view.verified_tip > block::Height(0) {
+            self.empty_state_body_sync_started = true;
+            self.empty_state_header_quiet_until = None;
+        }
 
         self.last_view = view;
         self.state.finalized_height = self.state.finalized_height.max(view.finalized);
@@ -1092,6 +1178,7 @@ impl BlockSyncReactor {
         &mut self,
         query_id: NonZeroU64,
         scope: zakura_header_chain::BodyWorkAuthority,
+        body_anchor: zakura_header_chain::Frontier,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
         let completion = (query_id, scope);
@@ -1109,6 +1196,21 @@ impl BlockSyncReactor {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
                 .increment(1);
             self.query_needed_blocks().await;
+            return;
+        }
+        let anchor_changed = body_anchor.height != self.verified_block_tip
+            || body_anchor.hash != self.state.verified_block_hash;
+        if anchor_changed {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: self.state.finalized_height,
+                verified_block_tip: body_anchor.height,
+                verified_block_hash: body_anchor.hash,
+            };
+            if body_anchor.height > self.verified_block_tip {
+                self.handle_state_frontiers_changed(frontiers).await;
+            } else {
+                self.handle_chain_tip_reset(frontiers, false).await;
+            }
             return;
         }
         self.handle_needed_blocks(scope, blocks).await;
@@ -1526,6 +1628,9 @@ impl BlockSyncReactor {
     async fn query_needed_blocks_with_options(&mut self, force: bool) -> bool {
         if !self.startup.state_queries_enabled {
             return false;
+        }
+        if self.empty_state_header_quiet_until.is_some() {
+            return true;
         }
         if self.request_floor >= self.state.best_header_tip {
             self.pending_needed_query = None;
