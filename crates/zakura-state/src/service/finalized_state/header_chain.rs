@@ -3045,29 +3045,45 @@ impl HeaderChainStore {
                 .iter()
                 .map(|node| (node.hash, node))
                 .collect();
-            let old_contexts: Vec<_> =
-                authenticated_context_headers(self, metadata.frontiers.finalized.hash, None)?
-                    .into_iter()
-                    .map(|context| (context.header.hash(), context))
-                    .collect();
-            let contexts: Vec<_> = authenticated_context_headers(
-                self,
-                changes.metadata.frontiers.finalized.hash,
-                Some(&staged_nodes),
-            )?
-            .into_iter()
-            .map(|context| (context.header.hash(), context))
-            .collect();
-            let old_hashes: HashSet<_> = old_contexts.iter().map(|(hash, _)| *hash).collect();
-            let new_hashes: HashSet<_> = contexts.iter().map(|(hash, _)| *hash).collect();
-            for (hash, _) in old_contexts {
-                if !new_hashes.contains(&hash) {
+            if let Some((context, outgoing)) = self.incremental_context_slide(
+                metadata.frontiers.finalized,
+                changes.metadata.frontiers.finalized,
+                &staged_nodes,
+            )? {
+                self.put_value(
+                    &mut batch,
+                    HEADER_VALIDATION_CONTEXT,
+                    context.header.hash().0,
+                    &context,
+                )?;
+                if let Some(hash) = outgoing {
                     self.delete_raw(&mut batch, HEADER_VALIDATION_CONTEXT, hash.0)?;
                 }
-            }
-            for (hash, context) in contexts {
-                if !old_hashes.contains(&hash) {
-                    self.put_value(&mut batch, HEADER_VALIDATION_CONTEXT, hash.0, &context)?;
+            } else {
+                let old_contexts: Vec<_> =
+                    authenticated_context_headers(self, metadata.frontiers.finalized.hash, None)?
+                        .into_iter()
+                        .map(|context| (context.header.hash(), context))
+                        .collect();
+                let contexts: Vec<_> = authenticated_context_headers(
+                    self,
+                    changes.metadata.frontiers.finalized.hash,
+                    Some(&staged_nodes),
+                )?
+                .into_iter()
+                .map(|context| (context.header.hash(), context))
+                .collect();
+                let old_hashes: HashSet<_> = old_contexts.iter().map(|(hash, _)| *hash).collect();
+                let new_hashes: HashSet<_> = contexts.iter().map(|(hash, _)| *hash).collect();
+                for (hash, _) in old_contexts {
+                    if !new_hashes.contains(&hash) {
+                        self.delete_raw(&mut batch, HEADER_VALIDATION_CONTEXT, hash.0)?;
+                    }
+                }
+                for (hash, context) in contexts {
+                    if !old_hashes.contains(&hash) {
+                        self.put_value(&mut batch, HEADER_VALIDATION_CONTEXT, hash.0, &context)?;
+                    }
                 }
             }
         }
@@ -3203,6 +3219,79 @@ impl HeaderChainStore {
             &changes.metadata,
         )?;
         Ok(batch)
+    }
+
+    /// Return the exact context-table delta for one authenticated finalized-parent advance.
+    fn incremental_context_slide(
+        &self,
+        previous: Frontier,
+        current: Frontier,
+        staged_nodes: &HashMap<block::Hash, &HeaderNode>,
+    ) -> Result<Option<(HeaderValidationContextDisk, Option<block::Hash>)>, HeaderChainStoreError>
+    {
+        if current.height.0 != previous.height.0.saturating_add(1) {
+            return Ok(None);
+        }
+        let Some(previous_node) = self.node(previous.hash)? else {
+            return Ok(None);
+        };
+        let stored_current = if staged_nodes.contains_key(&current.hash) {
+            None
+        } else {
+            self.node(current.hash)?
+        };
+        let current_node = staged_nodes
+            .get(&current.hash)
+            .copied()
+            .or(stored_current.as_ref());
+        let Some(current_node) = current_node else {
+            return Ok(None);
+        };
+        if previous_node.hash != previous.hash
+            || previous_node.header.hash() != previous.hash
+            || previous_node.height != previous.height
+            || current_node.hash != current.hash
+            || current_node.header.hash() != current.hash
+            || current_node.height != current.height
+            || current_node.parent_hash != previous.hash
+            || current_node.header.previous_block_hash != previous.hash
+        {
+            return Ok(None);
+        }
+
+        let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+            .map_err(|_| {
+                HeaderChainStoreError::Incoherent("validation context bound does not fit in u32")
+            })?;
+        let outgoing = if previous.height.0 >= predecessor_span {
+            let outgoing_height = block::Height(previous.height.0 - predecessor_span);
+            let Some(outgoing_hash) = self.authenticated_canonical_hash(outgoing_height)? else {
+                return Ok(None);
+            };
+            let Some(outgoing_context) = self.get_value::<HeaderValidationContextDisk>(
+                HEADER_VALIDATION_CONTEXT,
+                outgoing_hash.0,
+            )?
+            else {
+                return Ok(None);
+            };
+            if outgoing_context.header.hash() != outgoing_hash
+                || outgoing_context.height != outgoing_height
+            {
+                return Ok(None);
+            }
+            Some(outgoing_hash)
+        } else {
+            None
+        };
+
+        Ok(Some((
+            HeaderValidationContextDisk {
+                header: previous_node.header,
+                height: previous_node.height,
+            },
+            outgoing,
+        )))
     }
 
     fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {

@@ -1031,11 +1031,28 @@ impl FallibleDiskValue for HeaderValidationContextDisk {
 
     fn encode(&self) -> Result<Vec<u8>, HeaderChainValueError> {
         let mut encoder = Encoder::default();
-        let header = self
-            .header
-            .zcash_serialize_to_vec()
-            .map_err(|_| HeaderChainValueError::Header)?;
-        encoder.bounded("context_header", &header, MAX_HEADER_BYTES)?;
+        let header_start = encoder.0.len();
+        encoder.u32(0);
+        if self.header.zcash_serialize(&mut encoder.0).is_err() {
+            encoder.0.truncate(header_start);
+            return Err(HeaderChainValueError::Header);
+        }
+        let header_length = encoder.0.len().saturating_sub(header_start + 4);
+        if header_length > MAX_HEADER_BYTES {
+            encoder.0.truncate(header_start);
+            return Err(HeaderChainValueError::Oversized {
+                field: "context_header",
+                length: header_length,
+            });
+        }
+        let length = u32::try_from(header_length).map_err(|_| {
+            encoder.0.truncate(header_start);
+            HeaderChainValueError::Oversized {
+                field: "context_header",
+                length: header_length,
+            }
+        })?;
+        encoder.0[header_start..header_start + 4].copy_from_slice(&length.to_be_bytes());
         encoder.u32(self.height.0);
         Ok(encoder.0)
     }
