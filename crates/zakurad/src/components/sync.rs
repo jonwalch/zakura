@@ -1071,15 +1071,13 @@ where
         }
     }
 
-    /// Downloads and verifies through checkpoint semantic handoff, then hands
-    /// body sync to native Zakura while watching for progress, optionally
+    /// Downloads and verifies genesis, then hands body sync to native Zakura
+    /// while watching for progress, optionally
     /// falling back to the legacy syncer if Zakura makes none.
     ///
-    /// Zakura block sync uses this bootstrap path because state does not publish
-    /// the authenticated header snapshot until its configured checkpoint range
-    /// has committed. The legacy-compatible downloader keeps ownership until
-    /// that snapshot appears, stops dispatching, and drains its already-started
-    /// verifier work before native applies are enabled.
+    /// Genesis is the one special block that the legacy-compatible downloader
+    /// fetches. Once its commit publishes the durable header runtime, native
+    /// Zakura owns every body apply from height 1 onward.
     ///
     /// After genesis, native Zakura sync is expected to drive body downloads. But
     /// it cannot always: a node whose reachable peers are legacy-only (no
@@ -1138,32 +1136,23 @@ where
             {
                 return Err(eyre!("header runtime attachment failed: {error}"));
             }
-            if self
-                .try_to_sync(Some(&mut header_runtime_status))
-                .await
-                .is_err()
-            {
-                self.downloads.cancel_all();
-            }
-            self.update_metrics();
-
-            let runtime_status = header_runtime_status.borrow().clone();
-            block_sync_handoff
-                .observe_header_runtime(&runtime_status)
-                .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
-            if !runtime_status.is_ready() {
-                let restart_delay = if self.is_regtest {
-                    REGTEST_SYNC_RESTART_DELAY
-                } else {
-                    SYNC_RESTART_SLEEP
-                };
-                info!(
-                    timeout = ?restart_delay,
+            let wait = if self.is_regtest {
+                REGTEST_SYNC_RESTART_DELAY
+            } else {
+                SYNC_RESTART_DELAY
+            };
+            match tokio::time::timeout(wait, header_runtime_status.changed()).await {
+                Err(_) => info!(
+                    timeout = ?wait,
                     state_tip = ?self.latest_chain_tip.best_tip_height(),
-                    checkpoint = ?self.max_checkpoint_height,
-                    "waiting to resume pre-handoff checkpoint bootstrap"
-                );
-                sleep(restart_delay).await;
+                    "waiting for the durable header runtime after genesis commit"
+                ),
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(eyre!(
+                        "header runtime status channel closed before genesis handoff"
+                    ));
+                }
             }
         }
 
@@ -1175,13 +1164,12 @@ where
             .verified_best
             .height;
         self.trace
-            .checkpoint_handoff(Some(handoff_state_tip), self.max_checkpoint_height);
+            .checkpoint_handoff(Some(handoff_state_tip), Height(0));
         block_sync_handoff
             .finish_legacy_bootstrap()
-            .map_err(|error| eyre!("checkpoint apply handoff failed: {error}"))?;
+            .map_err(|error| eyre!("genesis apply handoff failed: {error}"))?;
         info!(
-            checkpoint = ?self.max_checkpoint_height,
-            "Zakura block sync replacement completed checkpoint bootstrap; \
+            "Zakura block sync replacement completed genesis bootstrap; \
              monitoring for Zakura body-sync progress"
         );
 

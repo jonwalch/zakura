@@ -89,7 +89,7 @@ impl SyncCoordinator {
         })
     }
 
-    /// Start with legacy checkpoint bootstrap authorized until semantic handoff.
+    /// Start with the legacy-compatible genesis fetch authorized until native handoff.
     pub(crate) fn new_legacy_bootstrap() -> Arc<Self> {
         Self::new_with_phase(ApplyPhase::LegacyBootstrap {
             epoch: LifecycleEpoch::INITIAL,

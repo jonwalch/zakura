@@ -24,7 +24,8 @@ use zakura_network::zakura::{
 use crate::components::sync;
 
 use super::{
-    block_verify_error_class, trace::block_driver::BlockDriverTraceExt, BlocksyncThroughputProbe,
+    block_verify_error_class, block_verify_error_diagnostic,
+    trace::block_driver::BlockDriverTraceExt, BlocksyncThroughputProbe,
     ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
 
@@ -443,11 +444,12 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 trace.trace_needed_blocks_query_started(from, limit, best_header_tip);
                 let started = Instant::now();
                 match query_block_sync_needed_blocks(read_state.clone(), from, limit).await {
-                    Ok(blocks) => {
+                    Ok((body_anchor, blocks)) => {
                         trace.trace_needed_blocks_query_succeeded(blocks.len(), started);
                         let _ = block_sync.send_control(BlockSyncEvent::ScopedNeededBlocks {
                             query_id,
                             scope,
+                            body_anchor,
                             blocks,
                         });
                         trace.trace_block_reactor_event("needed_blocks");
@@ -1393,6 +1395,13 @@ where
                     )
                 }
                 BodyVerificationClass::Retryable(kind) => {
+                    warn!(
+                        ?height,
+                        ?expected_hash,
+                        ?kind,
+                        diagnostic = block_verify_error_diagnostic(&error).as_deref(),
+                        "Zakura block-sync verifier could not apply a body"
+                    );
                     retryable_body_outcome(owner, source, expected_hash, kind)
                 }
             }
@@ -1528,7 +1537,7 @@ pub(crate) async fn query_block_sync_needed_blocks<ReadState>(
     read_state: ReadState,
     from: block::Height,
     limit: u32,
-) -> Result<Vec<BlockSyncBlockMeta>, zakura_state::BoxError>
+) -> Result<(zakura_header_chain::Frontier, Vec<BlockSyncBlockMeta>), zakura_state::BoxError>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1540,19 +1549,31 @@ where
     ReadState::Future: Send + 'static,
 {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Err(
+            std::io::Error::other("block-sync needed-body query limit must be nonzero").into(),
+        );
     }
 
     let mut needed = Vec::new();
+    let mut body_anchor = None;
     let mut next_from = from;
     let mut remaining = limit;
 
     while remaining > 0 {
         let chunk_limit = remaining.min(zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE);
-        needed.extend(
+        let chunk =
             query_block_sync_needed_blocks_chunk(read_state.clone(), next_from, chunk_limit)
-                .await?,
-        );
+                .await?;
+        if body_anchor
+            .replace(chunk.anchor)
+            .is_some_and(|anchor| anchor != chunk.anchor)
+        {
+            return Err(std::io::Error::other(
+                "block-sync body anchor changed across one chunked state query",
+            )
+            .into());
+        }
+        needed.extend(block_sync_needed_blocks_from_state(chunk.blocks));
 
         remaining = remaining.saturating_sub(chunk_limit);
         let Some(after_chunk) = next_from.0.checked_add(chunk_limit).map(block::Height) else {
@@ -1561,14 +1582,16 @@ where
         next_from = after_chunk;
     }
 
-    Ok(needed)
+    let body_anchor = body_anchor
+        .ok_or_else(|| std::io::Error::other("block-sync needed-body query returned no anchor"))?;
+    Ok((body_anchor, needed))
 }
 
 async fn query_block_sync_needed_blocks_chunk<ReadState>(
     read_state: ReadState,
     from: block::Height,
     limit: u32,
-) -> Result<Vec<BlockSyncBlockMeta>, zakura_state::BoxError>
+) -> Result<zakura_state::BlockSyncBodyMetadata, zakura_state::BoxError>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1588,13 +1611,15 @@ where
         Ok(Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(metadata))) => metadata,
         Ok(Ok(response)) => {
             warn!(?response, "unexpected MissingBlockBodyMetadata response");
-            return Ok(Vec::new());
+            return Err(
+                std::io::Error::other("unexpected MissingBlockBodyMetadata response").into(),
+            );
         }
         Ok(Err(error)) => return Err(error),
         Err(elapsed) => return Err(Box::new(elapsed)),
     };
 
-    Ok(block_sync_needed_blocks_from_state(metadata))
+    Ok(metadata)
 }
 
 #[cfg(test)]

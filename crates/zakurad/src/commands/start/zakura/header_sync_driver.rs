@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use tower::{Service, ServiceExt};
 
 use zakura_chain::block::{self};
-#[cfg(test)]
 use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 #[cfg(test)]
 use zakura_network::zakura::{AuxSchema, HeaderEntry, HeaderPathPage, ZakuraPeerId};
@@ -117,6 +116,7 @@ where
             state,
             read_state,
             header_chain_authority,
+            network.clone(),
         )),
     })
 }
@@ -283,7 +283,6 @@ where
     root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
 }
 
-#[cfg(test)]
 pub(crate) fn block_roots_cover_range(
     start_height: block::Height,
     count: u32,
@@ -309,6 +308,7 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
     state: State,
     read_state: ReadState,
     authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+    network: zakura_chain::parameters::Network,
     adapter_key: port::HeaderChainAdapterKey,
 }
 
@@ -317,11 +317,13 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
         state: State,
         read_state: ReadState,
         authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+        network: zakura_chain::parameters::Network,
     ) -> Self {
         Self {
             state,
             read_state,
             authority,
+            network,
             adapter_key: port::HeaderChainAdapterKey::new(),
         }
     }
@@ -416,7 +418,10 @@ where
     ) -> HeaderChainFuture<'_, Result<port::ReadHeaderPathReply, HeaderChainPortError>> {
         let read_state = self.read_state.clone();
         let adapter_key = self.adapter_key.clone();
-        Box::pin(async move { read_header_path(read_state, adapter_key, path, request).await })
+        let network = self.network.clone();
+        Box::pin(
+            async move { read_header_path(read_state, adapter_key, network, path, request).await },
+        )
     }
 
     fn release_header_path(
@@ -866,6 +871,7 @@ where
 async fn read_header_path<ReadState>(
     read_state: ReadState,
     adapter_key: port::HeaderChainAdapterKey,
+    network: zakura_chain::parameters::Network,
     path: port::RetainedHeaderPath,
     request: port::ReadHeaderPath,
 ) -> Result<port::ReadHeaderPathReply, HeaderChainPortError>
@@ -874,7 +880,8 @@ where
             zakura_state::ReadRequest,
             Response = zakura_state::ReadResponse,
             Error = zakura_state::BoxError,
-        > + Send
+        > + Clone
+        + Send
         + 'static,
     ReadState::Future: Send + 'static,
 {
@@ -884,32 +891,49 @@ where
     let port::ReadHeaderPath {
         after_hash,
         max_header_count,
+        want_tree_aux,
     } = request;
     match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
-        read_state.oneshot(zakura_state::ReadRequest::ReadRetainedHeaderPath {
-            peer: source,
-            session_id,
-            lease_id,
-            scope: path.scope,
-            after_hash,
-            max_count: max_header_count,
-        }),
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::ReadRetainedHeaderPath {
+                peer: source,
+                session_id,
+                lease_id,
+                scope: path.scope,
+                after_hash,
+                max_count: max_header_count,
+            }),
     )
     .await
     {
         Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
             zakura_state::RetainedPathReadOutcome::Page(page),
-        ))) => Ok(port::ReadHeaderPathReply::Page(Box::new(
-            port::RetainedHeaderPathPage {
-                common_ancestor: page.common_ancestor,
-                target: page.target,
-                scope: page.scope,
-                headers: page.headers,
-                aux_deliveries: page.aux_deliveries,
-                complete: page.complete,
-            },
-        ))),
+        ))) => {
+            let finalized_tree_aux = if want_tree_aux {
+                finalized_tree_aux_for_page(
+                    read_state,
+                    &network,
+                    page.common_ancestor,
+                    page.headers.len(),
+                )
+                .await?
+            } else {
+                vec![None; page.headers.len()]
+            };
+            Ok(port::ReadHeaderPathReply::Page(Box::new(
+                port::RetainedHeaderPathPage {
+                    common_ancestor: page.common_ancestor,
+                    target: page.target,
+                    scope: page.scope,
+                    headers: page.headers,
+                    aux_deliveries: page.aux_deliveries,
+                    finalized_tree_aux,
+                    complete: page.complete,
+                },
+            )))
+        }
         Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
             zakura_state::RetainedPathReadOutcome::Unavailable,
         ))) => Ok(port::ReadHeaderPathReply::Unavailable),
@@ -921,13 +945,131 @@ where
     }
 }
 
+async fn finalized_tree_aux_for_page<ReadState>(
+    read_state: ReadState,
+    network: &zakura_chain::parameters::Network,
+    common_ancestor: zakura_header_chain::Frontier,
+    header_count: usize,
+) -> Result<Vec<Option<zakura_header_chain::TreeAuxRecordV1>>, HeaderChainPortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let empty = || vec![None; header_count];
+    let Ok(count) = u32::try_from(header_count) else {
+        return Ok(empty());
+    };
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let Ok(start_height) = common_ancestor.height.next() else {
+        return Ok(empty());
+    };
+    let Some(end_height) = start_height + i64::from(count.saturating_sub(1)) else {
+        return Ok(empty());
+    };
+
+    let finalized_tip = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::FinalizedTip),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(tip))) => tip,
+        Ok(Ok(_)) => return Err(HeaderChainPortError::Unavailable { source: None }),
+        Ok(Err(error)) => {
+            return Err(HeaderChainPortError::Unavailable {
+                source: Some(Arc::from(error)),
+            })
+        }
+        Err(_) => return Err(HeaderChainPortError::Timeout),
+    };
+    if finalized_tip.is_none_or(|(height, _)| end_height > height) {
+        return Ok(empty());
+    }
+
+    let roots = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::BlockRoots {
+            start_height,
+            count,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::BlockRoots(roots))) => roots,
+        Ok(Ok(_)) => return Err(HeaderChainPortError::Unavailable { source: None }),
+        Ok(Err(error)) => {
+            return Err(HeaderChainPortError::Unavailable {
+                source: Some(Arc::from(error)),
+            })
+        }
+        Err(_) => return Err(HeaderChainPortError::Timeout),
+    };
+    if !block_roots_cover_range(start_height, count, &roots) {
+        return Ok(empty());
+    }
+
+    Ok(roots
+        .into_iter()
+        .map(|roots| Some(finalized_tree_aux_record(roots, network)))
+        .collect())
+}
+
+fn finalized_tree_aux_record(
+    roots: BlockCommitmentRoots,
+    network: &zakura_chain::parameters::Network,
+) -> zakura_header_chain::TreeAuxRecordV1 {
+    use zakura_chain::parameters::NetworkUpgrade;
+
+    let nu5_active = NetworkUpgrade::Nu5
+        .activation_height(network)
+        .is_some_and(|height| roots.height >= height);
+    let nu6_3_active = NetworkUpgrade::Nu6_3
+        .activation_height(network)
+        .is_some_and(|height| roots.height >= height);
+
+    zakura_header_chain::TreeAuxRecordV1 {
+        height: roots.height,
+        sapling_root: roots.sapling_root,
+        orchard_root: if nu5_active {
+            roots.orchard_root
+        } else {
+            zakura_chain::orchard::tree::NoteCommitmentTree::default().root()
+        },
+        ironwood_root: if nu6_3_active {
+            roots.ironwood_root
+        } else {
+            zakura_chain::ironwood::tree::NoteCommitmentTree::default().root()
+        },
+        sapling_tx_count: roots.sapling_tx,
+        orchard_tx_count: if nu5_active { roots.orchard_tx } else { 0 },
+        ironwood_tx_count: if nu6_3_active { roots.ironwood_tx } else { 0 },
+        auth_data_root: if nu5_active {
+            roots.auth_data_root
+        } else {
+            [0; 32].into()
+        },
+    }
+}
+
 #[cfg(test)]
 fn assemble_header_path_page(
     lease_id: u64,
     page: port::RetainedHeaderPathPage,
     requested_schema: AuxSchema,
 ) -> Option<HeaderPathPage> {
-    if page.headers.len() != page.aux_deliveries.len() {
+    if page.headers.len() != page.aux_deliveries.len()
+        || page.headers.len() != page.finalized_tree_aux.len()
+    {
         return None;
     }
 
@@ -935,8 +1077,11 @@ fn assemble_header_path_page(
         && page
             .aux_deliveries
             .iter()
-            .all(|deliveries| selected_aux_delivery(deliveries, AuxSchema::V1).is_some())
-    {
+            .zip(&page.finalized_tree_aux)
+            .all(|(deliveries, finalized_tree_aux)| {
+                finalized_tree_aux.is_some()
+                    || selected_aux_delivery(deliveries, AuxSchema::V1).is_some()
+            }) {
         AuxSchema::V1
     } else {
         AuxSchema::None
@@ -945,8 +1090,15 @@ fn assemble_header_path_page(
         .headers
         .into_iter()
         .zip(page.aux_deliveries)
-        .map(|(header, deliveries)| {
-            let delivery = selected_aux_delivery(&deliveries, tree_aux_schema);
+        .zip(page.finalized_tree_aux)
+        .map(|((header, deliveries), finalized_tree_aux)| {
+            let delivery_schema =
+                if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
+                    AuxSchema::V1
+                } else {
+                    AuxSchema::None
+                };
+            let delivery = selected_aux_delivery(&deliveries, delivery_schema);
             HeaderEntry {
                 header,
                 body_size: delivery.map_or(0, |delivery| match delivery.body_size {
@@ -954,7 +1106,7 @@ fn assemble_header_path_page(
                     zakura_header_chain::BodySizeHint::Known(size) => size.get(),
                 }),
                 tree_aux: (tree_aux_schema == AuxSchema::V1)
-                    .then(|| delivery.and_then(|delivery| delivery.tree_aux))
+                    .then(|| finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux)))
                     .flatten(),
             }
         })
@@ -1303,6 +1455,7 @@ mod tests {
             scope: owner().header_authority(),
             headers: vec![node.header],
             aux_deliveries: vec![Vec::new()],
+            finalized_tree_aux: vec![None],
             complete: true,
         };
 
@@ -1322,6 +1475,17 @@ mod tests {
             ironwood_tx_count: 0,
             auth_data_root: [0; 32].into(),
         };
+        page.finalized_tree_aux[0] = Some(tree_aux);
+        let served_from_finalized_state = assemble_header_path_page(1, page.clone(), AuxSchema::V1)
+            .expect("the coherent finalized-state page assembles");
+        assert_eq!(served_from_finalized_state.tree_aux_schema, AuxSchema::V1);
+        assert_eq!(served_from_finalized_state.entries[0].body_size, 0);
+        assert_eq!(
+            served_from_finalized_state.entries[0].tree_aux,
+            Some(tree_aux)
+        );
+        page.finalized_tree_aux[0] = None;
+
         page.aux_deliveries[0].push(zakura_header_chain::AuxDelivery {
             delivery_id: zakura_header_chain::EvidenceId::from_digest([10; 32]),
             header_hash: hash,
@@ -1344,6 +1508,106 @@ mod tests {
         assert_eq!(served.tree_aux_schema, AuxSchema::V1);
         assert_eq!(served.entries[0].body_size, 321);
         assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
+    }
+
+    #[tokio::test]
+    async fn finalized_pages_load_contiguous_tree_aux_from_state() {
+        let roots = |height| BlockCommitmentRoots {
+            height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx: u64::from(height.0),
+            orchard_tx: 0,
+            ironwood_tx: 0,
+            auth_data_root: [9; 32].into(),
+        };
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::FinalizedTip => {
+                    zakura_state::ReadResponse::FinalizedTip(Some((
+                        block::Height(2),
+                        block::Hash([2; 32]),
+                    )))
+                }
+                zakura_state::ReadRequest::BlockRoots {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(count, 2);
+                    zakura_state::ReadResponse::BlockRoots(vec![
+                        roots(block::Height(1)),
+                        roots(block::Height(2)),
+                    ])
+                }
+                request => panic!("unexpected finalized-page state request: {request:?}"),
+            })
+        });
+
+        let records = finalized_tree_aux_for_page(
+            read_state,
+            &zakura_chain::parameters::Network::Mainnet,
+            zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            2,
+        )
+        .await
+        .expect("the finalized roots are available");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0]
+                .expect("height one has a finalized root record")
+                .height,
+            block::Height(1)
+        );
+        assert_eq!(
+            records[1]
+                .expect("height two has a finalized root record")
+                .sapling_tx_count,
+            2
+        );
+    }
+
+    #[test]
+    fn finalized_tree_aux_uses_empty_tree_roots_before_activation() {
+        let orchard_root = zakura_chain::orchard::tree::NoteCommitmentTree::default().root();
+        let ironwood_root = zakura_chain::ironwood::tree::NoteCommitmentTree::default().root();
+        assert_ne!(orchard_root, Default::default());
+        assert_ne!(ironwood_root, Default::default());
+
+        let record = finalized_tree_aux_record(
+            BlockCommitmentRoots {
+                height: block::Height(1),
+                sapling_root: Default::default(),
+                orchard_root,
+                ironwood_root,
+                sapling_tx: 3,
+                orchard_tx: 4,
+                ironwood_tx: 5,
+                auth_data_root: [9; 32].into(),
+            },
+            &zakura_chain::parameters::Network::Mainnet,
+        );
+
+        assert_eq!(record.sapling_tx_count, 3);
+        assert_eq!(record.orchard_root, orchard_root);
+        assert_eq!(record.orchard_tx_count, 0);
+        assert_eq!(record.ironwood_root, ironwood_root);
+        assert_eq!(record.ironwood_tx_count, 0);
+        assert_eq!(record.auth_data_root, [0; 32].into());
+        zakura_chain::parallel::commitment_aux_verify::verify_supplied_orchard_root_below_nu5(
+            &zakura_chain::parameters::Network::Mainnet,
+            record.height,
+            &record.orchard_root,
+        )
+        .expect("the served pre-NU5 Orchard root passes native VCT verification");
+        zakura_chain::parallel::commitment_aux_verify::verify_supplied_ironwood_root_below_nu6_3(
+            &zakura_chain::parameters::Network::Mainnet,
+            record.height,
+            &record.ironwood_root,
+        )
+        .expect("the served pre-NU6.3 Ironwood root passes native VCT verification");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1440,10 +1704,12 @@ mod tests {
                 }
             }),
             port::HeaderChainAdapterKey::new(),
+            zakura_chain::parameters::Network::Mainnet,
             (*path).clone(),
             port::ReadHeaderPath {
                 after_hash: common_ancestor.hash,
                 max_header_count: 1,
+                want_tree_aux: true,
             },
         )
         .await;
@@ -1477,10 +1743,12 @@ mod tests {
                 }
             }),
             adapter_key.clone(),
+            zakura_chain::parameters::Network::Mainnet,
             read_path,
             port::ReadHeaderPath {
                 after_hash: common_ancestor.hash,
                 max_header_count: 1,
+                want_tree_aux: true,
             },
         )
         .await
