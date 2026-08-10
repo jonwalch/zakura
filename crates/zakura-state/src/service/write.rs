@@ -247,7 +247,7 @@ pub enum PreparedFullStateTransitionError {
 }
 
 /// Audited header runtime and immutable configuration injected into the state writer.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(in crate::service) struct HeaderChainWriter {
     runtime: HeaderChainRuntime,
     config: EngineConfig,
@@ -1962,8 +1962,7 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
             let vct_aux_for_outcome = vct_aux_window.clone();
             let vct_authentication_window = vct_aux_window.clone();
-            let vct_authentication_writer = header_chain.clone();
-            let checkpoint_header_writer = header_chain.clone();
+            let checkpoint_header_writer = header_chain.as_ref();
             let checkpoint_block = ordered_block.0.clone();
 
             // Try committing the block
@@ -1972,7 +1971,7 @@ impl WriteBlockWorkerTask {
                 prev_note_commitment_trees,
                 vct_aux_window,
                 |db, batch, proof| {
-                    let authentication = vct_authentication_writer.as_ref().and_then(|_writer| {
+                    let authentication = checkpoint_header_writer.and_then(|_writer| {
                         vct_authentication_window
                             .as_ref()
                             .and_then(|window| {
@@ -1980,7 +1979,7 @@ impl WriteBlockWorkerTask {
                             })
                             .map(|(_evidence, request)| request)
                     });
-                    if let Some(writer) = checkpoint_header_writer.as_ref() {
+                    if let Some(writer) = checkpoint_header_writer {
                         writer
                             .commit_checkpoint_finalized(&checkpoint_block, batch, authentication)
                             .map_err(|error| CommitBlockError::HeaderChainError {
