@@ -51,7 +51,7 @@ fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
 /// Keep one maximum wire page ahead of integrated full state, then refill at half-window low water.
 ///
 /// Each integrated full-state advance reanchors the durable header DAG.
-/// This bound keeps initial-sync consensus transitions proportional to pipeline work.
+/// The bound keeps initial-sync consensus transitions proportional to pipeline work.
 /// Half-window refills overlap proof validation and durable admission with body application.
 /// The refills also preserve enough work for a partial checkpoint range.
 const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
@@ -2226,7 +2226,7 @@ impl HeaderSyncReactor {
     /// Return requester headroom after both the durable DAG limit and the integrated body window.
     ///
     /// A partial window remains closed until half of the admitted body lag remains.
-    /// This hysteresis avoids small header transitions and preserves work for body application.
+    /// The hysteresis avoids small header transitions and preserves work for body application.
     /// The checkpoint bound lets a smaller protocol window admit a complete checkpoint range.
     /// The final partial page lets a node reach a target with a suffix shorter than one page.
     fn request_header_prefix_remaining(
@@ -3937,7 +3937,7 @@ impl HeaderSyncReactor {
 
     /// Keep exact ordinary header work alive across a monotone full-state finality advance.
     ///
-    /// This gate grants no durable authority.
+    /// The rebase gate grants no durable authority.
     /// The serialized state planner authenticates the finality path and proves ancestry.
     /// The planner trims any finalized prefix and then rebases or rejects the insertion.
     /// Body-authorized VCT repair work remains bound to each generation.

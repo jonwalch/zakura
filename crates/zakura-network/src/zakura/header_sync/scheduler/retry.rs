@@ -61,7 +61,7 @@ pub enum RetryUpdate {
     TooEarly,
     /// Retry remains active at the returned time.
     RetryAt(DateTime<Utc>),
-    /// This failure made persistent unavailability visible.
+    /// The failed delivery made persistent unavailability visible.
     Alarmed {
         /// Earliest persistent-alarm probe time.
         probe_at: DateTime<Utc>,

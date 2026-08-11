@@ -3791,7 +3791,7 @@ pub struct HeaderChainInfo {
     /// Meaning and validity boundary of `header_best`.
     header_best_semantics: String,
     /// Best locally header-valid frontier.
-    /// This frontier does not claim body validity.
+    /// The header frontier does not claim body validity.
     header_best: HeaderChainFrontierInfo,
     /// Best fully body-verified frontier on the selected path.
     verified_best: HeaderChainFrontierInfo,

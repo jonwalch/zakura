@@ -519,7 +519,7 @@ pub enum HeaderPortOperation {
     /// Close one exact header-sync session that stopped making progress.
     ///
     /// An unresponsive peer does not violate the protocol.
-    /// This action therefore remains distinct from [`Misbehavior`](Self::Misbehavior).
+    /// The drop action therefore remains distinct from [`Misbehavior`](Self::Misbehavior).
     /// Conflating the actions would feed a future ban score.
     DropPeer {
         /// Peer whose session the reactor closes.

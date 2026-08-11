@@ -1355,7 +1355,7 @@ impl PeerRoutine {
 
     /// Free request slots after the central queue retires their exact owners.
     /// Queue retirement already released their reservations.
-    /// This path drops only routine-local and registry bookkeeping.
+    /// The cleanup path drops only routine-local and registry bookkeeping.
     fn gc_obsolete_outstanding(&mut self) {
         let mut removed = false;
         let mut index = 0;
@@ -1964,7 +1964,7 @@ impl PeerRoutine {
 
     /// Drop a local request after the central queue retires its work scope.
     /// The central queue already released the reservation.
-    /// This path must preserve any replacement item at the same height.
+    /// The cleanup path preserves any replacement item at the same height.
     fn drop_obsolete_outstanding(&mut self, index: usize) {
         if index >= self.window.outstanding.len() {
             return;

@@ -33,7 +33,7 @@ pub struct ZakuraHeaderSyncConfig {
     /// How long the node refuses header-sync readmission to an unproductive peer.
     ///
     /// Discovery applies dial backoff only after a failed dial.
-    /// This window prevents an immediate redial after a successful dial ends in eviction.
+    /// The cooldown prevents an immediate redial after a successful dial ends in eviction.
     /// Set this value to zero to allow immediate readmission.
     #[serde(with = "humantime_serde")]
     pub unproductive_peer_cooldown: Duration,

@@ -38,7 +38,7 @@ const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
 pub(super) const EMPTY_STATE_HEADER_QUIET_PERIOD: Duration = Duration::from_secs(30);
 
 /// One complete maximum checkpoint gap.
-/// This minimum lets a small startup window complete a checkpoint between header-page commits.
+/// The minimum lets a small startup window complete a checkpoint between header-page commits.
 pub(super) const EMPTY_STATE_HEADER_QUIET_MIN_LAG: u32 = 400;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
