@@ -77,6 +77,6 @@ pub enum RetainedPathReadOutcome {
     /// State read a bounded page and renewed the lease deadline.
     Page(Box<RetainedPathPage>),
     /// The lease is absent or expired.
-    /// This session might no longer own the lease.
+    /// A replacement session might own the lease.
     Unavailable,
 }

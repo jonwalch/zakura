@@ -971,7 +971,7 @@ impl ValidateContextError {
 
     /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
-    /// This method returns the subset of [`Self::vct_retryable_height`] where the supplied root is
+    /// The query returns the subset of [`Self::vct_retryable_height`] where the supplied root is
     /// missing. The peer either omitted the root from its header range or supplied a root that
     /// verification later evicted. Only a later delivery of the same header range can fill the
     /// missing root. Header sync does not request individual roots. An await-successor stall

@@ -532,8 +532,8 @@ impl ZakuraDb {
 
     /// Returns the canonical hash for a full-state or header-only height.
     ///
-    /// This method resolves the consensus `hash_by_height` rows without checking header-body
-    /// availability. The method then falls back to the provisional Zakura frontier. A header-row
+    /// The lookup resolves consensus `hash_by_height` rows without checking header-body
+    /// availability. The lookup then falls back to the provisional Zakura frontier. A header-row
     /// check would hide a stored hash when the corresponding header row is absent. The durable
     /// frontier coherence check would report that hidden hash as a canonical-hash mismatch.
     #[allow(clippy::unwrap_in_result)]

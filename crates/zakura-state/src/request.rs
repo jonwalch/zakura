@@ -1055,7 +1055,7 @@ pub enum Request {
     /// Persist one retryable body-availability result through the serialized
     /// fork-aware header-chain writer.
     ///
-    /// This request accepts only transient evidence.
+    /// The unavailable-body request accepts only transient evidence.
     /// Only the full verifier boundary can construct deterministic consensus invalidity.
     RecordHeaderChainBodyUnavailable {
         /// One-shot evidence sealed by the registered body-attempt adapter.

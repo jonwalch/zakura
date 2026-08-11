@@ -1434,7 +1434,7 @@ impl FinalizedState {
 
     /// Reject a supplied fast-path root that failed verification for `height`.
     ///
-    /// This method returns a typed, retryable error.
+    /// The rejection path returns a typed, retryable error.
     /// Fast mode freezes the note-commitment frontier.
     /// The committer therefore cannot recompute the root locally.
     /// Local recomputation could fold an incorrect root into the history MMR.
