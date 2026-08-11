@@ -9,9 +9,7 @@ use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 #[cfg(test)]
 use zakura_network::zakura::{AuxSchema, HeaderEntry, HeaderPathPage, ZakuraPeerId};
 use zakura_network::zakura::{FullStateFrontiers, ZakuraHeaderSyncDriverStartup};
-use zakura_node_services::header_chain::{
-    self as port, HeaderChainFuture, HeaderChainPort, HeaderChainPortError,
-};
+use zakura_node_services::header_chain::{self as port, HeaderChainFuture, Port, PortError};
 
 use super::{verified_block_tip_from_state, ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT};
 
@@ -329,7 +327,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
     }
 }
 
-impl<State, ReadState> HeaderChainPort for HeaderChainServicePort<State, ReadState>
+impl<State, ReadState> Port for HeaderChainServicePort<State, ReadState>
 where
     State: Service<
             zakura_state::Request,
@@ -352,10 +350,7 @@ where
 {
     fn continuation_locator(
         &self,
-    ) -> HeaderChainFuture<
-        '_,
-        Result<Option<zakura_header_chain::HeaderLocator>, HeaderChainPortError>,
-    > {
+    ) -> HeaderChainFuture<'_, Result<Option<zakura_header_chain::HeaderLocator>, PortError>> {
         let read_state = self.read_state.clone();
         Box::pin(async move {
             match tokio::time::timeout(
@@ -365,11 +360,11 @@ where
             .await
             {
                 Ok(Ok(zakura_state::ReadResponse::HeaderLocator(locator))) => Ok(locator),
-                Ok(Ok(_)) => Err(HeaderChainPortError::Unavailable { source: None }),
-                Ok(Err(error)) => Err(HeaderChainPortError::Unavailable {
+                Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+                Ok(Err(error)) => Err(PortError::Unavailable {
                     source: Some(Arc::from(error)),
                 }),
-                Err(_) => Err(HeaderChainPortError::Timeout),
+                Err(_) => Err(PortError::Timeout),
             }
         })
     }
@@ -378,7 +373,7 @@ where
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
-    ) -> HeaderChainFuture<'_, Result<port::VctRepairContextReply, HeaderChainPortError>> {
+    ) -> HeaderChainFuture<'_, Result<port::VctRepairContextReply, PortError>> {
         let read_state = self.read_state.clone();
         Box::pin(async move {
             match tokio::time::timeout(
@@ -393,19 +388,19 @@ where
                 Ok(Ok(zakura_state::ReadResponse::VctRepairContext(None))) => {
                     Ok(port::VctRepairContextReply::Stale)
                 }
-                Ok(Ok(_)) => Err(HeaderChainPortError::Unavailable { source: None }),
-                Ok(Err(error)) => Err(HeaderChainPortError::Unavailable {
+                Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+                Ok(Err(error)) => Err(PortError::Unavailable {
                     source: Some(Arc::from(error)),
                 }),
-                Err(_) => Err(HeaderChainPortError::Timeout),
+                Err(_) => Err(PortError::Timeout),
             }
         })
     }
 
     fn acquire_header_path(
         &self,
-        request: port::AcquireHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<port::AcquireHeaderPathReply, HeaderChainPortError>> {
+        request: port::AcquirePath,
+    ) -> HeaderChainFuture<'_, Result<port::AcquirePathReply, PortError>> {
         let read_state = self.read_state.clone();
         let adapter_key = self.adapter_key.clone();
         Box::pin(async move { acquire_header_path(read_state, adapter_key, request).await })
@@ -414,8 +409,8 @@ where
     fn read_header_path(
         &self,
         path: port::RetainedHeaderPath,
-        request: port::ReadHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<port::ReadHeaderPathReply, HeaderChainPortError>> {
+        request: port::ReadPath,
+    ) -> HeaderChainFuture<'_, Result<port::ReadPathReply, PortError>> {
         let read_state = self.read_state.clone();
         let adapter_key = self.adapter_key.clone();
         let network = self.network.clone();
@@ -427,7 +422,7 @@ where
     fn release_header_path(
         &self,
         path: port::RetainedHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<(), HeaderChainPortError>> {
+    ) -> HeaderChainFuture<'_, Result<(), PortError>> {
         let read_state = self.read_state.clone();
         let adapter_key = self.adapter_key.clone();
         Box::pin(async move { release_header_path(read_state, adapter_key, path).await })
@@ -471,7 +466,7 @@ fn header_failure_evidence(
 
 fn classify_header_preparation_failure(
     error: zakura_header_chain::HeaderFailure,
-    entries: &[port::HeaderTargetEntry],
+    entries: &[port::TargetEntry],
     source: zakura_header_chain::SourceId,
     owner: zakura_header_chain::HeaderSyncWorkOwner,
 ) -> zakura_header_chain::HeaderChainError {
@@ -805,8 +800,8 @@ fn header_target_apply_failure(
 async fn acquire_header_path<ReadState>(
     read_state: ReadState,
     adapter_key: port::AdapterKey,
-    request: port::AcquireHeaderPath,
-) -> Result<port::AcquireHeaderPathReply, HeaderChainPortError>
+    request: port::AcquirePath,
+) -> Result<port::AcquirePathReply, PortError>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -816,7 +811,7 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    let port::AcquireHeaderPath {
+    let port::AcquirePath {
         source,
         session_id,
         scope,
@@ -836,35 +831,33 @@ where
     .await
     {
         Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathLease(outcome))) => match outcome {
-            zakura_state::RetainedPathLeaseOutcome::Acquired(lease) => {
-                Ok(port::AcquireHeaderPathReply::Acquired(Box::new(
-                    port::RetainedHeaderPath::from_adapter(
-                        &adapter_key,
-                        lease.lease_id,
-                        source,
-                        session_id,
-                        lease.common_ancestor,
-                        lease.target,
-                        lease.scope,
-                    ),
-                )))
-            }
+            zakura_state::RetainedPathLeaseOutcome::Acquired(lease) => Ok(
+                port::AcquirePathReply::Acquired(Box::new(port::RetainedHeaderPath::from_adapter(
+                    &adapter_key,
+                    lease.lease_id,
+                    source,
+                    session_id,
+                    lease.common_ancestor,
+                    lease.target,
+                    lease.scope,
+                ))),
+            ),
             zakura_state::RetainedPathLeaseOutcome::TargetNotRetained => {
-                Ok(port::AcquireHeaderPathReply::TargetNotRetained)
+                Ok(port::AcquirePathReply::TargetNotRetained)
             }
             zakura_state::RetainedPathLeaseOutcome::NoLocatorIntersection => {
-                Ok(port::AcquireHeaderPathReply::NoLocatorIntersection)
+                Ok(port::AcquirePathReply::NoLocatorIntersection)
             }
             zakura_state::RetainedPathLeaseOutcome::HistoryPruned => {
-                Ok(port::AcquireHeaderPathReply::HistoryPruned)
+                Ok(port::AcquirePathReply::HistoryPruned)
             }
-            zakura_state::RetainedPathLeaseOutcome::Busy => Ok(port::AcquireHeaderPathReply::Busy),
+            zakura_state::RetainedPathLeaseOutcome::Busy => Ok(port::AcquirePathReply::Busy),
         },
-        Ok(Ok(_)) => Err(HeaderChainPortError::Unavailable { source: None }),
-        Ok(Err(error)) => Err(HeaderChainPortError::Unavailable {
+        Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => Err(PortError::Unavailable {
             source: Some(Arc::from(error)),
         }),
-        Err(_) => Err(HeaderChainPortError::Timeout),
+        Err(_) => Err(PortError::Timeout),
     }
 }
 
@@ -873,8 +866,8 @@ async fn read_header_path<ReadState>(
     adapter_key: port::AdapterKey,
     network: zakura_chain::parameters::Network,
     path: port::RetainedHeaderPath,
-    request: port::ReadHeaderPath,
-) -> Result<port::ReadHeaderPathReply, HeaderChainPortError>
+    request: port::ReadPath,
+) -> Result<port::ReadPathReply, PortError>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -886,9 +879,9 @@ where
     ReadState::Future: Send + 'static,
 {
     let Some((lease_id, source, session_id)) = path.adapter_identity(&adapter_key) else {
-        return Err(HeaderChainPortError::Unavailable { source: None });
+        return Err(PortError::Unavailable { source: None });
     };
-    let port::ReadHeaderPath {
+    let port::ReadPath {
         after_hash,
         max_header_count,
         want_tree_aux,
@@ -922,7 +915,7 @@ where
             } else {
                 vec![None; page.headers.len()]
             };
-            Ok(port::ReadHeaderPathReply::Page(Box::new(
+            Ok(port::ReadPathReply::Page(Box::new(
                 port::RetainedHeaderPathPage {
                     common_ancestor: page.common_ancestor,
                     target: page.target,
@@ -936,12 +929,12 @@ where
         }
         Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
             zakura_state::RetainedPathReadOutcome::Unavailable,
-        ))) => Ok(port::ReadHeaderPathReply::Unavailable),
-        Ok(Ok(_)) => Err(HeaderChainPortError::Unavailable { source: None }),
-        Ok(Err(error)) => Err(HeaderChainPortError::Unavailable {
+        ))) => Ok(port::ReadPathReply::Unavailable),
+        Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => Err(PortError::Unavailable {
             source: Some(Arc::from(error)),
         }),
-        Err(_) => Err(HeaderChainPortError::Timeout),
+        Err(_) => Err(PortError::Timeout),
     }
 }
 
@@ -950,7 +943,7 @@ async fn finalized_tree_aux_for_page<ReadState>(
     network: &zakura_chain::parameters::Network,
     common_ancestor: zakura_header_chain::Frontier,
     header_count: usize,
-) -> Result<Vec<Option<zakura_header_chain::TreeAuxRecordV1>>, HeaderChainPortError>
+) -> Result<Vec<Option<zakura_header_chain::TreeAuxRecordV1>>, PortError>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -984,13 +977,13 @@ where
     .await
     {
         Ok(Ok(zakura_state::ReadResponse::FinalizedTip(tip))) => tip,
-        Ok(Ok(_)) => return Err(HeaderChainPortError::Unavailable { source: None }),
+        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
         Ok(Err(error)) => {
-            return Err(HeaderChainPortError::Unavailable {
+            return Err(PortError::Unavailable {
                 source: Some(Arc::from(error)),
             })
         }
-        Err(_) => return Err(HeaderChainPortError::Timeout),
+        Err(_) => return Err(PortError::Timeout),
     };
     if finalized_tip.is_none_or(|(height, _)| end_height > height) {
         return Ok(empty());
@@ -1006,13 +999,13 @@ where
     .await
     {
         Ok(Ok(zakura_state::ReadResponse::BlockRoots(roots))) => roots,
-        Ok(Ok(_)) => return Err(HeaderChainPortError::Unavailable { source: None }),
+        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
         Ok(Err(error)) => {
-            return Err(HeaderChainPortError::Unavailable {
+            return Err(PortError::Unavailable {
                 source: Some(Arc::from(error)),
             })
         }
-        Err(_) => return Err(HeaderChainPortError::Timeout),
+        Err(_) => return Err(PortError::Timeout),
     };
     if !block_roots_cover_range(start_height, count, &roots) {
         return Ok(empty());
@@ -1160,7 +1153,7 @@ async fn release_header_path<ReadState>(
     read_state: ReadState,
     adapter_key: port::AdapterKey,
     path: port::RetainedHeaderPath,
-) -> Result<(), HeaderChainPortError>
+) -> Result<(), PortError>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1171,7 +1164,7 @@ where
     ReadState::Future: Send + 'static,
 {
     let Some((lease_id, source, session_id)) = path.adapter_identity(&adapter_key) else {
-        return Err(HeaderChainPortError::Unavailable { source: None });
+        return Err(PortError::Unavailable { source: None });
     };
     match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
@@ -1185,10 +1178,10 @@ where
     .await
     {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(HeaderChainPortError::Unavailable {
+        Ok(Err(error)) => Err(PortError::Unavailable {
             source: Some(Arc::from(error)),
         }),
-        Err(_) => Err(HeaderChainPortError::Timeout),
+        Err(_) => Err(PortError::Timeout),
     }
 }
 
@@ -1614,7 +1607,7 @@ mod tests {
     async fn wedged_state_read_returns_busy_at_the_driver_deadline() {
         let owner = owner();
         let peer = ZakuraPeerId::new(vec![7; 32]).expect("the peer identity has canonical width");
-        let request = port::AcquireHeaderPath {
+        let request = port::AcquirePath {
             source: source_id(&peer),
             session_id: owner.session_id(),
             scope: owner.header_authority(),
@@ -1626,7 +1619,7 @@ mod tests {
         let result =
             acquire_header_path(pending_read_state(), port::AdapterKey::new(), request).await;
 
-        assert!(matches!(result, Err(HeaderChainPortError::Timeout)));
+        assert!(matches!(result, Err(PortError::Timeout)));
         assert_eq!(
             tokio::time::Instant::now().duration_since(started),
             ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT
@@ -1646,7 +1639,7 @@ mod tests {
             block::Height(1),
             owner.header_authority().branch.anchor_hash,
         );
-        let acquire_request = port::AcquireHeaderPath {
+        let acquire_request = port::AcquirePath {
             source,
             session_id: owner.session_id(),
             scope: owner.header_authority(),
@@ -1682,7 +1675,7 @@ mod tests {
         )
         .await
         .expect("the fixture state service acquires a retained path");
-        let port::AcquireHeaderPathReply::Acquired(path) = acquired else {
+        let port::AcquirePathReply::Acquired(path) = acquired else {
             panic!("the fixture state service grants the retained path");
         };
         assert_eq!(
@@ -1702,7 +1695,7 @@ mod tests {
             port::AdapterKey::new(),
             zakura_chain::parameters::Network::Mainnet,
             (*path).clone(),
-            port::ReadHeaderPath {
+            port::ReadPath {
                 after_hash: common_ancestor.hash,
                 max_header_count: 1,
                 want_tree_aux: true,
@@ -1711,7 +1704,7 @@ mod tests {
         .await;
         assert!(matches!(
             foreign_read,
-            Err(HeaderChainPortError::Unavailable { source: None })
+            Err(PortError::Unavailable { source: None })
         ));
         assert_eq!(
             foreign_calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -1741,7 +1734,7 @@ mod tests {
             adapter_key.clone(),
             zakura_chain::parameters::Network::Mainnet,
             read_path,
-            port::ReadHeaderPath {
+            port::ReadPath {
                 after_hash: common_ancestor.hash,
                 max_header_count: 1,
                 want_tree_aux: true,
@@ -1749,7 +1742,7 @@ mod tests {
         )
         .await
         .expect("the fixture state service reads through the retained path");
-        assert!(matches!(read, port::ReadHeaderPathReply::Unavailable));
+        assert!(matches!(read, port::ReadPathReply::Unavailable));
 
         release_header_path(
             tower::service_fn(move |request| {
@@ -1826,7 +1819,7 @@ mod tests {
         let source = zakura_header_chain::SourceId::from_digest([5; 32]);
         let owner = owner();
         let header = regtest_genesis_block().header.clone();
-        let entries = [port::HeaderTargetEntry {
+        let entries = [port::TargetEntry {
             header: header.clone(),
             body_size: 0,
             tree_aux: None,

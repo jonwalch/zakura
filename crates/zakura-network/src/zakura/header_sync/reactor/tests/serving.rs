@@ -68,7 +68,7 @@ fn same_peer_session_replaces_at_the_full_direction_limit() {
     let peer = peer();
     let old_cancel = CancellationToken::new();
     let (old_send, _old_outbound) = framed_channel(8);
-    reactor.handle_peer_connected(HeaderSyncPeerSession::from_parts_with_session_id(
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
         peer.clone(),
         7,
         old_send,
@@ -76,7 +76,7 @@ fn same_peer_session_replaces_at_the_full_direction_limit() {
     ));
     let replacement_cancel = CancellationToken::new();
     let (replacement_send, _replacement_outbound) = framed_channel(8);
-    reactor.handle_peer_connected(HeaderSyncPeerSession::from_parts_with_session_id(
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
         peer.clone(),
         8,
         replacement_send,
@@ -135,7 +135,7 @@ fn new_request_replaces_idle_served_path_and_releases_its_lease() {
     ));
     assert!(matches!(
         actions.try_recv(),
-        Ok(HeaderPortOperation::AcquireHeaderPath {
+        Ok(HeaderPortOperation::AcquirePath {
             request: GetHeaders {
                 request_id: 10,
                 target_tip_hash,
@@ -196,9 +196,11 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the reactor remains available");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -216,7 +218,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     let first_request = request(1, target.hash, common.hash);
 
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::GetHeaders(first_request.clone()),
@@ -224,7 +226,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         .await
         .expect("the request reaches the reactor");
     let scope = match next_action(&mut actions).await {
-        HeaderPortOperation::AcquireHeaderPath {
+        HeaderPortOperation::AcquirePath {
             request: actual,
             scope,
             ..
@@ -234,7 +236,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
 
     let stale_request = request(99, target.hash, common.hash);
     handle
-        .send(HeaderSyncEvent::HeaderPathLeaseReady {
+        .send(Event::PathLeaseReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -254,7 +256,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     ));
 
     handle
-        .send(HeaderSyncEvent::HeaderPathLeaseReady {
+        .send(Event::PathLeaseReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -270,7 +272,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         .expect("the lease result reaches the reactor");
     assert!(matches!(
         next_action(&mut actions).await,
-        HeaderPortOperation::ReadHeaderPath {
+        HeaderPortOperation::ReadPath {
             lease_id: 9,
             request_id,
             after_hash,
@@ -281,7 +283,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     ));
 
     handle
-        .send(HeaderSyncEvent::HeaderPathPageReady {
+        .send(Event::HeaderPathPageReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -293,7 +295,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         .expect("the stale page result reaches the reactor");
 
     handle
-        .send(HeaderSyncEvent::HeaderPathPageReady {
+        .send(Event::HeaderPathPageReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -340,7 +342,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
 
     let continuation = request(2, target.hash, first);
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::GetHeaders(continuation),
@@ -349,7 +351,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         .expect("the continuation reaches the reactor");
     assert!(matches!(
         next_action(&mut actions).await,
-        HeaderPortOperation::ReadHeaderPath {
+        HeaderPortOperation::ReadPath {
             lease_id: 9,
             request_id,
             after_hash,
@@ -370,7 +372,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         auth_data_root: [0; 32].into(),
     };
     handle
-        .send(HeaderSyncEvent::HeaderPathPageReady {
+        .send(Event::HeaderPathPageReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -442,9 +444,11 @@ async fn generation_change_retires_served_path_before_late_page_completion() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the peer connects");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -452,7 +456,7 @@ async fn generation_change_retires_served_path_before_late_page_completion() {
     let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x61; 32]));
     let request = request(1, target.hash, anchor.hash);
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::GetHeaders(request.clone()),
@@ -460,7 +464,7 @@ async fn generation_change_retires_served_path_before_late_page_completion() {
         .await
         .expect("the request reaches the reactor");
     let scope = match next_action(&mut actions).await {
-        HeaderPortOperation::AcquireHeaderPath {
+        HeaderPortOperation::AcquirePath {
             request: actual,
             scope,
             ..
@@ -468,7 +472,7 @@ async fn generation_change_retires_served_path_before_late_page_completion() {
         other => panic!("expected retained-path acquisition, got {other:?}"),
     };
     handle
-        .send(HeaderSyncEvent::HeaderPathLeaseReady {
+        .send(Event::PathLeaseReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -484,7 +488,7 @@ async fn generation_change_retires_served_path_before_late_page_completion() {
         .expect("the lease reaches the reactor");
     assert!(matches!(
         next_action(&mut actions).await,
-        HeaderPortOperation::ReadHeaderPath {
+        HeaderPortOperation::ReadPath {
             lease_id: 17,
             scope: action_scope,
             ..
@@ -537,7 +541,7 @@ async fn generation_change_retires_served_path_before_late_page_completion() {
     );
 
     handle
-        .send(HeaderSyncEvent::HeaderPathPageReady {
+        .send(Event::HeaderPathPageReady {
             peer,
             session_id: 0,
             scope,
@@ -584,9 +588,11 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the reactor remains available");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -604,7 +610,7 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
         let target = block::Hash([u8::try_from(offset + 1).expect("small marker"); 32]);
         let request = request(request_id, target, block::Hash([0x41; 32]));
         handle
-            .send(HeaderSyncEvent::SessionWireMessage {
+            .send(Event::WireMessage {
                 peer: peer.clone(),
                 session_id: 0,
                 msg: HeaderSyncMessage::GetHeaders(request.clone()),
@@ -612,7 +618,7 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
             .await
             .expect("the request reaches the reactor");
         let scope = match next_action(&mut actions).await {
-            HeaderPortOperation::AcquireHeaderPath {
+            HeaderPortOperation::AcquirePath {
                 request: actual,
                 scope,
                 ..
@@ -620,7 +626,7 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
             other => panic!("expected retained-path acquisition, got {other:?}"),
         };
         handle
-            .send(HeaderSyncEvent::HeaderPathLeaseReady {
+            .send(Event::PathLeaseReady {
                 peer: peer.clone(),
                 session_id: 0,
                 scope,
@@ -647,7 +653,7 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
     let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([9; 32]));
     let request = request(request_id, target.hash, anchor.hash);
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::GetHeaders(request.clone()),
@@ -655,7 +661,7 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
         .await
         .expect("the request reaches the reactor");
     let scope = match next_action(&mut actions).await {
-        HeaderPortOperation::AcquireHeaderPath {
+        HeaderPortOperation::AcquirePath {
             request: actual,
             scope,
             ..
@@ -663,7 +669,7 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
         other => panic!("expected retained-path acquisition, got {other:?}"),
     };
     handle
-        .send(HeaderSyncEvent::HeaderPathLeaseReady {
+        .send(Event::PathLeaseReady {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -679,10 +685,10 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
         .expect("the lease reaches the reactor");
     assert!(matches!(
         next_action(&mut actions).await,
-        HeaderPortOperation::ReadHeaderPath { lease_id: 17, .. }
+        HeaderPortOperation::ReadPath { lease_id: 17, .. }
     ));
     handle
-        .send(HeaderSyncEvent::HeaderPathPageReady {
+        .send(Event::HeaderPathPageReady {
             peer,
             session_id: 0,
             scope,

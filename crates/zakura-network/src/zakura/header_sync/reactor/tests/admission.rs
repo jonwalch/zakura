@@ -11,13 +11,8 @@ fn committed_header_generation_reconsiders_the_cached_peer_target() {
         build_header_sync_reactor(startup).expect("the cached-target fixture builds");
     let peer = peer();
     let (send, _outbound) = framed_channel(8);
-    reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
-            peer.clone(),
-            7,
-            send,
-            CancellationToken::new(),
-        ),
+    reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(peer.clone(), 7, send, CancellationToken::new()),
     ));
     let (_source, _owner, _branch) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
     let advertised = reactor
@@ -73,7 +68,7 @@ fn committed_resource_stall_is_terminal_without_retry_or_peer_fault() {
     let peer = peer();
     let (source, owner, branch) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
 
-    reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: peer.clone(),
         source,
         owner,
@@ -111,7 +106,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         let peer = peer();
         let (source, owner, branch) =
             seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
-        reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        reactor.handle_event(Event::HeaderTargetAdmissionReady {
             peer,
             source,
             owner,
@@ -167,7 +162,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         let published_candidates = handle.candidate_state();
         assert_eq!(published_tip, (replacement.height, replacement.hash));
 
-        reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        reactor.handle_event(Event::HeaderTargetAdmissionReady {
             peer,
             source,
             owner,
@@ -234,7 +229,7 @@ fn monotone_finality_records_an_exact_rebased_apply_completion() {
         Some(owner),
         "the registered attempt remains available for the uniform completion gate"
     );
-    reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: peer.clone(),
         source,
         owner,
@@ -338,7 +333,7 @@ fn monotone_finality_sends_exact_prepared_header_work_to_state_for_rebase() {
         Some(owner),
         "ordinary preparation remains registered for state-side rebase"
     );
-    reactor.handle_event(HeaderSyncEvent::HeaderTargetPrepared {
+    reactor.handle_event(Event::HeaderTargetPrepared {
         peer: peer.clone(),
         source,
         owner,
@@ -383,13 +378,8 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
         build_header_sync_reactor(startup).expect("the stale-anchor fixture builds");
     let peer = peer();
     let (send, mut outbound) = framed_channel(8);
-    reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
-            peer.clone(),
-            7,
-            send,
-            CancellationToken::new(),
-        ),
+    reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(peer.clone(), 7, send, CancellationToken::new()),
     ));
     let initial_status = outbound
         .recv()
@@ -405,7 +395,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
 
     let (source, owner, old_branch) =
         seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
-    reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: peer.clone(),
         source,
         owner,
@@ -527,7 +517,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
         build_header_sync_reactor(same_startup).expect("the same-snapshot restart builds");
     let same_tip = same_handle.best_header_tip();
     let same_candidates = same_handle.candidate_state();
-    same_reactor.handle_event(HeaderSyncEvent::HeaderTargetPrepared {
+    same_reactor.handle_event(Event::HeaderTargetPrepared {
         peer: peer.clone(),
         source,
         owner,
@@ -568,13 +558,13 @@ fn restart_drops_old_preparation_and_admission_completions() {
     let committed_tip = committed_handle.best_header_tip();
     let committed_candidates = committed_handle.candidate_state();
     assert_eq!(committed_tip, (replacement.height, replacement.hash));
-    committed_reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+    committed_reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: peer.clone(),
         source,
         owner,
         result: HeaderTargetAdmissionResult::Applied,
     });
-    committed_reactor.handle_event(HeaderSyncEvent::HeaderTargetAdmissionReady {
+    committed_reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: peer.clone(),
         source,
         owner,
@@ -606,8 +596,8 @@ async fn restart_rejects_old_ordered_stream_response() {
         build_header_sync_reactor(old_startup).expect("the pre-crash reactor builds");
     let peer = peer();
     let (old_send, _old_outbound) = framed_channel(8);
-    old_reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
+    old_reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(
             peer.clone(),
             7,
             old_send,
@@ -643,8 +633,8 @@ async fn restart_rejects_old_ordered_stream_response() {
     let (fresh_handle, mut fresh_actions, mut fresh_reactor) =
         build_header_sync_reactor(fresh_startup).expect("the replacement reactor builds");
     let (fresh_send, mut fresh_outbound) = framed_channel(8);
-    fresh_reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
+    fresh_reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(
             peer.clone(),
             8,
             fresh_send,
@@ -674,7 +664,7 @@ async fn restart_rejects_old_ordered_stream_response() {
     let published_tip = fresh_handle.best_header_tip();
     let published_candidates = fresh_handle.candidate_state();
 
-    fresh_reactor.handle_event(HeaderSyncEvent::SessionResponse {
+    fresh_reactor.handle_event(Event::SessionResponse {
         peer: peer.clone(),
         session_id: 7,
         scope: stale_scope,
@@ -756,9 +746,11 @@ async fn peer_admission_catches_up_snapshot_before_initial_status() {
 
     let (send, mut outbound) = framed_channel(8);
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("peer admission queues before the watch arm runs");
 

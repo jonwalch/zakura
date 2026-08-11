@@ -23,10 +23,10 @@ pub use error::HeaderSyncStartError;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub use events::HeaderSyncAction;
 pub use events::{
-    FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
-    HeaderPathPageResult, HeaderSyncEvent, HeaderSyncHandle, HeaderSyncMisbehavior,
-    HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
-    HeaderTargetPreparationResult, VctRepairContextResult,
+    Event, FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
+    HeaderPathPageResult, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
+    HeaderSyncStartup, HeaderTargetAdmissionResult, HeaderTargetPreparationResult,
+    VctRepairContextResult,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use fuzz::{replay_header_pursuit_bytes, HeaderPursuitReplaySummary, NoEffectsProbe};
@@ -37,7 +37,7 @@ pub use scheduler::retry::{
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use service::drive_header_sync_actions;
-pub use service::HeaderSyncPeerSession;
+pub use service::PeerSession;
 pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
 pub(crate) use wire::{headers_response_bytes, headers_response_capacity};
 pub use wire::{

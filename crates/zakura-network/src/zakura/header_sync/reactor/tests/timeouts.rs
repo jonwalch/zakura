@@ -104,7 +104,7 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
         build_header_sync_reactor(startup).expect("the repair timeout fixture builds");
     let peer = peer();
     let (send, _outbound) = framed_channel(8);
-    reactor.handle_peer_connected(HeaderSyncPeerSession::from_parts_with_session_id(
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
         peer.clone(),
         7,
         send,

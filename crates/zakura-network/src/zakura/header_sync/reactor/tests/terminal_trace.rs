@@ -6,7 +6,7 @@ use crate::zakura::{
 
 fn connect(reactor: &mut HeaderSyncReactor, peer: ZakuraPeerId, session_id: u64) {
     let (send, _outbound) = framed_channel(8);
-    reactor.handle_peer_connected(HeaderSyncPeerSession::from_parts_with_connection(
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
         peer.clone(),
         session_id,
         send,

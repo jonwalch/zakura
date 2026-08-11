@@ -64,28 +64,28 @@ mod stream_tests {
 
 /// Cloneable typed sender for one canonical header-sync stream.
 #[derive(Clone, Debug)]
-pub struct HeaderSyncPeerSession {
+pub struct PeerSession {
     peer_id: ZakuraPeerId,
     session_id: u64,
     direction: ServicePeerDirection,
-    inner: Arc<HeaderSyncPeerSessionInner>,
+    inner: Arc<PeerSessionInner>,
 }
 
 #[derive(Debug)]
-struct HeaderSyncPeerSessionInner {
+struct PeerSessionInner {
     send: FramedSend,
     cancel_token: CancellationToken,
     connection_cancel_token: CancellationToken,
     close_cause: CloseCause,
-    commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+    commands: Option<mpsc::UnboundedSender<PeerCommand>>,
     next_request_id: AtomicU64,
 }
 
-impl HeaderSyncPeerSession {
+impl PeerSession {
     fn new_with_commands(
         session: &PeerStreamSession,
         direction: ServicePeerDirection,
-        commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
+        commands: mpsc::UnboundedSender<PeerCommand>,
         session_id: u64,
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
@@ -184,13 +184,13 @@ impl HeaderSyncPeerSession {
         cancel_token: CancellationToken,
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
-        commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+        commands: Option<mpsc::UnboundedSender<PeerCommand>>,
     ) -> Self {
         Self {
             peer_id,
             session_id,
             direction,
-            inner: Arc::new(HeaderSyncPeerSessionInner {
+            inner: Arc::new(PeerSessionInner {
                 send,
                 cancel_token,
                 connection_cancel_token,
@@ -295,7 +295,7 @@ impl HeaderSyncPeerSession {
         };
         if let Some(commands) = &self.inner.commands {
             commands
-                .send(HeaderSyncPeerCommand::Reserve(expected))
+                .send(PeerCommand::Reserve(expected))
                 .map_err(|_| OrderedSendError::Closed)?;
         }
         let result = match self.inner.send.try_send(frame) {
@@ -305,7 +305,7 @@ impl HeaderSyncPeerSession {
         };
         if result.is_err() {
             if let Some(commands) = &self.inner.commands {
-                let _ = commands.send(HeaderSyncPeerCommand::Cancel(request_id));
+                let _ = commands.send(PeerCommand::Cancel(request_id));
             }
         }
         result
@@ -313,7 +313,7 @@ impl HeaderSyncPeerSession {
 
     pub(super) fn cancel_request(&self, request_id: HeaderSyncRequestId) {
         if let Some(commands) = &self.inner.commands {
-            let _ = commands.send(HeaderSyncPeerCommand::Cancel(request_id));
+            let _ = commands.send(PeerCommand::Cancel(request_id));
         }
     }
 
@@ -350,7 +350,7 @@ impl HeaderSyncPeerSession {
 }
 
 #[derive(Debug)]
-pub(super) enum HeaderSyncPeerCommand {
+pub(super) enum PeerCommand {
     Reserve(ExpectedHeadersResponse),
     Cancel(HeaderSyncRequestId),
 }
@@ -401,7 +401,7 @@ pub(crate) async fn drive_header_sync_actions(
                 scope,
             } => {
                 let _ = handle
-                    .send(HeaderSyncEvent::HeaderLocatorReady {
+                    .send(Event::HeaderLocatorReady {
                         peer,
                         session_id,
                         target_tip_hash,
@@ -412,20 +412,20 @@ pub(crate) async fn drive_header_sync_actions(
             }
             HeaderSyncAction::QueryVctRepairContext { owner, .. } => {
                 let _ = handle
-                    .send(HeaderSyncEvent::VctRepairContextReady {
+                    .send(Event::VctRepairContextReady {
                         owner,
                         result: VctRepairContextResult::Unavailable,
                     })
                     .await;
             }
-            HeaderSyncAction::AcquireHeaderPath {
+            HeaderSyncAction::AcquirePath {
                 peer,
                 session_id,
                 scope,
                 request,
             } => {
                 let _ = handle
-                    .send(HeaderSyncEvent::HeaderPathLeaseReady {
+                    .send(Event::PathLeaseReady {
                         peer,
                         session_id,
                         scope,
@@ -436,7 +436,7 @@ pub(crate) async fn drive_header_sync_actions(
                     })
                     .await;
             }
-            HeaderSyncAction::ReadHeaderPath { .. }
+            HeaderSyncAction::ReadPath { .. }
             | HeaderSyncAction::ReleaseHeaderPath { .. }
             | HeaderSyncAction::PrepareHeaderTarget { .. }
             | HeaderSyncAction::ApplyHeaderTarget { .. } => {}
@@ -610,7 +610,7 @@ impl Service for HeaderSyncService {
         let close_cause = peer.close_cause();
         let conn_id = peer.conn_id;
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let header_sync_session = HeaderSyncPeerSession::new_with_commands(
+        let header_sync_session = PeerSession::new_with_commands(
             &session,
             peer.direction,
             commands_tx,
@@ -646,7 +646,7 @@ impl Service for HeaderSyncService {
 
         let _ = self
             .header_sync
-            .send_lifecycle(HeaderSyncEvent::PeerConnected(header_sync_session));
+            .send_lifecycle(Event::PeerConnected(header_sync_session));
         let codec = self.header_sync.codec();
         let (_, _, _, recv, _, _) = session.into_parts();
         let pipe_peer = peer_id.clone();
@@ -692,7 +692,7 @@ impl Service for HeaderSyncService {
                 }
             };
             if should_notify {
-                let _ = teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected {
+                let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
                     peer: teardown_peer,
                     session_id,
                     reason: teardown_close_cause.get_or("stream_closed"),
@@ -747,13 +747,11 @@ impl Service for HeaderSyncService {
         };
         if let Some(record) = removed {
             record.cancel_token.cancel();
-            let _ = self
-                .header_sync
-                .send_lifecycle(HeaderSyncEvent::PeerDisconnected {
-                    peer: peer.clone(),
-                    session_id: record.session_id,
-                    reason: "service_removed",
-                });
+            let _ = self.header_sync.send_lifecycle(Event::PeerDisconnected {
+                peer: peer.clone(),
+                session_id: record.session_id,
+                reason: "service_removed",
+            });
         }
     }
 
@@ -772,7 +770,7 @@ impl Service for HeaderSyncService {
             .decode_frame(frame, None)
             .map_err(|error| SinkReject::protocol(std::io::Error::other(error.to_string())))?;
         self.header_sync
-            .try_send(HeaderSyncEvent::SessionWireMessage {
+            .try_send(Event::WireMessage {
                 peer,
                 session_id: 0,
                 msg: message,

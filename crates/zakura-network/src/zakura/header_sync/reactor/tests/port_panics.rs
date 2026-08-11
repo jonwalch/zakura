@@ -14,12 +14,12 @@ struct PanickingPort {
     vct_release: Option<Arc<Notify>>,
 }
 
-impl port::HeaderChainPort for PanickingPort {
+impl port::Port for PanickingPort {
     fn continuation_locator(
         &self,
     ) -> port::HeaderChainFuture<
         '_,
-        Result<Option<zakura_header_chain::HeaderLocator>, port::HeaderChainPortError>,
+        Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
     > {
         let release = self.release.clone();
         Box::pin(async move {
@@ -34,8 +34,7 @@ impl port::HeaderChainPort for PanickingPort {
         &self,
         _owner: zakura_header_chain::BodyWorkOwner,
         _height: block::Height,
-    ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::HeaderChainPortError>>
-    {
+    ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::PortError>> {
         let release = self.vct_release.clone();
         Box::pin(async move {
             if let Some(release) = release {
@@ -47,25 +46,23 @@ impl port::HeaderChainPort for PanickingPort {
 
     fn acquire_header_path(
         &self,
-        _request: port::AcquireHeaderPath,
-    ) -> port::HeaderChainFuture<'_, Result<port::AcquireHeaderPathReply, port::HeaderChainPortError>>
-    {
-        Box::pin(async { Ok(port::AcquireHeaderPathReply::TargetNotRetained) })
+        _request: port::AcquirePath,
+    ) -> port::HeaderChainFuture<'_, Result<port::AcquirePathReply, port::PortError>> {
+        Box::pin(async { Ok(port::AcquirePathReply::TargetNotRetained) })
     }
 
     fn read_header_path(
         &self,
         _path: port::RetainedHeaderPath,
-        _request: port::ReadHeaderPath,
-    ) -> port::HeaderChainFuture<'_, Result<port::ReadHeaderPathReply, port::HeaderChainPortError>>
-    {
-        Box::pin(async { Ok(port::ReadHeaderPathReply::Unavailable) })
+        _request: port::ReadPath,
+    ) -> port::HeaderChainFuture<'_, Result<port::ReadPathReply, port::PortError>> {
+        Box::pin(async { Ok(port::ReadPathReply::Unavailable) })
     }
 
     fn release_header_path(
         &self,
         _path: port::RetainedHeaderPath,
-    ) -> port::HeaderChainFuture<'_, Result<(), port::HeaderChainPortError>> {
+    ) -> port::HeaderChainFuture<'_, Result<(), port::PortError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -101,7 +98,7 @@ impl port::HeaderChainPort for PanickingPort {
     }
 }
 
-fn direct_reactor(port: Arc<dyn port::HeaderChainPort>) -> HeaderSyncReactor {
+fn direct_reactor(port: Arc<dyn port::Port>) -> HeaderSyncReactor {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -123,7 +120,7 @@ fn connected_session(
     let service_cancel = CancellationToken::new();
     let connection_cancel = CancellationToken::new();
     let close_cause = CloseCause::new();
-    reactor.handle_peer_connected(HeaderSyncPeerSession::from_parts_with_connection(
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
         peer,
         session_id,
         send,

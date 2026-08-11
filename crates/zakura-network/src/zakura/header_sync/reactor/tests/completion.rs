@@ -398,9 +398,11 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the peer connects");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -427,7 +429,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         tree_aux_schema_mask: 0,
     };
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::Status(remote_status.clone()),
@@ -443,7 +445,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         other => panic!("expected locator query for target, got {other:?}"),
     };
     handle
-        .send(HeaderSyncEvent::HeaderLocatorReady {
+        .send(Event::HeaderLocatorReady {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
@@ -468,13 +470,11 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     let second_peer =
         ZakuraPeerId::new(vec![0x72; 32]).expect("the second peer ID has the required length");
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(
-                second_peer.clone(),
-                second_send,
-                CancellationToken::new(),
-            ),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            second_peer.clone(),
+            second_send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the second peer connects");
     let _second_status = second_outbound
@@ -485,7 +485,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     let mut second_remote_status = remote_status;
     second_remote_status.selected_tip_hash = second_target;
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: second_peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::Status(second_remote_status),
@@ -501,7 +501,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         other => panic!("expected second locator query, got {other:?}"),
     };
     handle
-        .send(HeaderSyncEvent::HeaderLocatorReady {
+        .send(Event::HeaderLocatorReady {
             peer: second_peer,
             session_id: 0,
             target_tip_hash: second_target,
@@ -524,7 +524,7 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     first_header.time += chrono::Duration::seconds(1);
     let first_header = Arc::new(first_header);
     handle
-        .send(HeaderSyncEvent::SessionResponse {
+        .send(Event::SessionResponse {
             peer,
             session_id: 0,
             scope,
@@ -576,9 +576,11 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the peer connects");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -597,7 +599,7 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
         tree_aux_schema_mask: 0,
     };
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::Status(remote_status.clone()),
@@ -636,7 +638,7 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
     };
 
     handle
-        .send(HeaderSyncEvent::HeaderLocatorReady {
+        .send(Event::HeaderLocatorReady {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
@@ -660,7 +662,7 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
 
     assert_ne!(fresh_scope, stale_scope);
     handle
-        .send(HeaderSyncEvent::HeaderLocatorReady {
+        .send(Event::HeaderLocatorReady {
             peer,
             session_id: 0,
             target_tip_hash: target,
@@ -694,9 +696,11 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the peer connects");
     let status_frame = outbound.recv().await.expect("initial status is sent");
@@ -731,7 +735,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         tree_aux_schema_mask: 0,
     };
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::Status(remote_status.clone()),
@@ -747,7 +751,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         other => panic!("expected locator query for target, got {other:?}"),
     };
     handle
-        .send(HeaderSyncEvent::HeaderLocatorReady {
+        .send(Event::HeaderLocatorReady {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target.hash,
@@ -770,7 +774,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
             .expect("the fair reservation fits on the wire")
     );
     handle
-        .send(HeaderSyncEvent::SessionResponse {
+        .send(Event::SessionResponse {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -800,7 +804,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     };
     assert_eq!(continuation.locator_hashes, vec![first.hash]);
     handle
-        .send(HeaderSyncEvent::SessionResponse {
+        .send(Event::SessionResponse {
             peer: peer.clone(),
             session_id: 0,
             scope,
@@ -888,7 +892,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     let mut stale_insert = insert.clone();
     stale_insert.owner = stale_owner;
     handle
-        .send(HeaderSyncEvent::HeaderTargetPrepared {
+        .send(Event::HeaderTargetPrepared {
             peer: peer.clone(),
             source,
             owner: stale_owner,
@@ -910,7 +914,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     let mut mismatched_insert = insert.clone();
     mismatched_insert.source = zakura_header_chain::SourceId::from_digest([7; 32]);
     handle
-        .send(HeaderSyncEvent::HeaderTargetPrepared {
+        .send(Event::HeaderTargetPrepared {
             peer: peer.clone(),
             source,
             owner,
@@ -930,7 +934,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         "contradictory sealed evidence has no state-call or peer-score action"
     );
     handle
-        .send(HeaderSyncEvent::HeaderTargetPrepared {
+        .send(Event::HeaderTargetPrepared {
             peer: peer.clone(),
             source,
             owner,
@@ -959,7 +963,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         insert
     );
     handle
-        .send(HeaderSyncEvent::HeaderTargetPrepared {
+        .send(Event::HeaderTargetPrepared {
             peer: peer.clone(),
             source,
             owner,
@@ -979,7 +983,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         "a duplicate preparation cannot submit a second state call"
     );
     handle
-        .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        .send(Event::HeaderTargetAdmissionReady {
             peer: peer.clone(),
             source: zakura_header_chain::SourceId::from_digest([8; 32]),
             owner,
@@ -994,7 +998,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         "a wrong-source state result cannot score or retire current work"
     );
     handle
-        .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        .send(Event::HeaderTargetAdmissionReady {
             peer: peer.clone(),
             source,
             owner,
@@ -1005,7 +1009,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     let mut advisory_height_changed = remote_status;
     advisory_height_changed.selected_tip_height = block::Height(200);
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer,
             session_id: 0,
             msg: HeaderSyncMessage::Status(advisory_height_changed),
@@ -1036,9 +1040,11 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
     let (send, mut outbound) = framed_channel(16);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the peer connects");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -1064,7 +1070,7 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
         HeadersOutcomeCode::NoLocatorIntersection,
     ] {
         handle
-            .send(HeaderSyncEvent::SessionWireMessage {
+            .send(Event::WireMessage {
                 peer: peer.clone(),
                 session_id: 0,
                 msg: HeaderSyncMessage::Status(remote_status.clone()),
@@ -1080,7 +1086,7 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
             other => panic!("expected locator query for target, got {other:?}"),
         };
         handle
-            .send(HeaderSyncEvent::HeaderLocatorReady {
+            .send(Event::HeaderLocatorReady {
                 peer: peer.clone(),
                 session_id: 0,
                 target_tip_hash: target,
@@ -1098,7 +1104,7 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
             other => panic!("expected GetHeaders, got {other:?}"),
         };
         handle
-            .send(HeaderSyncEvent::SessionResponse {
+            .send(Event::SessionResponse {
                 peer: peer.clone(),
                 session_id: 0,
                 scope,
@@ -1113,7 +1119,7 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
     }
 
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer,
             session_id: 0,
             msg: HeaderSyncMessage::Status(remote_status),

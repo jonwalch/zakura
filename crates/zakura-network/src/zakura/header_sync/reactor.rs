@@ -183,7 +183,7 @@ fn build_header_sync_reactor(
 
 #[derive(Debug)]
 struct PeerState {
-    session: HeaderSyncPeerSession,
+    session: PeerSession,
     status_publisher: Option<StatusPublisher>,
     last_status: Option<Status>,
     /// Consecutive requests this session answered with nothing usable.
@@ -237,8 +237,8 @@ impl PendingLeaseRelease {
 #[derive(Debug)]
 struct HeaderSyncReactor {
     startup: HeaderSyncStartup,
-    events: mpsc::Receiver<HeaderSyncEvent>,
-    lifecycle: mpsc::UnboundedReceiver<HeaderSyncEvent>,
+    events: mpsc::Receiver<Event>,
+    lifecycle: mpsc::UnboundedReceiver<Event>,
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
     pending_port_operations: FuturesUnordered<PendingPortOperation>,
@@ -283,7 +283,7 @@ struct PortPanicContext {
     operation: &'static str,
     peer: Option<ZakuraPeerId>,
     session_id: Option<u64>,
-    session: Option<HeaderSyncPeerSession>,
+    session: Option<PeerSession>,
     scope: Option<zakura_header_chain::HeaderWorkAuthority>,
     owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
     target_tip_hash: Option<block::Hash>,
@@ -376,8 +376,8 @@ fn vct_repair_task(
 }
 
 #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
-fn port_header_entry(entry: HeaderEntry) -> zakura_node_services::header_chain::HeaderTargetEntry {
-    zakura_node_services::header_chain::HeaderTargetEntry {
+fn port_header_entry(entry: HeaderEntry) -> zakura_node_services::header_chain::TargetEntry {
+    zakura_node_services::header_chain::TargetEntry {
         header: entry.header,
         body_size: entry.body_size,
         tree_aux: entry.tree_aux,
@@ -546,33 +546,33 @@ impl HeaderSyncReactor {
         self.retire_all_peer_work(terminal_outcome);
     }
 
-    fn handle_event(&mut self, event: HeaderSyncEvent) {
+    fn handle_event(&mut self, event: Event) {
         metrics::counter!(
             "sync.header.reactor.events",
             "event" => event.metrics_label()
         )
         .increment(1);
         match event {
-            HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session),
-            HeaderSyncEvent::PeerDisconnected {
+            Event::PeerConnected(session) => self.handle_peer_connected(session),
+            Event::PeerDisconnected {
                 peer,
                 session_id,
                 reason,
             } => self.handle_peer_disconnected(&peer, session_id, reason),
-            HeaderSyncEvent::AdvisoryHeaderSummary { .. } => {}
-            HeaderSyncEvent::SessionWireMessage {
+            Event::AdvisorySummary { .. } => {}
+            Event::WireMessage {
                 peer,
                 session_id,
                 msg,
             } => self.handle_wire_message(peer, session_id, msg),
-            HeaderSyncEvent::SessionResponse {
+            Event::SessionResponse {
                 peer,
                 session_id,
                 scope,
                 msg,
             } => self.handle_wire_response(peer, session_id, scope, msg),
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderSyncEvent::HeaderLocatorReady {
+            Event::HeaderLocatorReady {
                 peer,
                 session_id,
                 target_tip_hash,
@@ -582,11 +582,11 @@ impl HeaderSyncReactor {
                 self.handle_header_locator_ready(peer, session_id, target_tip_hash, scope, locator)
             }
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderSyncEvent::VctRepairContextReady { owner, result } => {
+            Event::VctRepairContextReady { owner, result } => {
                 self.handle_vct_repair_context_ready(owner, result)
             }
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderSyncEvent::HeaderPathLeaseReady {
+            Event::PathLeaseReady {
                 peer,
                 session_id,
                 scope,
@@ -594,7 +594,7 @@ impl HeaderSyncReactor {
                 result,
             } => self.handle_header_path_lease_ready(peer, session_id, scope, request, result),
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderSyncEvent::HeaderPathPageReady {
+            Event::HeaderPathPageReady {
                 peer,
                 session_id,
                 scope,
@@ -610,14 +610,14 @@ impl HeaderSyncReactor {
                 result,
             ),
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderSyncEvent::HeaderTargetPrepared {
+            Event::HeaderTargetPrepared {
                 peer,
                 source,
                 owner,
                 result,
             } => self.handle_header_target_prepared(peer, source, owner, result),
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderSyncEvent::HeaderTargetAdmissionReady {
+            Event::HeaderTargetAdmissionReady {
                 peer,
                 source,
                 owner,
@@ -633,7 +633,7 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn handle_peer_connected(&mut self, session: HeaderSyncPeerSession) {
+    fn handle_peer_connected(&mut self, session: PeerSession) {
         let latest_snapshot = self
             .startup
             .committed_snapshots
@@ -985,7 +985,7 @@ impl HeaderSyncReactor {
                     });
                     self.served_path_deadlines
                         .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-                    let action = HeaderPortOperation::ReadHeaderPath {
+                    let action = HeaderPortOperation::ReadPath {
                         peer: peer.clone(),
                         session_id,
                         lease_id: *lease_id,
@@ -1026,7 +1026,7 @@ impl HeaderSyncReactor {
         );
         self.served_path_deadlines
             .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-        if !self.dispatch_action(HeaderPortOperation::AcquireHeaderPath {
+        if !self.dispatch_action(HeaderPortOperation::AcquirePath {
             peer: peer.clone(),
             session_id,
             scope,
@@ -1866,7 +1866,7 @@ impl HeaderSyncReactor {
         );
         self.served_path_deadlines
             .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-        if !self.dispatch_action(HeaderPortOperation::ReadHeaderPath {
+        if !self.dispatch_action(HeaderPortOperation::ReadPath {
             peer: peer.clone(),
             session_id,
             lease_id: lease.lease_id,
@@ -3226,7 +3226,7 @@ impl HeaderSyncReactor {
     fn emit_queue_send_failed(
         &self,
         peer: &ZakuraPeerId,
-        session: &HeaderSyncPeerSession,
+        session: &PeerSession,
         message: &'static str,
         error: &OrderedSendError,
         request_id: Option<u64>,
@@ -3345,14 +3345,14 @@ impl HeaderSyncReactor {
                         }) as HeaderSyncPortCompletion
                     })
                 }
-                HeaderPortOperation::AcquireHeaderPath {
+                HeaderPortOperation::AcquirePath {
                     peer,
                     session_id,
                     scope,
                     request,
                 } => Box::pin(async move {
                     let reply = header_chain
-                        .acquire_header_path(port::AcquireHeaderPath {
+                        .acquire_header_path(port::AcquirePath {
                             source: source_id_from_peer(&peer),
                             session_id,
                             scope,
@@ -3361,7 +3361,7 @@ impl HeaderSyncReactor {
                         })
                         .await;
                     let (result, acquired) = match reply {
-                        Ok(port::AcquireHeaderPathReply::Acquired(path)) => {
+                        Ok(port::AcquirePathReply::Acquired(path)) => {
                             let lease_id = path.handle_id();
                             (
                                 HeaderPathLeaseResult::Acquired(HeaderPathLease {
@@ -3375,17 +3375,17 @@ impl HeaderSyncReactor {
                         }
                         Ok(reply) => (
                             HeaderPathLeaseResult::Outcome(match reply {
-                                port::AcquireHeaderPathReply::TargetNotRetained => {
+                                port::AcquirePathReply::TargetNotRetained => {
                                     HeadersOutcomeCode::TargetNotRetained
                                 }
-                                port::AcquireHeaderPathReply::NoLocatorIntersection => {
+                                port::AcquirePathReply::NoLocatorIntersection => {
                                     HeadersOutcomeCode::NoLocatorIntersection
                                 }
-                                port::AcquireHeaderPathReply::HistoryPruned => {
+                                port::AcquirePathReply::HistoryPruned => {
                                     HeadersOutcomeCode::HistoryPruned
                                 }
-                                port::AcquireHeaderPathReply::Busy => HeadersOutcomeCode::Busy,
-                                port::AcquireHeaderPathReply::Acquired(_) => {
+                                port::AcquirePathReply::Busy => HeadersOutcomeCode::Busy,
+                                port::AcquirePathReply::Acquired(_) => {
                                     unreachable!("acquired paths are handled above")
                                 }
                             }),
@@ -3408,7 +3408,7 @@ impl HeaderSyncReactor {
                         );
                     }) as HeaderSyncPortCompletion
                 }),
-                HeaderPortOperation::ReadHeaderPath {
+                HeaderPortOperation::ReadPath {
                     peer,
                     session_id,
                     lease_id,
@@ -3429,7 +3429,7 @@ impl HeaderSyncReactor {
                         let result = match header_chain
                             .read_header_path(
                                 path,
-                                port::ReadHeaderPath {
+                                port::ReadPath {
                                     after_hash,
                                     max_header_count,
                                     want_tree_aux: tree_aux_schema == AuxSchema::V1,
@@ -3437,12 +3437,12 @@ impl HeaderSyncReactor {
                             )
                             .await
                         {
-                            Ok(port::ReadHeaderPathReply::Page(page)) => {
+                            Ok(port::ReadPathReply::Page(page)) => {
                                 assemble_port_header_path_page(lease_id, *page, tree_aux_schema)
                                     .map(|page| HeaderPathPageResult::Page(Box::new(page)))
                                     .unwrap_or(HeaderPathPageResult::Unavailable)
                             }
-                            Ok(port::ReadHeaderPathReply::Unavailable) => {
+                            Ok(port::ReadPathReply::Unavailable) => {
                                 HeaderPathPageResult::Unavailable
                             }
                             Err(error) => {
@@ -3517,7 +3517,7 @@ impl HeaderSyncReactor {
                             reactor.handle_header_target_prepared(peer, source, owner, result);
                         }) as HeaderSyncPortCompletion;
                     }
-                    let entries = match port::HeaderTargetEntries::try_from(
+                    let entries = match port::TargetEntries::try_from(
                         entries
                             .into_iter()
                             .map(port_header_entry)
@@ -3629,7 +3629,7 @@ impl HeaderSyncReactor {
                 None,
                 None,
             ),
-            HeaderPortOperation::AcquireHeaderPath {
+            HeaderPortOperation::AcquirePath {
                 peer,
                 session_id,
                 scope,
@@ -3643,7 +3643,7 @@ impl HeaderSyncReactor {
                 Some(request.target_tip_hash),
                 None,
             ),
-            HeaderPortOperation::ReadHeaderPath {
+            HeaderPortOperation::ReadPath {
                 peer,
                 session_id,
                 lease_id,

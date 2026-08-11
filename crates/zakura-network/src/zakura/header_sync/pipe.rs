@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    events::{HeaderSyncEvent, HeaderSyncHandle, HeaderSyncRequestId},
-    service::{ExpectedHeadersResponse, HeaderSyncPeerCommand},
+    events::{Event, HeaderSyncHandle, HeaderSyncRequestId},
+    service::{ExpectedHeadersResponse, PeerCommand},
     HeaderSyncCodec, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME,
 };
 use crate::zakura::{Frame, FramedRecv, SinkReject, ZakuraPeerId};
@@ -26,7 +26,7 @@ pub(super) async fn run_peer(
     peer: ZakuraPeerId,
     session_id: u64,
     direction: crate::zakura::ServicePeerDirection,
-    mut commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+    mut commands: mpsc::UnboundedReceiver<PeerCommand>,
     mut recv: FramedRecv,
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
@@ -35,7 +35,7 @@ pub(super) async fn run_peer(
     loop {
         enum Input {
             Frame(Frame),
-            Command(HeaderSyncPeerCommand),
+            Command(PeerCommand),
             Done,
         }
 
@@ -107,13 +107,13 @@ pub(super) async fn run_peer(
                 protocol_reject(error)
             })?;
         let event = match expected_response {
-            Some(response) => HeaderSyncEvent::SessionResponse {
+            Some(response) => Event::SessionResponse {
                 peer: peer.clone(),
                 session_id,
                 scope: response.scope,
                 msg,
             },
-            None => HeaderSyncEvent::SessionWireMessage {
+            None => Event::WireMessage {
                 peer: peer.clone(),
                 session_id,
                 msg,
@@ -158,14 +158,14 @@ fn emit_pipe_violation(
 fn apply_command(
     expected: &mut HashMap<HeaderSyncRequestId, ExpectedHeadersResponse>,
     cancelled: &mut CancelledResponseIds,
-    command: HeaderSyncPeerCommand,
+    command: PeerCommand,
 ) {
     match command {
-        HeaderSyncPeerCommand::Reserve(response) => {
+        PeerCommand::Reserve(response) => {
             cancelled.remove(response.request_id);
             expected.insert(response.request_id, response);
         }
-        HeaderSyncPeerCommand::Cancel(request_id) => {
+        PeerCommand::Cancel(request_id) => {
             if expected.remove(&request_id).is_some() {
                 cancelled.insert(request_id);
             }
@@ -237,7 +237,7 @@ mod tests {
         }
     }
 
-    fn handle(codec: HeaderSyncCodec) -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
+    fn handle(codec: HeaderSyncCodec) -> (HeaderSyncHandle, mpsc::Receiver<Event>) {
         let (events, receiver) = mpsc::channel(4);
         let (lifecycle, _) = mpsc::unbounded_channel();
         let (_, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
@@ -272,7 +272,7 @@ mod tests {
         let (handle, mut events) = handle(codec.clone());
         let (commands_tx, commands) = mpsc::unbounded_channel();
         commands_tx
-            .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+            .send(PeerCommand::Reserve(ExpectedHeadersResponse {
                 request_id: HeaderSyncRequestId::new(1).expect("one is nonzero"),
                 scope: scope(),
                 context: HeaderSyncDecodeContext {
@@ -297,7 +297,7 @@ mod tests {
 
         assert!(matches!(
             events.recv().await,
-            Some(HeaderSyncEvent::SessionResponse {
+            Some(Event::SessionResponse {
                 scope: response_scope,
                 msg: HeaderSyncMessage::HeadersOutcome(_),
                 ..
@@ -323,7 +323,7 @@ mod tests {
             let (commands_tx, commands) = mpsc::unbounded_channel();
             if let Some(request_id) = reserved_id {
                 commands_tx
-                    .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+                    .send(PeerCommand::Reserve(ExpectedHeadersResponse {
                         request_id: HeaderSyncRequestId::new(request_id)
                             .expect("the fixture request ID is nonzero"),
                         scope: scope(),
@@ -376,7 +376,7 @@ mod tests {
         let (commands_tx, commands) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(1).expect("one is nonzero");
         commands_tx
-            .send(HeaderSyncPeerCommand::Reserve(ExpectedHeadersResponse {
+            .send(PeerCommand::Reserve(ExpectedHeadersResponse {
                 request_id,
                 scope: scope(),
                 context: HeaderSyncDecodeContext {
@@ -386,7 +386,7 @@ mod tests {
             }))
             .expect("the pipe command receiver is open");
         commands_tx
-            .send(HeaderSyncPeerCommand::Cancel(request_id))
+            .send(PeerCommand::Cancel(request_id))
             .expect("the pipe command receiver is open");
 
         run_peer(

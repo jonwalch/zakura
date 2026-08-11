@@ -96,14 +96,16 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the repair supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::Status(Status {
@@ -122,7 +124,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
         .await
         .expect("the repair supplier status reaches the reactor");
     handle
-        .send(HeaderSyncEvent::VctRepairContextReady {
+        .send(Event::VctRepairContextReady {
             owner,
             result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
                 target: repair_header,
@@ -146,7 +148,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     assert_eq!(request.max_header_count, 1);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
     handle
-        .send(HeaderSyncEvent::SessionResponse {
+        .send(Event::SessionResponse {
             peer: peer.clone(),
             session_id: 0,
             scope: owner.header_authority(),
@@ -252,7 +254,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     });
     let adapter_key = zakura_node_services::header_chain::AdapterKey::new();
     handle
-        .send(HeaderSyncEvent::HeaderTargetPrepared {
+        .send(Event::HeaderTargetPrepared {
             peer: peer.clone(),
             source,
             owner: action_owner,
@@ -289,7 +291,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
         .expect("the committed metadata-only snapshot is observed");
     time::sleep(std::time::Duration::from_millis(10)).await;
     handle
-        .send(HeaderSyncEvent::HeaderTargetAdmissionReady {
+        .send(Event::HeaderTargetAdmissionReady {
             peer,
             source,
             owner: action_owner,
@@ -342,14 +344,16 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
     handle
-        .send(HeaderSyncEvent::PeerConnected(
-            HeaderSyncPeerSession::from_parts(peer.clone(), send, CancellationToken::new()),
-        ))
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
         .await
         .expect("the supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
     handle
-        .send(HeaderSyncEvent::SessionWireMessage {
+        .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
             msg: HeaderSyncMessage::Status(Status {
@@ -368,7 +372,7 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         .await
         .expect("the supplier status reaches the reactor");
     handle
-        .send(HeaderSyncEvent::VctRepairContextReady {
+        .send(Event::VctRepairContextReady {
             owner,
             result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
                 target: repair_header,
@@ -398,7 +402,7 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         HeaderPortOperation::QueryVctRepairContext { .. }
     ));
     handle
-        .send(HeaderSyncEvent::SessionResponse {
+        .send(Event::SessionResponse {
             peer,
             session_id: 0,
             scope: owner.header_authority(),

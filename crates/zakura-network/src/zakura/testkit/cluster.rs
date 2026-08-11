@@ -152,8 +152,8 @@ mod tests {
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
-            DiscoveryMessage, Frame, FramedSend, FullStateFrontiers, HeaderEntry, HeaderSyncAction,
-            HeaderSyncEvent, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
+            DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
+            HeaderSyncAction, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
             Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, MAX_BS_RESPONSE_BYTES,
             ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
             ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
@@ -257,7 +257,7 @@ mod tests {
             action => return Err(format!("unexpected header action: {action:?}").into()),
         };
         header_sync
-            .send(HeaderSyncEvent::HeaderLocatorReady {
+            .send(Event::HeaderLocatorReady {
                 peer: hostile_id.clone(),
                 session_id,
                 target_tip_hash: target.1,

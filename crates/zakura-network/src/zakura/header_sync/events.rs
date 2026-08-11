@@ -5,8 +5,8 @@ use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
 
 use super::{
-    AuxSchema, GetHeaders, HeaderEntry, HeaderSyncCodec, HeaderSyncMessage, HeaderSyncPeerSession,
-    HeadersOutcomeCode, ZakuraHeaderSyncConfig,
+    AuxSchema, GetHeaders, HeaderEntry, HeaderSyncCodec, HeaderSyncMessage, HeadersOutcomeCode,
+    PeerSession, ZakuraHeaderSyncConfig,
 };
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState, ZakuraPeerId,
@@ -40,7 +40,7 @@ pub struct HeaderSyncStartup {
     /// VCT metadata repair needs published by the finalized writer.
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed durable header-chain operations.
-    pub header_chain_port: Arc<dyn zakura_node_services::header_chain::HeaderChainPort>,
+    pub header_chain_port: Arc<dyn zakura_node_services::header_chain::Port>,
     /// Selects whether reactor operations use the typed port or the test observer.
     pub(crate) port_dispatch: PortDispatch,
     /// Local header-sync configuration.
@@ -76,9 +76,7 @@ impl HeaderSyncStartup {
             committed_snapshots: None,
             vct_root_repairs: None,
             #[cfg(not(test))]
-            header_chain_port: Arc::new(
-                zakura_node_services::header_chain::UnavailableHeaderChainPort,
-            ),
+            header_chain_port: Arc::new(zakura_node_services::header_chain::UnavailablePort),
             #[cfg(test)]
             header_chain_port: Arc::new(zakura_node_services::header_chain::InertHeaderChainPort),
             #[cfg(not(any(test, feature = "zakura-testkit")))]
@@ -113,8 +111,8 @@ pub(crate) enum PortDispatch {
 /// Cheap cloneable handle used by transport and discovery services.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncHandle {
-    pub(super) events: mpsc::Sender<HeaderSyncEvent>,
-    pub(super) lifecycle: mpsc::UnboundedSender<HeaderSyncEvent>,
+    pub(super) events: mpsc::Sender<Event>,
+    pub(super) lifecycle: mpsc::UnboundedSender<Event>,
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
@@ -124,26 +122,17 @@ pub struct HeaderSyncHandle {
 
 impl HeaderSyncHandle {
     /// Send an event to the reactor.
-    pub async fn send(
-        &self,
-        event: HeaderSyncEvent,
-    ) -> Result<(), mpsc::error::SendError<HeaderSyncEvent>> {
+    pub async fn send(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
         self.events.send(event).await
     }
 
     /// Try to send an event without awaiting.
-    pub fn try_send(
-        &self,
-        event: HeaderSyncEvent,
-    ) -> Result<(), mpsc::error::TrySendError<HeaderSyncEvent>> {
+    pub fn try_send(&self, event: Event) -> Result<(), mpsc::error::TrySendError<Event>> {
         self.events.try_send(event)
     }
 
     /// Send a lifecycle event over the unbounded control channel.
-    pub fn send_lifecycle(
-        &self,
-        event: HeaderSyncEvent,
-    ) -> Result<(), mpsc::error::SendError<HeaderSyncEvent>> {
+    pub fn send_lifecycle(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
         self.lifecycle
             .send(event)
             .map_err(|error| mpsc::error::SendError(error.0))
@@ -187,9 +176,9 @@ impl HeaderSyncHandle {
 
 /// Facts accepted by the header-sync reactor.
 #[derive(Clone, Debug)]
-pub enum HeaderSyncEvent {
+pub enum Event {
     /// A canonical header-sync stream opened.
-    PeerConnected(HeaderSyncPeerSession),
+    PeerConnected(PeerSession),
     /// A canonical header-sync stream closed.
     PeerDisconnected {
         /// Authenticated peer identity.
@@ -200,14 +189,14 @@ pub enum HeaderSyncEvent {
         reason: &'static str,
     },
     /// First-party discovery summary used only for dial preference.
-    AdvisoryHeaderSummary {
+    AdvisorySummary {
         /// Peer that supplied the summary.
         peer: ZakuraPeerId,
         /// Advisory summary.
         summary: HeaderSyncServiceSummary,
     },
     /// A message decoded on a canonical stream.
-    SessionWireMessage {
+    WireMessage {
         /// Sending peer.
         peer: ZakuraPeerId,
         /// Ordered-stream generation.
@@ -251,7 +240,7 @@ pub enum HeaderSyncEvent {
     },
     /// State finished acquiring an immutable path for one inbound request.
     #[cfg(any(test, feature = "zakura-testkit"))]
-    HeaderPathLeaseReady {
+    PathLeaseReady {
         /// Peer that sent the request.
         peer: ZakuraPeerId,
         /// Ordered-stream generation that owns the request.
@@ -316,20 +305,20 @@ pub enum VctRepairContextResult {
     Unavailable,
 }
 
-impl HeaderSyncEvent {
+impl Event {
     pub(super) fn metrics_label(&self) -> &'static str {
         match self {
             Self::PeerConnected(_) => "peer_connected",
             Self::PeerDisconnected { .. } => "peer_disconnected",
-            Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
-            Self::SessionWireMessage { .. } => "session_wire_message",
+            Self::AdvisorySummary { .. } => "advisory_header_summary",
+            Self::WireMessage { .. } => "session_wire_message",
             Self::SessionResponse { .. } => "session_response",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::VctRepairContextReady { .. } => "vct_repair_context_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]
-            Self::HeaderPathLeaseReady { .. } => "header_path_lease_ready",
+            Self::PathLeaseReady { .. } => "header_path_lease_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderPathPageReady { .. } => "header_path_page_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]
@@ -434,7 +423,7 @@ pub enum HeaderPortOperation {
         height: block::Height,
     },
     /// Acquire an immutable retained path for one inbound request.
-    AcquireHeaderPath {
+    AcquirePath {
         /// Peer that sent the request.
         peer: ZakuraPeerId,
         /// Ordered-stream generation that owns the request.
@@ -445,7 +434,7 @@ pub enum HeaderPortOperation {
         request: GetHeaders,
     },
     /// Read one bounded page from an already acquired retained path.
-    ReadHeaderPath {
+    ReadPath {
         /// Peer that owns the lease.
         peer: ZakuraPeerId,
         /// Ordered-stream generation that owns the lease.

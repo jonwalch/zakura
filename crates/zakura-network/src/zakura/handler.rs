@@ -558,7 +558,7 @@ pub struct ZakuraHeaderSyncDriverStartup {
     /// VCT metadata repair needs published by the finalized writer.
     pub vct_root_repairs: Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     /// Typed header-chain operations used directly by the reactor.
-    pub header_chain_port: Arc<dyn zakura_node_services::header_chain::HeaderChainPort>,
+    pub header_chain_port: Arc<dyn zakura_node_services::header_chain::Port>,
 }
 
 impl ZakuraEndpoint {
@@ -5124,10 +5124,10 @@ mod tests {
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
-            HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncPeerSession, ServicePeerLimits,
-            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
-            ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits, LOCAL_MAX_MESSAGE_BYTES,
+            MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -6060,12 +6060,10 @@ mod tests {
         assert_eq!(i_open_collision_winner(&node_a, &node_b), a_wins);
     }
 
-    fn header_sync_test_session(
-        peer: ZakuraPeerId,
-    ) -> (HeaderSyncPeerSession, crate::zakura::FramedRecv) {
+    fn header_sync_test_session(peer: ZakuraPeerId) -> (PeerSession, crate::zakura::FramedRecv) {
         let (send, recv) = crate::zakura::framed_channel(32);
         (
-            HeaderSyncPeerSession::from_parts(peer, send, CancellationToken::new()),
+            PeerSession::from_parts(peer, send, CancellationToken::new()),
             recv,
         )
     }
@@ -6227,7 +6225,7 @@ mod tests {
         );
         let send_result = tokio::time::timeout(
             Duration::from_secs(1),
-            header_sync.send(HeaderSyncEvent::PeerConnected(session)),
+            header_sync.send(Event::PeerConnected(session)),
         )
         .await
         .expect("send returns promptly after header-sync shutdown");

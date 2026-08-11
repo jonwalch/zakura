@@ -23,11 +23,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
-    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle,
-    OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-    PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SinkReject,
-    Stream, StreamMode, ZakuraConnId, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES,
-    ZAKURA_CAP_DISCOVERY,
+    CloseCause, Event, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, OrderedSendError,
+    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, PeerStreamSession, Pipe,
+    Service, ServiceAdmissionDecision, ServicePeerDirection, SinkReject, Stream, StreamMode,
+    ZakuraConnId, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 
 #[cfg(test)]
@@ -772,7 +771,7 @@ impl DiscoverySink {
         if let Some(header_sync) = &self.header_sync {
             for summary in header_summaries {
                 if let Err(error) = header_sync
-                    .send(HeaderSyncEvent::AdvisoryHeaderSummary {
+                    .send(Event::AdvisorySummary {
                         peer: self.session.peer_id().clone(),
                         summary,
                     })
@@ -1042,8 +1041,8 @@ mod tests {
     use crate::zakura::header_sync::HeaderSyncService;
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
-        BlockSyncStartup, FullStateFrontiers, HeaderSyncAction, HeaderSyncPeerSession,
-        HeaderSyncStartup, ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
+        BlockSyncStartup, FullStateFrontiers, HeaderSyncAction, HeaderSyncStartup, PeerSession,
+        ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
         ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
         LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC,
         ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
@@ -1572,14 +1571,14 @@ mod tests {
         connected_tx.send_replace(vec![peer_id.clone()]);
 
         let (header_send, _header_recv) = framed_channel(8);
-        let header_session = HeaderSyncPeerSession::from_parts_with_direction(
+        let header_session = PeerSession::from_parts_with_direction(
             peer_id.clone(),
             ServicePeerDirection::Inbound,
             header_send,
             CancellationToken::new(),
         );
         header_sync
-            .send(HeaderSyncEvent::PeerConnected(header_session))
+            .send(Event::PeerConnected(header_session))
             .await?;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {

@@ -1619,8 +1619,8 @@ mod zakura_header_sync_driver_tests {
         height: block::Height,
         block: &Arc<block::Block>,
         serialized_size: usize,
-    ) -> zakura_node_services::header_chain::HeaderTargetEntry {
-        zakura_node_services::header_chain::HeaderTargetEntry {
+    ) -> zakura_node_services::header_chain::TargetEntry {
+        zakura_node_services::header_chain::TargetEntry {
             header: block.header.clone(),
             body_size: u32::try_from(serialized_size).expect("mainnet block vectors fit in u32"),
             tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {

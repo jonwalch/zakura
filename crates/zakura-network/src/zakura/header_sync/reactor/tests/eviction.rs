@@ -26,13 +26,8 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
     let peer = peer();
     let cancel = CancellationToken::new();
     let (send, outbound) = framed_channel(8);
-    reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
-            peer.clone(),
-            session_id,
-            send,
-            cancel.clone(),
-        ),
+    reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(peer.clone(), session_id, send, cancel.clone()),
     ));
     assert!(
         reactor.peer_state.contains_key(&peer),
@@ -279,13 +274,8 @@ fn a_strike_from_a_superseded_session_cannot_drop_its_replacement() {
     let mut fixture = eviction_fixture(1, 7);
     let replacement = CancellationToken::new();
     let (send, _replacement_outbound) = framed_channel(8);
-    fixture.reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
-            fixture.peer.clone(),
-            8,
-            send,
-            replacement.clone(),
-        ),
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(fixture.peer.clone(), 8, send, replacement.clone()),
     ));
     assert!(
         fixture.cancel.is_cancelled(),
@@ -356,13 +346,8 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
 
     let refused = CancellationToken::new();
     let (send, _refused_outbound) = framed_channel(8);
-    fixture.reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
-            fixture.peer.clone(),
-            8,
-            send,
-            refused.clone(),
-        ),
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(fixture.peer.clone(), 8, send, refused.clone()),
     ));
     assert!(
         !fixture.is_admitted() && refused.is_cancelled(),
@@ -383,13 +368,8 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
     );
     let readmitted = CancellationToken::new();
     let (send, _readmitted_outbound) = framed_channel(8);
-    fixture.reactor.handle_event(HeaderSyncEvent::PeerConnected(
-        HeaderSyncPeerSession::from_parts_with_session_id(
-            fixture.peer.clone(),
-            9,
-            send,
-            readmitted.clone(),
-        ),
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(fixture.peer.clone(), 9, send, readmitted.clone()),
     ));
 
     assert!(
