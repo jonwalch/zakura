@@ -329,7 +329,7 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     let max_checkpoint_height = blocks[1].coinbase_height().unwrap();
     let mut config = Config::ephemeral();
     config.enable_zakura_header_seed_from_committed_blocks = true;
-    // This state-only fixture commits bodies directly.
+    // The state-only fixture commits bodies directly.
     // The fixture has no network-supplied auxiliary root.
     config.vct_fast_sync = false;
     let (mut state_service, read, _tip, _tip_change) =
