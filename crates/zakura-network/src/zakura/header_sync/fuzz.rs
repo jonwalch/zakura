@@ -7,10 +7,10 @@ use zakura_chain::{
     work::difficulty::U256,
 };
 use zakura_header_chain::{
-    AlarmSet, BranchId, ChainScore, CompletionDecision, CompletionGate, EngineMode, EngineSnapshot,
-    Frontier, FrontierSet, HeaderGeneration, HeaderLocator, HeaderSyncWorkOwner,
-    HeaderWorkAuthority, HeaderWorkOwner, PendingOwners, RetiredWork, SourceId, StateVersion,
-    SuffixWork, VerifiedGeneration, MAX_STAGED_TARGETS_V1,
+    AlarmSet, BranchId, ChainScore, CompletionDecision, EngineMode, EngineSnapshot, Frontier,
+    FrontierSet, Gate, HeaderGeneration, HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority,
+    HeaderWorkOwner, PendingOwners, RetiredWork, SourceId, StateVersion, SuffixWork,
+    VerifiedGeneration, MAX_STAGED_TARGETS_V1,
 };
 
 use super::{
@@ -400,8 +400,7 @@ impl PursuitHarness {
             self.summary.refused_operations += 1;
             return;
         }
-        let decision =
-            CompletionGate::check(&self.snapshot, &self.pending, source(peer_key), &owner);
+        let decision = Gate::check(&self.snapshot, &self.pending, source(peer_key), &owner);
         if decision == CompletionDecision::Current {
             self.summary.state_submissions += 1;
             self.record_completion_effects();
@@ -489,7 +488,7 @@ impl PursuitHarness {
             return;
         };
         self.summary.released_completions += 1;
-        let decision = CompletionGate::check(
+        let decision = Gate::check(
             &self.snapshot,
             &self.pending,
             source(completion.peer_key),
@@ -636,7 +635,7 @@ impl PursuitHarness {
                 .held
                 .values()
                 .any(|completion| completion.owner == owner)
-            || CompletionGate::check(&self.snapshot, &self.pending, source(peer_key), &owner)
+            || Gate::check(&self.snapshot, &self.pending, source(peer_key), &owner)
                 != CompletionDecision::Current
         {
             self.summary.refused_operations += 1;
@@ -712,7 +711,7 @@ impl PursuitHarness {
             }
         };
         self.summary.released_state_results += 1;
-        let decision = CompletionGate::check(
+        let decision = Gate::check(
             &self.snapshot,
             &self.pending,
             source(completion.peer_key),

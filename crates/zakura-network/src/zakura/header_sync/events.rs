@@ -42,7 +42,7 @@ pub struct HeaderSyncStartup {
     /// Typed durable header-chain operations.
     pub header_chain_port: Arc<dyn zakura_node_services::header_chain::HeaderChainPort>,
     /// Selects whether reactor operations use the typed port or the test observer.
-    pub(crate) port_dispatch: HeaderPortDispatch,
+    pub(crate) port_dispatch: PortDispatch,
     /// Local header-sync configuration.
     pub config: ZakuraHeaderSyncConfig,
     /// Application frame cap for header-sync messages.
@@ -82,9 +82,9 @@ impl HeaderSyncStartup {
             #[cfg(test)]
             header_chain_port: Arc::new(zakura_node_services::header_chain::InertHeaderChainPort),
             #[cfg(not(any(test, feature = "zakura-testkit")))]
-            port_dispatch: HeaderPortDispatch::Direct,
+            port_dispatch: PortDispatch::Direct,
             #[cfg(any(test, feature = "zakura-testkit"))]
-            port_dispatch: HeaderPortDispatch::External,
+            port_dispatch: PortDispatch::External,
             config,
             max_frame_bytes,
             request_timeout: Duration::from_secs(30),
@@ -96,13 +96,13 @@ impl HeaderSyncStartup {
 
     /// Use the installed typed header-chain port directly.
     pub(crate) fn use_direct_port(&mut self) {
-        self.port_dispatch = HeaderPortDispatch::Direct;
+        self.port_dispatch = PortDispatch::Direct;
     }
 }
 
 /// Explicit reactor port-dispatch policy.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HeaderPortDispatch {
+pub(crate) enum PortDispatch {
     /// Execute operations through the installed typed port.
     Direct,
     /// Publish operations to the test driver channel.

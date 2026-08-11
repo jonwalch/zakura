@@ -1727,7 +1727,7 @@ impl BlockSyncReactor {
         };
         let mut pending = zakura_header_chain::PendingOwners::default();
         pending.insert(source, *owner);
-        match zakura_header_chain::CompletionGate::check(&current, &pending, source, owner) {
+        match zakura_header_chain::Gate::check(&current, &pending, source, owner) {
             zakura_header_chain::CompletionDecision::Current => true,
             zakura_header_chain::CompletionDecision::Stale(reason) => {
                 metrics::counter!(

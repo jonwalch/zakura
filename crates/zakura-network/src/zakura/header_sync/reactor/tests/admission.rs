@@ -298,7 +298,7 @@ fn monotone_finality_sends_exact_prepared_header_work_to_state_for_rebase() {
         &zakura_header_chain::SystemClock,
     )
     .expect("the exact held header target prepares");
-    let adapter_key = zakura_node_services::header_chain::HeaderChainAdapterKey::new();
+    let adapter_key = zakura_node_services::header_chain::AdapterKey::new();
     let prepared = zakura_node_services::header_chain::PreparedHeaderTarget::from_insert(
         &adapter_key,
         Box::new(zakura_header_chain::InsertHeaders {

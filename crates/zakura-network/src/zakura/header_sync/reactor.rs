@@ -17,7 +17,7 @@ use tokio::{
 use zakura_chain::block;
 
 use super::{
-    events::{HeaderPortDispatch, HeaderPortOperation},
+    events::{HeaderPortOperation, PortDispatch},
     scheduler::{
         completed_targets::CompletedHeaderTargets,
         peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
@@ -3262,9 +3262,9 @@ impl HeaderSyncReactor {
 
     fn dispatch_action(&mut self, action: HeaderPortOperation) -> bool {
         match self.startup.port_dispatch {
-            HeaderPortDispatch::Direct => self.dispatch_direct_port_operation(action),
+            PortDispatch::Direct => self.dispatch_direct_port_operation(action),
             #[cfg(any(test, feature = "zakura-testkit"))]
-            HeaderPortDispatch::External => self.dispatch_external_port_operation(action),
+            PortDispatch::External => self.dispatch_external_port_operation(action),
         }
     }
 
@@ -3902,7 +3902,7 @@ impl HeaderSyncReactor {
         let Some(current) = self.committed_snapshot.as_ref() else {
             return Err(zakura_header_chain::StaleReason::MissingOwner);
         };
-        let decision = zakura_header_chain::CompletionGate::check_registered(
+        let decision = zakura_header_chain::Gate::check_registered(
             current,
             self.peer_work_queue.registered_attempt(peer),
             source,

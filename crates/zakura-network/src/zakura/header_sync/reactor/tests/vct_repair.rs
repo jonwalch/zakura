@@ -250,7 +250,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
         batch,
         aux: vec![delivery],
     });
-    let adapter_key = zakura_node_services::header_chain::HeaderChainAdapterKey::new();
+    let adapter_key = zakura_node_services::header_chain::AdapterKey::new();
     handle
         .send(HeaderSyncEvent::HeaderTargetPrepared {
             peer: peer.clone(),

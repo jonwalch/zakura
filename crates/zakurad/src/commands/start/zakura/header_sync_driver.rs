@@ -309,7 +309,7 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
     read_state: ReadState,
     authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     network: zakura_chain::parameters::Network,
-    adapter_key: port::HeaderChainAdapterKey,
+    adapter_key: port::AdapterKey,
 }
 
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
@@ -324,7 +324,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
             read_state,
             authority,
             network,
-            adapter_key: port::HeaderChainAdapterKey::new(),
+            adapter_key: port::AdapterKey::new(),
         }
     }
 }
@@ -544,7 +544,7 @@ fn classify_body_size_hint_failure(
 #[allow(clippy::too_many_arguments)]
 async fn prepare_header_target<ReadState>(
     read_state: ReadState,
-    adapter_key: port::HeaderChainAdapterKey,
+    adapter_key: port::AdapterKey,
     request: port::PrepareHeaderTarget,
 ) -> port::PrepareHeaderTargetReply
 where
@@ -690,7 +690,7 @@ where
 async fn apply_header_target<State>(
     state: State,
     authority: zakura_state::HeaderChainBodyEvidenceAuthority,
-    adapter_key: port::HeaderChainAdapterKey,
+    adapter_key: port::AdapterKey,
     target: port::PreparedHeaderTarget,
 ) -> port::ApplyHeaderTargetReply
 where
@@ -804,7 +804,7 @@ fn header_target_apply_failure(
 
 async fn acquire_header_path<ReadState>(
     read_state: ReadState,
-    adapter_key: port::HeaderChainAdapterKey,
+    adapter_key: port::AdapterKey,
     request: port::AcquireHeaderPath,
 ) -> Result<port::AcquireHeaderPathReply, HeaderChainPortError>
 where
@@ -870,7 +870,7 @@ where
 
 async fn read_header_path<ReadState>(
     read_state: ReadState,
-    adapter_key: port::HeaderChainAdapterKey,
+    adapter_key: port::AdapterKey,
     network: zakura_chain::parameters::Network,
     path: port::RetainedHeaderPath,
     request: port::ReadHeaderPath,
@@ -1158,7 +1158,7 @@ fn selected_aux_delivery(
 
 async fn release_header_path<ReadState>(
     read_state: ReadState,
-    adapter_key: port::HeaderChainAdapterKey,
+    adapter_key: port::AdapterKey,
     path: port::RetainedHeaderPath,
 ) -> Result<(), HeaderChainPortError>
 where
@@ -1623,12 +1623,8 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
 
-        let result = acquire_header_path(
-            pending_read_state(),
-            port::HeaderChainAdapterKey::new(),
-            request,
-        )
-        .await;
+        let result =
+            acquire_header_path(pending_read_state(), port::AdapterKey::new(), request).await;
 
         assert!(matches!(result, Err(HeaderChainPortError::Timeout)));
         assert_eq!(
@@ -1657,7 +1653,7 @@ mod tests {
             target_tip_hash: target.hash,
             locator_hashes: vec![common_ancestor.hash],
         };
-        let adapter_key = port::HeaderChainAdapterKey::new();
+        let adapter_key = port::AdapterKey::new();
         let acquired = acquire_header_path(
             tower::service_fn(move |request| {
                 assert!(matches!(
@@ -1703,7 +1699,7 @@ mod tests {
                     Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderLocator(None))
                 }
             }),
-            port::HeaderChainAdapterKey::new(),
+            port::AdapterKey::new(),
             zakura_chain::parameters::Network::Mainnet,
             (*path).clone(),
             port::ReadHeaderPath {

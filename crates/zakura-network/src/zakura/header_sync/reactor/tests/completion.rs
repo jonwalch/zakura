@@ -866,8 +866,8 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         batch,
         aux: Vec::new(),
     };
-    let adapter_key = zakura_node_services::header_chain::HeaderChainAdapterKey::new();
-    let foreign_key = zakura_node_services::header_chain::HeaderChainAdapterKey::new();
+    let adapter_key = zakura_node_services::header_chain::AdapterKey::new();
+    let foreign_key = zakura_node_services::header_chain::AdapterKey::new();
     let sealed = zakura_node_services::header_chain::PreparedHeaderTarget::from_insert(
         &adapter_key,
         Box::new(insert.clone()),
