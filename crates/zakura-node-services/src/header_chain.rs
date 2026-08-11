@@ -18,9 +18,9 @@ pub type HeaderChainFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>
 /// Values sealed by a different key cannot be opened or used as retained-path handles.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct HeaderChainAdapterKey(Arc<()>);
+pub struct AdapterKey(Arc<()>);
 
-impl HeaderChainAdapterKey {
+impl AdapterKey {
     /// Create the unique capability for one header-chain adapter instance.
     pub fn new() -> Self {
         Self(Arc::new(()))
@@ -31,15 +31,15 @@ impl HeaderChainAdapterKey {
     }
 }
 
-impl Default for HeaderChainAdapterKey {
+impl Default for AdapterKey {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl fmt::Debug for HeaderChainAdapterKey {
+impl fmt::Debug for AdapterKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("HeaderChainAdapterKey(<redacted>)")
+        formatter.write_str("AdapterKey(<redacted>)")
     }
 }
 
@@ -98,7 +98,7 @@ impl RetainedHeaderPath {
     /// Construct a retained path in a state adapter.
     #[doc(hidden)]
     pub fn from_adapter(
-        adapter_key: &HeaderChainAdapterKey,
+        adapter_key: &AdapterKey,
         adapter_id: u64,
         source: SourceId,
         session_id: u64,
@@ -119,10 +119,7 @@ impl RetainedHeaderPath {
 
     /// Return the opaque identity only to the adapter that issued this path.
     #[doc(hidden)]
-    pub fn adapter_identity(
-        &self,
-        adapter_key: &HeaderChainAdapterKey,
-    ) -> Option<(u64, SourceId, u64)> {
+    pub fn adapter_identity(&self, adapter_key: &AdapterKey) -> Option<(u64, SourceId, u64)> {
         adapter_key.authenticates(&self.adapter_seal).then_some((
             self.adapter_id,
             self.source,
@@ -320,7 +317,7 @@ pub struct PreparedHeaderTarget {
 impl PreparedHeaderTarget {
     /// Seal an insertion in a state adapter.
     #[doc(hidden)]
-    pub fn from_insert(adapter_key: &HeaderChainAdapterKey, insert: Box<InsertHeaders>) -> Self {
+    pub fn from_insert(adapter_key: &AdapterKey, insert: Box<InsertHeaders>) -> Self {
         Self {
             adapter_seal: adapter_key.0.clone(),
             insert,
@@ -329,10 +326,7 @@ impl PreparedHeaderTarget {
 
     /// Consume a sealed target only in the adapter that prepared it.
     #[doc(hidden)]
-    pub fn into_insert(
-        self,
-        adapter_key: &HeaderChainAdapterKey,
-    ) -> Result<Box<InsertHeaders>, Self> {
+    pub fn into_insert(self, adapter_key: &AdapterKey) -> Result<Box<InsertHeaders>, Self> {
         if adapter_key.authenticates(&self.adapter_seal) {
             Ok(self.insert)
         } else {
@@ -632,8 +626,8 @@ mod tests {
 
     #[test]
     fn retained_path_identity_requires_the_issuing_adapter_key() {
-        let issuing_key = HeaderChainAdapterKey::new();
-        let foreign_key = HeaderChainAdapterKey::new();
+        let issuing_key = AdapterKey::new();
+        let foreign_key = AdapterKey::new();
         let source = SourceId::from_digest([0x5a; 32]);
         let common_ancestor = Frontier::new(block::Height(2), block::Hash([2; 32]));
         let target = Frontier::new(block::Height(3), block::Hash([3; 32]));
