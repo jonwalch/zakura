@@ -9,7 +9,7 @@ use zakura_header_chain::{
     VctRepairContext,
 };
 
-/// A boxed operation returned by [`HeaderChainPort`].
+/// A boxed operation returned by [`Port`].
 pub type HeaderChainFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Process-local capability that authenticates values sealed by one header-chain adapter.
@@ -46,7 +46,7 @@ impl fmt::Debug for AdapterKey {
 
 /// A local failure while executing a header-chain port operation.
 #[derive(Clone, Debug)]
-pub enum HeaderChainPortError {
+pub enum PortError {
     /// The adapter's operation deadline elapsed.
     Timeout,
     /// The backing service became unavailable or returned an invalid reply.
@@ -67,7 +67,7 @@ pub enum VctRepairContextReply {
 
 /// Wire-neutral request for an immutable retained header path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AcquireHeaderPath {
+pub struct AcquirePath {
     /// Stable requester identity.
     pub source: SourceId,
     /// Ordered-stream generation.
@@ -164,7 +164,7 @@ impl Eq for RetainedHeaderPath {}
 
 /// Result of acquiring an immutable retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AcquireHeaderPathReply {
+pub enum AcquirePathReply {
     /// The adapter retains the requested target path.
     Acquired(Box<RetainedHeaderPath>),
     /// The adapter no longer retains the target.
@@ -179,7 +179,7 @@ pub enum AcquireHeaderPathReply {
 
 /// A bounded read from an already acquired retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReadHeaderPath {
+pub struct ReadPath {
     /// Common ancestor or previous page tip.
     pub after_hash: block::Hash,
     /// Maximum number of returned headers.
@@ -213,7 +213,7 @@ pub struct RetainedHeaderPathPage {
 
 /// Result of reading an immutable retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReadHeaderPathReply {
+pub enum ReadPathReply {
     /// The requested page remains available.
     Page(Box<RetainedHeaderPathPage>),
     /// The lease expired or became unavailable.
@@ -222,7 +222,7 @@ pub enum ReadHeaderPathReply {
 
 /// One header and its unauthenticated parallel metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeaderTargetEntry {
+pub struct TargetEntry {
     /// Canonical Zcash block header.
     pub header: Arc<block::Header>,
     /// Serialized-body-size hint.
@@ -234,16 +234,16 @@ pub struct HeaderTargetEntry {
 
 /// A header-target entry list bounded by the engine's production transition cap.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeaderTargetEntries(Vec<HeaderTargetEntry>);
+pub struct TargetEntries(Vec<TargetEntry>);
 
-impl HeaderTargetEntries {
+impl TargetEntries {
     /// Borrow the bounded entries in parent-first order.
-    pub fn as_slice(&self) -> &[HeaderTargetEntry] {
+    pub fn as_slice(&self) -> &[TargetEntry] {
         &self.0
     }
 
     /// Consume the bounded wrapper without reallocating its entries.
-    pub fn into_vec(self) -> Vec<HeaderTargetEntry> {
+    pub fn into_vec(self) -> Vec<TargetEntry> {
         self.0
     }
 
@@ -258,12 +258,12 @@ impl HeaderTargetEntries {
     }
 }
 
-impl TryFrom<Vec<HeaderTargetEntry>> for HeaderTargetEntries {
-    type Error = HeaderTargetEntriesError;
+impl TryFrom<Vec<TargetEntry>> for TargetEntries {
+    type Error = TargetEntriesError;
 
-    fn try_from(entries: Vec<HeaderTargetEntry>) -> Result<Self, Self::Error> {
+    fn try_from(entries: Vec<TargetEntry>) -> Result<Self, Self::Error> {
         if entries.len() > zakura_header_chain::MAX_HEADERS_PER_TRANSITION_V1 {
-            return Err(HeaderTargetEntriesError {
+            return Err(TargetEntriesError {
                 actual: entries.len(),
                 maximum: zakura_header_chain::MAX_HEADERS_PER_TRANSITION_V1,
             });
@@ -274,14 +274,14 @@ impl TryFrom<Vec<HeaderTargetEntry>> for HeaderTargetEntries {
 
 /// A header-target list exceeded the frozen production transition cap.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderTargetEntriesError {
+pub struct TargetEntriesError {
     /// Supplied entry count.
     pub actual: usize,
     /// Maximum accepted entry count.
     pub maximum: usize,
 }
 
-impl fmt::Display for HeaderTargetEntriesError {
+impl fmt::Display for TargetEntriesError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -291,7 +291,7 @@ impl fmt::Display for HeaderTargetEntriesError {
     }
 }
 
-impl Error for HeaderTargetEntriesError {}
+impl Error for TargetEntriesError {}
 
 /// Complete input to deterministic target preparation.
 #[derive(Clone, Debug)]
@@ -305,7 +305,7 @@ pub struct PrepareHeaderTarget {
     /// Exact advertised target.
     pub target: Frontier,
     /// Response entries in parent-first order.
-    pub entries: HeaderTargetEntries,
+    pub entries: TargetEntries,
     /// Proof that the response satisfies its target purpose.
     pub completion: TargetCompletion,
 }
@@ -387,37 +387,37 @@ pub enum ApplyHeaderTargetOutcome {
 ///
 /// Each request and its typed reply share one future.
 /// Implementations own local deadlines and translations to backing service protocols.
-pub trait HeaderChainPort: Send + Sync + 'static {
+pub trait Port: Send + Sync + 'static {
     /// Read one coherent selected-path continuation locator.
     fn continuation_locator(
         &self,
-    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, HeaderChainPortError>>;
+    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>>;
 
     /// Resolve one exact selected-header auxiliary repair.
     fn vct_repair_context(
         &self,
         owner: BodyWorkOwner,
         height: block::Height,
-    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>>;
+    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>>;
 
     /// Acquire an immutable retained target path.
     fn acquire_header_path(
         &self,
-        request: AcquireHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<AcquireHeaderPathReply, HeaderChainPortError>>;
+        request: AcquirePath,
+    ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>>;
 
     /// Read one bounded page from an immutable retained target path.
     fn read_header_path(
         &self,
         path: RetainedHeaderPath,
-        request: ReadHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<ReadHeaderPathReply, HeaderChainPortError>>;
+        request: ReadPath,
+    ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>>;
 
     /// Idempotently release an immutable retained target path.
     fn release_header_path(
         &self,
         path: RetainedHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<(), HeaderChainPortError>>;
+    ) -> HeaderChainFuture<'_, Result<(), PortError>>;
 
     /// Validate and seal one complete target outside the serialized writer.
     fn prepare_header_target(
@@ -432,50 +432,50 @@ pub trait HeaderChainPort: Send + Sync + 'static {
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply>;
 }
 
-impl std::fmt::Debug for dyn HeaderChainPort {
+impl std::fmt::Debug for dyn Port {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("HeaderChainPort")
+        formatter.write_str("Port")
     }
 }
 
 /// Nodes use this explicit unavailable port when they have no durable header-chain state.
 #[derive(Debug, Default)]
-pub struct UnavailableHeaderChainPort;
+pub struct UnavailablePort;
 
-impl HeaderChainPort for UnavailableHeaderChainPort {
+impl Port for UnavailablePort {
     fn continuation_locator(
         &self,
-    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, HeaderChainPortError>> {
-        Box::pin(async { Err(HeaderChainPortError::Unavailable { source: None }) })
+    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
+        Box::pin(async { Err(PortError::Unavailable { source: None }) })
     }
 
     fn vct_repair_context(
         &self,
         _owner: BodyWorkOwner,
         _height: block::Height,
-    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>> {
-        Box::pin(async { Err(HeaderChainPortError::Unavailable { source: None }) })
+    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
+        Box::pin(async { Err(PortError::Unavailable { source: None }) })
     }
 
     fn acquire_header_path(
         &self,
-        _request: AcquireHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<AcquireHeaderPathReply, HeaderChainPortError>> {
-        Box::pin(async { Ok(AcquireHeaderPathReply::TargetNotRetained) })
+        _request: AcquirePath,
+    ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
+        Box::pin(async { Ok(AcquirePathReply::TargetNotRetained) })
     }
 
     fn read_header_path(
         &self,
         _path: RetainedHeaderPath,
-        _request: ReadHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<ReadHeaderPathReply, HeaderChainPortError>> {
-        Box::pin(async { Ok(ReadHeaderPathReply::Unavailable) })
+        _request: ReadPath,
+    ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
+        Box::pin(async { Ok(ReadPathReply::Unavailable) })
     }
 
     fn release_header_path(
         &self,
         _path: RetainedHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<(), HeaderChainPortError>> {
+    ) -> HeaderChainFuture<'_, Result<(), PortError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -510,10 +510,10 @@ impl HeaderChainPort for UnavailableHeaderChainPort {
 #[derive(Debug, Default)]
 pub struct InertHeaderChainPort;
 
-impl HeaderChainPort for InertHeaderChainPort {
+impl Port for InertHeaderChainPort {
     fn continuation_locator(
         &self,
-    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, HeaderChainPortError>> {
+    ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(std::future::pending())
     }
 
@@ -521,29 +521,29 @@ impl HeaderChainPort for InertHeaderChainPort {
         &self,
         _owner: BodyWorkOwner,
         _height: block::Height,
-    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>> {
+    ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
         Box::pin(std::future::pending())
     }
 
     fn acquire_header_path(
         &self,
-        _request: AcquireHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<AcquireHeaderPathReply, HeaderChainPortError>> {
+        _request: AcquirePath,
+    ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
         Box::pin(std::future::pending())
     }
 
     fn read_header_path(
         &self,
         _path: RetainedHeaderPath,
-        _request: ReadHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<ReadHeaderPathReply, HeaderChainPortError>> {
+        _request: ReadPath,
+    ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
         Box::pin(std::future::pending())
     }
 
     fn release_header_path(
         &self,
         _path: RetainedHeaderPath,
-    ) -> HeaderChainFuture<'_, Result<(), HeaderChainPortError>> {
+    ) -> HeaderChainFuture<'_, Result<(), PortError>> {
         Box::pin(std::future::pending())
     }
 
@@ -569,10 +569,10 @@ mod tests {
     #[derive(Debug)]
     struct MinimalMock;
 
-    impl HeaderChainPort for MinimalMock {
+    impl Port for MinimalMock {
         fn continuation_locator(
             &self,
-        ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, HeaderChainPortError>> {
+        ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
             Box::pin(async { Ok(None) })
         }
 
@@ -580,29 +580,29 @@ mod tests {
             &self,
             _owner: BodyWorkOwner,
             _height: block::Height,
-        ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, HeaderChainPortError>> {
+        ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
             Box::pin(async { Ok(VctRepairContextReply::Stale) })
         }
 
         fn acquire_header_path(
             &self,
-            _request: AcquireHeaderPath,
-        ) -> HeaderChainFuture<'_, Result<AcquireHeaderPathReply, HeaderChainPortError>> {
-            Box::pin(async { Ok(AcquireHeaderPathReply::Busy) })
+            _request: AcquirePath,
+        ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
+            Box::pin(async { Ok(AcquirePathReply::Busy) })
         }
 
         fn read_header_path(
             &self,
             _path: RetainedHeaderPath,
-            _request: ReadHeaderPath,
-        ) -> HeaderChainFuture<'_, Result<ReadHeaderPathReply, HeaderChainPortError>> {
-            Box::pin(async { Ok(ReadHeaderPathReply::Unavailable) })
+            _request: ReadPath,
+        ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
+            Box::pin(async { Ok(ReadPathReply::Unavailable) })
         }
 
         fn release_header_path(
             &self,
             _path: RetainedHeaderPath,
-        ) -> HeaderChainFuture<'_, Result<(), HeaderChainPortError>> {
+        ) -> HeaderChainFuture<'_, Result<(), PortError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -623,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn port_is_object_safe_and_mockable_without_state_services() {
-        let port: Arc<dyn HeaderChainPort> = Arc::new(MinimalMock);
+        let port: Arc<dyn Port> = Arc::new(MinimalMock);
         assert!(port.continuation_locator().await.unwrap().is_none());
     }
 
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn header_target_entries_enforce_the_engine_batch_cap() {
-        let entry = HeaderTargetEntry {
+        let entry = TargetEntry {
             header: zakura_chain::block::genesis::regtest_genesis_block()
                 .header
                 .clone(),
@@ -667,13 +667,13 @@ mod tests {
         };
         let limit = zakura_header_chain::MAX_HEADERS_PER_TRANSITION_V1;
 
-        let accepted = HeaderTargetEntries::try_from(vec![entry.clone(); limit])
+        let accepted = TargetEntries::try_from(vec![entry.clone(); limit])
             .expect("the exact engine batch limit is accepted");
         assert_eq!(accepted.len(), limit);
 
         assert_eq!(
-            HeaderTargetEntries::try_from(vec![entry; limit + 1]),
-            Err(HeaderTargetEntriesError {
+            TargetEntries::try_from(vec![entry; limit + 1]),
+            Err(TargetEntriesError {
                 actual: limit + 1,
                 maximum: limit,
             })
