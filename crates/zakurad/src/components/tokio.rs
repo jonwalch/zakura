@@ -102,7 +102,7 @@ impl RuntimeRun for Runtime {
     }
 }
 
-async fn run_until_shutdown(
+pub(crate) async fn run_until_shutdown(
     fut: impl Future<Output = Result<(), Report>>,
     shutdown_signal: impl Future<Output = ()>,
     shutdown_token: CancellationToken,

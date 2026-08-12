@@ -285,14 +285,15 @@ impl StartCmd {
         )
     }
 
-    async fn start(
+    pub(crate) async fn start(
         &self,
+        config: Arc<ZakuradConfig>,
+        custom_services: Vec<zakura_network::zakura::CustomService>,
         shutdown: CancellationToken,
         cleanup_ready: CancellationToken,
     ) -> Result<(), Report> {
         check_tcp_slow_start_after_idle();
 
-        let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
         let config = if is_regtest {
@@ -411,7 +412,7 @@ impl StartCmd {
             };
 
         let state = ServiceBuilder::new()
-            .buffer(Self::state_buffer_bound())
+            .buffer(Self::state_buffer_bound(&config))
             .service(state_service);
 
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
@@ -467,9 +468,10 @@ impl StartCmd {
                 advertised_services,
                 zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
-                Vec::new(),
+                custom_services,
             )
-            .await;
+            .await
+            .map_err(|error| eyre!(error))?;
 
         // Start health server if configured (after sync_status is available)
 
@@ -1016,6 +1018,7 @@ impl StartCmd {
         };
 
         info!("exiting Zakura: asking other tasks to stop");
+        zakura_chain::shutdown::set_shutting_down();
 
         // ongoing tasks
         rpc_task_handle.abort();
@@ -1029,6 +1032,9 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
+        if let Some(zakura_endpoint) = zakura_endpoint {
+            zakura_endpoint.shutdown().await;
+        }
         if zcashd_compat_task_finished {
             debug!("zcashd-compat supervisor task already exited before shutdown");
         } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
@@ -1103,9 +1109,7 @@ impl StartCmd {
 
     /// Returns the bound for the state service buffer,
     /// based on the configurations of the services that use the state concurrently.
-    fn state_buffer_bound() -> usize {
-        let config = APPLICATION.config();
-
+    fn state_buffer_bound(config: &ZakuradConfig) -> usize {
         // Ignore the checkpoint verify limit, because it is very large.
         //
         // TODO: do we also need to account for concurrent use across services?
@@ -1136,7 +1140,7 @@ impl Runnable for StartCmd {
 
         rt.expect("runtime should not already be taken")
             .run_with_graceful_shutdown(|shutdown, cleanup_ready| {
-                self.start(shutdown, cleanup_ready)
+                self.start(APPLICATION.config(), Vec::new(), shutdown, cleanup_ready)
             });
 
         info!("stopping zakurad");

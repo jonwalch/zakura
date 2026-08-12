@@ -47,6 +47,7 @@ use crate::{
     peer_cache_updater::peer_cache_updater,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
+    zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
@@ -179,12 +180,12 @@ pub async fn init_with_zakura_header_sync<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
     block_gossip_peer_ips: Vec<IpAddr>,
-    header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
-    Option<crate::zakura::ZakuraEndpoint>,
+    Option<ZakuraEndpoint>,
 )
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
@@ -202,6 +203,7 @@ where
         Vec::new(),
     )
     .await
+    .expect("Zakura endpoint should start when P2P v2 is enabled")
 }
 
 /// Initialize a peer set with optional Zakura runtime components.
@@ -213,14 +215,17 @@ pub async fn init_with_zakura<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
     block_gossip_peer_ips: Vec<IpAddr>,
-    header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
-    custom_services: Vec<crate::zakura::CustomService>,
-) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
-    Arc<std::sync::Mutex<AddressBook>>,
-    mpsc::Sender<(PeerSocketAddr, u32)>,
-    Option<crate::zakura::ZakuraEndpoint>,
-)
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<CustomService>,
+) -> Result<
+    (
+        Buffer<BoxService<Request, Response, BoxError>, Request>,
+        Arc<std::sync::Mutex<AddressBook>>,
+        mpsc::Sender<(PeerSocketAddr, u32)>,
+        Option<ZakuraEndpoint>,
+    ),
+    BoxError,
+>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
@@ -249,8 +254,7 @@ where
         header_sync_driver_startup,
         custom_services,
     )
-    .await
-    .expect("Zakura endpoint should start when P2P v2 is enabled");
+    .await?;
 
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
         AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
@@ -482,12 +486,12 @@ where
         None => peer_set,
     };
 
-    (
+    Ok((
         peer_set,
         address_book,
         misbehavior_tx,
         returned_zakura_endpoint,
-    )
+    ))
 }
 
 /// Use the provided `outbound_connector` to connect to the configured DNS seeder and
