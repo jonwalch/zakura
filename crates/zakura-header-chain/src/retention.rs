@@ -40,7 +40,11 @@ pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
         .view_nodes()
         .into_iter()
         .filter_map(|node| {
-            matches!(node.body_validation_state, BodyValidationState::Verified { .. }).then_some(node.hash)
+            matches!(
+                node.body_validation_state,
+                BodyValidationState::Verified { .. }
+            )
+            .then_some(node.hash)
         })
         .collect::<Vec<_>>();
     for hash in verified_body_hashes {
@@ -123,9 +127,13 @@ fn evict_permanently_ineligible<G: HeaderGraphEdit>(
         .into_iter()
         .filter(|hash| {
             !protected.contains(hash)
-                && store
-                    .view_node(*hash)
-                    .is_some_and(|node| node.eligibility.has_permanent_reason())
+                && store.view_node(*hash).is_some_and(|node| {
+                    node.eligibility.has_permanent_reason()
+                        || matches!(
+                            node.body_validation_state,
+                            BodyValidationState::ConsensusInvalid { .. }
+                        )
+                })
         })
         .collect();
     roots.sort_unstable_by_key(|hash| {

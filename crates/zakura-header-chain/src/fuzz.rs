@@ -19,17 +19,17 @@ use zakura_chain::{
 use crate::{
     AlarmSet, AuxDelivery, AuxDelta, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch,
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
-    Clock, ConsensusBodyInvalid, DurableTransitionFacts, EligibilityReason, EngineConfig,
-    EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord,
-    FinalitySource, Frontier, FrontierSet, FullStateEvidenceAuthority, FullStateFinalized,
-    GraphError, HeaderBatchInput, HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact,
-    HeaderFailure, HeaderGeneration, HeaderRule, HeaderRules, HeaderValidationState,
-    HeaderWorkAuthority, HeaderWorkOwner, InsertHeaders, MemHeaderStore, OperatorInvalidate,
-    OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
-    ProjectionDelta, SourceId, StateVersion, SuffixWork, TargetCompletion, TransientBodyFailure,
-    TransientBodyFailureKind, TransitionContext, TransitionFailure, TransitionPlan,
-    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, MAX_CANDIDATE_TIPS_V1,
+    Clock, ConsensusBodyInvalid, DurableTransitionFacts, EngineConfig, EngineMetadata, EngineMode,
+    EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    FrontierSet, FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
+    HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact, HeaderFailure, HeaderGeneration,
+    HeaderRule, HeaderRules, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
+    InsertHeaders, MemHeaderStore, OperatorInvalidate, OperatorInvalidationId, OperatorReconsider,
+    PreparedHeader, PreparedHeaderBatch, ProjectionDelta, SourceId, StateVersion, SuffixWork,
+    TargetCompletion, TransientBodyFailure, TransientBodyFailureKind, TransitionContext,
+    TransitionFailure, TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease,
+    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration,
+    VerifiedHeaderRef, MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -1455,7 +1455,10 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
             .graph
             .node(invalid.hash)
             .expect("the transient target remains retained");
-        assert_eq!(node.body_validation_state, BodyValidationState::Unavailable(availability));
+        assert_eq!(
+            node.body_validation_state,
+            BodyValidationState::Unavailable(availability)
+        );
         assert!(node.eligibility.direct_reasons.is_empty());
         assert_eq!(node.eligibility.inherited_from, None);
         hasher.update([match kind {
@@ -1502,12 +1505,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
             rule: rule.clone(),
         }
     );
-    assert!(invalid_node.eligibility.direct_reasons.contains(
-        &EligibilityReason::ConsensusBodyInvalid {
-            evidence: invalid_evidence,
-            rule: rule.clone(),
-        }
-    ));
+    assert!(invalid_node.eligibility.direct_reasons.is_empty());
     assert_eq!(
         invalidated
             .graph
@@ -1822,7 +1820,11 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
 
         let eligible = node.validation == HeaderValidationState::Valid
             && node.eligibility.direct_reasons.is_empty()
-            && node.eligibility.inherited_from.is_none();
+            && node.eligibility.inherited_from.is_none()
+            && !matches!(
+                node.body_validation_state,
+                BodyValidationState::ConsensusInvalid { .. }
+            );
         assert_eq!(
             node.is_eligible(),
             eligible,

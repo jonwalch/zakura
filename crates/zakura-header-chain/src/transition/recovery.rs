@@ -67,8 +67,6 @@ pub enum AuditViolation {
     Parent(block::Hash),
     /// The audit found cumulative work that did not equal parent plus block work.
     Work(block::Hash),
-    /// The audit found conflicting body-invalidity and direct-eligibility evidence.
-    BodyEligibility(block::Hash),
     /// The audit found header validation state that contradicted deterministic header facts.
     HeaderValidation(block::Hash),
     /// The audit found an absent trust pin or an absent conflict reason.
@@ -427,29 +425,6 @@ fn check_nodes(
         } else {
             violations.push(AuditViolation::Parent(node.hash));
         }
-        let body_reason = node
-            .eligibility
-            .direct_reasons
-            .iter()
-            .find(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }));
-        let matches = match (&node.body_validation_state, body_reason) {
-            (
-                BodyValidationState::ConsensusInvalid {
-                    evidence: left_evidence,
-                    rule: left_rule,
-                },
-                Some(EligibilityReason::ConsensusBodyInvalid {
-                    evidence: right_evidence,
-                    rule: right_rule,
-                }),
-            ) => left_evidence == right_evidence && left_rule == right_rule,
-            (BodyValidationState::ConsensusInvalid { .. }, _) => false,
-            (_, None) => true,
-            (_, Some(_)) => false,
-        };
-        if !matches {
-            violations.push(AuditViolation::BodyEligibility(node.hash));
-        }
         let future_limit = now.checked_add_signed(Duration::hours(2));
         let expected_deferred = node.header.time.checked_sub_signed(Duration::hours(2));
         let valid_time_state = match node.validation {
@@ -556,7 +531,6 @@ fn check_trust_pins(
                         && node.height <= reason_finalized.height
                         && node.hash != reason_finalized.hash
                 }
-                EligibilityReason::ConsensusBodyInvalid { .. } => true,
                 EligibilityReason::OperatorInvalid {
                     id, reason_digest, ..
                 } => {
@@ -788,9 +762,12 @@ fn verified_path(
         metadata.frontiers.verified_best,
     )?;
     if path.iter().skip(1).any(|frontier| {
-        nodes
-            .get(&frontier.hash)
-            .is_none_or(|node| !matches!(node.body_validation_state, BodyValidationState::Verified { .. }))
+        nodes.get(&frontier.hash).is_none_or(|node| {
+            !matches!(
+                node.body_validation_state,
+                BodyValidationState::Verified { .. }
+            )
+        })
     }) {
         return Err(source_failure(AuditViolation::ProtectedPath(
             metadata.frontiers.verified_best.hash,
@@ -849,16 +826,15 @@ fn violation_key(violation: &AuditViolation) -> (u8, u32, [u8; 32]) {
         AuditViolation::NodeHash(hash) => (0, 0, hash.0),
         AuditViolation::Parent(hash) => (1, 0, hash.0),
         AuditViolation::Work(hash) => (2, 0, hash.0),
-        AuditViolation::BodyEligibility(hash) => (3, 0, hash.0),
-        AuditViolation::HeaderValidation(hash) => (4, 0, hash.0),
-        AuditViolation::TrustPin(height, hash) => (5, height.0, hash.0),
-        AuditViolation::EligibilityRoot(hash) => (6, 0, hash.0),
-        AuditViolation::Auxiliary(hash) => (7, 0, hash.0),
-        AuditViolation::ValidationContext(hash) => (8, 0, hash.0),
-        AuditViolation::Finality => (9, 0, [0; 32]),
-        AuditViolation::Configuration => (10, 0, [0; 32]),
-        AuditViolation::ProtectedPath(hash) => (11, 0, hash.0),
-        AuditViolation::Limits => (12, 0, [0; 32]),
+        AuditViolation::HeaderValidation(hash) => (3, 0, hash.0),
+        AuditViolation::TrustPin(height, hash) => (4, height.0, hash.0),
+        AuditViolation::EligibilityRoot(hash) => (5, 0, hash.0),
+        AuditViolation::Auxiliary(hash) => (6, 0, hash.0),
+        AuditViolation::ValidationContext(hash) => (7, 0, hash.0),
+        AuditViolation::Finality => (8, 0, [0; 32]),
+        AuditViolation::Configuration => (9, 0, [0; 32]),
+        AuditViolation::ProtectedPath(hash) => (10, 0, hash.0),
+        AuditViolation::Limits => (11, 0, [0; 32]),
     }
 }
 
@@ -1374,7 +1350,13 @@ mod tests {
             evidence: EvidenceId::from_digest([2; 32]),
             rule: BodyRuleId::new("body.rule"),
         };
-        assert!(violations(&store, &config).contains(&AuditViolation::BodyEligibility(child_hash)));
+        let plan = audit_store(&store, &config)
+            .expect("body invalidity is authoritative without an eligibility reason");
+        assert_eq!(
+            plan.selected_projection,
+            vec![base.metadata.frontiers.finalized]
+        );
+        assert!(plan.repairs.contains(&RecoveryRepair::SelectedProjection));
 
         let mut store = base.clone();
         let corrupted_until = store.nodes[1].header.time + Duration::hours(100);

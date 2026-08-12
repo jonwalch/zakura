@@ -12,9 +12,8 @@ use zakura_chain::{
 };
 
 use crate::{
-    BodyRuleId, BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId,
-    Frontier, HeaderNode, HeaderValidationState, OperatorInvalidationId, WorkCoordinate,
-    WorkCoordinateError,
+    BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId, Frontier,
+    HeaderNode, HeaderValidationState, OperatorInvalidationId, WorkCoordinate, WorkCoordinateError,
 };
 
 mod overlay;
@@ -72,12 +71,6 @@ pub(crate) trait HeaderGraphEdit: HeaderGraphView {
         hash: block::Hash,
         id: OperatorInvalidationId,
         evidence: Option<EvidenceId>,
-    ) -> Result<bool, GraphError>;
-    fn edit_set_consensus_body_invalid(
-        &mut self,
-        hash: block::Hash,
-        evidence: EvidenceId,
-        rule: BodyRuleId,
     ) -> Result<bool, GraphError>;
     fn edit_set_body_state(
         &mut self,
@@ -143,9 +136,9 @@ pub enum GraphError {
     /// Retention attempted to remove a node that still has retained children.
     #[error("cannot remove non-leaf header {0:?}")]
     NodeHasChildren(block::Hash),
-    /// Body-invalid state and its exact durable eligibility reason disagreed.
-    #[error("body-invalid state and eligibility evidence disagree for {0:?}")]
-    BodyEligibilityMismatch(block::Hash),
+    /// A permanent consensus-invalid body state was replaced with different evidence or state.
+    #[error("consensus-invalid body state is permanent for {0:?}")]
+    PermanentBodyInvalidity(block::Hash),
     /// A requested ancestor height is above its descendant.
     #[error("ancestor height {ancestor:?} exceeds descendant height {descendant:?}")]
     InvalidAncestorHeight {
@@ -301,27 +294,6 @@ impl MemHeaderStore {
             })?;
         let inherited_from = (!parent.is_eligible()).then_some(parent_hash);
         let direct_reasons: BTreeSet<EligibilityReason> = direct_reasons.into_iter().collect();
-        let body_reason = match &body {
-            BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                Some(EligibilityReason::ConsensusBodyInvalid {
-                    evidence: *evidence,
-                    rule: rule.clone(),
-                })
-            }
-            _ => None,
-        };
-        let recorded_body_reasons = direct_reasons
-            .iter()
-            .filter(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }))
-            .count();
-        if body_reason
-            .as_ref()
-            .is_some_and(|reason| !direct_reasons.contains(reason))
-            || (body_reason.is_none() && recorded_body_reasons != 0)
-            || recorded_body_reasons > 1
-        {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
         let node = HeaderNode {
             header,
             hash,
@@ -360,9 +332,6 @@ impl MemHeaderStore {
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
-        if matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }) {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
         let changed = self
             .nodes
             .get_mut(&hash)
@@ -406,86 +375,43 @@ impl MemHeaderStore {
         Ok(changed)
     }
 
-    /// Records an authoritative consensus failure for the retained block body at `hash`.
+    /// Replaces the body-validation state for retained header `hash`.
     ///
-    /// Sets the node's body state to `ConsensusInvalid { evidence, rule }` and adds
-    /// the matching permanent eligibility reason as one in-memory state change.
-    /// The node and its descendants are then excluded from fork choice.
-    ///
-    /// Returns `true` when state changes and `false` when the identical failure was
-    /// already recorded.
-    ///
-    /// Returns an error if `hash` is unknown or existing body-invalid state/reason
-    /// conflicts with the supplied evidence or rule.
-    ///
-    /// This method does not validate the body itself. Callers must supply an
-    /// authenticated, commitment-matching consensus result.
-    pub(crate) fn set_consensus_body_invalid(
-        &mut self,
-        hash: block::Hash,
-        evidence: EvidenceId,
-        rule: BodyRuleId,
-    ) -> Result<bool, GraphError> {
-        let node = self
-            .nodes
-            .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))?;
-        let body_validation_state = BodyValidationState::ConsensusInvalid {
-            evidence,
-            rule: rule.clone(),
-        };
-        let reason = EligibilityReason::ConsensusBodyInvalid { evidence, rule };
-        if node.eligibility.direct_reasons.iter().any(|existing| {
-            matches!(existing, EligibilityReason::ConsensusBodyInvalid { .. })
-                && *existing != reason
-        }) || matches!(node.body_validation_state, BodyValidationState::ConsensusInvalid { .. })
-            && node.body_validation_state != body_validation_state
-        {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
-        let changed = node.body_validation_state != body_validation_state || !node.eligibility.direct_reasons.contains(&reason);
-        node.body_validation_state = body_validation_state;
-        node.eligibility.direct_reasons.insert(reason);
-        if changed {
-            self.recompute_descendant_eligibility(hash)?;
-        }
-        Ok(changed)
-    }
-
-    /// Replaces the non-invalid body-validation state for retained header `hash`.
-    ///
-    /// Accepts `Unknown`, `CommitmentMatched`, `Verified`, or `Unavailable`.
     /// Returns `true` when the state changes and `false` when it is unchanged.
-    /// This operation does not alter fork-choice eligibility.
-    ///
-    /// Returns an error if the node is unknown, `body` is `ConsensusInvalid`, or
-    /// the node already carries a consensus-body-invalid eligibility reason.
-    /// Use `set_consensus_body_invalid` to record consensus failure atomically.
+    /// Consensus-invalid state makes the node and its descendants ineligible.
+    /// Identical invalid evidence is idempotent. Different evidence or any later
+    /// non-invalid state fails because consensus invalidity is permanent.
     ///
     /// This method does not enforce legal body-state transitions; the caller must
-    /// ensure the replacement state is authoritative.
+    /// ensure each initial replacement is authoritative.
     pub(crate) fn set_body_state(
         &mut self,
         hash: block::Hash,
         body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
-        if matches!(body_validation_state, BodyValidationState::ConsensusInvalid { .. }) {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
+        let (changed, eligibility_changed) = {
+            let node = self
+                .nodes
+                .get_mut(&hash)
+                .ok_or(GraphError::UnknownNode(hash))?;
+            if matches!(
+                node.body_validation_state,
+                BodyValidationState::ConsensusInvalid { .. }
+            ) {
+                return if node.body_validation_state == body_validation_state {
+                    Ok(false)
+                } else {
+                    Err(GraphError::PermanentBodyInvalidity(hash))
+                };
+            }
+            let was_eligible = node.is_eligible();
+            let changed = node.body_validation_state != body_validation_state;
+            node.body_validation_state = body_validation_state;
+            (changed, was_eligible != node.is_eligible())
+        };
+        if eligibility_changed {
+            self.recompute_descendant_eligibility(hash)?;
         }
-        let node = self
-            .nodes
-            .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))?;
-        if node
-            .eligibility
-            .direct_reasons
-            .iter()
-            .any(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }))
-        {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
-        let changed = node.body_validation_state != body_validation_state;
-        node.body_validation_state = body_validation_state;
         Ok(changed)
     }
 
@@ -896,7 +822,6 @@ impl MemHeaderStore {
             self.children.entry(*parent).or_default().insert(*child);
         }
 
-
         // Apply eligible-tip removals and additions
         for hash in &delta.remove_eligible_tips {
             self.eligible_tips.remove(hash);
@@ -1007,15 +932,6 @@ impl HeaderGraphEdit for MemHeaderStore {
         evidence: Option<EvidenceId>,
     ) -> Result<bool, GraphError> {
         self.remove_operator_invalidation(hash, id, evidence)
-    }
-
-    fn edit_set_consensus_body_invalid(
-        &mut self,
-        hash: block::Hash,
-        evidence: EvidenceId,
-        rule: BodyRuleId,
-    ) -> Result<bool, GraphError> {
-        self.set_consensus_body_invalid(hash, evidence, rule)
     }
 
     fn edit_set_body_state(
@@ -1129,15 +1045,6 @@ impl HeaderGraphEdit for GraphOverlay<'_> {
         self.remove_operator_invalidation(hash, id, evidence)
     }
 
-    fn edit_set_consensus_body_invalid(
-        &mut self,
-        hash: block::Hash,
-        evidence: EvidenceId,
-        rule: BodyRuleId,
-    ) -> Result<bool, GraphError> {
-        self.set_consensus_body_invalid(hash, evidence, rule)
-    }
-
     fn edit_set_body_state(
         &mut self,
         hash: block::Hash,
@@ -1169,6 +1076,7 @@ impl HeaderGraphEdit for GraphOverlay<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BodyRuleId;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use zakura_chain::block::genesis::regtest_genesis_block;
@@ -1597,7 +1505,13 @@ mod tests {
         let body_evidence = EvidenceId::from_digest([5; 32]);
         let body_rule = BodyRuleId::new("test.operator-reconsider");
         store
-            .set_consensus_body_invalid(target.hash, body_evidence, body_rule.clone())
+            .set_body_state(
+                target.hash,
+                BodyValidationState::ConsensusInvalid {
+                    evidence: body_evidence,
+                    rule: body_rule.clone(),
+                },
+            )
             .expect("intrinsic body invalidity is recorded independently");
 
         store
@@ -1622,12 +1536,13 @@ mod tests {
         for reason in permanent_reasons {
             assert!(target_node.eligibility.direct_reasons.contains(&reason));
         }
-        assert!(target_node.eligibility.direct_reasons.contains(
-            &EligibilityReason::ConsensusBodyInvalid {
+        assert_eq!(
+            target_node.body_validation_state,
+            BodyValidationState::ConsensusInvalid {
                 evidence: body_evidence,
                 rule: body_rule,
             }
-        ));
+        );
         assert_eq!(
             store
                 .node(descendant.hash)
@@ -1635,6 +1550,53 @@ mod tests {
                 .eligibility
                 .inherited_from,
             Some(target.hash)
+        );
+    }
+
+    #[test]
+    fn consensus_invalid_body_state_is_permanent_and_controls_eligibility() {
+        let mut store = anchor_store();
+        let anchor = store.finalized();
+        let target = insert_child(&mut store, anchor.hash, 1);
+        let descendant = insert_child(&mut store, target.hash, 2);
+        let invalid = BodyValidationState::ConsensusInvalid {
+            evidence: EvidenceId::from_digest([5; 32]),
+            rule: BodyRuleId::new("test.consensus-invalid"),
+        };
+
+        assert!(store
+            .set_body_state(target.hash, invalid.clone())
+            .expect("the first consensus-invalid result is authoritative"));
+        assert!(!store
+            .set_body_state(target.hash, invalid)
+            .expect("identical invalid evidence is idempotent"));
+        let target_node = store
+            .node(target.hash)
+            .expect("the target remains retained");
+        assert!(!target_node.is_eligible());
+        assert!(target_node.eligibility.direct_reasons.is_empty());
+        assert_eq!(
+            store
+                .node(descendant.hash)
+                .expect("the descendant remains retained")
+                .eligibility
+                .inherited_from,
+            Some(target.hash)
+        );
+
+        assert_eq!(
+            store.set_body_state(
+                target.hash,
+                BodyValidationState::ConsensusInvalid {
+                    evidence: EvidenceId::from_digest([6; 32]),
+                    rule: BodyRuleId::new("test.conflicting-invalid"),
+                },
+            ),
+            Err(GraphError::PermanentBodyInvalidity(target.hash))
+        );
+        assert_eq!(
+            store.set_body_state(target.hash, BodyValidationState::Unknown),
+            Err(GraphError::PermanentBodyInvalidity(target.hash))
         );
     }
 
@@ -1721,13 +1683,19 @@ mod tests {
             unknown_tip
         );
         assert_eq!(
-            store.node(verified_hash).expect("retained").body_validation_state,
+            store
+                .node(verified_hash)
+                .expect("retained")
+                .body_validation_state,
             BodyValidationState::Verified {
                 evidence: crate::EvidenceId::from_digest([4; 32])
             }
         );
         assert_eq!(
-            store.node(unknown_tip.hash).expect("retained").body_validation_state,
+            store
+                .node(unknown_tip.hash)
+                .expect("retained")
+                .body_validation_state,
             BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
                 attempts: 10,
                 suppliers: 0,

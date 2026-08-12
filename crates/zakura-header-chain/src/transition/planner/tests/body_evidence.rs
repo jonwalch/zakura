@@ -1,4 +1,77 @@
 use super::*;
+use crate::BodyRuleId;
+
+#[test]
+fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized();
+    let difficulty = store
+        .graph
+        .node(anchor.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let first = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x31);
+    let second = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x32);
+    let selected = store
+        .graph
+        .select_header_best()
+        .expect("the fixture has an eligible tip")
+        .0;
+    let losing = if selected == first { second } else { first };
+    store
+        .graph
+        .set_body_state(losing.hash, BodyValidationState::Unknown)
+        .expect("the losing body remains unverified");
+    synchronize_fixture(&mut store, anchor);
+    let before = store.snapshot();
+    let invalid_evidence = EvidenceId::from_digest([0x33; 32]);
+
+    let plan = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: before.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+                crate::ConsensusBodyInvalid {
+                    hash: losing.hash,
+                    evidence: invalid_evidence,
+                    rule: BodyRuleId::new("test.losing-body-invalid"),
+                    source: SourceId::from_digest([0x34; 32]),
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect("authenticated invalidity excludes the losing branch");
+
+    assert_eq!(plan.change_set.metadata.frontiers.header_best, selected);
+    assert_eq!(
+        plan.change_set.selected_projection,
+        ProjectionDelta::default()
+    );
+    assert!(plan.change_set.eligibility_changes.is_empty());
+    assert_eq!(
+        plan.change_set.metadata.header_generation,
+        before
+            .header_generation
+            .checked_next()
+            .expect("the fixture generation has capacity")
+    );
+    let changed = plan
+        .projected
+        .node(losing.hash)
+        .expect("the invalid losing node remains retained");
+    assert_eq!(
+        changed.body_validation_state,
+        BodyValidationState::ConsensusInvalid {
+            evidence: invalid_evidence,
+            rule: BodyRuleId::new("test.losing-body-invalid"),
+        }
+    );
+    assert!(changed.eligibility.direct_reasons.is_empty());
+}
 
 #[test]
 fn transient_body_evidence_cannot_regress_a_verified_body() {

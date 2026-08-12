@@ -7,8 +7,8 @@ use zakura_chain::{block, work::difficulty::Work};
 
 use super::{GraphError, InsertResult, MemHeaderStore};
 use crate::{
-    BodyRuleId, BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId,
-    Frontier, HeaderNode, HeaderValidationState, OperatorInvalidationId,
+    BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId, Frontier,
+    HeaderNode, HeaderValidationState, OperatorInvalidationId,
 };
 
 // Changes made by an overlay relative to the base graph.
@@ -228,16 +228,14 @@ impl<'a> GraphOverlay<'a> {
         children
     }
 
-
     /// Stages one admitted header whose parent is visible through the overlay.
     ///
     /// Derives its height, cumulative work, and inherited eligibility from the
-    /// parent. The supplied body state must agree with any body-invalid eligibility
-    /// reason.
+    /// parent. Consensus-invalid body state makes the new header ineligible.
     ///
     /// Returns [`InsertResult::AlreadyPresent`] for an identical existing header.
     /// Rejects conflicting duplicates, unknown parents, height/work overflow, and
-    /// inconsistent body eligibility.
+    /// invalid graph structure.
     ///
     /// This method does not perform header consensus or proof-of-work validation;
     /// it records the caller-supplied validation result and work.
@@ -250,7 +248,7 @@ impl<'a> GraphOverlay<'a> {
         body: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
         let hash = header.hash();
-        
+
         // If already present, return the existing frontier.
         if let Some(existing) = self.node(hash) {
             if existing.header == header {
@@ -280,35 +278,11 @@ impl<'a> GraphOverlay<'a> {
         // Collect the direct reasons into a set.
         let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
 
-        // Ensure the body eligibility is consistent with the direct reasons.
-        let body_reason = match &body {
-            BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                Some(EligibilityReason::ConsensusBodyInvalid {
-                    evidence: *evidence,
-                    rule: rule.clone(),
-                })
-            }
-            _ => None,
-        };
-
-        // Ensure there is at most one body-invalid reason.
-        let recorded_body_reasons = direct_reasons
-            .iter()
-            .filter(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }))
-            .count();
-        if body_reason
-            .as_ref()
-            .is_some_and(|reason| !direct_reasons.contains(reason))
-            || (body_reason.is_none() && recorded_body_reasons != 0)
-            || recorded_body_reasons > 1
-        {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
-
         // If the header is valid, has no direct reasons, and no inherited eligibility, it is eligible.
         let eligible = validation == HeaderValidationState::Valid
             && direct_reasons.is_empty()
-            && inherited_from.is_none();
+            && inherited_from.is_none()
+            && !matches!(body, BodyValidationState::ConsensusInvalid { .. });
 
         // Insert the node into the overlay.
         self.puts.insert(
@@ -349,22 +323,17 @@ impl<'a> GraphOverlay<'a> {
         Ok(InsertResult::Inserted(Frontier::new(height, hash)))
     }
 
-    /// Adds a non-body reason that directly makes the header ineligible.
+    /// Adds a reason that directly makes the header ineligible.
     ///
     /// If the reason is new, recomputes inherited eligibility for the header and
     /// its descendants. Returns whether the reason was newly added.
     ///
-    /// Rejects unknown headers and consensus-body-invalid reasons, which must be
-    /// applied through [`Self::set_consensus_body_invalid`] to keep body state and
-    /// eligibility consistent.
+    /// Rejects unknown headers.
     pub(crate) fn add_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
-        if matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }) {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
         let changed = self
             .node_mut(hash)?
             .eligibility
@@ -404,61 +373,32 @@ impl<'a> GraphOverlay<'a> {
         Ok(changed)
     }
 
-    /// Records a consensus-invalid body and its matching eligibility reason.
-    ///
-    /// Updates the body state and direct eligibility reason together so they cannot
-    /// disagree. If this changes the node, recomputes inherited eligibility for the
-    /// node and its descendants. Returns whether the node changed.
-    ///
-    /// Rejects unknown headers and conflicting body-invalid evidence or rules.
-    pub(crate) fn set_consensus_body_invalid(
-        &mut self,
-        hash: block::Hash,
-        evidence: EvidenceId,
-        rule: BodyRuleId,
-    ) -> Result<bool, GraphError> {
-        let node = self.node_mut(hash)?;
-        let body = BodyValidationState::ConsensusInvalid {
-            evidence,
-            rule: rule.clone(),
-        };
-        let reason = EligibilityReason::ConsensusBodyInvalid { evidence, rule };
-        if node.eligibility.direct_reasons.iter().any(|existing| {
-            matches!(existing, EligibilityReason::ConsensusBodyInvalid { .. })
-                && *existing != reason
-        }) || matches!(node.body_validation_state, BodyValidationState::ConsensusInvalid { .. })
-            && node.body_validation_state != body
-        {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
-        let changed = node.body_validation_state != body || !node.eligibility.direct_reasons.contains(&reason);
-        node.body_validation_state = body;
-        node.eligibility.direct_reasons.insert(reason);
-        if changed {
-            self.recompute_descendant_eligibility(hash)?;
-        }
-        Ok(changed)
-    }
-
+    /// Replaces body-validation state while preserving permanent invalidity.
     pub(crate) fn set_body_state(
         &mut self,
         hash: block::Hash,
-        body: BodyValidationState,
+        body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
-        if matches!(body, BodyValidationState::ConsensusInvalid { .. }) {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
+        let (changed, eligibility_changed) = {
+            let node = self.node_mut(hash)?;
+            if matches!(
+                node.body_validation_state,
+                BodyValidationState::ConsensusInvalid { .. }
+            ) {
+                return if node.body_validation_state == body_validation_state {
+                    Ok(false)
+                } else {
+                    Err(GraphError::PermanentBodyInvalidity(hash))
+                };
+            }
+            let was_eligible = node.is_eligible();
+            let changed = node.body_validation_state != body_validation_state;
+            node.body_validation_state = body_validation_state;
+            (changed, was_eligible != node.is_eligible())
+        };
+        if eligibility_changed {
+            self.recompute_descendant_eligibility(hash)?;
         }
-        let node = self.node_mut(hash)?;
-        if node
-            .eligibility
-            .direct_reasons
-            .iter()
-            .any(|reason| matches!(reason, EligibilityReason::ConsensusBodyInvalid { .. }))
-        {
-            return Err(GraphError::BodyEligibilityMismatch(hash));
-        }
-        let changed = node.body_validation_state != body;
-        node.body_validation_state = body;
         Ok(changed)
     }
 
@@ -706,7 +646,7 @@ impl<'a> GraphOverlay<'a> {
             #[cfg(test)]
             self.eligibility_nodes_visited
                 .set(self.eligibility_nodes_visited.get().saturating_add(1));
-            
+
             // Get the parent hash.
             let parent_hash = self
                 .node(hash)

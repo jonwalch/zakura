@@ -575,7 +575,10 @@ fn select_fully_verified_path<G: HeaderGraphView>(
     for node in nodes {
         if node.hash != finalized.hash
             && node.is_eligible()
-            && matches!(node.body_validation_state, BodyValidationState::Verified { .. })
+            && matches!(
+                node.body_validation_state,
+                BodyValidationState::Verified { .. }
+            )
             && connected.contains(&node.parent_hash)
         {
             connected.insert(node.hash);
@@ -1175,7 +1178,9 @@ fn apply_event<G: HeaderGraphEdit>(
                 ));
             }
             if matches!(
-                graph.view_node(event.hash).map(|node| &node.body_validation_state),
+                graph
+                    .view_node(event.hash)
+                    .map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
@@ -1188,7 +1193,10 @@ fn apply_event<G: HeaderGraphEdit>(
             )?;
         }
         TransitionEvent::BodySupplierDiscovered(event) => {
-            let old = match graph.view_node(event.hash).map(|node| &node.body_validation_state) {
+            let old = match graph
+                .view_node(event.hash)
+                .map(|node| &node.body_validation_state)
+            {
                 Some(BodyValidationState::Unavailable(summary))
                     if event.hash == graph.view_select_header_best()?.0.hash && summary.alarmed =>
                 {
@@ -1250,17 +1258,21 @@ fn apply_event<G: HeaderGraphEdit>(
         }
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
             if matches!(
-                graph.view_node(event.hash).map(|node| &node.body_validation_state),
+                graph
+                    .view_node(event.hash)
+                    .map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
                     "body invalid evidence cannot contradict an already verified body",
                 ));
             }
-            graph.edit_set_consensus_body_invalid(
+            graph.edit_set_body_state(
                 event.hash,
-                event.evidence,
-                event.rule.clone(),
+                BodyValidationState::ConsensusInvalid {
+                    evidence: event.evidence,
+                    rule: event.rule.clone(),
+                },
             )?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::Verified(event)) => {
@@ -1496,6 +1508,11 @@ fn derive_plan(
             .node(node.hash)
             .is_some_and(|old| old.validation != node.validation)
     });
+    let header_eligibility_changed = put_nodes.iter().any(|node| {
+        base_graph
+            .node(node.hash)
+            .is_some_and(|old| old.is_eligible() != node.is_eligible())
+    });
     let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
         "selected projection is empty",
     ))?;
@@ -1520,6 +1537,7 @@ fn derive_plan(
         if selected_changed
             || header_topology_changed
             || header_validation_changed
+            || header_eligibility_changed
             || !eligibility_changes.is_empty()
             || finality_append.is_some()
         {

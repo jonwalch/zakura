@@ -57,13 +57,6 @@ pub enum EligibilityReason {
         /// Current exact finality anchor.
         finalized: Frontier,
     },
-    /// A commitment-matching body deterministically failed consensus.
-    ConsensusBodyInvalid {
-        /// Stable verifier evidence.
-        evidence: EvidenceId,
-        /// Exact failed body rule.
-        rule: BodyRuleId,
-    },
     /// One independently reversible operator invalidation.
     OperatorInvalid {
         /// Exact invalidation to remove on reconsideration.
@@ -83,8 +76,7 @@ impl Ord for EligibilityReason {
             SettledUpgradeConflict { .. } => 0,
             CheckpointConflict { .. } => 1,
             FinalityConflict { .. } => 2,
-            ConsensusBodyInvalid { .. } => 3,
-            OperatorInvalid { .. } => 4,
+            OperatorInvalid { .. } => 3,
         };
         rank(self)
             .cmp(&rank(other))
@@ -116,18 +108,6 @@ impl Ord for EligibilityReason {
                         .cmp(&right.height)
                         .then_with(|| left.hash.0.cmp(&right.hash.0))
                 }
-                (
-                    ConsensusBodyInvalid {
-                        evidence: left_evidence,
-                        rule: left_rule,
-                    },
-                    ConsensusBodyInvalid {
-                        evidence: right_evidence,
-                        rule: right_rule,
-                    },
-                ) => left_evidence
-                    .cmp(right_evidence)
-                    .then_with(|| left_rule.cmp(right_rule)),
                 (
                     OperatorInvalid {
                         id: left,
@@ -283,6 +263,10 @@ impl HeaderNode {
     /// Return true when this node currently participates in fork choice.
     pub fn is_eligible(&self) -> bool {
         self.eligibility.is_eligible(self.validation)
+            && !matches!(
+                self.body_validation_state,
+                BodyValidationState::ConsensusInvalid { .. }
+            )
     }
 
     /// Return this node's checked cumulative work coordinate.

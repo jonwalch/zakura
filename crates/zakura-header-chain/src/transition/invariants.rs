@@ -377,7 +377,10 @@ fn verify_incremental_checkpoint_finality(
     if changed.aux_delivery_ids != previous.aux_delivery_ids {
         return Err(InvariantViolation::Auxiliary(changed.hash));
     }
-    if !matches!(changed.body_validation_state, BodyValidationState::Verified { .. }) {
+    if !matches!(
+        changed.body_validation_state,
+        BodyValidationState::Verified { .. }
+    ) {
         return Err(InvariantViolation::VerifiedProjection(changed.hash));
     }
     let projected_changed = graph
@@ -595,7 +598,9 @@ fn verify_verified<G: HeaderGraphView>(
     if mode == EngineMode::Integrated {
         for frontier in projection.iter().skip(1) {
             if !matches!(
-                graph.view_node(frontier.hash).map(|node| node.body_validation_state.clone()),
+                graph
+                    .view_node(frontier.hash)
+                    .map(|node| node.body_validation_state.clone()),
                 Some(BodyValidationState::Verified { .. })
             ) {
                 return Err(InvariantViolation::VerifiedProjection(frontier.hash));
@@ -700,10 +705,17 @@ fn verify_generations(
                             .is_some_and(|old| old.validation != node.validation),
                 )
             })?;
+    let header_eligibility_changed = plan.change_set.put_nodes.iter().any(|node| {
+        before
+            .graph()
+            .node(node.hash)
+            .is_some_and(|old| old.is_eligible() != node.is_eligible())
+    });
     let header_effect = selected_changed
         || !plan.change_set.index_changes.inserted.is_empty()
         || !plan.change_set.delete_nodes.is_empty()
         || header_validation_changed
+        || header_eligibility_changed
         || !plan.change_set.eligibility_changes.is_empty()
         || plan.change_set.finality_append.is_some();
     let expected_header = if header_effect {
