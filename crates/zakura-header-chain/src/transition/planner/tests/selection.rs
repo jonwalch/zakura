@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn complete_unchanged_projection_remains_borrowed() {
+    let (store, _) = TestStore::new(EngineMode::Integrated);
+    let projection = Cow::Borrowed(store.selected.as_slice());
+    let trimmed = trim_projection(&store.graph, projection)
+        .expect("the complete fixture projection remains valid");
+
+    assert!(matches!(trimmed, Cow::Borrowed(_)));
+}
+
+#[test]
 fn committed_transition_reports_a_stale_source_without_panicking() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());

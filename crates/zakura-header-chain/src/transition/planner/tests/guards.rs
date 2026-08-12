@@ -263,9 +263,13 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     ));
 
     let mut corrupt = plan.clone();
-    corrupt
+    corrupt.trust_pins = corrupt
         .trust_pins
-        .push(Frontier::new(first.height, block::Hash([9; 32])));
+        .iter()
+        .copied()
+        .chain([Frontier::new(first.height, block::Hash([9; 32]))])
+        .collect::<Vec<_>>()
+        .into();
     assert_eq!(
         verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::TrustPin(first.height))

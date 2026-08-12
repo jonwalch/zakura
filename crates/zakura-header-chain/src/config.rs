@@ -207,6 +207,8 @@ pub struct EngineConfig {
     pub limits: EngineLimits,
     /// Cached digest of the immutable trust-anchor fields.
     trust_anchor_digest: [u8; 32],
+    /// Cached sorted immutable trust pins used by transition verification.
+    trust_pins: Arc<[Frontier]>,
 }
 
 impl EngineConfig {
@@ -237,6 +239,7 @@ impl EngineConfig {
         }
         let trust_anchor_digest =
             trust_anchor_digest(&settled_manifest, &bootstrap_anchor, &local_checkpoints);
+        let trust_pins = trust_pins(&settled_manifest, &network, &local_checkpoints);
         Ok(Self {
             mode,
             network,
@@ -245,6 +248,7 @@ impl EngineConfig {
             settled_manifest,
             limits: EngineLimits::v1(),
             trust_anchor_digest,
+            trust_pins,
         })
     }
 
@@ -268,12 +272,22 @@ impl EngineConfig {
         self.trust_anchor_digest
     }
 
+    /// Return the sorted immutable trust pins used by transition verification.
+    pub(crate) fn trust_pins(&self) -> Arc<[Frontier]> {
+        self.trust_pins.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_local_checkpoints(&mut self, local_checkpoints: CheckpointSet) {
         self.local_checkpoints = local_checkpoints;
         self.trust_anchor_digest = trust_anchor_digest(
             &self.settled_manifest,
             &self.bootstrap_anchor,
+            &self.local_checkpoints,
+        );
+        self.trust_pins = trust_pins(
+            &self.settled_manifest,
+            &self.network,
             &self.local_checkpoints,
         );
     }
@@ -294,6 +308,21 @@ fn trust_anchor_digest(
         hasher.update(checkpoint.hash.0);
     }
     hasher.finalize().into()
+}
+
+fn trust_pins(
+    settled_manifest: &SettledUpgradeManifest,
+    network: &Network,
+    local_checkpoints: &CheckpointSet,
+) -> Arc<[Frontier]> {
+    let mut pins: Vec<_> = local_checkpoints.iter().collect();
+    if let Some(pin) = settled_manifest.pin_for_network(network) {
+        let key = (pin.activation.height, pin.activation.hash.0);
+        if let Err(index) = pins.binary_search_by_key(&key, |pin| (pin.height, pin.hash.0)) {
+            pins.insert(index, pin.activation);
+        }
+    }
+    pins.into()
 }
 
 /// Invalid immutable engine or trust-anchor configuration.
@@ -609,6 +638,18 @@ mod tests {
             replaced.trust_anchor_digest(),
             checkpointed.trust_anchor_digest(),
             "test-only checkpoint replacement must refresh the cached digest",
+        );
+        assert_eq!(
+            replaced.trust_pins().as_ref(),
+            checkpointed.trust_pins().as_ref()
+        );
+        assert!(
+            !Arc::ptr_eq(&plain.trust_pins(), &replaced.trust_pins()),
+            "test-only checkpoint replacement must refresh the cached pins"
+        );
+        assert!(
+            Arc::ptr_eq(&checkpointed.trust_pins(), &checkpointed.trust_pins()),
+            "successive plans can share the immutable trust-pin allocation"
         );
 
         let mismatched = TrustedAnchor {
