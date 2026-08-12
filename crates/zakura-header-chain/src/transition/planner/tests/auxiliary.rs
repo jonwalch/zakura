@@ -1,3 +1,4 @@
+use super::super::projected_state::path;
 use super::*;
 use crate::{AuxDelta, InvariantViolation};
 
@@ -700,7 +701,7 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
     insert.aux.push(duplicate);
     assert!(matches!(
         apply_transition(&store, oversized.clone(), &context(&config, &clock, None)),
-        Err(TransitionFailure::ResourceStalled)
+        Err(TransitionFailure::AuxiliaryLimitExceeded)
     ));
 
     config.limits.max_aux_deliveries_per_header =
@@ -709,8 +710,9 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
         std::num::NonZeroUsize::new(1).expect("one is nonzero");
     assert!(matches!(
         apply_transition(&store, oversized, &context(&config, &clock, None)),
-        Err(TransitionFailure::ResourceStalled)
+        Err(TransitionFailure::AuxiliaryLimitExceeded)
     ));
     assert_eq!(store.metadata.state_version, StateVersion::new(0));
+    assert!(!store.metadata.alarms.resource_stalled);
     assert!(store.aux.is_empty());
 }
