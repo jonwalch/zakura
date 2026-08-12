@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    fmt,
     sync::Arc,
 };
 
@@ -20,6 +21,42 @@ use crate::{
 mod overlay;
 pub(crate) use overlay::{GraphDelta, GraphOverlay};
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use zakura_chain::block;
+
+    use super::{GraphDelta, HeaderNode, MemHeaderStore};
+
+    pub(crate) fn mutate_retained_header(
+        graph: &mut MemHeaderStore,
+        hash: block::Hash,
+        mutation: impl FnOnce(&mut HeaderNode),
+    ) {
+        let header_node = graph
+            .nodes
+            .get_mut(&hash)
+            .expect("the test mutation names a retained header");
+        mutation(header_node);
+    }
+
+    pub(crate) fn mutate_updated_header(
+        graph_delta: &mut GraphDelta,
+        hash: block::Hash,
+        mutation: impl FnOnce(&mut HeaderNode),
+    ) {
+        let header_node = graph_delta
+            .updated_header_nodes
+            .iter_mut()
+            .find(|header_node| header_node.hash == hash)
+            .expect("the test mutation names an updated header");
+        mutation(header_node);
+    }
+
+    pub(crate) fn add_deleted_header(graph_delta: &mut GraphDelta, hash: block::Hash) {
+        graph_delta.deleted_header_hashes.push(hash);
+    }
+}
+
 /// Read-only access to one coherent retained header graph.
 ///
 /// This abstraction allows fork-choice, planning, and invariant code to query
@@ -27,17 +64,28 @@ pub(crate) use overlay::{GraphDelta, GraphOverlay};
 /// changes. It exposes retained nodes, ancestry, eligibility, finality, and
 /// derived fork-choice views without granting mutation or persistence access.
 pub(crate) trait HeaderGraphView {
-    fn view_finalized(&self) -> Frontier;
-    fn view_node_count(&self) -> usize;
-    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode>;
-    fn view_nodes(&self) -> Vec<&HeaderNode>;
-    fn view_retained_hashes(&self) -> Vec<block::Hash>;
-    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash>;
-    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash>;
-    fn view_eligible_tips(&self) -> Vec<Frontier>;
-    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError>;
-    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError>;
-    fn view_ancestor(
+    /// Return the finalized frontier that roots every retained header path.
+    fn view_finalized_frontier(&self) -> Frontier;
+    /// Return the number of retained header nodes.
+    fn view_header_node_count(&self) -> usize;
+    /// Return the retained header node with the exact canonical hash.
+    fn view_header_node(&self, hash: block::Hash) -> Option<&HeaderNode>;
+    /// Return every retained header node.
+    fn view_header_nodes(&self) -> Vec<&HeaderNode>;
+    /// Return every retained canonical header hash.
+    fn view_retained_header_hashes(&self) -> Vec<block::Hash>;
+    /// Return retained header hashes at the exact height.
+    fn view_header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash>;
+    /// Return the retained direct children of the exact parent hash.
+    fn view_header_children(&self, parent: block::Hash) -> Vec<block::Hash>;
+    /// Return every eligible header without an eligible retained child.
+    fn view_eligible_header_tips(&self) -> Vec<Frontier>;
+    /// Select the eligible header chain with the greatest deterministic score.
+    fn view_select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError>;
+    /// Return one retained header's score relative to the finalized frontier.
+    fn view_header_chain_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError>;
+    /// Return the descendant's retained ancestor at the exact height.
+    fn view_header_ancestor(
         &self,
         descendant: block::Hash,
         height: block::Height,
@@ -53,56 +101,66 @@ pub(crate) trait HeaderGraphView {
 /// Callers remain responsible for event authority and transition-level
 /// invariant validation.
 pub(crate) trait HeaderGraphEdit: HeaderGraphView {
-    fn edit_insert(
+    /// Insert one admitted header and derive its graph-owned fields.
+    fn edit_insert_header(
         &mut self,
         header: Arc<block::Header>,
         validation: HeaderValidationState,
         direct_reasons: Vec<EligibilityReason>,
-        body: BodyValidationState,
+        body_validation_state: BodyValidationState,
     ) -> Result<InsertResult, GraphError>;
-    fn edit_add_eligibility_reason(
+    /// Add one direct reason that excludes a retained header from selection.
+    fn edit_add_header_eligibility_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError>;
-    fn edit_remove_operator_invalidation(
+    /// Remove the operator invalidation with the exact identity and evidence.
+    fn edit_remove_header_operator_invalidation(
         &mut self,
         hash: block::Hash,
         id: OperatorInvalidationId,
         evidence: Option<EvidenceId>,
     ) -> Result<bool, GraphError>;
-    fn edit_set_body_state(
+    /// Replace a retained header's body-validation state.
+    fn edit_set_body_validation_state(
         &mut self,
         hash: block::Hash,
-        body: BodyValidationState,
+        body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError>;
-    fn edit_set_validation(
+    /// Replace a retained header's time-dependent validation state.
+    fn edit_set_header_validation_state(
         &mut self,
         hash: block::Hash,
         validation: HeaderValidationState,
     ) -> Result<bool, GraphError>;
-    fn edit_record_aux_delivery(
+    /// Append one authenticated auxiliary evidence delivery identity.
+    fn edit_record_auxiliary_evidence_delivery(
         &mut self,
         hash: block::Hash,
         delivery_id: EvidenceId,
     ) -> Result<bool, GraphError>;
-    fn edit_advance_finalized(
+    /// Move finality to an eligible descendant and remove every discarded path.
+    fn edit_advance_finalized_frontier(
         &mut self,
-        finalized: Frontier,
+        finalized_frontier: Frontier,
     ) -> Result<Vec<block::Hash>, GraphError>;
-    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError>;
+    /// Remove one retained header that has no retained children.
+    fn edit_remove_header_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError>;
 }
 
 /// Failure to construct or query a coherent in-memory header DAG.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum GraphError {
     /// A delta was produced from a different graph revision.
-    #[error("graph delta names base revision {delta}, current revision is {current}")]
+    #[error(
+        "graph delta names base revision {delta_base_revision}, current revision is {current_revision}"
+    )]
     StaleDelta {
         /// Current committed graph revision.
-        current: u64,
+        current_revision: GraphRevision,
         /// Revision captured by the overlay.
-        delta: u64,
+        delta_base_revision: GraphRevision,
     },
     /// The graph revision cannot advance further.
     #[error("graph revision exhausted")]
@@ -134,21 +192,26 @@ pub enum GraphError {
     ConflictingDuplicate(block::Hash),
     /// A reconstructed graph contains more than one row for one hash.
     #[error("duplicate reconstructed header {0:?}")]
-    DuplicateNode(block::Hash),
-    /// A node record contradicts its canonical header or graph coordinate.
-    #[error("invalid retained header node {0:?}")]
-    InvalidNode(block::Hash),
+    DuplicateHeaderNode(block::Hash),
+    /// A retained header row violates one structural invariant.
+    #[error("retained header {header:?} violates the {invariant} invariant")]
+    InvalidHeaderNode {
+        /// Header whose durable row is invalid.
+        header: block::Hash,
+        /// Exact structural invariant that failed.
+        invariant: HeaderNodeInvariant,
+    },
     /// A requested retained node does not exist.
     #[error("unknown retained header {0:?}")]
-    UnknownNode(block::Hash),
+    UnknownHeaderNode(block::Hash),
     /// Finality attempted to root the graph at an ineligible header.
     #[error("cannot finalize ineligible retained header {0:?}")]
-    IneligibleFinalized(block::Hash),
+    IneligibleFinalizedFrontier(block::Hash),
     /// Finality selected a retained header outside the current finalized subtree.
     #[error(
         "new finalized header {candidate:?} is not a descendant of current finalized header {current:?}"
     )]
-    FinalizedNotDescendant {
+    FinalizedFrontierNotDescendant {
         /// Current finalized root.
         current: block::Hash,
         /// Proposed finalized root.
@@ -156,7 +219,7 @@ pub enum GraphError {
     },
     /// Retention attempted to remove a node that still has retained children.
     #[error("cannot remove non-leaf header {0:?}")]
-    NodeHasChildren(block::Hash),
+    HeaderNodeHasChildren(block::Hash),
     /// A caller tried to replace a permanent consensus-invalid body-validation state.
     #[error("consensus-invalid body state is permanent for {0:?}")]
     PermanentBodyInvalidity(block::Hash),
@@ -173,15 +236,100 @@ pub enum GraphError {
     Work(#[from] WorkCoordinateError),
 }
 
+/// Structural fact that authenticates one retained header row.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub enum HeaderNodeInvariant {
+    /// The header difficulty target must encode valid canonical block work.
+    #[error("canonical block work")]
+    CanonicalBlockWork,
+    /// The finalized row height must match the finalized frontier height.
+    #[error("finalized frontier height")]
+    FinalizedFrontierHeight,
+    /// The stored hash must equal the canonical header hash.
+    #[error("canonical header hash")]
+    CanonicalHeaderHash,
+    /// The stored parent hash must equal the canonical header parent hash.
+    #[error("canonical parent hash")]
+    CanonicalParentHash,
+    /// Every retained coordinate must use the finalized row's work origin.
+    #[error("work origin")]
+    WorkOrigin,
+    /// A child height must immediately follow its retained parent height.
+    #[error("parent height")]
+    ParentHeight,
+    /// A child coordinate must equal its parent coordinate plus canonical block work.
+    #[error("cumulative work")]
+    CumulativeWork,
+    /// An ordinary graph transition must preserve immutable header fields.
+    #[error("immutable header fields")]
+    ImmutableFields,
+    /// A work rebase must use the current finalized frontier as its origin.
+    #[error("work rebase origin")]
+    WorkRebaseOrigin,
+    /// A work rebase must preserve work relative to the finalized frontier.
+    #[error("work rebase coordinate")]
+    WorkRebaseCoordinate,
+    /// Reconstruction must preserve the supplied direct header state.
+    #[error("derived header state")]
+    DerivedHeaderState,
+}
+
+/// Monotonic capability that identifies one committed in-memory graph state.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct GraphRevision(u64);
+
+impl GraphRevision {
+    fn checked_next(self) -> Result<Self, GraphError> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(GraphError::RevisionExhausted)
+    }
+}
+
+impl fmt::Display for GraphRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Permanent consensus-invalid body evidence keyed by canonical header hash.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConsensusInvalidTombstone {
+pub struct ConsensusInvalidBodyTombstone {
     /// Canonical header hash whose body failed consensus.
     pub hash: block::Hash,
     /// Exact authoritative evidence identity.
     pub evidence: EvidenceId,
     /// Exact failed consensus rule.
     pub rule: BodyRuleId,
+}
+
+/// Complete audited input for transactional header-graph reconstruction.
+#[derive(Clone, Debug)]
+pub struct HeaderGraphReconstruction {
+    /// Finalized frontier that roots every retained header path.
+    finalized_frontier: Frontier,
+    /// Durable header rows to validate and index.
+    header_nodes: Vec<HeaderNode>,
+    /// Append-only consensus-invalid body evidence, including pruned headers.
+    consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
+}
+
+impl HeaderGraphReconstruction {
+    /// Collect the durable rows that form one reconstruction transaction.
+    pub fn new(
+        finalized_frontier: Frontier,
+        header_nodes: impl IntoIterator<Item = HeaderNode>,
+        consensus_invalid_body_tombstones: impl IntoIterator<Item = ConsensusInvalidBodyTombstone>,
+    ) -> Self {
+        Self {
+            finalized_frontier,
+            header_nodes: header_nodes.into_iter().collect(),
+            consensus_invalid_body_tombstones: consensus_invalid_body_tombstones
+                .into_iter()
+                .collect(),
+        }
+    }
 }
 
 /// Result of an idempotent DAG insertion.
@@ -200,8 +348,8 @@ pub enum InsertResult {
 /// It is not a durable store or a generic CRUD interface.
 #[derive(Clone, Debug)]
 pub struct MemHeaderStore {
-    revision: u64,
-    finalized: Frontier,
+    graph_revision: GraphRevision,
+    finalized_frontier: Frontier,
     // Nodes by hash.
     nodes: HashMap<block::Hash, HeaderNode>,
     // Children by parent hash.
@@ -210,89 +358,92 @@ pub struct MemHeaderStore {
 
     // A hash belongs to this when: a header is eligible (validated, no exclusion reasons, no ineligible ancestors)
     // and has no eligible children.
-    eligible_tips: HashSet<block::Hash>,
-    consensus_invalid_tombstones: HashMap<block::Hash, ConsensusInvalidTombstone>,
+    eligible_header_tips: HashSet<block::Hash>,
+    consensus_invalid_body_tombstones: HashMap<block::Hash, ConsensusInvalidBodyTombstone>,
 }
 
 struct DerivedIndexChanges {
-    add_children: Vec<(block::Hash, block::Hash)>,
-    remove_children: Vec<(block::Hash, block::Hash)>,
-    add_eligible_tips: Vec<block::Hash>,
-    remove_eligible_tips: Vec<block::Hash>,
+    added_header_children: Vec<(block::Hash, block::Hash)>,
+    removed_header_children: Vec<(block::Hash, block::Hash)>,
+    add_eligible_header_tips: Vec<block::Hash>,
+    remove_eligible_header_tips: Vec<block::Hash>,
 }
 
 impl MemHeaderStore {
     /// Construct a store rooted at one trusted, already-validated work origin.
     pub fn new(
-        finalized: Frontier,
+        finalized_frontier: Frontier,
         header: Arc<block::Header>,
         block_work: Work,
         cumulative_work: U256,
     ) -> Result<Self, GraphError> {
         let actual = header.hash();
-        if actual != finalized.hash {
+        if actual != finalized_frontier.hash {
             return Err(GraphError::AnchorHashMismatch {
-                expected: finalized.hash,
+                expected: finalized_frontier.hash,
                 actual,
             });
         }
         let anchor = HeaderNode {
             parent_hash: header.previous_block_hash,
             header,
-            hash: finalized.hash,
-            height: finalized.height,
+            hash: finalized_frontier.hash,
+            height: finalized_frontier.height,
             block_work,
-            work_coordinate: WorkCoordinate::new(finalized.hash, cumulative_work),
+            work_coordinate: WorkCoordinate::new(finalized_frontier.hash, cumulative_work),
             validation: HeaderValidationState::Valid,
             eligibility: EligibilityState::default(),
             body_validation_state: BodyValidationState::Unknown,
             aux_delivery_ids: Vec::new(),
         };
         let mut nodes = HashMap::new();
-        nodes.insert(finalized.hash, anchor);
+        nodes.insert(finalized_frontier.hash, anchor);
         let mut heights = HashMap::new();
-        heights.insert(finalized.height, HashSet::from([finalized.hash]));
+        heights.insert(
+            finalized_frontier.height,
+            HashSet::from([finalized_frontier.hash]),
+        );
         Ok(Self {
-            revision: 0,
-            finalized,
+            graph_revision: GraphRevision::default(),
+            finalized_frontier,
             nodes,
             children: HashMap::new(),
             heights,
-            eligible_tips: HashSet::from([finalized.hash]),
-            consensus_invalid_tombstones: HashMap::new(),
+            eligible_header_tips: HashSet::from([finalized_frontier.hash]),
+            consensus_invalid_body_tombstones: HashMap::new(),
         })
     }
 
     /// Return the revision that binds newly created graph deltas.
-    pub const fn revision(&self) -> u64 {
-        self.revision
+    pub const fn graph_revision(&self) -> GraphRevision {
+        self.graph_revision
     }
 
     /// Return permanent consensus-invalid evidence for `hash`.
-    pub fn consensus_invalid_tombstone(
+    pub fn consensus_invalid_body_tombstone(
         &self,
         hash: block::Hash,
-    ) -> Option<&ConsensusInvalidTombstone> {
-        self.consensus_invalid_tombstones.get(&hash)
+    ) -> Option<&ConsensusInvalidBodyTombstone> {
+        self.consensus_invalid_body_tombstones.get(&hash)
     }
 
     /// Return the immutable finalized root of every eligible path.
-    pub const fn finalized(&self) -> Frontier {
-        self.finalized
+    pub const fn finalized_frontier(&self) -> Frontier {
+        self.finalized_frontier
     }
 
     /// Return the number of retained nodes, including the finalized anchor.
-    pub fn node_count(&self) -> usize {
+    pub fn header_node_count(&self) -> usize {
         self.nodes.len()
     }
 
     /// Read one retained node by exact consensus hash.
-    pub fn node(&self, hash: block::Hash) -> Option<&HeaderNode> {
+    pub fn header_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
         self.nodes.get(&hash)
     }
 
     /// Return every retained hash at a height, ordered by raw internal bytes.
-    pub fn hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
+    pub fn header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
         let mut hashes: Vec<_> = self
             .heights
             .get(&height)
@@ -305,7 +456,7 @@ impl MemHeaderStore {
     }
 
     /// Return direct children ordered by raw internal bytes.
-    pub fn children(&self, parent: block::Hash) -> Vec<block::Hash> {
+    pub fn header_children(&self, parent: block::Hash) -> Vec<block::Hash> {
         let mut children: Vec<_> = self
             .children
             .get(&parent)
@@ -324,9 +475,8 @@ impl MemHeaderStore {
         header: Arc<block::Header>,
         validation: HeaderValidationState,
         direct_reasons: impl IntoIterator<Item = EligibilityReason>,
-        mut body: BodyValidationState,
+        mut body_validation_state: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
-        // Check if the header already exists in the graph. If so, return the existing frontier.
         let hash = header.hash();
         if let Some(existing) = self.nodes.get(&hash) {
             if existing.header == header {
@@ -338,10 +488,14 @@ impl MemHeaderStore {
             return Err(GraphError::ConflictingDuplicate(hash));
         }
         let parent_hash = header.previous_block_hash;
-        let block_work = header
-            .difficulty_threshold
-            .to_work()
-            .ok_or(GraphError::InvalidNode(hash))?;
+        let block_work =
+            header
+                .difficulty_threshold
+                .to_work()
+                .ok_or(GraphError::InvalidHeaderNode {
+                    header: hash,
+                    invariant: HeaderNodeInvariant::CanonicalBlockWork,
+                })?;
         let parent = self
             .nodes
             .get(&parent_hash)
@@ -359,7 +513,7 @@ impl MemHeaderStore {
         let work_coordinate = match parent.work_coordinate().checked_add(block_work) {
             Ok(coordinate) => coordinate,
             Err(WorkCoordinateError::Overflow) if validation == HeaderValidationState::Valid => {
-                self.rebase_work_to_finalized()?;
+                self.rebase_work_coordinates_to_finalized_frontier()?;
                 self.nodes
                     .get(&parent_hash)
                     .expect("the work rebase retains every graph node")
@@ -368,8 +522,8 @@ impl MemHeaderStore {
             }
             Err(error) => return Err(error.into()),
         };
-        if let Some(tombstone) = self.consensus_invalid_tombstones.get(&hash) {
-            body = BodyValidationState::ConsensusInvalid {
+        if let Some(tombstone) = self.consensus_invalid_body_tombstones.get(&hash) {
+            body_validation_state = BodyValidationState::ConsensusInvalid {
                 evidence: tombstone.evidence,
                 rule: tombstone.rule.clone(),
             };
@@ -387,7 +541,7 @@ impl MemHeaderStore {
                 direct_reasons,
                 inherited_from,
             },
-            body_validation_state: body,
+            body_validation_state,
             aux_delivery_ids: Vec::new(),
         };
         self.nodes.insert(hash, node);
@@ -399,8 +553,8 @@ impl MemHeaderStore {
             .expect("the inserted node is present")
             .is_eligible()
         {
-            self.eligible_tips.remove(&parent_hash);
-            self.eligible_tips.insert(hash);
+            self.eligible_header_tips.remove(&parent_hash);
+            self.eligible_header_tips.insert(hash);
         }
         self.advance_revision()?;
         Ok(InsertResult::Inserted(Frontier::new(height, hash)))
@@ -417,7 +571,7 @@ impl MemHeaderStore {
         let changed = self
             .nodes
             .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))?
+            .ok_or(GraphError::UnknownHeaderNode(hash))?
             .eligibility
             .direct_reasons
             .insert(reason);
@@ -442,7 +596,7 @@ impl MemHeaderStore {
         let reasons = &mut self
             .nodes
             .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))?
+            .ok_or(GraphError::UnknownHeaderNode(hash))?
             .eligibility
             .direct_reasons;
         let before = reasons.len();
@@ -472,14 +626,14 @@ impl MemHeaderStore {
     /// This method does not enforce transitions between non-invalid
     /// body-validation states. The caller must supply an authoritative
     /// body-validation state.
-    pub(crate) fn set_body_state(
+    pub(crate) fn set_body_validation_state(
         &mut self,
         hash: block::Hash,
         body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
         let tombstone = match &body_validation_state {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                Some(ConsensusInvalidTombstone {
+                Some(ConsensusInvalidBodyTombstone {
                     hash,
                     evidence: *evidence,
                     rule: rule.clone(),
@@ -487,7 +641,7 @@ impl MemHeaderStore {
             }
             _ => None,
         };
-        if let Some(existing) = self.consensus_invalid_tombstones.get(&hash) {
+        if let Some(existing) = self.consensus_invalid_body_tombstones.get(&hash) {
             if tombstone.as_ref() != Some(existing) {
                 return Err(GraphError::PermanentBodyInvalidity(hash));
             }
@@ -496,7 +650,7 @@ impl MemHeaderStore {
             let node = self
                 .nodes
                 .get_mut(&hash)
-                .ok_or(GraphError::UnknownNode(hash))?;
+                .ok_or(GraphError::UnknownHeaderNode(hash))?;
             if matches!(
                 node.body_validation_state,
                 BodyValidationState::ConsensusInvalid { .. }
@@ -516,7 +670,8 @@ impl MemHeaderStore {
             self.recompute_descendant_eligibility(hash)?;
         }
         if let Some(tombstone) = tombstone {
-            self.consensus_invalid_tombstones.insert(hash, tombstone);
+            self.consensus_invalid_body_tombstones
+                .insert(hash, tombstone);
         }
         if changed {
             self.advance_revision()?;
@@ -535,7 +690,7 @@ impl MemHeaderStore {
     /// Returns an error if `hash` is unknown or the retained graph is inconsistent.
     ///
     /// The caller must ensure the new state is justified by the authoritative clock.
-    pub(crate) fn set_validation(
+    pub(crate) fn set_header_validation_state(
         &mut self,
         hash: block::Hash,
         validation: HeaderValidationState,
@@ -543,7 +698,7 @@ impl MemHeaderStore {
         let node = self
             .nodes
             .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))?;
+            .ok_or(GraphError::UnknownHeaderNode(hash))?;
         let changed = node.validation != validation;
         node.validation = validation;
         if changed {
@@ -554,7 +709,7 @@ impl MemHeaderStore {
     }
 
     /// Append one authenticated auxiliary evidence ID to a retained header.
-    pub(crate) fn record_aux_delivery(
+    pub(crate) fn record_auxiliary_evidence_delivery(
         &mut self,
         hash: block::Hash,
         delivery_id: EvidenceId,
@@ -562,7 +717,7 @@ impl MemHeaderStore {
         let ids = &mut self
             .nodes
             .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))?
+            .ok_or(GraphError::UnknownHeaderNode(hash))?
             .aux_delivery_ids;
         if ids.contains(&delivery_id) {
             return Ok(false);
@@ -573,15 +728,20 @@ impl MemHeaderStore {
     }
 
     /// Rebase every retained work coordinate to the current finalized frontier.
-    pub(crate) fn rebase_work_to_finalized(&mut self) -> Result<(), GraphError> {
+    pub(crate) fn rebase_work_coordinates_to_finalized_frontier(
+        &mut self,
+    ) -> Result<(), GraphError> {
         let anchor = self
-            .node(self.finalized.hash)
-            .ok_or(GraphError::UnknownNode(self.finalized.hash))?
+            .header_node(self.finalized_frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))?
             .work_coordinate();
         let mut rebased = HashMap::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
             let suffix = node.work_coordinate().suffix_after(anchor)?.as_u256();
-            rebased.insert(node.hash, WorkCoordinate::new(self.finalized.hash, suffix));
+            rebased.insert(
+                node.hash,
+                WorkCoordinate::new(self.finalized_frontier.hash, suffix),
+            );
         }
         for (hash, coordinate) in rebased {
             self.nodes
@@ -594,7 +754,7 @@ impl MemHeaderStore {
     }
 
     /// Return the exact ancestor at `height`, if the retained path reaches it.
-    pub fn ancestor(
+    pub fn header_ancestor(
         &self,
         descendant: block::Hash,
         height: block::Height,
@@ -602,7 +762,7 @@ impl MemHeaderStore {
         let mut node = self
             .nodes
             .get(&descendant)
-            .ok_or(GraphError::UnknownNode(descendant))?;
+            .ok_or(GraphError::UnknownHeaderNode(descendant))?;
         if height > node.height {
             return Err(GraphError::InvalidAncestorHeight {
                 ancestor: height,
@@ -619,9 +779,9 @@ impl MemHeaderStore {
     }
 
     /// Return all currently maximal eligible nodes in deterministic hash order.
-    pub fn eligible_tips(&self) -> Vec<Frontier> {
+    pub fn eligible_header_tips(&self) -> Vec<Frontier> {
         let mut tips: Vec<_> = self
-            .eligible_tips
+            .eligible_header_tips
             .iter()
             .filter_map(|hash| self.nodes.get(hash))
             .map(|node| Frontier::new(node.height, node.hash))
@@ -631,13 +791,13 @@ impl MemHeaderStore {
     }
 
     /// Select the deterministic greatest-work eligible tip after the finalized anchor.
-    pub fn select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError> {
+    pub fn select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError> {
         let anchor = self
             .nodes
-            .get(&self.finalized.hash)
-            .ok_or(GraphError::UnknownNode(self.finalized.hash))?;
+            .get(&self.finalized_frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))?;
         let mut best = None;
-        for hash in &self.eligible_tips {
+        for hash in &self.eligible_header_tips {
             let node = self
                 .nodes
                 .get(hash)
@@ -652,16 +812,19 @@ impl MemHeaderStore {
                 best = Some((tip, score));
             }
         }
-        best.ok_or(GraphError::UnknownNode(self.finalized.hash))
+        best.ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))
     }
 
     /// Return the selection score of one retained descendant of the finalized anchor.
-    pub fn score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
+    pub fn header_chain_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
         let anchor = self
             .nodes
-            .get(&self.finalized.hash)
-            .ok_or(GraphError::UnknownNode(self.finalized.hash))?;
-        let node = self.nodes.get(&hash).ok_or(GraphError::UnknownNode(hash))?;
+            .get(&self.finalized_frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))?;
+        let node = self
+            .nodes
+            .get(&hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?;
         Ok(ChainScore::new(
             node.work_coordinate()
                 .suffix_after(anchor.work_coordinate())?,
@@ -669,61 +832,97 @@ impl MemHeaderStore {
         ))
     }
 
-    /// Transactionally reconstruct a graph from audited durable rows.
-    pub fn reconstruct(
-        finalized: Frontier,
-        nodes: impl IntoIterator<Item = HeaderNode>,
-        tombstones: impl IntoIterator<Item = ConsensusInvalidTombstone>,
-    ) -> Result<Self, GraphError> {
+    /// Validate durable rows and reconstruct every derived graph index.
+    ///
+    /// The constructor rejects duplicate hashes, non-canonical header hashes,
+    /// invalid parent links, height gaps, forged block work, forged work
+    /// coordinates, inconsistent permanent body invalidity, and an invalid
+    /// finalized frontier. The constructor computes inherited eligibility and
+    /// eligible header tips only after every source row passes validation.
+    pub fn reconstruct(reconstruction: HeaderGraphReconstruction) -> Result<Self, GraphError> {
+        let HeaderGraphReconstruction {
+            finalized_frontier,
+            header_nodes,
+            consensus_invalid_body_tombstones: durable_consensus_invalid_body_tombstones,
+        } = reconstruction;
         let mut node_map = HashMap::new();
-        for node in nodes {
+        for node in header_nodes {
             let hash = node.hash;
             if node_map.insert(hash, node).is_some() {
-                return Err(GraphError::DuplicateNode(hash));
+                return Err(GraphError::DuplicateHeaderNode(hash));
             }
         }
-        let mut consensus_invalid_tombstones = HashMap::new();
-        for tombstone in tombstones {
+        let mut consensus_invalid_body_tombstones = HashMap::new();
+        for tombstone in durable_consensus_invalid_body_tombstones {
             let hash = tombstone.hash;
-            if let Some(existing) = consensus_invalid_tombstones.insert(hash, tombstone.clone()) {
+            if let Some(existing) =
+                consensus_invalid_body_tombstones.insert(hash, tombstone.clone())
+            {
                 if existing != tombstone {
                     return Err(GraphError::PermanentBodyInvalidity(hash));
                 }
-                return Err(GraphError::DuplicateNode(hash));
+                return Err(GraphError::DuplicateHeaderNode(hash));
             }
         }
         let finalized_node = node_map
-            .get(&finalized.hash)
-            .ok_or(GraphError::UnknownNode(finalized.hash))?;
-        if finalized_node.height != finalized.height {
-            return Err(GraphError::InvalidNode(finalized.hash));
+            .get(&finalized_frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(finalized_frontier.hash))?;
+        if finalized_node.height != finalized_frontier.height {
+            return Err(GraphError::InvalidHeaderNode {
+                header: finalized_frontier.hash,
+                invariant: HeaderNodeInvariant::FinalizedFrontierHeight,
+            });
         }
         let anchor_coordinate = finalized_node.work_coordinate();
         for node in node_map.values() {
-            if node.header.hash() != node.hash
-                || node.header.previous_block_hash != node.parent_hash
-                || node.header.difficulty_threshold.to_work() != Some(node.block_work)
-                || node.work_coordinate().origin_hash() != anchor_coordinate.origin_hash()
-            {
-                return Err(GraphError::InvalidNode(node.hash));
+            if node.header.hash() != node.hash {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::CanonicalHeaderHash,
+                });
             }
-            if node.hash != finalized.hash {
+            if node.header.previous_block_hash != node.parent_hash {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::CanonicalParentHash,
+                });
+            }
+            if node.header.difficulty_threshold.to_work() != Some(node.block_work) {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::CanonicalBlockWork,
+                });
+            }
+            if node.work_coordinate().origin_hash() != anchor_coordinate.origin_hash() {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::WorkOrigin,
+                });
+            }
+            if node.hash != finalized_frontier.hash {
                 let parent = node_map
                     .get(&node.parent_hash)
                     .ok_or(GraphError::UnknownParent {
                         header: node.hash,
                         parent: node.parent_hash,
                     })?;
-                if parent.height.next().ok() != Some(node.height)
-                    || parent.work_coordinate().checked_add(node.block_work)?
-                        != node.work_coordinate()
+                if parent.height.next().ok() != Some(node.height) {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::ParentHeight,
+                    });
+                }
+                if parent.work_coordinate().checked_add(node.block_work)? != node.work_coordinate()
                 {
-                    return Err(GraphError::InvalidNode(node.hash));
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::CumulativeWork,
+                    });
                 }
             }
             match (
                 &node.body_validation_state,
-                consensus_invalid_tombstones.get(&node.hash),
+                consensus_invalid_body_tombstones.get(&node.hash),
             ) {
                 (BodyValidationState::ConsensusInvalid { evidence, rule }, Some(tombstone))
                     if *evidence == tombstone.evidence && *rule == tombstone.rule => {}
@@ -734,7 +933,7 @@ impl MemHeaderStore {
                 (_, None) => {}
             }
         }
-        for (hash, tombstone) in &consensus_invalid_tombstones {
+        for (hash, tombstone) in &consensus_invalid_body_tombstones {
             if let Some(node) = node_map.get_mut(hash) {
                 node.body_validation_state = BodyValidationState::ConsensusInvalid {
                     evidence: tombstone.evidence,
@@ -749,7 +948,7 @@ impl MemHeaderStore {
             .collect();
         frontiers.sort_unstable_by_key(|frontier| (frontier.height, frontier.hash.0));
         for frontier in frontiers {
-            if frontier == finalized {
+            if frontier == finalized_frontier {
                 inherited.insert(frontier.hash, None);
                 continue;
             }
@@ -771,14 +970,16 @@ impl MemHeaderStore {
                 .eligibility
                 .inherited_from = inherited_from;
         }
-        if !node_map[&finalized.hash].is_eligible() {
-            return Err(GraphError::IneligibleFinalized(finalized.hash));
+        if !node_map[&finalized_frontier.hash].is_eligible() {
+            return Err(GraphError::IneligibleFinalizedFrontier(
+                finalized_frontier.hash,
+            ));
         }
         let mut children: HashMap<_, HashSet<_>> = HashMap::new();
         let mut heights: HashMap<_, HashSet<_>> = HashMap::new();
         for node in node_map.values() {
             heights.entry(node.height).or_default().insert(node.hash);
-            if node.hash != finalized.hash {
+            if node.hash != finalized_frontier.hash {
                 children
                     .entry(node.parent_hash)
                     .or_default()
@@ -786,35 +987,27 @@ impl MemHeaderStore {
             }
         }
         let mut store = Self {
-            revision: 0,
-            finalized,
+            graph_revision: GraphRevision::default(),
+            finalized_frontier,
             nodes: node_map,
             children,
             heights,
-            eligible_tips: HashSet::new(),
-            consensus_invalid_tombstones,
+            eligible_header_tips: HashSet::new(),
+            consensus_invalid_body_tombstones,
         };
-        store.rebuild_eligible_tips();
+        store.rebuild_eligible_header_tips();
         Ok(store)
     }
 
-    pub(crate) fn nodes(&self) -> impl Iterator<Item = &HeaderNode> {
+    pub(crate) fn header_nodes(&self) -> impl Iterator<Item = &HeaderNode> {
         self.nodes.values()
     }
 
     #[cfg(test)]
-    pub(crate) fn tombstones(&self) -> impl Iterator<Item = &ConsensusInvalidTombstone> {
-        self.consensus_invalid_tombstones.values()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_corrupt_node(
-        &mut self,
-        hash: block::Hash,
-    ) -> Result<&mut HeaderNode, GraphError> {
-        self.nodes
-            .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))
+    pub(crate) fn consensus_invalid_body_tombstones(
+        &self,
+    ) -> impl Iterator<Item = &ConsensusInvalidBodyTombstone> {
+        self.consensus_invalid_body_tombstones.values()
     }
 
     /// Propagates an eligibility change at `root` through its retained subtree.
@@ -824,9 +1017,9 @@ impl MemHeaderStore {
     /// eligibility. Then refreshes eligible-tip membership for the root, all
     /// descendants, and their parents.
     ///
-    /// Returns `GraphError::UnknownNode` if a child edge references a missing node
+    /// Returns `GraphError::UnknownHeaderNode` if a child edge references a missing node
     /// or a retained child references a missing parent.
-    pub(crate) fn recompute_all_eligibility(&mut self) -> Result<(), GraphError> {
+    pub(crate) fn recompute_all_header_eligibility(&mut self) -> Result<(), GraphError> {
         let mut frontiers: Vec<_> = self
             .nodes
             .values()
@@ -836,11 +1029,11 @@ impl MemHeaderStore {
         let mut changes = Vec::with_capacity(frontiers.len());
         let mut eligible = HashMap::with_capacity(frontiers.len());
         for frontier in frontiers {
-            if frontier == self.finalized {
+            if frontier == self.finalized_frontier {
                 changes.push((frontier.hash, None));
                 let node = self
-                    .node(frontier.hash)
-                    .ok_or(GraphError::UnknownNode(frontier.hash))?;
+                    .header_node(frontier.hash)
+                    .ok_or(GraphError::UnknownHeaderNode(frontier.hash))?;
                 eligible.insert(
                     frontier.hash,
                     node.validation == HeaderValidationState::Valid
@@ -853,13 +1046,15 @@ impl MemHeaderStore {
                 continue;
             }
             let parent_hash = self
-                .node(frontier.hash)
+                .header_node(frontier.hash)
                 .expect("frontier came from nodes")
                 .parent_hash;
-            let _parent = self.node(parent_hash).ok_or(GraphError::UnknownParent {
-                header: frontier.hash,
-                parent: parent_hash,
-            })?;
+            let _parent = self
+                .header_node(parent_hash)
+                .ok_or(GraphError::UnknownParent {
+                    header: frontier.hash,
+                    parent: parent_hash,
+                })?;
             let parent_eligible =
                 eligible
                     .get(&parent_hash)
@@ -870,8 +1065,8 @@ impl MemHeaderStore {
                     })?;
             let inherited_from = (!parent_eligible).then_some(parent_hash);
             let node = self
-                .node(frontier.hash)
-                .ok_or(GraphError::UnknownNode(frontier.hash))?;
+                .header_node(frontier.hash)
+                .ok_or(GraphError::UnknownHeaderNode(frontier.hash))?;
             eligible.insert(
                 frontier.hash,
                 node.validation == HeaderValidationState::Valid
@@ -891,52 +1086,50 @@ impl MemHeaderStore {
                 .eligibility
                 .inherited_from = inherited_from;
         }
-        self.rebuild_eligible_tips();
+        self.rebuild_eligible_header_tips();
         Ok(())
     }
 
-    /// Moves the graph’s finality anchor to an eligible retained frontier.
+    /// Move the finalized frontier to an eligible retained descendant.
     ///
-    /// Retains the new anchor and all of its descendants, and removes every other
-    /// node, including its ancestors and competing branches. Rebuilds affected
-    /// height, child, and eligible-tip indexes, and clears inherited ineligibility
-    /// from the new root.
+    /// The graph retains the new finalized frontier and every descendant. The
+    /// graph removes every ancestor and competing branch. The graph rebuilds
+    /// each affected index. Validation failures leave the graph unchanged. The
+    /// method returns removed header hashes in deterministic order.
     ///
-    /// Returns the hashes of removed nodes in deterministic raw-byte order.
-    ///
-    /// Returns an error without modifying the graph if the frontier’s hash is
-    /// unknown, its recorded height differs, or the node is ineligible.
-    ///
-    /// The caller must establish authority to advance finality before invoking this
-    /// method. Durable commit and publication are handled by the transition layer.
-    pub(crate) fn advance_finalized(
+    /// The transition layer must authorize and durably commit this operation.
+    pub(crate) fn advance_finalized_frontier(
         &mut self,
-        finalized: Frontier,
+        finalized_frontier: Frontier,
     ) -> Result<Vec<block::Hash>, GraphError> {
         let node = self
-            .node(finalized.hash)
-            .ok_or(GraphError::UnknownNode(finalized.hash))?;
-        if node.height != finalized.height {
-            return Err(GraphError::UnknownNode(finalized.hash));
+            .header_node(finalized_frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(finalized_frontier.hash))?;
+        if node.height != finalized_frontier.height {
+            return Err(GraphError::UnknownHeaderNode(finalized_frontier.hash));
         }
         if !node.is_eligible() {
-            return Err(GraphError::IneligibleFinalized(finalized.hash));
+            return Err(GraphError::IneligibleFinalizedFrontier(
+                finalized_frontier.hash,
+            ));
         }
-        if self.ancestor(finalized.hash, self.finalized.height)? != Some(self.finalized) {
-            return Err(GraphError::FinalizedNotDescendant {
-                current: self.finalized.hash,
-                candidate: finalized.hash,
+        if self.header_ancestor(finalized_frontier.hash, self.finalized_frontier.height)?
+            != Some(self.finalized_frontier)
+        {
+            return Err(GraphError::FinalizedFrontierNotDescendant {
+                current: self.finalized_frontier.hash,
+                candidate: finalized_frontier.hash,
             });
         }
         // Visited hashes
         let mut retained = HashSet::new();
         // Nodes to visit
-        let mut pending = vec![finalized.hash];
+        let mut pending = vec![finalized_frontier.hash];
 
         // Traverse the graph in depth-first order, starting from the new finalized frontier.
         while let Some(hash) = pending.pop() {
             if retained.insert(hash) {
-                pending.extend(self.children(hash));
+                pending.extend(self.header_children(hash));
             }
         }
 
@@ -954,7 +1147,7 @@ impl MemHeaderStore {
                 .remove(hash)
                 .expect("the deletion set came from retained graph nodes");
             self.children.remove(hash);
-            self.eligible_tips.remove(hash);
+            self.eligible_header_tips.remove(hash);
             if let Some(hashes) = self.heights.get_mut(&node.height) {
                 hashes.remove(hash);
                 if hashes.is_empty() {
@@ -962,33 +1155,36 @@ impl MemHeaderStore {
                 }
             }
         }
-        self.finalized = finalized;
+        self.finalized_frontier = finalized_frontier;
         self.nodes
-            .get_mut(&finalized.hash)
+            .get_mut(&finalized_frontier.hash)
             .expect("the new finalized root is retained")
             .eligibility
             .inherited_from = None;
-        self.refresh_eligible_tip(finalized.hash);
+        self.refresh_eligible_header_tip(finalized_frontier.hash);
         self.advance_revision()?;
         Ok(deleted)
     }
 
-    pub(crate) fn retained_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
+    pub(crate) fn retained_header_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
         self.nodes.keys().copied()
     }
 
-    pub(crate) fn remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
-        let node = self.nodes.get(&hash).ok_or(GraphError::UnknownNode(hash))?;
+    pub(crate) fn remove_header_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
+        let node = self
+            .nodes
+            .get(&hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?;
         if self
             .children
             .get(&hash)
             .is_some_and(|children| !children.is_empty())
         {
-            return Err(GraphError::NodeHasChildren(hash));
+            return Err(GraphError::HeaderNodeHasChildren(hash));
         }
         let parent_hash = node.parent_hash;
         let height = node.height;
-        self.eligible_tips.remove(&hash);
+        self.eligible_header_tips.remove(&hash);
         self.nodes.remove(&hash);
         self.children.remove(&hash);
         if let Some(children) = self.children.get_mut(&parent_hash) {
@@ -1003,16 +1199,13 @@ impl MemHeaderStore {
                 self.heights.remove(&height);
             }
         }
-        self.refresh_eligible_tip(parent_hash);
+        self.refresh_eligible_header_tip(parent_hash);
         self.advance_revision()?;
         Ok(())
     }
 
     fn advance_revision(&mut self) -> Result<(), GraphError> {
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .ok_or(GraphError::RevisionExhausted)?;
+        self.graph_revision = self.graph_revision.checked_next()?;
         Ok(())
     }
 
@@ -1021,37 +1214,37 @@ impl MemHeaderStore {
         affected.insert(
             self.nodes
                 .get(&root)
-                .ok_or(GraphError::UnknownNode(root))?
+                .ok_or(GraphError::UnknownHeaderNode(root))?
                 .parent_hash,
         );
-        let mut queue = VecDeque::from(self.children(root));
+        let mut queue = VecDeque::from(self.header_children(root));
         while let Some(hash) = queue.pop_front() {
             affected.insert(hash);
             let parent_hash = self
                 .nodes
                 .get(&hash)
-                .ok_or(GraphError::UnknownNode(hash))?
+                .ok_or(GraphError::UnknownHeaderNode(hash))?
                 .parent_hash;
             affected.insert(parent_hash);
             let parent = self
                 .nodes
                 .get(&parent_hash)
-                .ok_or(GraphError::UnknownNode(parent_hash))?;
+                .ok_or(GraphError::UnknownHeaderNode(parent_hash))?;
             let inherited_from = (!parent.is_eligible()).then_some(parent_hash);
             self.nodes
                 .get_mut(&hash)
                 .expect("the queued child was read from the retained node map")
                 .eligibility
                 .inherited_from = inherited_from;
-            queue.extend(self.children(hash));
+            queue.extend(self.header_children(hash));
         }
         for hash in affected {
-            self.refresh_eligible_tip(hash);
+            self.refresh_eligible_header_tip(hash);
         }
         Ok(())
     }
 
-    fn has_eligible_child(&self, hash: block::Hash) -> bool {
+    fn has_eligible_header_child(&self, hash: block::Hash) -> bool {
         self.children.get(&hash).is_some_and(|children| {
             children
                 .iter()
@@ -1059,22 +1252,22 @@ impl MemHeaderStore {
         })
     }
 
-    fn refresh_eligible_tip(&mut self, hash: block::Hash) {
-        self.eligible_tips.remove(&hash);
+    fn refresh_eligible_header_tip(&mut self, hash: block::Hash) {
+        self.eligible_header_tips.remove(&hash);
         if self
             .nodes
             .get(&hash)
-            .is_some_and(|node| node.is_eligible() && !self.has_eligible_child(hash))
+            .is_some_and(|node| node.is_eligible() && !self.has_eligible_header_child(hash))
         {
-            self.eligible_tips.insert(hash);
+            self.eligible_header_tips.insert(hash);
         }
     }
 
-    fn rebuild_eligible_tips(&mut self) {
-        self.eligible_tips = self
+    fn rebuild_eligible_header_tips(&mut self) {
+        self.eligible_header_tips = self
             .nodes
             .values()
-            .filter(|node| node.is_eligible() && !self.has_eligible_child(node.hash))
+            .filter(|node| node.is_eligible() && !self.has_eligible_header_child(node.hash))
             .map(|node| node.hash)
             .collect();
     }
@@ -1094,10 +1287,7 @@ impl MemHeaderStore {
         if delta.is_empty() {
             return Ok(());
         }
-        projected.revision = self
-            .revision
-            .checked_add(1)
-            .ok_or(GraphError::RevisionExhausted)?;
+        projected.graph_revision = self.graph_revision.checked_next()?;
         *self = projected;
         Ok(())
     }
@@ -1119,41 +1309,42 @@ impl MemHeaderStore {
             .iter()
             .flat_map(|(parent, children)| children.iter().map(|child| (*parent, *child)))
             .collect();
-        let mut add_children: Vec<_> = new_edges.difference(&old_edges).copied().collect();
-        let mut remove_children: Vec<_> = old_edges.difference(&new_edges).copied().collect();
-        let mut add_eligible_tips: Vec<_> = projected
-            .eligible_tips
-            .difference(&self.eligible_tips)
+        let mut added_header_children: Vec<_> = new_edges.difference(&old_edges).copied().collect();
+        let mut removed_header_children: Vec<_> =
+            old_edges.difference(&new_edges).copied().collect();
+        let mut add_eligible_header_tips: Vec<_> = projected
+            .eligible_header_tips
+            .difference(&self.eligible_header_tips)
             .copied()
             .collect();
-        let mut remove_eligible_tips: Vec<_> = self
-            .eligible_tips
-            .difference(&projected.eligible_tips)
+        let mut remove_eligible_header_tips: Vec<_> = self
+            .eligible_header_tips
+            .difference(&projected.eligible_header_tips)
             .copied()
             .collect();
-        add_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
-        remove_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
-        add_eligible_tips.sort_unstable_by_key(|hash| hash.0);
-        remove_eligible_tips.sort_unstable_by_key(|hash| hash.0);
+        added_header_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+        removed_header_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+        add_eligible_header_tips.sort_unstable_by_key(|hash| hash.0);
+        remove_eligible_header_tips.sort_unstable_by_key(|hash| hash.0);
         Ok(DerivedIndexChanges {
-            add_children,
-            remove_children,
-            add_eligible_tips,
-            remove_eligible_tips,
+            added_header_children,
+            removed_header_children,
+            add_eligible_header_tips,
+            remove_eligible_header_tips,
         })
     }
 
     fn project_delta(&self, delta: &GraphDelta) -> Result<Self, GraphError> {
-        if delta.base_revision != self.revision {
+        if delta.base_revision != self.graph_revision {
             return Err(GraphError::StaleDelta {
-                current: self.revision,
-                delta: delta.base_revision,
+                current_revision: self.graph_revision,
+                delta_base_revision: delta.base_revision,
             });
         }
         let mut puts = HashMap::new();
-        for node in &delta.put_nodes {
+        for node in &delta.updated_header_nodes {
             if puts.insert(node.hash, node.clone()).is_some() {
-                return Err(GraphError::DuplicateNode(node.hash));
+                return Err(GraphError::DuplicateHeaderNode(node.hash));
             }
             if let Some(old) = self.nodes.get(&node.hash) {
                 let immutable_changed = old.header != node.header
@@ -1169,37 +1360,42 @@ impl MemHeaderStore {
                     != node.body_validation_state;
                 if immutable_changed
                     || invalidity_changed
-                    || (delta.kind == overlay::GraphDeltaKind::Ordinary && coordinate_changed)
+                    || (delta.work_coordinate_transition
+                        == overlay::WorkCoordinateTransition::PreserveCoordinates
+                        && coordinate_changed)
                 {
-                    return Err(GraphError::InvalidNode(node.hash));
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::ImmutableFields,
+                    });
                 }
             }
         }
         let mut deletes = HashSet::new();
-        for hash in &delta.delete_nodes {
+        for hash in &delta.deleted_header_hashes {
             if !deletes.insert(*hash) || puts.contains_key(hash) {
-                return Err(GraphError::DuplicateNode(*hash));
+                return Err(GraphError::DuplicateHeaderNode(*hash));
             }
             if !self.nodes.contains_key(hash) {
-                return Err(GraphError::UnknownNode(*hash));
+                return Err(GraphError::UnknownHeaderNode(*hash));
             }
         }
-        let finalized = delta.finalized.unwrap_or(self.finalized);
-        if finalized != self.finalized {
+        let finalized = delta.finalized_frontier.unwrap_or(self.finalized_frontier);
+        if finalized != self.finalized_frontier {
             let mut cursor = finalized;
-            while cursor.height > self.finalized.height {
+            while cursor.height > self.finalized_frontier.height {
                 let node = puts
                     .get(&cursor.hash)
                     .or_else(|| self.nodes.get(&cursor.hash))
-                    .ok_or(GraphError::UnknownNode(cursor.hash))?;
+                    .ok_or(GraphError::UnknownHeaderNode(cursor.hash))?;
                 if node.height != cursor.height {
-                    return Err(GraphError::UnknownNode(cursor.hash));
+                    return Err(GraphError::UnknownHeaderNode(cursor.hash));
                 }
                 cursor = Frontier::new(block::Height(cursor.height.0 - 1), node.parent_hash);
             }
-            if cursor != self.finalized {
-                return Err(GraphError::FinalizedNotDescendant {
-                    current: self.finalized.hash,
+            if cursor != self.finalized_frontier {
+                return Err(GraphError::FinalizedFrontierNotDescendant {
+                    current: self.finalized_frontier.hash,
                     candidate: finalized.hash,
                 });
             }
@@ -1211,11 +1407,11 @@ impl MemHeaderStore {
             .cloned()
             .collect();
         nodes.extend(puts.into_values());
-        let mut tombstones = self.consensus_invalid_tombstones.clone();
+        let mut tombstones = self.consensus_invalid_body_tombstones.clone();
         let mut delta_tombstones = HashSet::new();
-        for tombstone in &delta.put_tombstones {
+        for tombstone in &delta.new_consensus_invalid_body_tombstones {
             if !delta_tombstones.insert(tombstone.hash) {
-                return Err(GraphError::DuplicateNode(tombstone.hash));
+                return Err(GraphError::DuplicateHeaderNode(tombstone.hash));
             }
             if let Some(existing) = tombstones.get(&tombstone.hash) {
                 if existing != tombstone {
@@ -1224,103 +1420,118 @@ impl MemHeaderStore {
             }
             tombstones.insert(tombstone.hash, tombstone.clone());
         }
-        if delta.kind == overlay::GraphDeltaKind::WorkRebase {
+        if delta.work_coordinate_transition
+            == overlay::WorkCoordinateTransition::RebaseToFinalizedFrontier
+        {
             let anchor = self
-                .node(self.finalized.hash)
-                .ok_or(GraphError::UnknownNode(self.finalized.hash))?
+                .header_node(self.finalized_frontier.hash)
+                .ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))?
                 .work_coordinate();
             for node in &nodes {
-                if node.work_coordinate().origin_hash() != self.finalized.hash {
-                    return Err(GraphError::InvalidNode(node.hash));
+                if node.work_coordinate().origin_hash() != self.finalized_frontier.hash {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::WorkRebaseOrigin,
+                    });
                 }
                 if let Some(old) = self.nodes.get(&node.hash) {
                     let expected = WorkCoordinate::new(
-                        self.finalized.hash,
+                        self.finalized_frontier.hash,
                         old.work_coordinate().suffix_after(anchor)?.as_u256(),
                     );
                     if node.work_coordinate() != expected {
-                        return Err(GraphError::InvalidNode(node.hash));
+                        return Err(GraphError::InvalidHeaderNode {
+                            header: node.hash,
+                            invariant: HeaderNodeInvariant::WorkRebaseCoordinate,
+                        });
                     }
                 }
             }
         }
         let expected_nodes: HashMap<_, _> =
             nodes.iter().map(|node| (node.hash, node.clone())).collect();
-        let mut projected = Self::reconstruct(finalized, nodes, tombstones.into_values())?;
+        let mut projected = Self::reconstruct(HeaderGraphReconstruction::new(
+            finalized,
+            nodes,
+            tombstones.into_values(),
+        ))?;
         if projected.nodes != expected_nodes {
             let hash = expected_nodes
                 .iter()
                 .find_map(|(hash, node)| (projected.nodes.get(hash) != Some(node)).then_some(*hash))
                 .unwrap_or(finalized.hash);
-            return Err(GraphError::InvalidNode(hash));
+            return Err(GraphError::InvalidHeaderNode {
+                header: hash,
+                invariant: HeaderNodeInvariant::DerivedHeaderState,
+            });
         }
-        projected.revision = self.revision;
+        projected.graph_revision = self.graph_revision;
         Ok(projected)
     }
 }
 
 impl HeaderGraphView for MemHeaderStore {
-    fn view_finalized(&self) -> Frontier {
-        self.finalized()
+    fn view_finalized_frontier(&self) -> Frontier {
+        self.finalized_frontier()
     }
 
-    fn view_node_count(&self) -> usize {
-        self.node_count()
+    fn view_header_node_count(&self) -> usize {
+        self.header_node_count()
     }
 
-    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
-        self.node(hash)
+    fn view_header_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
+        self.header_node(hash)
     }
 
-    fn view_nodes(&self) -> Vec<&HeaderNode> {
-        self.nodes().collect()
+    fn view_header_nodes(&self) -> Vec<&HeaderNode> {
+        self.header_nodes().collect()
     }
 
-    fn view_retained_hashes(&self) -> Vec<block::Hash> {
-        self.retained_hashes().collect()
+    fn view_retained_header_hashes(&self) -> Vec<block::Hash> {
+        self.retained_header_hashes().collect()
     }
 
-    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
-        self.hashes_at_height(height)
+    fn view_header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
+        self.header_hashes_at_height(height)
     }
 
-    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash> {
-        self.children(parent)
+    fn view_header_children(&self, parent: block::Hash) -> Vec<block::Hash> {
+        self.header_children(parent)
     }
 
-    fn view_eligible_tips(&self) -> Vec<Frontier> {
-        self.eligible_tips()
+    fn view_eligible_header_tips(&self) -> Vec<Frontier> {
+        self.eligible_header_tips()
     }
 
-    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError> {
-        self.select_header_best()
+    fn view_select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError> {
+        self.select_best_header_chain()
     }
 
-    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
-        self.score(hash)
+    fn view_header_chain_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
+        self.header_chain_score(hash)
     }
 
-    fn view_ancestor(
+    fn view_header_ancestor(
         &self,
         descendant: block::Hash,
         height: block::Height,
     ) -> Result<Option<Frontier>, GraphError> {
-        self.ancestor(descendant, height)
+        self.header_ancestor(descendant, height)
     }
 }
 
 impl HeaderGraphEdit for MemHeaderStore {
-    fn edit_insert(
+    fn edit_insert_header(
         &mut self,
         header: Arc<block::Header>,
         validation: HeaderValidationState,
         direct_reasons: Vec<EligibilityReason>,
-        body: BodyValidationState,
+        body_validation_state: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
-        self.insert(header, validation, direct_reasons, body)
+        self.insert(header, validation, direct_reasons, body_validation_state)
     }
 
-    fn edit_add_eligibility_reason(
+    fn edit_add_header_eligibility_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
@@ -1328,7 +1539,7 @@ impl HeaderGraphEdit for MemHeaderStore {
         self.add_eligibility_reason(hash, reason)
     }
 
-    fn edit_remove_operator_invalidation(
+    fn edit_remove_header_operator_invalidation(
         &mut self,
         hash: block::Hash,
         id: OperatorInvalidationId,
@@ -1337,39 +1548,39 @@ impl HeaderGraphEdit for MemHeaderStore {
         self.remove_operator_invalidation(hash, id, evidence)
     }
 
-    fn edit_set_body_state(
+    fn edit_set_body_validation_state(
         &mut self,
         hash: block::Hash,
-        body: BodyValidationState,
+        body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
-        self.set_body_state(hash, body)
+        self.set_body_validation_state(hash, body_validation_state)
     }
 
-    fn edit_set_validation(
+    fn edit_set_header_validation_state(
         &mut self,
         hash: block::Hash,
         validation: HeaderValidationState,
     ) -> Result<bool, GraphError> {
-        self.set_validation(hash, validation)
+        self.set_header_validation_state(hash, validation)
     }
 
-    fn edit_record_aux_delivery(
+    fn edit_record_auxiliary_evidence_delivery(
         &mut self,
         hash: block::Hash,
         delivery_id: EvidenceId,
     ) -> Result<bool, GraphError> {
-        self.record_aux_delivery(hash, delivery_id)
+        self.record_auxiliary_evidence_delivery(hash, delivery_id)
     }
 
-    fn edit_advance_finalized(
+    fn edit_advance_finalized_frontier(
         &mut self,
         finalized: Frontier,
     ) -> Result<Vec<block::Hash>, GraphError> {
-        self.advance_finalized(finalized)
+        self.advance_finalized_frontier(finalized)
     }
 
-    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
-        self.remove_leaf(hash)
+    fn edit_remove_header_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
+        self.remove_header_leaf(hash)
     }
 }
 
@@ -1425,19 +1636,19 @@ mod tests {
         finalized: Frontier,
     ) -> Result<Vec<block::Hash>, GraphError> {
         let node = store
-            .node(finalized.hash)
-            .ok_or(GraphError::UnknownNode(finalized.hash))?;
+            .header_node(finalized.hash)
+            .ok_or(GraphError::UnknownHeaderNode(finalized.hash))?;
         if node.height != finalized.height {
-            return Err(GraphError::UnknownNode(finalized.hash));
+            return Err(GraphError::UnknownHeaderNode(finalized.hash));
         }
         if !node.is_eligible() {
-            return Err(GraphError::IneligibleFinalized(finalized.hash));
+            return Err(GraphError::IneligibleFinalizedFrontier(finalized.hash));
         }
         let mut retained = HashSet::new();
         let mut pending = vec![finalized.hash];
         while let Some(hash) = pending.pop() {
             if retained.insert(hash) {
-                pending.extend(store.children(hash));
+                pending.extend(store.header_children(hash));
             }
         }
         let mut deleted: Vec<_> = store
@@ -1447,22 +1658,29 @@ mod tests {
             .filter(|hash| !retained.contains(hash))
             .collect();
         deleted.sort_unstable_by_key(|hash| hash.0);
-        let nodes: Vec<_> = store
+        let finalized_header_nodes: Vec<_> = store
             .nodes
             .values()
             .filter(|node| retained.contains(&node.hash))
             .cloned()
             .collect();
-        let tombstones = store.tombstones().cloned().collect::<Vec<_>>();
-        *store = MemHeaderStore::reconstruct(finalized, nodes, tombstones)?;
-        store.recompute_all_eligibility()?;
+        let tombstones = store
+            .consensus_invalid_body_tombstones()
+            .cloned()
+            .collect::<Vec<_>>();
+        *store = MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(
+            finalized,
+            finalized_header_nodes,
+            tombstones,
+        ))?;
+        store.recompute_all_header_eligibility()?;
         Ok(deleted)
     }
 
     #[test]
     fn conflicting_duplicate_reports_the_duplicate_hash() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let original = child(anchor.hash, 1);
         let original_hash = original.hash();
         let frontier = insert_child(&mut store, anchor.hash, 1);
@@ -1488,21 +1706,21 @@ mod tests {
     #[test]
     fn removing_a_non_leaf_reports_that_its_children_are_retained() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let parent = insert_child(&mut store, anchor.hash, 1);
         let _child = insert_child(&mut store, parent.hash, 2);
 
         assert_eq!(
-            store.remove_leaf(parent.hash),
-            Err(GraphError::NodeHasChildren(parent.hash))
+            store.remove_header_leaf(parent.hash),
+            Err(GraphError::HeaderNodeHasChildren(parent.hash))
         );
-        assert!(store.node(parent.hash).is_some());
+        assert!(store.header_node(parent.hash).is_some());
     }
 
     #[test]
     fn advancing_finality_retains_exactly_the_new_finalized_subtree() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let selected_parent = insert_child(&mut store, anchor.hash, 1);
         let selected_child = insert_child(&mut store, selected_parent.hash, 2);
         let selected_tip = insert_child(&mut store, selected_child.hash, 3);
@@ -1514,21 +1732,21 @@ mod tests {
             .expect("the rebuild oracle accepts the same finalized node");
 
         let deleted = store
-            .advance_finalized(selected_child)
+            .advance_finalized_frontier(selected_child)
             .expect("the retained selected node can become finalized");
 
-        assert_eq!(store.finalized(), selected_child);
+        assert_eq!(store.finalized_frontier(), selected_child);
         assert_eq!(deleted, rebuilt_deleted);
         assert_eq!(store.nodes, rebuilt.nodes);
         assert_eq!(store.children, rebuilt.children);
         assert_eq!(store.heights, rebuilt.heights);
-        assert_eq!(store.eligible_tips, rebuilt.eligible_tips);
-        assert!(store.node(selected_child.hash).is_some());
-        assert!(store.node(selected_tip.hash).is_some());
-        assert!(store.node(anchor.hash).is_none());
-        assert!(store.node(selected_parent.hash).is_none());
-        assert!(store.node(rejected_sibling.hash).is_none());
-        assert!(store.node(rejected_descendant.hash).is_none());
+        assert_eq!(store.eligible_header_tips, rebuilt.eligible_header_tips);
+        assert!(store.header_node(selected_child.hash).is_some());
+        assert!(store.header_node(selected_tip.hash).is_some());
+        assert!(store.header_node(anchor.hash).is_none());
+        assert!(store.header_node(selected_parent.hash).is_none());
+        assert!(store.header_node(rejected_sibling.hash).is_none());
+        assert!(store.header_node(rejected_descendant.hash).is_none());
         assert_eq!(
             deleted.into_iter().collect::<HashSet<_>>(),
             HashSet::from([
@@ -1543,7 +1761,7 @@ mod tests {
     #[test]
     fn advancing_finality_rejects_an_ineligible_root_without_mutation() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let candidate = insert_child(&mut store, anchor.hash, 1);
         store
             .add_eligibility_reason(
@@ -1557,17 +1775,17 @@ mod tests {
         let before = store.clone();
 
         assert_eq!(
-            store.advance_finalized(candidate),
-            Err(GraphError::IneligibleFinalized(candidate.hash))
+            store.advance_finalized_frontier(candidate),
+            Err(GraphError::IneligibleFinalizedFrontier(candidate.hash))
         );
         assert_eq!(store.nodes, before.nodes);
         assert_eq!(store.children, before.children);
         assert_eq!(store.heights, before.heights);
-        assert_eq!(store.eligible_tips, before.eligible_tips);
-        assert_eq!(store.finalized, before.finalized);
+        assert_eq!(store.eligible_header_tips, before.eligible_header_tips);
+        assert_eq!(store.finalized_frontier, before.finalized_frontier);
     }
 
-    fn uncached_eligible_tips(store: &MemHeaderStore) -> Vec<Frontier> {
+    fn uncached_eligible_header_tips(store: &MemHeaderStore) -> Vec<Frontier> {
         let mut tips: Vec<_> = store
             .nodes
             .values()
@@ -1686,14 +1904,17 @@ mod tests {
     #[test]
     fn fork_indexes_selection_and_inherited_reason_sets_are_exact() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let left = insert_child(&mut store, anchor.hash, 1);
         let right = insert_child(&mut store, anchor.hash, 2);
-        assert_eq!(store.hashes_at_height(block::Height(1)).len(), 2);
+        assert_eq!(store.header_hashes_at_height(block::Height(1)).len(), 2);
 
         let left_tip = insert_child(&mut store, left.hash, 3);
         assert_eq!(
-            store.select_header_best().expect("graph is coherent").0,
+            store
+                .select_best_header_chain()
+                .expect("graph is coherent")
+                .0,
             left_tip
         );
 
@@ -1715,7 +1936,7 @@ mod tests {
             .expect("left is retained");
         assert_eq!(
             store
-                .node(left.hash)
+                .header_node(left.hash)
                 .expect("retained")
                 .eligibility
                 .direct_reasons
@@ -1724,14 +1945,17 @@ mod tests {
         );
         assert_eq!(
             store
-                .node(left_tip.hash)
+                .header_node(left_tip.hash)
                 .expect("retained")
                 .eligibility
                 .inherited_from,
             Some(left.hash)
         );
         assert_eq!(
-            store.select_header_best().expect("graph is coherent").0,
+            store
+                .select_best_header_chain()
+                .expect("graph is coherent")
+                .0,
             right
         );
 
@@ -1742,7 +1966,10 @@ mod tests {
                 Some(EvidenceId::from_digest([1; 32])),
             )
             .expect("left is retained");
-        assert!(!store.node(left.hash).expect("retained").is_eligible());
+        assert!(!store
+            .header_node(left.hash)
+            .expect("retained")
+            .is_eligible());
         store
             .remove_operator_invalidation(
                 left.hash,
@@ -1750,9 +1977,15 @@ mod tests {
                 Some(EvidenceId::from_digest([2; 32])),
             )
             .expect("left is retained");
-        assert!(store.node(left_tip.hash).expect("retained").is_eligible());
+        assert!(store
+            .header_node(left_tip.hash)
+            .expect("retained")
+            .is_eligible());
         assert_eq!(
-            store.select_header_best().expect("graph is coherent").0,
+            store
+                .select_best_header_chain()
+                .expect("graph is coherent")
+                .0,
             left_tip
         );
     }
@@ -1760,7 +1993,7 @@ mod tests {
     #[test]
     fn operator_reconsider_preserves_every_unnamed_reason() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let target = insert_child(&mut store, anchor.hash, 1);
         let descendant = insert_child(&mut store, target.hash, 2);
         let first_id = crate::OperatorInvalidationId::new([1; 16]);
@@ -1796,7 +2029,7 @@ mod tests {
         let body_evidence = EvidenceId::from_digest([5; 32]);
         let body_rule = BodyRuleId::new("test.operator-reconsider");
         store
-            .set_body_state(
+            .set_body_validation_state(
                 target.hash,
                 BodyValidationState::ConsensusInvalid {
                     evidence: body_evidence,
@@ -1813,7 +2046,9 @@ mod tests {
             )
             .expect("the operator target is retained");
 
-        let target_node = store.node(target.hash).expect("the target is retained");
+        let target_node = store
+            .header_node(target.hash)
+            .expect("the target is retained");
         assert!(!target_node
             .eligibility
             .direct_reasons
@@ -1836,7 +2071,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .node(descendant.hash)
+                .header_node(descendant.hash)
                 .expect("the descendant is retained")
                 .eligibility
                 .inherited_from,
@@ -1847,7 +2082,7 @@ mod tests {
     #[test]
     fn consensus_invalid_body_state_is_permanent_and_controls_eligibility() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let target = insert_child(&mut store, anchor.hash, 1);
         let descendant = insert_child(&mut store, target.hash, 2);
         let invalid = BodyValidationState::ConsensusInvalid {
@@ -1856,19 +2091,19 @@ mod tests {
         };
 
         assert!(store
-            .set_body_state(target.hash, invalid.clone())
+            .set_body_validation_state(target.hash, invalid.clone())
             .expect("the first consensus-invalid result is authoritative"));
         assert!(!store
-            .set_body_state(target.hash, invalid)
+            .set_body_validation_state(target.hash, invalid)
             .expect("identical invalid evidence is idempotent"));
         let target_node = store
-            .node(target.hash)
+            .header_node(target.hash)
             .expect("the target remains retained");
         assert!(!target_node.is_eligible());
         assert!(target_node.eligibility.direct_reasons.is_empty());
         assert_eq!(
             store
-                .node(descendant.hash)
+                .header_node(descendant.hash)
                 .expect("the descendant remains retained")
                 .eligibility
                 .inherited_from,
@@ -1876,7 +2111,7 @@ mod tests {
         );
 
         assert_eq!(
-            store.set_body_state(
+            store.set_body_validation_state(
                 target.hash,
                 BodyValidationState::ConsensusInvalid {
                     evidence: EvidenceId::from_digest([6; 32]),
@@ -1886,7 +2121,7 @@ mod tests {
             Err(GraphError::PermanentBodyInvalidity(target.hash))
         );
         assert_eq!(
-            store.set_body_state(target.hash, BodyValidationState::Unknown),
+            store.set_body_validation_state(target.hash, BodyValidationState::Unknown),
             Err(GraphError::PermanentBodyInvalidity(target.hash))
         );
     }
@@ -1894,20 +2129,20 @@ mod tests {
     #[test]
     fn reconstruction_rejects_duplicate_disconnected_and_forged_nodes() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let child = insert_child(&mut store, anchor.hash, 1);
-        let nodes: Vec<_> = store.nodes().cloned().collect();
+        let nodes: Vec<_> = store.header_nodes().cloned().collect();
 
         let mut duplicate = nodes.clone();
         duplicate.push(
             store
-                .node(child.hash)
+                .header_node(child.hash)
                 .expect("the child is retained")
                 .clone(),
         );
         assert!(matches!(
-            MemHeaderStore::reconstruct(anchor, duplicate, []),
-            Err(GraphError::DuplicateNode(hash)) if hash == child.hash
+            MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(anchor, duplicate, [])),
+            Err(GraphError::DuplicateHeaderNode(hash)) if hash == child.hash
         ));
 
         let mut disconnected = nodes.clone();
@@ -1917,8 +2152,9 @@ mod tests {
             .expect("the child row is present")
             .parent_hash = block::Hash([9; 32]);
         assert!(matches!(
-            MemHeaderStore::reconstruct(anchor, disconnected, []),
-            Err(GraphError::InvalidNode(hash)) if hash == child.hash
+            MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(anchor, disconnected, [])),
+            Err(GraphError::InvalidHeaderNode { header, invariant: HeaderNodeInvariant::CanonicalParentHash })
+                if header == child.hash
         ));
 
         let mut forged_work = nodes.clone();
@@ -1928,8 +2164,9 @@ mod tests {
             .expect("the child row is present")
             .block_work = Work::zero();
         assert!(matches!(
-            MemHeaderStore::reconstruct(anchor, forged_work, []),
-            Err(GraphError::InvalidNode(hash)) if hash == child.hash
+            MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(anchor, forged_work, [])),
+            Err(GraphError::InvalidHeaderNode { header, invariant: HeaderNodeInvariant::CanonicalBlockWork })
+                if header == child.hash
         ));
 
         let mut forged_coordinate = nodes;
@@ -1939,48 +2176,50 @@ mod tests {
             .expect("the child row is present")
             .work_coordinate = WorkCoordinate::new(anchor.hash, U256::MAX);
         assert!(matches!(
-            MemHeaderStore::reconstruct(anchor, forged_coordinate, []),
-            Err(GraphError::InvalidNode(hash)) if hash == child.hash
+            MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(
+                anchor,
+                forged_coordinate,
+                [],
+            )),
+            Err(GraphError::InvalidHeaderNode { header, invariant: HeaderNodeInvariant::CumulativeWork })
+                if header == child.hash
         ));
     }
 
     #[test]
     fn failed_eligibility_recomputation_is_transactional() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let first = insert_child(&mut store, anchor.hash, 1);
         let second = insert_child(&mut store, anchor.hash, 2);
-        store
-            .test_corrupt_node(first.hash)
-            .expect("the first child is retained")
-            .eligibility
-            .inherited_from = Some(anchor.hash);
-        store
-            .test_corrupt_node(second.hash)
-            .expect("the second child is retained")
-            .parent_hash = block::Hash([7; 32]);
+        test_support::mutate_retained_header(&mut store, first.hash, |header_node| {
+            header_node.eligibility.inherited_from = Some(anchor.hash);
+        });
+        test_support::mutate_retained_header(&mut store, second.hash, |header_node| {
+            header_node.parent_hash = block::Hash([7; 32]);
+        });
         let before_nodes = store.nodes.clone();
-        let before_tips = store.eligible_tips.clone();
+        let before_tips = store.eligible_header_tips.clone();
 
         assert!(matches!(
-            store.recompute_all_eligibility(),
+            store.recompute_all_header_eligibility(),
             Err(GraphError::UnknownParent { header, .. }) if header == second.hash
         ));
         assert_eq!(store.nodes, before_nodes);
-        assert_eq!(store.eligible_tips, before_tips);
+        assert_eq!(store.eligible_header_tips, before_tips);
     }
 
     #[test]
     fn tombstoned_header_remains_invalid_after_retention_and_readmission() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let header = child(anchor.hash, 1);
         let hash = header.hash();
         let frontier = insert_child(&mut store, anchor.hash, 1);
         let evidence = EvidenceId::from_digest([8; 32]);
         let rule = BodyRuleId::new("test.permanent-tombstone");
         store
-            .set_body_state(
+            .set_body_validation_state(
                 hash,
                 BodyValidationState::ConsensusInvalid {
                     evidence,
@@ -1989,7 +2228,7 @@ mod tests {
             )
             .expect("the consensus-invalid result is authoritative");
         store
-            .remove_leaf(frontier.hash)
+            .remove_header_leaf(frontier.hash)
             .expect("retention removes the invalid leaf");
 
         store
@@ -2000,7 +2239,9 @@ mod tests {
                 BodyValidationState::Unknown,
             )
             .expect("the same canonical header is readmitted");
-        let node = store.node(hash).expect("the header is retained again");
+        let node = store
+            .header_node(hash)
+            .expect("the header is retained again");
         assert_eq!(
             node.body_validation_state,
             BodyValidationState::ConsensusInvalid { evidence, rule }
@@ -2025,7 +2266,7 @@ mod tests {
         let first = insert_child(&mut store, anchor.hash, 1);
         assert_eq!(
             store
-                .node(first.hash)
+                .header_node(first.hash)
                 .expect("the first child is retained")
                 .work_coordinate()
                 .cumulative_work(),
@@ -2035,13 +2276,15 @@ mod tests {
         let second = insert_child(&mut store, first.hash, 2);
         assert_eq!(
             store
-                .node(anchor.hash)
+                .header_node(anchor.hash)
                 .expect("the anchor remains retained")
                 .work_coordinate(),
             WorkCoordinate::new(anchor.hash, U256::zero())
         );
         assert_eq!(
-            store.score(second.hash).expect("the score remains exact"),
+            store
+                .header_chain_score(second.hash)
+                .expect("the score remains exact"),
             ChainScore::new(
                 crate::SuffixWork::new(
                     work.as_u256()
@@ -2075,7 +2318,7 @@ mod tests {
         for incumbent_depth in [999, 1_000, 1_001] {
             for competitor_first in [false, true] {
                 let mut store = anchor_store();
-                let anchor = store.finalized();
+                let anchor = store.finalized_frontier();
                 let (incumbent, competitor) = if competitor_first {
                     let competitor = insert_branch(&mut store, anchor, incumbent_depth + 1, 127);
                     let incumbent = insert_branch(&mut store, anchor, incumbent_depth, 0);
@@ -2083,7 +2326,10 @@ mod tests {
                 } else {
                     let incumbent = insert_branch(&mut store, anchor, incumbent_depth, 0);
                     assert_eq!(
-                        store.select_header_best().expect("graph is coherent").0,
+                        store
+                            .select_best_header_chain()
+                            .expect("graph is coherent")
+                            .0,
                         incumbent
                     );
                     let competitor = insert_branch(&mut store, anchor, incumbent_depth + 1, 127);
@@ -2091,7 +2337,10 @@ mod tests {
                 };
                 assert_ne!(incumbent.hash, competitor.hash);
                 assert_eq!(
-                    store.select_header_best().expect("graph is coherent").0,
+                    store
+                        .select_best_header_chain()
+                        .expect("graph is coherent")
+                        .0,
                     competitor,
                     "selection is anchored at finalized and independent of depth or arrival order"
                 );
@@ -2102,7 +2351,7 @@ mod tests {
     #[test]
     fn body_availability_does_not_override_header_work_or_mark_other_bodies() {
         let mut store = anchor_store();
-        let anchor = store.finalized();
+        let anchor = store.finalized_frontier();
         let verified = child(anchor.hash, 41);
         let verified_hash = verified.hash();
         store
@@ -2118,7 +2367,7 @@ mod tests {
         let unknown_parent = insert_child(&mut store, anchor.hash, 51);
         let unknown_tip = insert_child(&mut store, unknown_parent.hash, 52);
         store
-            .set_body_state(
+            .set_body_validation_state(
                 unknown_tip.hash,
                 BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
                     attempts: 10,
@@ -2130,12 +2379,15 @@ mod tests {
             .expect("the unavailable tip is retained");
 
         assert_eq!(
-            store.select_header_best().expect("graph is coherent").0,
+            store
+                .select_best_header_chain()
+                .expect("graph is coherent")
+                .0,
             unknown_tip
         );
         assert_eq!(
             store
-                .node(verified_hash)
+                .header_node(verified_hash)
                 .expect("retained")
                 .body_validation_state,
             BodyValidationState::Verified {
@@ -2144,7 +2396,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .node(unknown_tip.hash)
+                .header_node(unknown_tip.hash)
                 .expect("retained")
                 .body_validation_state,
             BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
@@ -2163,7 +2415,7 @@ mod tests {
             reverse in any::<bool>(),
         ) {
             let mut store = anchor_store();
-            let anchor = store.finalized();
+            let anchor = store.finalized_frontier();
             let mut branches = Vec::new();
             for (branch, length) in branch_lengths.iter().copied().enumerate() {
                 let mut parent = anchor.hash;
@@ -2200,7 +2452,7 @@ mod tests {
                 .max_by_key(|(length, hash_bytes, _)| (*length, *hash_bytes))
                 .expect("at least one branch was generated")
                 .2;
-            prop_assert_eq!(store.select_header_best().expect("graph is coherent").0.hash, expected);
+            prop_assert_eq!(store.select_best_header_chain().expect("graph is coherent").0.hash, expected);
         }
 
 
@@ -2209,7 +2461,7 @@ mod tests {
             operations in prop::collection::vec((0_u8..5, any::<usize>()), 1..100),
         ) {
             let mut store = anchor_store();
-            let anchor = store.node(store.finalized().hash).expect("anchor is retained").clone();
+            let anchor = store.header_node(store.finalized_frontier().hash).expect("anchor is retained").clone();
             let mut model = ReferenceDag::new(&anchor);
 
             for (operation_index, (kind, target)) in operations.into_iter().enumerate() {
@@ -2262,13 +2514,13 @@ mod tests {
                     3 => {
                         if target_hash != model.anchor {
                             let until = regtest_genesis_block().header.time + chrono::Duration::days(1);
-                            store.set_validation(target_hash, HeaderValidationState::DeferredUntil(until)).expect("target is retained");
+                            store.set_header_validation_state(target_hash, HeaderValidationState::DeferredUntil(until)).expect("target is retained");
                             model.nodes.get_mut(&target_hash).expect("target exists").validation = HeaderValidationState::DeferredUntil(until);
                         }
                     }
                     4 => {
                         if target_hash != model.anchor {
-                            store.set_validation(target_hash, HeaderValidationState::Valid).expect("target is retained");
+                            store.set_header_validation_state(target_hash, HeaderValidationState::Valid).expect("target is retained");
                             model.nodes.get_mut(&target_hash).expect("target exists").validation = HeaderValidationState::Valid;
                         }
                     }
@@ -2276,10 +2528,10 @@ mod tests {
                 }
 
                 prop_assert_eq!(
-                    store.select_header_best().expect("graph is coherent").0.hash,
+                    store.select_best_header_chain().expect("graph is coherent").0.hash,
                     model.selected(),
                 );
-                prop_assert_eq!(store.eligible_tips(), uncached_eligible_tips(&store));
+                prop_assert_eq!(store.eligible_header_tips(), uncached_eligible_header_tips(&store));
             }
         }
     }

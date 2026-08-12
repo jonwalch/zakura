@@ -150,11 +150,11 @@ fn assert_transition_engine_matches_store(runtime: &HeaderChainRuntime) {
         .expect("the transition engine mutex is not poisoned");
     let durable_nodes = runtime
         .store
-        .all_nodes()
+        .all_header_nodes()
         .expect("the durable nodes are readable");
-    assert_eq!(engine.graph().node_count(), durable_nodes.len());
+    assert_eq!(engine.graph().header_node_count(), durable_nodes.len());
     for node in durable_nodes {
-        assert_eq!(engine.graph().node(node.hash), Some(&node));
+        assert_eq!(engine.graph().header_node(node.hash), Some(&node));
     }
     assert_eq!(
         engine.metadata(),

@@ -101,7 +101,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
         assert_eq!(
             runtime
                 .store
-                .node(future.hash)
+                .header_node(future.hash)
                 .expect("the deferred node read succeeds")
                 .expect("the deferred node is retained")
                 .validation,
@@ -206,7 +206,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
             observation
                 .reopened
                 .store
-                .node(future.hash)
+                .header_node(future.hash)
                 .expect("the future node read succeeds")
                 .expect("the future node remains retained")
                 .validation,
@@ -242,7 +242,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
             observation
                 .reopened
                 .store
-                .node(future.hash)
+                .header_node(future.hash)
                 .expect("the reopened future node read succeeds")
                 .expect("the reopened future node remains retained")
                 .validation,

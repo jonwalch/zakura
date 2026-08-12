@@ -26,8 +26,6 @@ pub struct TransitionPlan {
     pub(super) before: EngineSnapshot,
     pub(super) change_set: ChangeSet,
     pub(super) graph_delta: GraphDelta,
-    #[cfg(any(test, feature = "fuzz-impl"))]
-    pub(super) projected: MemHeaderStore,
     pub(super) cause: TransitionCause,
     pub(super) trust_pins: Arc<[Frontier]>,
     pub(super) limits: EngineLimits,
@@ -54,14 +52,9 @@ impl TransitionPlan {
         self.before.state_version == self.change_set.metadata.state_version
     }
 
+    /// Return the opaque graph transition that matches the durable write set.
     pub(crate) const fn graph_delta(&self) -> &GraphDelta {
         &self.graph_delta
-    }
-
-    /// Return the test/reference materialization of the verified graph delta.
-    #[cfg(any(test, feature = "fuzz-impl"))]
-    pub const fn projected_graph(&self) -> &MemHeaderStore {
-        &self.projected
     }
 }
 
@@ -198,9 +191,9 @@ pub(super) fn apply_transition_engine(
         &request.event,
         &event_context,
     )?;
-    let work_rebased = graph.work_rebased();
-    if work_rebased {
-        metadata.work_origin = graph.view_finalized();
+    let work_coordinates_rebased = graph.work_coordinates_rebased();
+    if work_coordinates_rebased {
+        metadata.work_origin = graph.view_finalized_frontier();
     }
     if let Some(pin) = migrated_pin_refuted {
         metadata.alarms.migrated_pin_refuted = Some(pin);
@@ -208,7 +201,7 @@ pub(super) fn apply_transition_engine(
     if operator_reason_changed {
         verified = Cow::Owned(select_fully_verified_path(&graph)?);
     }
-    let (mut header_best, _) = graph.view_select_header_best()?;
+    let (mut header_best, _) = graph.view_select_best_header_chain()?;
 
     let full_state_finalized = match &request.event {
         TransitionEvent::FullStateFinalized(event) => {
@@ -241,13 +234,15 @@ pub(super) fn apply_transition_engine(
         if header_best
             .height
             .0
-            .saturating_sub(graph.view_finalized().height.0)
+            .saturating_sub(graph.view_finalized_frontier().height.0)
             > depth
         {
             let height = block::Height(header_best.height.0 - depth);
-            let new_finalized = graph.view_ancestor(header_best.hash, height)?.ok_or(
-                TransitionFailure::InvalidEvidence("selected ancestry is incomplete"),
-            )?;
+            let new_finalized = graph
+                .view_header_ancestor(header_best.hash, height)?
+                .ok_or(TransitionFailure::InvalidEvidence(
+                    "selected ancestry is incomplete",
+                ))?;
             finality = Some((
                 new_finalized,
                 FinalitySource::HeadersOnlyDepth {
@@ -257,7 +252,7 @@ pub(super) fn apply_transition_engine(
         }
     }
 
-    let mut cause = if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
+    let mut cause = if work_coordinates_rebased || header_rebase == HeaderInsertionRebase::Rebased {
         TransitionCause::HeaderWorkRebased
     } else if matches!(
         request.event,
@@ -272,10 +267,10 @@ pub(super) fn apply_transition_engine(
     };
     let mut finality_append = None;
     if let Some((new_finalized, source)) = finality {
-        if new_finalized != graph.view_finalized() {
-            let previous = graph.view_finalized();
+        if new_finalized != graph.view_finalized_frontier() {
+            let previous = graph.view_finalized_frontier();
             let epoch = metadata.finality_epoch.checked_next()?;
-            graph.edit_advance_finalized(new_finalized)?;
+            graph.edit_advance_finalized_frontier(new_finalized)?;
             let verified = verified.to_mut();
             verified.retain(|frontier| frontier.height >= new_finalized.height);
             if verified.first().copied() != Some(new_finalized) {
@@ -287,7 +282,7 @@ pub(super) fn apply_transition_engine(
                 source,
                 epoch,
             });
-            header_best = graph.view_select_header_best()?.0;
+            header_best = graph.view_select_best_header_chain()?.0;
             if matches!(source, FinalitySource::HeadersOnlyDepth { .. }) {
                 cause = TransitionCause::HeadersOnlyFinality;
             }
@@ -295,9 +290,12 @@ pub(super) fn apply_transition_engine(
     }
 
     if context.config.mode == EngineMode::HeadersOnly {
-        verified = Cow::Owned(vec![graph.view_finalized()]);
+        verified = Cow::Owned(vec![graph.view_finalized_frontier()]);
     }
-    let verified_best = verified.last().copied().unwrap_or(graph.view_finalized());
+    let verified_best = verified
+        .last()
+        .copied()
+        .unwrap_or(graph.view_finalized_frontier());
     let retention = crate::retention::enforce_retention(
         &mut graph,
         header_best,
@@ -310,7 +308,7 @@ pub(super) fn apply_transition_engine(
         super::verify_plan(engine, &plan)?;
         return Ok(plan);
     }
-    header_best = graph.view_select_header_best()?.0;
+    header_best = graph.view_select_best_header_chain()?.0;
     let selected = if cause == TransitionCause::CheckpointFinality
         && header_best == before.frontiers.header_best
         && finality_append.is_some_and(|record| {
@@ -337,9 +335,13 @@ pub(super) fn apply_transition_engine(
     };
     let verified = trim_projection(&graph, verified)?;
     let graph_delta = graph.delta();
-    let evicted: HashSet<_> = graph_delta.delete_nodes().iter().copied().collect();
+    let evicted: HashSet<_> = graph_delta
+        .deleted_header_hashes()
+        .iter()
+        .copied()
+        .collect();
     aux_changes.retain(|change| match change {
-        crate::AuxDelta::Put(delivery) => graph.view_node(delivery.header_hash).is_some(),
+        crate::AuxDelta::Put(delivery) => graph.view_header_node(delivery.header_hash).is_some(),
         crate::AuxDelta::Delete { .. } => true,
     });
     for hash in &evicted {
@@ -476,9 +478,9 @@ fn rebase_header_insertion(
     )?;
 
     let finalized = current.frontiers.finalized;
-    let parent_is_current_descendant = match graph.node(insert.parent_hash) {
+    let parent_is_current_descendant = match graph.header_node(insert.parent_hash) {
         Some(parent) if parent.height >= finalized.height => {
-            graph.ancestor(insert.parent_hash, finalized.height)? == Some(finalized)
+            graph.header_ancestor(insert.parent_hash, finalized.height)? == Some(finalized)
         }
         Some(_) | None => false,
     };
@@ -602,9 +604,9 @@ fn migrated_pin_refuted(
 fn select_fully_verified_path<G: HeaderGraphView>(
     graph: &G,
 ) -> Result<Vec<Frontier>, TransitionFailure> {
-    let finalized = graph.view_finalized();
+    let finalized = graph.view_finalized_frontier();
     let mut connected = HashSet::from([finalized.hash]);
-    let mut nodes = graph.view_nodes();
+    let mut nodes = graph.view_header_nodes();
     nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
     for node in nodes {
         if node.hash != finalized.hash
@@ -622,17 +624,17 @@ fn select_fully_verified_path<G: HeaderGraphView>(
         .into_iter()
         .map(|hash| {
             let node = graph
-                .view_node(hash)
+                .view_header_node(hash)
                 .expect("verified candidates are retained graph nodes");
             graph
-                .view_score(hash)
+                .view_header_chain_score(hash)
                 .map(|score| (score, Frontier::new(node.height, hash)))
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max_by_key(|(score, _)| *score)
         .map(|(_, frontier)| frontier)
-        .ok_or(GraphError::UnknownNode(finalized.hash))?;
+        .ok_or(GraphError::UnknownHeaderNode(finalized.hash))?;
     path(graph, tip)
 }
 
@@ -765,7 +767,7 @@ fn retained_header_context<G: HeaderGraphView>(
     let mut context = Vec::with_capacity(required);
     let mut hash = parent.hash;
     while context.len() < required {
-        let Some(node) = graph.view_node(hash) else {
+        let Some(node) = graph.view_header_node(hash) else {
             let DurableTransitionFacts::HeaderInsertion {
                 validation_contexts,
                 ..
@@ -920,7 +922,7 @@ fn apply_event<G: HeaderGraphEdit>(
             }
             let parent_node =
                 graph
-                    .view_node(event.parent_hash)
+                    .view_header_node(event.parent_hash)
                     .ok_or(GraphError::UnknownParent {
                         header: event.target_tip_hash,
                         parent: event.parent_hash,
@@ -992,7 +994,7 @@ fn apply_event<G: HeaderGraphEdit>(
                     state => state,
                 };
                 let reasons = anchor_reasons(context, prepared.height, prepared.hash);
-                parent = match graph.edit_insert(
+                parent = match graph.edit_insert_header(
                     prepared.header.clone(),
                     validation,
                     reasons,
@@ -1033,7 +1035,7 @@ fn apply_event<G: HeaderGraphEdit>(
                             .find(|frontier| frontier.height == selected_target.height)
                             .map(|frontier| frontier.hash)
                             != Some(selected_target.hash)
-                        || graph.view_ancestor(
+                        || graph.view_header_ancestor(
                             event.owner.header_authority().branch.target_tip_hash,
                             selected_target.height,
                         )? != Some(selected_target)
@@ -1081,7 +1083,7 @@ fn apply_event<G: HeaderGraphEdit>(
                     ));
                 }
                 let indexed_count = graph
-                    .view_node(delivery.header_hash)
+                    .view_header_node(delivery.header_hash)
                     .expect("the auxiliary header was checked above")
                     .aux_delivery_ids
                     .iter()
@@ -1097,7 +1099,10 @@ fn apply_event<G: HeaderGraphEdit>(
                         ));
                     }
                 }
-                graph.edit_record_aux_delivery(delivery.header_hash, delivery.delivery_id)?;
+                graph.edit_record_auxiliary_evidence_delivery(
+                    delivery.header_hash,
+                    delivery.delivery_id,
+                )?;
                 aux_changes.push(crate::AuxDelta::Put(Box::new(*delivery)));
             }
         }
@@ -1108,7 +1113,7 @@ fn apply_event<G: HeaderGraphEdit>(
             let mut parent = match event.cause {
                 crate::VerifiedChangeCause::Grow
                 | crate::VerifiedChangeCause::CheckpointFinalizedGrow => event.old_tip,
-                crate::VerifiedChangeCause::Reset => graph.view_finalized(),
+                crate::VerifiedChangeCause::Reset => graph.view_finalized_frontier(),
             };
             if matches!(event.cause, crate::VerifiedChangeCause::Reset) {
                 let verified = verified.to_mut();
@@ -1130,9 +1135,9 @@ fn apply_event<G: HeaderGraphEdit>(
                         "verified path is not continuous",
                     ));
                 }
-                if graph.view_node(header.hash).is_none() {
+                if graph.view_header_node(header.hash).is_none() {
                     validate_full_state_header(graph, parent, header, durable, context)?;
-                    graph.edit_insert(
+                    graph.edit_insert_header(
                         header.header.clone(),
                         HeaderValidationState::Valid,
                         anchor_reasons(context, header.height, header.hash),
@@ -1141,7 +1146,7 @@ fn apply_event<G: HeaderGraphEdit>(
                         },
                     )?;
                 } else {
-                    graph.edit_set_body_state(
+                    graph.edit_set_body_validation_state(
                         header.hash,
                         BodyValidationState::Verified {
                             evidence: event.full_state_transition_id,
@@ -1158,7 +1163,7 @@ fn apply_event<G: HeaderGraphEdit>(
                     "accepted full-state side path is empty",
                 ));
             }
-            let mut parent = graph.view_finalized();
+            let mut parent = graph.view_finalized_frontier();
             let last_index = event.path.len().saturating_sub(1);
             for (index, header) in event.path.iter().enumerate() {
                 if header.header.hash() != header.hash
@@ -1175,9 +1180,9 @@ fn apply_event<G: HeaderGraphEdit>(
                         "accepted full-state side path is not continuous",
                     ));
                 }
-                if graph.view_node(header.hash).is_none() {
+                if graph.view_header_node(header.hash).is_none() {
                     validate_full_state_header(graph, parent, header, durable, context)?;
-                    graph.edit_insert(
+                    graph.edit_insert_header(
                         header.header.clone(),
                         HeaderValidationState::Valid,
                         anchor_reasons(context, header.height, header.hash),
@@ -1186,7 +1191,7 @@ fn apply_event<G: HeaderGraphEdit>(
                         },
                     )?;
                 } else if index == last_index {
-                    graph.edit_set_body_state(
+                    graph.edit_set_body_validation_state(
                         header.hash,
                         BodyValidationState::Verified {
                             evidence: event.full_state_transition_id,
@@ -1208,7 +1213,7 @@ fn apply_event<G: HeaderGraphEdit>(
             }
             if matches!(
                 graph
-                    .view_node(event.hash)
+                    .view_header_node(event.hash)
                     .map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Verified { .. })
             ) {
@@ -1216,18 +1221,19 @@ fn apply_event<G: HeaderGraphEdit>(
                     "body retry evidence cannot regress an already verified body",
                 ));
             }
-            graph.edit_set_body_state(
+            graph.edit_set_body_validation_state(
                 event.hash,
                 BodyValidationState::Unavailable(event.availability),
             )?;
         }
         TransitionEvent::BodySupplierDiscovered(event) => {
             let old = match graph
-                .view_node(event.hash)
+                .view_header_node(event.hash)
                 .map(|node| &node.body_validation_state)
             {
                 Some(BodyValidationState::Unavailable(summary))
-                    if event.hash == graph.view_select_header_best()?.0.hash && summary.alarmed =>
+                    if event.hash == graph.view_select_best_header_chain()?.0.hash
+                        && summary.alarmed =>
                 {
                     *summary
                 }
@@ -1256,13 +1262,13 @@ fn apply_event<G: HeaderGraphEdit>(
                     "body supplier discovery does not add an eligible supplier",
                 ));
             }
-            graph.edit_set_body_state(
+            graph.edit_set_body_validation_state(
                 event.hash,
                 BodyValidationState::Unavailable(event.availability),
             )?;
         }
         TransitionEvent::OperatorBodyRetry(event) => {
-            if event.hash != graph.view_select_header_best()?.0.hash
+            if event.hash != graph.view_select_best_header_chain()?.0.hash
                 || event.availability.attempts != 0
                 || event.availability.suppliers == 0
                 || event.availability.alarmed
@@ -1273,14 +1279,14 @@ fn apply_event<G: HeaderGraphEdit>(
                 ));
             }
             if !matches!(
-                graph.view_node(event.hash).map(|node| &node.body_validation_state),
+                graph.view_header_node(event.hash).map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Unavailable(summary)) if summary.alarmed
             ) {
                 return Err(TransitionFailure::InvalidEvidence(
                     "operator body retry requires the selected persistent alarm",
                 ));
             }
-            graph.edit_set_body_state(
+            graph.edit_set_body_validation_state(
                 event.hash,
                 BodyValidationState::Unavailable(event.availability),
             )?;
@@ -1288,7 +1294,7 @@ fn apply_event<G: HeaderGraphEdit>(
         TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(event)) => {
             if matches!(
                 graph
-                    .view_node(event.hash)
+                    .view_header_node(event.hash)
                     .map(|node| &node.body_validation_state),
                 Some(BodyValidationState::Verified { .. })
             ) {
@@ -1296,7 +1302,7 @@ fn apply_event<G: HeaderGraphEdit>(
                     "body invalid evidence cannot contradict an already verified body",
                 ));
             }
-            graph.edit_set_body_state(
+            graph.edit_set_body_validation_state(
                 event.hash,
                 BodyValidationState::ConsensusInvalid {
                     evidence: event.evidence,
@@ -1305,7 +1311,7 @@ fn apply_event<G: HeaderGraphEdit>(
             )?;
         }
         TransitionEvent::BodyEvidence(BodyEvidence::Verified(event)) => {
-            graph.edit_set_body_state(
+            graph.edit_set_body_validation_state(
                 event.hash,
                 BodyValidationState::Verified {
                     evidence: event.evidence,
@@ -1324,13 +1330,13 @@ fn apply_event<G: HeaderGraphEdit>(
                     "operator invalidation identity is not bound to its target",
                 ));
             }
-            *operator_reason_changed = graph.edit_add_eligibility_reason(
+            *operator_reason_changed = graph.edit_add_header_eligibility_reason(
                 event.target,
                 EligibilityReason::operator_invalid(event.target, event.id, event.evidence),
             )?;
         }
         TransitionEvent::OperatorReconsider(event) => {
-            *operator_reason_changed = graph.edit_remove_operator_invalidation(
+            *operator_reason_changed = graph.edit_remove_header_operator_invalidation(
                 event.target,
                 event.id,
                 event.invalidation_evidence,
@@ -1373,13 +1379,13 @@ fn apply_event<G: HeaderGraphEdit>(
                         "auxiliary evidence names the same delivery more than once",
                     ));
                 }
-                let header = graph.view_node(event_delivery.header_hash).ok_or(
+                let header = graph.view_header_node(event_delivery.header_hash).ok_or(
                     TransitionFailure::InvalidEvidence(
                         "auxiliary evidence references an unknown header",
                     ),
                 )?;
                 let header_frontier = Frontier::new(header.height, header.hash);
-                if graph.view_ancestor(event.owner.branch.target_tip_hash, header.height)?
+                if graph.view_header_ancestor(event.owner.branch.target_tip_hash, header.height)?
                     != Some(header_frontier)
                 {
                     return Err(TransitionFailure::InvalidEvidence(
@@ -1412,7 +1418,7 @@ fn apply_event<G: HeaderGraphEdit>(
                 if let crate::AuxAuthentication::Authenticated { boundary_hash, .. } =
                     event.authentication
                 {
-                    let boundary = graph.view_node(boundary_hash).ok_or(
+                    let boundary = graph.view_header_node(boundary_hash).ok_or(
                         TransitionFailure::InvalidEvidence(
                             "auxiliary authentication boundary is unknown",
                         ),
@@ -1425,9 +1431,10 @@ fn apply_event<G: HeaderGraphEdit>(
                     let boundary_frontier = Frontier::new(boundary.height, boundary.hash);
                     if boundary.height != expected_height
                         || boundary.parent_hash != header.hash
-                        || graph
-                            .view_ancestor(event.owner.branch.target_tip_hash, boundary.height)?
-                            != Some(boundary_frontier)
+                        || graph.view_header_ancestor(
+                            event.owner.branch.target_tip_hash,
+                            boundary.height,
+                        )? != Some(boundary_frontier)
                     {
                         return Err(TransitionFailure::InvalidEvidence(
                             "auxiliary authentication is not the owned one-header-later boundary",
@@ -1450,7 +1457,7 @@ fn apply_event<G: HeaderGraphEdit>(
         }
         TransitionEvent::ReevaluateDeferred => {
             let due: Vec<_> = graph
-                .view_nodes()
+                .view_header_nodes()
                 .into_iter()
                 .filter_map(|node| match node.validation {
                     HeaderValidationState::DeferredUntil(until) if until <= context.clock.now() => {
@@ -1460,7 +1467,7 @@ fn apply_event<G: HeaderGraphEdit>(
                 })
                 .collect();
             for hash in due {
-                graph.edit_set_validation(hash, HeaderValidationState::Valid)?;
+                graph.edit_set_header_validation_state(hash, HeaderValidationState::Valid)?;
             }
         }
     }
@@ -1531,13 +1538,14 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
         trust_pins,
         limits,
     } = inputs;
-    let put_nodes = graph_delta.put_nodes().to_vec();
-    let delete_nodes = graph_delta.delete_nodes().to_vec();
-    let put_consensus_invalid_tombstones = graph_delta.put_tombstones().to_vec();
+    let put_nodes = graph_delta.updated_header_nodes().to_vec();
+    let delete_nodes = graph_delta.deleted_header_hashes().to_vec();
+    let put_consensus_invalid_body_tombstones =
+        graph_delta.new_consensus_invalid_body_tombstones().to_vec();
     let mut eligibility_changes: Vec<_> = put_nodes
         .iter()
         .filter_map(|node| {
-            let old = base_graph.node(node.hash)?;
+            let old = base_graph.header_node(node.hash)?;
             (old.eligibility != node.eligibility).then(|| EligibilityDelta {
                 hash: node.hash,
                 before: old.eligibility.clone(),
@@ -1551,15 +1559,15 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
     let header_topology_changed = !delete_nodes.is_empty()
         || put_nodes
             .iter()
-            .any(|node| base_graph.node(node.hash).is_none());
+            .any(|node| base_graph.header_node(node.hash).is_none());
     let header_validation_changed = put_nodes.iter().any(|node| {
         base_graph
-            .node(node.hash)
+            .header_node(node.hash)
             .is_some_and(|old| old.validation != node.validation)
     });
     let header_eligibility_changed = put_nodes.iter().any(|node| {
         base_graph
-            .node(node.hash)
+            .header_node(node.hash)
             .is_some_and(|old| old.is_eligible() != node.is_eligible())
     });
     let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
@@ -1567,8 +1575,8 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
     ))?;
     metadata.alarms.resource_stalled = retention.resource_stalled;
     let header_best_node = graph
-        .view_node(header_best.hash)
-        .ok_or(GraphError::UnknownNode(header_best.hash))?;
+        .view_header_node(header_best.hash)
+        .ok_or(GraphError::UnknownHeaderNode(header_best.hash))?;
     metadata.alarms.header_best_body_unavailable = match &header_best_node.body_validation_state {
         BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
@@ -1606,11 +1614,11 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
         "verified projection is empty",
     ))?;
     metadata.frontiers = FrontierSet {
-        finalized: graph.view_finalized(),
+        finalized: graph.view_finalized_frontier(),
         header_best,
         verified_best,
     };
-    metadata.header_best_score = graph.view_score(header_best.hash)?;
+    metadata.header_best_score = graph.view_header_chain_score(header_best.hash)?;
     metadata.oldest_retained_height = if delete_nodes.is_empty() {
         put_nodes
             .iter()
@@ -1621,21 +1629,21 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
             })
     } else {
         graph
-            .view_nodes()
+            .view_header_nodes()
             .into_iter()
             .map(|node| node.height)
             .min()
-            .unwrap_or(graph.view_finalized().height)
+            .unwrap_or(graph.view_finalized_frontier().height)
     };
     let inserted = put_nodes
         .iter()
-        .filter(|node| base_graph.node(node.hash).is_none())
+        .filter(|node| base_graph.header_node(node.hash).is_none())
         .map(|node| Frontier::new(node.height, node.hash))
         .collect();
     let change_set = ChangeSet {
         put_nodes,
         delete_nodes: delete_nodes.clone(),
-        put_consensus_invalid_tombstones,
+        put_consensus_invalid_body_tombstones,
         index_changes: IndexChanges {
             inserted,
             deleted: delete_nodes,
@@ -1647,14 +1655,10 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
         finality_append,
         metadata,
     };
-    #[cfg(any(test, feature = "fuzz-impl"))]
-    let projected = materialize_graph(&graph)?;
     Ok(TransitionPlan {
         before,
         change_set,
         graph_delta,
-        #[cfg(any(test, feature = "fuzz-impl"))]
-        projected,
         cause,
         trust_pins,
         limits,
@@ -1675,7 +1679,7 @@ fn no_change(
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
-            put_consensus_invalid_tombstones: Vec::new(),
+            put_consensus_invalid_body_tombstones: Vec::new(),
             index_changes: IndexChanges::default(),
             selected_projection: ProjectionDelta::default(),
             verified_projection: ProjectionDelta::default(),
@@ -1685,8 +1689,6 @@ fn no_change(
             metadata,
         },
         graph_delta: GraphDelta::empty(_engine.graph()),
-        #[cfg(any(test, feature = "fuzz-impl"))]
-        projected: _engine.graph().clone(),
         cause,
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
@@ -1708,7 +1710,7 @@ fn resource_stalled(
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
-            put_consensus_invalid_tombstones: Vec::new(),
+            put_consensus_invalid_body_tombstones: Vec::new(),
             index_changes: IndexChanges::default(),
             selected_projection: ProjectionDelta::default(),
             verified_projection: ProjectionDelta::default(),
@@ -1718,8 +1720,6 @@ fn resource_stalled(
             metadata,
         },
         graph_delta: GraphDelta::empty(engine.graph()),
-        #[cfg(any(test, feature = "fuzz-impl"))]
-        projected: engine.graph().clone(),
         cause: TransitionCause::ResourceStalled,
         trust_pins: invariant_pins(context),
         limits: context.config.limits,
@@ -1730,26 +1730,17 @@ fn invariant_pins(context: &TransitionContext<'_>) -> Arc<[Frontier]> {
     context.config.trust_pins()
 }
 
-#[cfg(any(test, feature = "fuzz-impl"))]
-fn materialize_graph(graph: &GraphOverlay<'_>) -> Result<MemHeaderStore, GraphError> {
-    MemHeaderStore::reconstruct(
-        graph.view_finalized(),
-        graph.view_nodes().into_iter().cloned(),
-        graph.consensus_invalid_tombstones(),
-    )
-}
-
 fn path<G: HeaderGraphView>(graph: &G, tip: Frontier) -> Result<Vec<Frontier>, TransitionFailure> {
     let mut path = Vec::new();
     let mut current = tip;
     loop {
         path.push(current);
-        if current == graph.view_finalized() {
+        if current == graph.view_finalized_frontier() {
             break;
         }
         let node = graph
-            .view_node(current.hash)
-            .ok_or(GraphError::UnknownNode(current.hash))?;
+            .view_header_node(current.hash)
+            .ok_or(GraphError::UnknownHeaderNode(current.hash))?;
         current = Frontier::new(block::Height(current.height.0 - 1), node.parent_hash);
     }
     path.reverse();
@@ -1760,10 +1751,10 @@ fn trim_projection<'a, G: HeaderGraphView>(
     graph: &G,
     projection: Cow<'a, [Frontier]>,
 ) -> Result<Cow<'a, [Frontier]>, TransitionFailure> {
-    let requires_trim = projection.first().copied() != Some(graph.view_finalized())
+    let requires_trim = projection.first().copied() != Some(graph.view_finalized_frontier())
         || projection.iter().any(|frontier| {
-            frontier.height < graph.view_finalized().height
-                || graph.view_node(frontier.hash).is_none()
+            frontier.height < graph.view_finalized_frontier().height
+                || graph.view_header_node(frontier.hash).is_none()
         });
     if !requires_trim {
         return Ok(projection);
@@ -1772,17 +1763,17 @@ fn trim_projection<'a, G: HeaderGraphView>(
         .iter()
         .copied()
         .filter(|frontier| {
-            frontier.height >= graph.view_finalized().height
-                && graph.view_node(frontier.hash).is_some()
+            frontier.height >= graph.view_finalized_frontier().height
+                && graph.view_header_node(frontier.hash).is_some()
         })
         .collect();
-    if result.first().copied() != Some(graph.view_finalized()) {
-        result.insert(0, graph.view_finalized());
+    if result.first().copied() != Some(graph.view_finalized_frontier()) {
+        result.insert(0, graph.view_finalized_frontier());
     }
     for pair in result.windows(2) {
         if pair[1].height.0 != pair[0].height.0 + 1
             || graph
-                .view_node(pair[1].hash)
+                .view_header_node(pair[1].hash)
                 .is_none_or(|node| node.parent_hash != pair[0].hash)
         {
             return Err(TransitionFailure::InvalidEvidence(

@@ -116,7 +116,9 @@ impl FuzzStore {
                 header_best: frontier,
                 verified_best: frontier,
             },
-            header_best_score: graph.score(frontier.hash).expect("the anchor has a score"),
+            header_best_score: graph
+                .header_chain_score(frontier.hash)
+                .expect("the anchor has a score"),
             oldest_retained_height: frontier.height,
             alarms: AlarmSet::default(),
             last_transition: None,
@@ -145,12 +147,14 @@ impl FuzzStore {
     }
 
     fn commit(&mut self, plan: &TransitionPlan) {
-        for node in self.graph.nodes() {
+        for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
         }
-        self.graph = plan.projected_graph().clone();
-        for node in self.graph.nodes() {
+        self.graph
+            .apply_delta(plan.graph_delta())
+            .expect("the verified fuzz transition applies to its base graph");
+        for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
         }
@@ -173,7 +177,7 @@ impl FuzzStore {
             }
         }
         for tip in &mut self.branches {
-            if tip.is_some_and(|frontier| self.graph.node(frontier.hash).is_none()) {
+            if tip.is_some_and(|frontier| self.graph.header_node(frontier.hash).is_none()) {
                 *tip = None;
             }
         }
@@ -189,7 +193,7 @@ impl FuzzStore {
         while predecessors.len() < required {
             let (height, header) = self
                 .graph
-                .node(hash)
+                .header_node(hash)
                 .map(|node| (node.height, node.header.clone()))
                 .or_else(|| self.context_archive.get(&hash).cloned())
                 .expect("the fuzz archive retains every contextual predecessor");
@@ -323,7 +327,8 @@ impl FuzzStore {
             .selected
             .iter()
             .find(|frontier| {
-                frontier.height == block::Height(height) && self.graph.node(frontier.hash).is_some()
+                frontier.height == block::Height(height)
+                    && self.graph.header_node(frontier.hash).is_some()
             })
             .map(|frontier| frontier.hash)
             .unwrap_or(finalized.hash);
@@ -332,12 +337,12 @@ impl FuzzStore {
 
     fn branch_parent(&self, key: u8) -> Frontier {
         self.branches[usize::from(key % 16)]
-            .filter(|frontier| self.graph.node(frontier.hash).is_some())
+            .filter(|frontier| self.graph.header_node(frontier.hash).is_some())
             .unwrap_or(self.metadata.frontiers.header_best)
     }
 
     fn record_branch_tip(&mut self, key: u8, tip: block::Hash) {
-        let Some(node) = self.graph.node(tip) else {
+        let Some(node) = self.graph.header_node(tip) else {
             return;
         };
         self.branches[usize::from(key % 16)] = Some(Frontier::new(node.height, tip));
@@ -356,7 +361,7 @@ impl FuzzStore {
             .map(|frontier| {
                 let node = self
                     .graph
-                    .node(frontier.hash)
+                    .header_node(frontier.hash)
                     .expect("selected projections contain retained nodes");
                 VerifiedHeaderRef {
                     height: frontier.height,
@@ -412,7 +417,7 @@ fn apply_transition(
         crate::TransitionEvent::InsertHeaders(event) => {
             let parent = store
                 .graph
-                .node(event.parent_hash)
+                .header_node(event.parent_hash)
                 .expect("an insertion fixture names a retained parent");
             DurableTransitionFacts::HeaderInsertion {
                 validation_contexts: vec![store.lease(Frontier::new(parent.height, parent.hash))],
@@ -778,7 +783,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                     || plan.change_set().put_nodes.iter().any(|node| {
                         store
                             .graph
-                            .node(node.hash)
+                            .header_node(node.hash)
                             .is_some_and(|old| old.validation != node.validation)
                     });
                 store.commit(&plan);
@@ -889,7 +894,7 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
     let finalized = store.metadata.frontiers.finalized;
     for index in 0..=MAX_CANDIDATE_TIPS_V1 {
         assert_eq!(
-            store.graph.eligible_tips().len(),
+            store.graph.eligible_header_tips().len(),
             index.max(1),
             "candidate pressure seed {seed} retains every pre-cap tip at step {index}"
         );
@@ -907,18 +912,18 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
         } else {
             let new_work = store
                 .graph
-                .node(finalized.hash)
+                .header_node(finalized.hash)
                 .expect("the fixed anchor is retained")
                 .block_work;
             store
                 .graph
-                .eligible_tips()
+                .eligible_header_tips()
                 .into_iter()
                 .map(|tip| {
                     (
                         store
                             .graph
-                            .score(tip.hash)
+                            .header_chain_score(tip.hash)
                             .expect("eligible retained tips have scores"),
                         tip.hash,
                     )
@@ -954,14 +959,14 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
         store.commit(&plan);
         if let Some(evicted) = expected_evicted {
             assert!(
-                store.graph.node(evicted).is_none(),
+                store.graph.header_node(evicted).is_none(),
                 "the independently lowest candidate is absent after pressure"
             );
         }
         assert_exhaustive_oracle(&store);
     }
     assert_eq!(
-        store.graph.eligible_tips().len(),
+        store.graph.eligible_header_tips().len(),
         MAX_CANDIDATE_TIPS_V1,
         "candidate-tip retention ends exactly at the configured cap"
     );
@@ -1241,7 +1246,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     let anchor = store.metadata.frontiers.finalized;
     let anchor_node = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the fixed anchor is retained");
     let anchor_header = anchor_node.header.clone();
     let lease = ValidationLease::new(
@@ -1453,7 +1458,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
         assert_eq!(trial.metadata.frontiers, before.frontiers);
         let node = trial
             .graph
-            .node(invalid.hash)
+            .header_node(invalid.hash)
             .expect("the transient target remains retained");
         assert_eq!(
             node.body_validation_state,
@@ -1496,7 +1501,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
     invalidated.commit(&plan);
     let invalid_node = invalidated
         .graph
-        .node(invalid.hash)
+        .header_node(invalid.hash)
         .expect("the invalid target remains retained as evidence");
     assert_eq!(
         invalid_node.body_validation_state,
@@ -1509,7 +1514,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
     assert_eq!(
         invalidated
             .graph
-            .node(descendant.hash)
+            .header_node(descendant.hash)
             .expect("the invalid target descendant remains retained")
             .eligibility
             .inherited_from,
@@ -1534,7 +1539,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
     };
     assert!(matches!(
         apply_transition(&store, request, &context),
-        Err(TransitionFailure::Graph(GraphError::UnknownNode(hash))) if hash == unknown
+        Err(TransitionFailure::Graph(GraphError::UnknownHeaderNode(hash))) if hash == unknown
     ));
     assert_eq!(store.snapshot(), before);
     assert_eq!(retained_digest(&store), before_digest);
@@ -1668,7 +1673,7 @@ fn commit_next_child_exactly(
     assert_eq!(
         store
             .graph
-            .node(child.hash)
+            .header_node(child.hash)
             .expect("the committed next child is retained")
             .parent_hash,
         expected_parent.hash
@@ -1760,7 +1765,7 @@ fn permutation_fixture(
 
 fn assert_exhaustive_oracle(store: &FuzzStore) {
     let finalized = store.metadata.frontiers.finalized;
-    let mut nodes: Vec<_> = store.graph.nodes().collect();
+    let mut nodes: Vec<_> = store.graph.header_nodes().collect();
     nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
     assert!(!nodes.is_empty(), "the finalized anchor must be retained");
 
@@ -1769,14 +1774,14 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
     let mut indexed_children: HashMap<block::Hash, Vec<block::Hash>> = HashMap::new();
     for node in &nodes {
         assert_eq!(
-            store.graph.node(node.hash),
+            store.graph.header_node(node.hash),
             Some(*node),
             "the primary hash index must return every retained node"
         );
         assert!(
             store
                 .graph
-                .hashes_at_height(node.height)
+                .header_hashes_at_height(node.height)
                 .contains(&node.hash),
             "the height index must contain every retained node"
         );
@@ -1788,7 +1793,7 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
         } else {
             let parent = store
                 .graph
-                .node(node.parent_hash)
+                .header_node(node.parent_hash)
                 .expect("every non-finalized retained node has a retained parent");
             assert_eq!(
                 node.height,
@@ -1837,7 +1842,7 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
         let mut expected_children = indexed_children.remove(&node.hash).unwrap_or_default();
         expected_children.sort_unstable_by_key(|hash| hash.0);
         assert_eq!(
-            store.graph.children(node.hash),
+            store.graph.header_children(node.hash),
             expected_children,
             "the child index must exactly match retained parent links"
         );
@@ -1874,7 +1879,7 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
     );
     for tip in store.branches.iter().flatten() {
         assert_eq!(
-            store.graph.node(tip.hash).map(|node| node.height),
+            store.graph.header_node(tip.hash).map(|node| node.height),
             Some(tip.height),
             "every named branch tip is an exact retained frontier"
         );
@@ -1892,7 +1897,7 @@ fn independent_path(store: &FuzzStore, tip: Frontier) -> Vec<Frontier> {
         }
         let node = store
             .graph
-            .node(current.hash)
+            .header_node(current.hash)
             .expect("published projection members are retained");
         current = Frontier::new(
             block::Height(current.height.0.saturating_sub(1)),
@@ -1904,7 +1909,7 @@ fn independent_path(store: &FuzzStore, tip: Frontier) -> Vec<Frontier> {
 }
 
 fn retained_digest(store: &FuzzStore) -> [u8; 32] {
-    let mut nodes: Vec<_> = store.graph.nodes().collect();
+    let mut nodes: Vec<_> = store.graph.header_nodes().collect();
     nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-header-chain-fuzz-retained-v1");

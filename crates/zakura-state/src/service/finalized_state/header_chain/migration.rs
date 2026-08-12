@@ -144,7 +144,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     let changes = ChangeSet {
         put_nodes: vec![anchor_node],
         delete_nodes: Vec::new(),
-        put_consensus_invalid_tombstones: Vec::new(),
+        put_consensus_invalid_body_tombstones: Vec::new(),
         index_changes: IndexChanges {
             inserted: vec![anchor],
             deleted: Vec::new(),

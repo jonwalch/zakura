@@ -163,7 +163,7 @@ fn header_acceptance_cannot_construct_body_or_state_validity() {
 }
 
 #[test]
-fn every_named_invariant_category_rejects_its_projected_corruption() {
+fn graph_boundary_and_transition_invariants_reject_corruption() {
     use std::num::NonZeroUsize;
 
     use crate::{
@@ -182,32 +182,32 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let plan = apply_transition(&store, request, &context(&config, &clock, None))
         .expect("the baseline plan satisfies every invariant");
     let tip = plan.change_set.metadata.frontiers.header_best;
-    let first = plan
-        .projected
-        .ancestor(tip.hash, block::Height(1))
+    let baseline_graph = projected_graph(&store.graph, &plan);
+    let first = baseline_graph
+        .header_ancestor(tip.hash, block::Height(1))
         .expect("the baseline ancestry is coherent")
         .expect("height one is retained");
 
     let mut corrupt = plan.clone();
-    corrupt
-        .projected
-        .test_corrupt_node(tip.hash)
-        .expect("tip exists")
-        .hash = block::Hash([0; 32]);
+    crate::graph::test_support::mutate_updated_header(
+        &mut corrupt.graph_delta,
+        tip.hash,
+        |header_node| header_node.hash = block::Hash([0; 32]),
+    );
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::NodeHash(_))
+        Err(InvariantViolation::Index(_))
     ));
 
     let mut corrupt = plan.clone();
-    corrupt
-        .projected
-        .test_corrupt_node(tip.hash)
-        .expect("tip exists")
-        .parent_hash = block::Hash([0; 32]);
+    crate::graph::test_support::mutate_updated_header(
+        &mut corrupt.graph_delta,
+        tip.hash,
+        |header_node| header_node.parent_hash = block::Hash([0; 32]),
+    );
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::Parent(_))
+        Err(InvariantViolation::Index(_))
     ));
 
     let mut corrupt = plan.clone();
@@ -218,26 +218,29 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     ));
 
     let mut corrupt = plan.clone();
-    corrupt
-        .projected
-        .test_corrupt_node(tip.hash)
-        .expect("tip exists")
-        .work_coordinate = WorkCoordinate::new(block::Hash([0; 32]), U256::zero());
+    crate::graph::test_support::mutate_updated_header(
+        &mut corrupt.graph_delta,
+        tip.hash,
+        |header_node| {
+            header_node.work_coordinate = WorkCoordinate::new(block::Hash([0; 32]), U256::zero());
+        },
+    );
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::Work(_))
+        Err(InvariantViolation::Index(_))
     ));
 
     let mut corrupt = plan.clone();
-    corrupt
-        .projected
-        .test_corrupt_node(tip.hash)
-        .expect("tip exists")
-        .eligibility
-        .inherited_from = Some(block::Hash([0; 32]));
+    crate::graph::test_support::mutate_updated_header(
+        &mut corrupt.graph_delta,
+        tip.hash,
+        |header_node| {
+            header_node.eligibility.inherited_from = Some(block::Hash([0; 32]));
+        },
+    );
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::Eligibility(_))
+        Err(InvariantViolation::Index(_))
     ));
 
     let mut corrupt = plan.clone();
@@ -279,7 +282,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let finalized = store.metadata.frontiers.finalized.hash;
     corrupt.change_set.delete_nodes.push(finalized);
     corrupt.change_set.index_changes.deleted.push(finalized);
-    corrupt.graph_delta.test_delete_nodes_mut().push(finalized);
+    crate::graph::test_support::add_deleted_header(&mut corrupt.graph_delta, finalized);
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Index(_))

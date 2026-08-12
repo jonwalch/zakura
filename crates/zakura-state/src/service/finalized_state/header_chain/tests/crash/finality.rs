@@ -134,7 +134,7 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
             observation
                 .reopened
                 .store
-                .node(anchor.hash)
+                .header_node(anchor.hash)
                 .expect("the old anchor row read succeeds")
                 .is_none(),
             committed,
@@ -143,13 +143,13 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
         assert!(observation
             .reopened
             .store
-            .node(child.hash)
+            .header_node(child.hash)
             .expect("the new anchor row read succeeds")
             .is_some());
         assert!(observation
             .reopened
             .store
-            .node(grandchild.hash)
+            .header_node(grandchild.hash)
             .expect("the retained suffix row read succeeds")
             .is_some());
         let durable_metadata = observation
@@ -467,7 +467,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
                 observation
                     .reopened
                     .store
-                    .node(higher.hash)
+                    .header_node(higher.hash)
                     .expect("the target node read succeeds")
                     .expect("the operator target remains retained")
                     .eligibility
@@ -503,7 +503,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
                 observation
                     .reopened
                     .store
-                    .node(higher.hash)
+                    .header_node(higher.hash)
                     .expect("the reopened target node read succeeds")
                     .expect("the reopened operator target remains retained")
                     .eligibility

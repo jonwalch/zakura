@@ -88,7 +88,7 @@ id = "LC-DAG-02"
 name = "Fork-aware indexes"
 status = "implemented"
 owner = "zakura_state::HeaderChainStore"
-tests = ["DG-04::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-04::startup_repairs_every_reconstructible_index_atomically_before_publication", "DG-04::every_named_invariant_category_rejects_its_projected_corruption"]
+tests = ["DG-04::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-04::startup_repairs_every_reconstructible_index_atomically_before_publication", "DG-04::graph_boundary_and_transition_invariants_reject_corruption"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -104,7 +104,7 @@ id = "LC-FRONTIER-01"
 name = "Shared finalized ancestry"
 status = "implemented"
 owner = "zakura_header_chain::verify_plan"
-tests = ["DG-02::invalidating_verified_path_preserves_independent_header_best", "DG-02::every_named_invariant_category_rejects_its_projected_corruption", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child"]
+tests = ["DG-02::invalidating_verified_path_preserves_independent_header_best", "DG-02::graph_boundary_and_transition_invariants_reject_corruption", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -119,7 +119,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-FRONTIER-03"
 name = "Selection is not verification"
 status = "implemented"
-owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
 tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -401,7 +401,7 @@ networks = ["mainnet", "testnet"]
 id = "LC-SELECT-01"
 name = "Eligible-path filtering"
 status = "implemented"
-owner = "zakura_header_chain::MemHeaderStore::eligible_tips"
+owner = "zakura_header_chain::MemHeaderStore::eligible_header_tips"
 tests = ["DG-01::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -409,7 +409,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-SELECT-02"
 name = "Greatest-work selection"
 status = "implemented"
-owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
 tests = ["DG-01::insertion_permutations_match_an_independent_greatest_work_model", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -425,7 +425,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-SELECT-04"
 name = "Deterministic selection"
 status = "implemented"
-owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
 tests = ["DG-01::insertion_permutations_match_an_independent_greatest_work_model", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -433,7 +433,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-REORG-01"
 name = "Finalized-anchor reorganization"
 status = "implemented"
-owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
 tests = ["DG-05::fixed_anchor_replacements_cover_finalization_boundary_in_both_orders"]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -601,7 +601,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-AVAIL-03"
 name = "Availability-neutral fork choice"
 status = "implemented"
-owner = "zakura_header_chain::MemHeaderStore::select_header_best"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
 tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
 networks = ["mainnet", "testnet", "custom"]
 

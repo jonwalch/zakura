@@ -30,7 +30,10 @@ pub use frontier::{
 };
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
-pub use graph::{ConsensusInvalidTombstone, GraphError, InsertResult, MemHeaderStore};
+pub use graph::{
+    ConsensusInvalidBodyTombstone, GraphError, GraphRevision, HeaderGraphReconstruction,
+    HeaderNodeInvariant, InsertResult, MemHeaderStore,
+};
 pub use header_node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState,

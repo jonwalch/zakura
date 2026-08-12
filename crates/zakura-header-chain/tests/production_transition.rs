@@ -77,7 +77,9 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
             header_best: anchor,
             verified_best: anchor,
         },
-        header_best_score: graph.score(anchor.hash).expect("the anchor has a score"),
+        header_best_score: graph
+            .header_chain_score(anchor.hash)
+            .expect("the anchor has a score"),
         oldest_retained_height: anchor.height,
         alarms: AlarmSet::default(),
         last_transition: None,

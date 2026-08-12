@@ -44,14 +44,17 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     .expect("resource refusal produces an alarm-only plan");
     assert_eq!(refused.cause(), TransitionCause::ResourceStalled);
     assert!(refused.change_set.metadata.alarms.resource_stalled);
-    assert_eq!(refused.graph_delta, crate::graph::GraphDelta::default());
+    assert!(refused.graph_delta.is_empty());
     assert_eq!(
         refused.change_set.metadata.state_version,
         StateVersion::new(1)
     );
     assert!(refused.change_set.put_nodes.is_empty());
     assert!(refused.change_set.delete_nodes.is_empty());
-    assert_eq!(refused.projected.node_count(), 1);
+    assert_eq!(
+        projected_graph(&store.graph, &refused).header_node_count(),
+        1
+    );
     assert_eq!(
         refused.change_set.metadata.frontiers,
         store.metadata.frontiers
@@ -70,7 +73,10 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
         recovered.change_set.metadata.state_version,
         StateVersion::new(2)
     );
-    assert_eq!(recovered.projected.node_count(), 2);
+    assert_eq!(
+        projected_graph(&store.graph, &recovered).header_node_count(),
+        2
+    );
 }
 
 #[test]
@@ -85,7 +91,7 @@ fn engine_rejects_context_free_batch_with_invalid_retained_time() {
     let mut header = *original.header;
     header.time = store
         .graph
-        .node(insert.parent_hash)
+        .header_node(insert.parent_hash)
         .expect("the exact parent is retained")
         .header
         .time;
@@ -168,10 +174,10 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
         &context(&matching_config, &clock, None),
     )
     .expect("an insertion matching the immutable configured checkpoint commits");
+    let matching_graph = projected_graph(&matching_store.graph, &matching);
     assert_eq!(matching.change_set.metadata.frontiers.header_best, child);
-    assert!(matching
-        .projected
-        .node(child.hash)
+    assert!(matching_graph
+        .header_node(child.hash)
         .expect("the matching checkpoint child is retained")
         .eligibility
         .direct_reasons
@@ -197,13 +203,13 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
         &context(&conflicting_config, &clock, Some(&Authority)),
     )
     .expect("a conflicting header is retained only as checkpoint evidence");
+    let conflicting_graph = projected_graph(&conflicting_store.graph, &conflicting);
     assert_eq!(
         conflicting.change_set.metadata.frontiers.header_best,
         conflicting_store.metadata.frontiers.header_best
     );
-    assert!(conflicting
-        .projected
-        .node(child.hash)
+    assert!(conflicting_graph
+        .header_node(child.hash)
         .expect("the conflicting checkpoint child is retained")
         .eligibility
         .direct_reasons
@@ -212,15 +218,14 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
             expected: expected.hash,
         }));
 
-    let conflicting_child = conflicting
-        .projected
-        .node(child.hash)
+    let conflicting_child = conflicting_graph
+        .header_node(child.hash)
         .expect("the conflicting checkpoint child is retained");
     let mut descendant_header = *conflicting_child.header;
     descendant_header.previous_block_hash = conflicting_child.hash;
     descendant_header.nonce.0[0] ^= 1;
     let descendant_header = Arc::new(descendant_header);
-    let mut descendant_graph = conflicting.projected.clone();
+    let mut descendant_graph = conflicting_graph.clone();
     let descendant = descendant_graph
         .insert(
             descendant_header,
@@ -231,7 +236,7 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
         .expect("the checkpoint-conflicting descendant links");
     let descendant = match descendant {
         crate::InsertResult::Inserted(frontier) => descendant_graph
-            .node(frontier.hash)
+            .header_node(frontier.hash)
             .expect("the inserted descendant is retained"),
         crate::InsertResult::AlreadyPresent(_) => {
             unreachable!("the descendant nonce is unique in this fixture")
@@ -252,9 +257,9 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
         &context(&conflicting_config, &clock, Some(&Authority)),
     )
     .expect("operator reconsider can remove only a matching operator reason");
-    assert!(reconsider
-        .projected
-        .node(child.hash)
+    let reconsidered_graph = projected_graph(&committed_conflict.graph, &reconsider);
+    assert!(reconsidered_graph
+        .header_node(child.hash)
         .expect("the checkpoint conflict remains retained")
         .eligibility
         .direct_reasons
@@ -324,7 +329,7 @@ fn migrated_pin_refutation_requires_full_state_authority_and_exact_pin() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let pin = store.graph.finalized();
+    let pin = store.graph.finalized_frontier();
     store.finality.push(FinalityRecord {
         previous: pin,
         current: pin,

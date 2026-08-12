@@ -43,10 +43,10 @@ fn full_commit_ensures_exact_node_body_and_independent_selection() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let easy = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -58,7 +58,7 @@ fn full_commit_ensures_exact_node_body_and_independent_selection() {
     let header_best = insert_verified_branch(&mut store.graph, anchor, 1, hard, 0x58);
     store
         .graph
-        .set_body_state(header_best.hash, BodyValidationState::Unknown)
+        .set_body_validation_state(header_best.hash, BodyValidationState::Unknown)
         .expect("the harder competitor remains header-only");
     synchronize_fixture(&mut store, anchor);
     assert_eq!(store.metadata.frontiers.header_best, header_best);
@@ -78,7 +78,7 @@ fn full_commit_ensures_exact_node_body_and_independent_selection() {
         accepted_header.hash(),
     );
     assert!(
-        store.graph.node(accepted.hash).is_none(),
+        store.graph.header_node(accepted.hash).is_none(),
         "the full-state header is deliberately absent from the DAG"
     );
     let evidence = EvidenceId::from_digest([0x5a; 32]);
@@ -102,9 +102,9 @@ fn full_commit_ensures_exact_node_body_and_independent_selection() {
     )
     .expect("the exact full-state growth produces one coherent header transition");
 
-    let accepted_node = plan
-        .projected
-        .node(accepted.hash)
+    let projected_graph = projected_graph(&store.graph, &plan);
+    let accepted_node = projected_graph
+        .header_node(accepted.hash)
         .expect("the full-state header is inserted into the projected DAG");
     assert_eq!(accepted_node.parent_hash, anchor.hash);
     assert_eq!(
@@ -167,6 +167,7 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
         &context(&config, &clock, Some(&authority)),
     )
     .expect("authenticated full state admits the absent side path");
+    let projected_graph = projected_graph(&store.graph, &plan);
 
     assert_eq!(
         plan.change_set.metadata.frontiers.verified_best,
@@ -177,7 +178,9 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
         ProjectionDelta::default()
     );
     assert!(matches!(
-        plan.projected.node(accepted).map(|node| &node.body_validation_state),
+        projected_graph
+            .header_node(accepted)
+            .map(|node| &node.body_validation_state),
         Some(BodyValidationState::Verified {
             evidence: actual
         }) if *actual == evidence
@@ -192,8 +195,8 @@ fn apply_transition_is_the_only_public_dag_mutation_entry_point() {
         "pub fn add_eligibility_reason(",
         "pub fn remove_operator_invalidation(",
         "pub fn set_consensus_body_invalid(",
-        "pub fn set_body_state(",
-        "pub fn set_validation(",
+        "pub fn set_body_validation_state(",
+        "pub fn set_header_validation_state(",
     ] {
         assert!(
             !graph_source.contains(old_entry),

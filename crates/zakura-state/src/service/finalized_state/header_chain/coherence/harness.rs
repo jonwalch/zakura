@@ -31,7 +31,7 @@ use super::{
             DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY,
-        HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_TOMBSTONE,
+        HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
         HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
         HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
     },
@@ -40,7 +40,7 @@ use super::{
 
 const HEADER_FAMILIES: [&str; 12] = [
     HEADER_NODE_BY_HASH,
-    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
     HEADER_BODY_EVIDENCE_AUTHORITY,
     HEADER_CHILD,
     HEADER_SELECTED,
@@ -726,7 +726,7 @@ impl Harness {
 
         let stored_nodes = runtime
             .store
-            .all_nodes()
+            .all_header_nodes()
             .expect("the exhaustive node rows are readable");
         assert_eq!(stored_nodes.len(), self.model.len());
         for node in stored_nodes {

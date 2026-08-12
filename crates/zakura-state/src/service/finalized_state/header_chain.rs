@@ -39,14 +39,14 @@ use super::{
             HeaderEligibilityRootKey, HeaderFinalityKey, HeaderHeightKey,
         },
         header_chain_values::{
-            HeaderBodyEvidenceAuthorityDisk, HeaderChainValueError, HeaderEligibilityReasonDisk,
-            HeaderNodeDisk, HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk,
-            HeaderValidationContextDisk,
+            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
+            HeaderEligibilityReasonDisk, HeaderNodeDisk, HeaderReconstructionPhaseDisk,
+            HeaderReconstructionProgressDisk, HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
     DiskDb, DiskWriteBatch, ReadDisk, WriteDisk, HEADER_AUX_DELIVERY,
-    HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_TOMBSTONE,
+    HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
     HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
     HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
 };
@@ -368,11 +368,11 @@ fn load_transition_engine(
     store: &HeaderChainStore,
 ) -> Result<HeaderChainEngine, HeaderChainStoreError> {
     let metadata = store.metadata()?;
-    let graph = MemHeaderStore::reconstruct(
+    let graph = MemHeaderStore::reconstruct(zakura_header_chain::HeaderGraphReconstruction::new(
         metadata.frontiers.finalized,
-        store.all_nodes()?,
-        store.all_consensus_invalid_tombstones()?,
-    )
+        store.all_header_nodes()?,
+        store.all_consensus_invalid_body_tombstones()?,
+    ))
     .map_err(|_| HeaderChainStoreError::Incoherent("audited node graph is invalid"))?;
     HeaderChainEngine::from_audited_state(
         graph,
@@ -728,7 +728,7 @@ impl HeaderChainReader {
             }
             return Ok(None);
         };
-        let indexed_node = self.store.node(hash)?.ok_or(StoreError::Incoherent(
+        let indexed_node = self.store.header_node(hash)?.ok_or(StoreError::Incoherent(
             "selected projection references a missing node",
         ))?;
         if indexed_node.height != height {
@@ -748,9 +748,12 @@ impl HeaderChainReader {
         }
 
         let tip = snapshot.frontiers.header_best;
-        let mut selected_ancestor = self.store.node(tip.hash)?.ok_or(StoreError::Incoherent(
-            "committed selected tip references a missing node",
-        ))?;
+        let mut selected_ancestor =
+            self.store
+                .header_node(tip.hash)?
+                .ok_or(StoreError::Incoherent(
+                    "committed selected tip references a missing node",
+                ))?;
         if selected_ancestor.height != tip.height {
             return Err(StoreError::Incoherent(
                 "committed selected tip height disagrees with its node",
@@ -760,12 +763,12 @@ impl HeaderChainReader {
             let parent_height = block::Height(selected_ancestor.height.0.checked_sub(1).ok_or(
                 StoreError::Incoherent("selected path reached a parent below height zero"),
             )?);
-            let parent =
-                self.store
-                    .node(selected_ancestor.parent_hash)?
-                    .ok_or(StoreError::Incoherent(
-                        "selected path references a missing parent node",
-                    ))?;
+            let parent = self
+                .store
+                .header_node(selected_ancestor.parent_hash)?
+                .ok_or(StoreError::Incoherent(
+                    "selected path references a missing parent node",
+                ))?;
             if parent.height != parent_height {
                 return Err(StoreError::Incoherent(
                     "selected path parent height is not contiguous",
@@ -902,7 +905,7 @@ impl HeaderChainReader {
         let end = requested_end.min(snapshot.frontiers.header_best.height);
         let mut selected = self
             .store
-            .node(snapshot.frontiers.header_best.hash)?
+            .header_node(snapshot.frontiers.header_best.hash)?
             .ok_or(StoreError::Incoherent(
                 "committed selected tip references a missing node",
             ))?;
@@ -935,12 +938,12 @@ impl HeaderChainReader {
             let parent_height = block::Height(selected.height.0.checked_sub(1).ok_or(
                 StoreError::Incoherent("selected path reached a parent below height zero"),
             )?);
-            let parent = self
-                .store
-                .node(selected.parent_hash)?
-                .ok_or(StoreError::Incoherent(
-                    "selected path references a missing parent node",
-                ))?;
+            let parent =
+                self.store
+                    .header_node(selected.parent_hash)?
+                    .ok_or(StoreError::Incoherent(
+                        "selected path references a missing parent node",
+                    ))?;
             if parent.height != parent_height {
                 return Err(StoreError::Incoherent(
                     "selected path parent height is not contiguous",
@@ -990,7 +993,7 @@ impl HeaderChainReader {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        if self.store.node(parent_hash)?.is_none() {
+        if self.store.header_node(parent_hash)?.is_none() {
             return Ok(None);
         }
         self.store
@@ -1186,7 +1189,7 @@ impl HeaderChainReader {
             let frontier = engine.selected_projection()[index];
             let node = engine
                 .graph()
-                .node(frontier.hash)
+                .header_node(frontier.hash)
                 .ok_or(StoreError::Incoherent(
                     "committed selected projection references a missing node",
                 ))?;
@@ -1286,14 +1289,14 @@ impl HeaderChainReader {
             if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
                 return Ok(RetainedPathLeaseOutcome::Busy);
             }
-            let Some(target_node) = engine.graph().node(target_tip_hash) else {
+            let Some(target_node) = engine.graph().header_node(target_tip_hash) else {
                 return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
             };
             let target = Frontier::new(target_node.height, target_tip_hash);
             let mut reverse_path = vec![target];
             let mut current = target_node;
             while current.height > snapshot.frontiers.finalized.height {
-                let Some(parent) = engine.graph().node(current.parent_hash) else {
+                let Some(parent) = engine.graph().header_node(current.parent_hash) else {
                     return Ok(RetainedPathLeaseOutcome::HistoryPruned);
                 };
                 if parent.height.next().ok() != Some(current.height) {
@@ -1599,7 +1602,7 @@ impl HeaderChainRuntime {
         let current =
             engine
                 .graph()
-                .node(hash)
+                .header_node(hash)
                 .cloned()
                 .ok_or(HeaderChainStoreError::Incoherent(
                     "selected projection references a missing in-memory node",
@@ -1614,7 +1617,7 @@ impl HeaderChainRuntime {
             let expected_height = height.next().map_err(|_| {
                 HeaderChainStoreError::Incoherent("selected auxiliary successor height overflowed")
             })?;
-            let node = engine.graph().node(frontier.hash).cloned().ok_or(
+            let node = engine.graph().header_node(frontier.hash).cloned().ok_or(
                 HeaderChainStoreError::Incoherent(
                     "selected successor references a missing in-memory node",
                 ),
@@ -1650,7 +1653,7 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        Ok(engine.graph().node(target).and_then(|node| {
+        Ok(engine.graph().header_node(target).and_then(|node| {
             node.eligibility
                 .direct_reasons
                 .iter()
@@ -1851,7 +1854,7 @@ impl HeaderChainRuntime {
             TransitionEvent::VerifiedChainChanged(event) => event
                 .new_path
                 .iter()
-                .all(|header| transition_engine.graph().node(header.hash).is_some()),
+                .all(|header| transition_engine.graph().header_node(header.hash).is_some()),
             _ => false,
         };
         // Header sync normally admits headers before native checkpoint growth promotes them.
@@ -2051,7 +2054,7 @@ impl HeaderChainRuntime {
                 let anchor_changed = event.owner.header_authority().branch.anchor_hash
                     != before.frontiers.finalized.hash;
                 let mut validation_contexts = Vec::new();
-                if self.store.node(event.parent_hash)?.is_some() {
+                if self.store.header_node(event.parent_hash)?.is_some() {
                     validation_contexts.push(
                         self.store
                             .validation_context(event.parent_hash, &base_context.config.network)?,
@@ -2203,7 +2206,7 @@ impl HeaderChainRuntime {
                 } else if let Some(node) = put_nodes.get(&expected.hash) {
                     Some((*node).clone())
                 } else {
-                    self.store.node(expected.hash)?
+                    self.store.header_node(expected.hash)?
                 };
                 let matches = projected.is_some_and(|node| {
                     node.height == expected.height
@@ -3001,7 +3004,7 @@ impl HeaderChainStore {
         let change_set = ChangeSet {
             put_nodes: vec![anchor.clone()],
             delete_nodes: Vec::new(),
-            put_consensus_invalid_tombstones: Vec::new(),
+            put_consensus_invalid_body_tombstones: Vec::new(),
             index_changes: zakura_header_chain::IndexChanges {
                 inserted: vec![metadata.frontiers.finalized],
                 deleted: Vec::new(),
@@ -3098,7 +3101,7 @@ impl HeaderChainStore {
         }
 
         for hash in &changes.delete_nodes {
-            if let Some(node) = self.node(*hash).map_err(|_| {
+            if let Some(node) = self.header_node(*hash).map_err(|_| {
                 HeaderChainStoreError::Incoherent("deleted node could not be decoded")
             })? {
                 self.delete_raw(&mut batch, HEADER_NODE_BY_HASH, hash.0)?;
@@ -3126,7 +3129,7 @@ impl HeaderChainStore {
         }
 
         for node in &changes.put_nodes {
-            if let Some(old) = self.node(node.hash).map_err(|_| {
+            if let Some(old) = self.header_node(node.hash).map_err(|_| {
                 HeaderChainStoreError::Incoherent("replaced node could not be decoded")
             })? {
                 self.delete_deferred_for(&mut batch, &old)?;
@@ -3139,7 +3142,10 @@ impl HeaderChainStore {
                 &HeaderNodeDisk::from_domain(node),
             )?;
             if let Some(authority) =
-                HeaderBodyEvidenceAuthorityDisk::from_domain(node.hash, &node.body_validation_state)
+                FullStateBodyValidationEvidenceAuthorityDisk::from_body_validation_state(
+                    node.hash,
+                    &node.body_validation_state,
+                )
             {
                 self.put_value(
                     &mut batch,
@@ -3177,10 +3183,10 @@ impl HeaderChainStore {
             }
         }
 
-        for tombstone in &changes.put_consensus_invalid_tombstones {
+        for tombstone in &changes.put_consensus_invalid_body_tombstones {
             if let Some(existing) = self
-                .get_value::<zakura_header_chain::ConsensusInvalidTombstone>(
-                    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+                .get_value::<zakura_header_chain::ConsensusInvalidBodyTombstone>(
+                    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
                     tombstone.hash.0,
                 )?
             {
@@ -3193,7 +3199,7 @@ impl HeaderChainStore {
             }
             self.put_value(
                 &mut batch,
-                HEADER_CONSENSUS_INVALID_TOMBSTONE,
+                HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
                 tombstone.hash.0,
                 tombstone,
             )?;
@@ -3281,13 +3287,13 @@ impl HeaderChainStore {
         if current.height.0 != previous.height.0.saturating_add(1) {
             return Ok(None);
         }
-        let Some(previous_node) = self.node(previous.hash)? else {
+        let Some(previous_node) = self.header_node(previous.hash)? else {
             return Ok(None);
         };
         let stored_current = if staged_nodes.contains_key(&current.hash) {
             None
         } else {
-            self.node(current.hash)?
+            self.header_node(current.hash)?
         };
         let current_node = staged_nodes
             .get(&current.hash)
@@ -3348,7 +3354,7 @@ impl HeaderChainStore {
         if plan.repairs.contains(&RecoveryRepair::InheritedEligibility)
             || plan.repairs.contains(&RecoveryRepair::ElapsedDeferrals)
         {
-            for node in &plan.nodes {
+            for node in &plan.header_nodes {
                 self.put_value(
                     &mut batch,
                     HEADER_NODE_BY_HASH,
@@ -3359,7 +3365,7 @@ impl HeaderChainStore {
         }
         if plan.repairs.contains(&RecoveryRepair::ChildIndex) {
             self.clear_family(&mut batch, HEADER_CHILD)?;
-            for (parent, child) in &plan.child_edges {
+            for (parent, child) in &plan.header_child_edges {
                 self.put_empty(
                     &mut batch,
                     HEADER_CHILD,
@@ -3796,7 +3802,7 @@ impl HeaderChainStore {
             .ok_or(StoreError::Unavailable("header-chain metadata is absent"))
     }
 
-    fn node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
+    fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
         let value = self
             .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
             .map_err(store_error)?;
@@ -3828,7 +3834,7 @@ impl HeaderChainStore {
     ) -> Result<ValidationLease, StoreError> {
         let metadata = self.metadata()?;
         let parent_node = self
-            .node(parent)?
+            .header_node(parent)?
             .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
         let parent_frontier = Frontier::new(parent_node.height, parent);
         let mut predecessors = vec![zakura_header_chain::HeaderContextFact {
@@ -3892,7 +3898,7 @@ impl StoreAuditRead for HeaderChainStore {
         HeaderChainStore::metadata(self)
     }
 
-    fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
+    fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
         let mut reasons_by_hash: HashMap<block::Hash, Vec<EligibilityReason>> = HashMap::new();
         for (hash, reason) in self.all_reason_rows()? {
             reasons_by_hash.entry(hash).or_default().push(reason);
@@ -3923,18 +3929,18 @@ impl StoreAuditRead for HeaderChainStore {
         Ok(nodes)
     }
 
-    fn all_consensus_invalid_tombstones(
+    fn all_consensus_invalid_body_tombstones(
         &self,
-    ) -> Result<Vec<zakura_header_chain::ConsensusInvalidTombstone>, StoreError> {
+    ) -> Result<Vec<zakura_header_chain::ConsensusInvalidBodyTombstone>, StoreError> {
         let mut tombstones = Vec::new();
         for (key, value) in self
-            .scan_raw(HEADER_CONSENSUS_INVALID_TOMBSTONE)
+            .scan_raw(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)
             .map_err(store_error)?
         {
             if key.len() != 32 {
                 return Err(StoreError::Incoherent("invalid tombstone key width"));
             }
-            let tombstone = zakura_header_chain::ConsensusInvalidTombstone::decode(&value)
+            let tombstone = zakura_header_chain::ConsensusInvalidBodyTombstone::decode(&value)
                 .map_err(|_| StoreError::Incoherent("invalid tombstone value"))?;
             if key.as_slice() != tombstone.hash.0 {
                 return Err(StoreError::Incoherent("tombstone key/hash mismatch"));
@@ -3944,18 +3950,23 @@ impl StoreAuditRead for HeaderChainStore {
         Ok(tombstones)
     }
 
-    fn body_evidence_is_authoritative(
+    fn full_state_attests_to_body_validation_state(
         &self,
-        hash: block::Hash,
-        state: &zakura_header_chain::BodyValidationState,
+        header_hash: block::Hash,
+        body_validation_state: &zakura_header_chain::BodyValidationState,
     ) -> Result<bool, StoreError> {
         let authority = self
-            .get_value::<HeaderBodyEvidenceAuthorityDisk>(HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)
+            .get_value::<FullStateBodyValidationEvidenceAuthorityDisk>(
+                HEADER_BODY_EVIDENCE_AUTHORITY,
+                header_hash.0,
+            )
             .map_err(store_error)?;
-        Ok(authority.is_some_and(|authority| authority.attests(hash, state)))
+        Ok(authority.is_some_and(|authority| {
+            authority.attests_to_body_validation_state(header_hash, body_validation_state)
+        }))
     }
 
-    fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
+    fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
         let mut edges = Vec::new();
         for (key, value) in self.scan_raw(HEADER_CHILD).map_err(store_error)? {
             if key.len() != 64 || !value.is_empty() {
@@ -4060,7 +4071,7 @@ impl StoreAuditRead for HeaderChainStore {
         #[cfg(test)]
         if hash.is_none() {
             return Ok(self
-                .all_nodes()?
+                .all_header_nodes()?
                 .into_iter()
                 .find(|node| node.height == height)
                 .map(|node| node.hash));
@@ -4083,7 +4094,7 @@ fn authenticated_context_headers(
 ) -> Result<Vec<HeaderValidationContextDisk>, StoreError> {
     let staged_parent = staged_nodes.and_then(|nodes| nodes.get(&parent).copied());
     let stored_parent = if staged_parent.is_none() {
-        store.node(parent)?
+        store.header_node(parent)?
     } else {
         None
     };
@@ -4103,7 +4114,7 @@ fn authenticated_context_headers(
             .map_err(|_| StoreError::Incoherent("validation context height underflow"))?;
         let staged_node = staged_nodes.and_then(|nodes| nodes.get(&current_hash).copied());
         let stored_node = if staged_node.is_none() {
-            store.node(current_hash)?
+            store.header_node(current_hash)?
         } else {
             None
         };

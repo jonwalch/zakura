@@ -10,7 +10,7 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, BodyValidationState, ConsensusInvalidTombstone, CounterExhausted,
+    AuxDelivery, BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted,
     EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, FinalityRecord,
     FinalitySource, Frontier, HeaderNode, MemHeaderStore, StoreError,
 };
@@ -30,20 +30,20 @@ pub trait StoreAuditRead {
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError>;
     /// Return complete singleton metadata from the same version.
     fn metadata(&self) -> Result<EngineMetadata, StoreError>;
-    /// Every node row, including disconnected rows.
-    fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError>;
-    /// Every append-only consensus-invalid tombstone, including pruned hashes.
-    fn all_consensus_invalid_tombstones(
+    /// Return every header-node row, including disconnected rows.
+    fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError>;
+    /// Return every append-only consensus-invalid body tombstone, including pruned hashes.
+    fn all_consensus_invalid_body_tombstones(
         &self,
-    ) -> Result<Vec<ConsensusInvalidTombstone>, StoreError>;
-    /// Return whether authoritative full-state evidence attests to this exact body state.
-    fn body_evidence_is_authoritative(
+    ) -> Result<Vec<ConsensusInvalidBodyTombstone>, StoreError>;
+    /// Return whether full-state evidence attests to this exact body-validation state.
+    fn full_state_attests_to_body_validation_state(
         &self,
-        hash: block::Hash,
-        state: &BodyValidationState,
+        header_hash: block::Hash,
+        body_validation_state: &BodyValidationState,
     ) -> Result<bool, StoreError>;
-    /// Every persisted parent/child edge.
-    fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError>;
+    /// Return every persisted header parent-child edge.
+    fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError>;
     /// Complete selected projection.
     fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError>;
     /// Complete verified projection.
@@ -80,9 +80,9 @@ pub enum AuditViolation {
     /// The audit found header validation state that contradicted deterministic header facts.
     HeaderValidation(block::Hash),
     /// The audit found a missing or contradictory permanent invalidity tombstone.
-    ConsensusInvalidTombstone(block::Hash),
+    ConsensusInvalidBodyTombstone(block::Hash),
     /// The audit found a body projection without exact full-state evidence authority.
-    BodyEvidenceAuthority(block::Hash),
+    BodyValidationEvidenceAuthority(block::Hash),
     /// The audit found an absent trust pin or an absent conflict reason.
     TrustPin(block::Height, block::Hash),
     /// The audit found authoritative reason roots that disagreed with node source rows.
@@ -127,14 +127,14 @@ pub enum RecoveryRepair {
 /// Exact source-derived state to install before startup publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryPlan {
-    /// Snapshot observed before repair.
+    /// Snapshot that recovery observed before repair.
     pub before: EngineSnapshot,
     /// Corrected metadata with counters advanced exactly once when required.
     pub metadata: EngineMetadata,
-    /// Nodes with reconstructed inherited eligibility caches.
-    pub nodes: Vec<HeaderNode>,
+    /// Header nodes with reconstructed inherited eligibility caches.
+    pub header_nodes: Vec<HeaderNode>,
     /// Complete expected adjacency index.
-    pub child_edges: Vec<(block::Hash, block::Hash)>,
+    pub header_child_edges: Vec<(block::Hash, block::Hash)>,
     /// Complete selected projection.
     pub selected_projection: Vec<Frontier>,
     /// Complete verified projection.
@@ -218,14 +218,14 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         violations.push(AuditViolation::Configuration);
     }
 
-    let mut source_nodes = store.all_nodes()?;
-    let tombstones = store.all_consensus_invalid_tombstones()?;
+    let mut source_nodes = store.all_header_nodes()?;
+    let tombstones = store.all_consensus_invalid_body_tombstones()?;
     let tombstones_by_hash: HashMap<_, _> = tombstones
         .iter()
         .map(|tombstone| (tombstone.hash, tombstone))
         .collect();
     if tombstones_by_hash.len() != tombstones.len() {
-        violations.push(AuditViolation::ConsensusInvalidTombstone(
+        violations.push(AuditViolation::ConsensusInvalidBodyTombstone(
             metadata.frontiers.finalized.hash,
         ));
     }
@@ -234,8 +234,10 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
             evidence: tombstone.evidence,
             rule: tombstone.rule.clone(),
         };
-        if !store.body_evidence_is_authoritative(tombstone.hash, &state)? {
-            violations.push(AuditViolation::BodyEvidenceAuthority(tombstone.hash));
+        if !store.full_state_attests_to_body_validation_state(tombstone.hash, &state)? {
+            violations.push(AuditViolation::BodyValidationEvidenceAuthority(
+                tombstone.hash,
+            ));
         }
     }
     source_nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
@@ -247,9 +249,10 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         if matches!(
             node.body_validation_state,
             BodyValidationState::Verified { .. } | BodyValidationState::ConsensusInvalid { .. }
-        ) && !store.body_evidence_is_authoritative(node.hash, &node.body_validation_state)?
+        ) && !store
+            .full_state_attests_to_body_validation_state(node.hash, &node.body_validation_state)?
         {
-            violations.push(AuditViolation::BodyEvidenceAuthority(node.hash));
+            violations.push(AuditViolation::BodyValidationEvidenceAuthority(node.hash));
         }
     }
     let by_hash: HashMap<_, _> = source_nodes.iter().map(|node| (node.hash, node)).collect();
@@ -282,7 +285,7 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
             (BodyValidationState::ConsensusInvalid { evidence, rule }, Some(tombstone))
                 if *evidence == tombstone.evidence && *rule == tombstone.rule => {}
             (BodyValidationState::ConsensusInvalid { .. }, _) | (_, Some(_)) => {
-                violations.push(AuditViolation::ConsensusInvalidTombstone(node.hash));
+                violations.push(AuditViolation::ConsensusInvalidBodyTombstone(node.hash));
             }
             (_, None) => {}
         }
@@ -317,41 +320,48 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         }
     }
 
-    let mut graph = MemHeaderStore::reconstruct(finalized, source_nodes.clone(), tombstones)
-        .map_err(|_| RecoveryFailure::Source {
-            violations: vec![AuditViolation::ProtectedPath(finalized.hash)],
-        })?;
+    let mut graph = MemHeaderStore::reconstruct(crate::HeaderGraphReconstruction::new(
+        finalized,
+        source_nodes.clone(),
+        tombstones,
+    ))
+    .map_err(|_| RecoveryFailure::Source {
+        violations: vec![AuditViolation::ProtectedPath(finalized.hash)],
+    })?;
     graph
-        .recompute_all_eligibility()
+        .recompute_all_header_eligibility()
         .map_err(|_| RecoveryFailure::Source {
             violations: vec![AuditViolation::ProtectedPath(finalized.hash)],
         })?;
-    let mut nodes: Vec<_> = graph.nodes().cloned().collect();
-    nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
-    let node_map: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node.clone())).collect();
-
-    let mut child_edges: Vec<_> = nodes
+    let mut header_nodes: Vec<_> = graph.header_nodes().cloned().collect();
+    header_nodes.sort_unstable_by_key(|header_node| (header_node.height, header_node.hash.0));
+    let header_nodes_by_hash: HashMap<_, _> = header_nodes
         .iter()
-        .filter(|node| node.hash != finalized.hash)
-        .map(|node| (node.parent_hash, node.hash))
+        .map(|header_node| (header_node.hash, header_node.clone()))
         .collect();
-    child_edges.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
-    let mut deferred_entries: Vec<_> = nodes
+
+    let mut header_child_edges: Vec<_> = header_nodes
         .iter()
-        .filter_map(|node| match node.validation {
+        .filter(|header_node| header_node.hash != finalized.hash)
+        .map(|header_node| (header_node.parent_hash, header_node.hash))
+        .collect();
+    header_child_edges.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+    let mut deferred_entries: Vec<_> = header_nodes
+        .iter()
+        .filter_map(|header_node| match header_node.validation {
             crate::HeaderValidationState::Valid => None,
-            crate::HeaderValidationState::DeferredUntil(until) => Some((until, node.hash)),
+            crate::HeaderValidationState::DeferredUntil(until) => Some((until, header_node.hash)),
         })
         .collect();
     deferred_entries.sort_unstable_by_key(|(until, hash)| (*until, hash.0));
-    if graph.eligible_tips().len() > config.limits.max_candidate_tips.get() {
+    if graph.eligible_header_tips().len() > config.limits.max_candidate_tips.get() {
         return Err(source_failure(AuditViolation::Limits));
     }
     let (selected_tip, selected_score) = graph
-        .select_header_best()
+        .select_best_header_chain()
         .map_err(|_| source_failure(AuditViolation::ProtectedPath(finalized.hash)))?;
-    let selected_projection = path_to(&node_map, finalized, selected_tip)?;
-    let verified_projection = verified_path(&node_map, &metadata)?;
+    let selected_projection = path_to(&header_nodes_by_hash, finalized, selected_tip)?;
+    let verified_projection = verified_path(&header_nodes_by_hash, &metadata)?;
 
     let mut repairs = BTreeSet::new();
     if trust_anchor_changed {
@@ -362,8 +372,8 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         repairs.insert(RecoveryRepair::DeferredIndex);
     }
     compare_by_key(
-        store.child_edges()?,
-        &child_edges,
+        store.header_child_edges()?,
+        &header_child_edges,
         |(parent, child)| (parent.0, child.0),
         RecoveryRepair::ChildIndex,
         &mut repairs,
@@ -384,18 +394,18 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
     if store.verified_projection()? != verified_projection {
         repairs.insert(RecoveryRepair::VerifiedProjection);
     }
-    if source_nodes != nodes {
+    if source_nodes != header_nodes {
         repairs.insert(RecoveryRepair::InheritedEligibility);
     }
-    let oldest_retained_height = nodes
+    let oldest_retained_height = header_nodes
         .iter()
-        .map(|node| node.height)
+        .map(|header_node| header_node.height)
         .min()
         .unwrap_or(finalized.height);
     if metadata.oldest_retained_height != oldest_retained_height {
         repairs.insert(RecoveryRepair::RetentionMetadata);
     }
-    let body_unavailable_alarm = match &node_map
+    let body_unavailable_alarm = match &header_nodes_by_hash
         .get(&selected_tip.hash)
         .ok_or_else(|| source_failure(AuditViolation::ProtectedPath(selected_tip.hash)))?
         .body_validation_state
@@ -428,8 +438,8 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
     Ok(RecoveryPlan {
         before,
         metadata,
-        nodes,
-        child_edges,
+        header_nodes,
+        header_child_edges,
         selected_projection,
         verified_projection,
         deferred_entries,
@@ -893,8 +903,8 @@ fn violation_key(violation: &AuditViolation) -> (u8, u32, [u8; 32]) {
         AuditViolation::Parent(hash) => (1, 0, hash.0),
         AuditViolation::Work(hash) => (2, 0, hash.0),
         AuditViolation::HeaderValidation(hash) => (3, 0, hash.0),
-        AuditViolation::ConsensusInvalidTombstone(hash) => (4, 0, hash.0),
-        AuditViolation::BodyEvidenceAuthority(hash) => (5, 0, hash.0),
+        AuditViolation::ConsensusInvalidBodyTombstone(hash) => (4, 0, hash.0),
+        AuditViolation::BodyValidationEvidenceAuthority(hash) => (5, 0, hash.0),
         AuditViolation::TrustPin(height, hash) => (6, height.0, hash.0),
         AuditViolation::EligibilityRoot(hash) => (7, 0, hash.0),
         AuditViolation::Auxiliary(hash) => (8, 0, hash.0),
@@ -955,19 +965,19 @@ mod tests {
             Ok(self.metadata.clone())
         }
 
-        fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
+        fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
             Ok(self.nodes.clone())
         }
 
-        fn all_consensus_invalid_tombstones(
+        fn all_consensus_invalid_body_tombstones(
             &self,
-        ) -> Result<Vec<ConsensusInvalidTombstone>, StoreError> {
+        ) -> Result<Vec<ConsensusInvalidBodyTombstone>, StoreError> {
             Ok(self
                 .nodes
                 .iter()
                 .filter_map(|node| match &node.body_validation_state {
                     BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                        Some(ConsensusInvalidTombstone {
+                        Some(ConsensusInvalidBodyTombstone {
                             hash: node.hash,
                             evidence: *evidence,
                             rule: rule.clone(),
@@ -978,7 +988,7 @@ mod tests {
                 .collect())
         }
 
-        fn body_evidence_is_authoritative(
+        fn full_state_attests_to_body_validation_state(
             &self,
             _hash: block::Hash,
             _state: &BodyValidationState,
@@ -986,7 +996,7 @@ mod tests {
             Ok(true)
         }
 
-        fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
+        fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
             Ok(self.children.clone())
         }
 
@@ -1277,7 +1287,7 @@ mod tests {
             .expect("an exact elapsed deferral is a reconstructible startup transition");
         assert!(plan.repairs.contains(&RecoveryRepair::ElapsedDeferrals));
         assert_eq!(
-            plan.nodes
+            plan.header_nodes
                 .iter()
                 .find(|node| node.hash == child_hash)
                 .expect("the child remains retained")

@@ -6,10 +6,10 @@ fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta(
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -17,13 +17,13 @@ fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta(
     let second = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x32);
     let selected = store
         .graph
-        .select_header_best()
+        .select_best_header_chain()
         .expect("the fixture has an eligible tip")
         .0;
     let losing = if selected == first { second } else { first };
     store
         .graph
-        .set_body_state(losing.hash, BodyValidationState::Unknown)
+        .set_body_validation_state(losing.hash, BodyValidationState::Unknown)
         .expect("the losing body remains unverified");
     synchronize_fixture(&mut store, anchor);
     let before = store.snapshot();
@@ -59,9 +59,9 @@ fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta(
             .checked_next()
             .expect("the fixture generation has capacity")
     );
-    let changed = plan
-        .projected
-        .node(losing.hash)
+    let projected_graph = projected_graph(&store.graph, &plan);
+    let changed = projected_graph
+        .header_node(losing.hash)
         .expect("the invalid losing node remains retained");
     assert_eq!(
         changed.body_validation_state,
@@ -79,7 +79,7 @@ fn transient_body_evidence_cannot_regress_a_verified_body() {
     let clock = ManualClock(Utc::now());
     store
         .graph
-        .set_body_state(
+        .set_body_validation_state(
             store.metadata.frontiers.verified_best.hash,
             BodyValidationState::Verified {
                 evidence: EvidenceId::from_digest([0xbf; 32]),
@@ -131,7 +131,7 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
     };
     store
         .graph
-        .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
         .expect("the selected fixture body exists");
     store.metadata.alarms.header_best_body_unavailable = Some(old);
     let updated = crate::BodyUnavailableSummary {
@@ -158,22 +158,23 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("a changed supplier set makes the persistent episode probeable");
+    let projected_graph = projected_graph(&store.graph, &plan);
     assert_eq!(plan.change_set.metadata.frontiers, store.metadata.frontiers);
     assert_eq!(
-        plan.projected
-            .node(selected.hash)
+        projected_graph
+            .header_node(selected.hash)
             .expect("the selected node remains retained")
             .body_validation_state,
         BodyValidationState::Unavailable(updated)
     );
     assert_eq!(
-        plan.projected
-            .node(selected.hash)
+        projected_graph
+            .header_node(selected.hash)
             .expect("the selected node remains retained")
             .eligibility,
         store
             .graph
-            .node(selected.hash)
+            .header_node(selected.hash)
             .expect("the selected fixture node exists")
             .eligibility
     );
@@ -210,7 +211,7 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     };
     store
         .graph
-        .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
         .expect("the selected fixture body exists");
     store.metadata.alarms.header_best_body_unavailable = Some(old);
     let apply = |availability| {

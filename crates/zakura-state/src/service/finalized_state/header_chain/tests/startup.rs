@@ -90,7 +90,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
         vec![anchor_frontier, Frontier::new(child.height, child.hash)]
     );
     assert!(matches!(
-        runtime.store.node(child.hash),
+        runtime.store.header_node(child.hash),
         Ok(Some(HeaderNode {
             body_validation_state: BodyValidationState::Verified { .. },
             ..
@@ -177,7 +177,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     assert_eq!(
         runtime
             .store
-            .all_nodes()
+            .all_header_nodes()
             .expect("the retained nodes are readable")
             .len(),
         1,
@@ -489,14 +489,14 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
         Ok(Some(anchor.hash))
     );
     assert_eq!(
-        runtime.store.child_edges(),
+        runtime.store.header_child_edges(),
         Ok(vec![(anchor.hash, child.hash)])
     );
     assert_eq!(runtime.store.deferred_entries(), Ok(Vec::new()));
     assert_eq!(
         runtime
             .store
-            .node(child.hash)
+            .header_node(child.hash)
             .expect("the repaired child decodes")
             .expect("the repaired child remains")
             .eligibility
@@ -562,6 +562,6 @@ fn startup_rejects_verified_projection_without_exact_body_authority() {
         store.startup(&engine_config),
         Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source {
             violations,
-        })) if violations.contains(&zakura_header_chain::AuditViolation::BodyEvidenceAuthority(anchor.hash))
+        })) if violations.contains(&zakura_header_chain::AuditViolation::BodyValidationEvidenceAuthority(anchor.hash))
     ));
 }

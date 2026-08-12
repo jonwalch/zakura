@@ -157,7 +157,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
     // Fork-aware header-chain engine v1
     HEADER_NODE_BY_HASH,
-    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
     HEADER_BODY_EVIDENCE_AUTHORITY,
     HEADER_CHILD,
     HEADER_SELECTED,
@@ -213,7 +213,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
 /// Fork-aware header-chain node rows keyed by canonical hash.
 pub const HEADER_NODE_BY_HASH: &str = "header_node_by_hash_v1";
 /// Append-only consensus-invalid body evidence keyed by canonical header hash.
-pub const HEADER_CONSENSUS_INVALID_TOMBSTONE: &str = "header_consensus_invalid_tombstone_v1";
+pub const HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE: &str = "header_consensus_invalid_tombstone_v1";
 /// Durable full-state authority for verified and consensus-invalid body projections.
 pub const HEADER_BODY_EVIDENCE_AUTHORITY: &str = "header_body_evidence_authority_v1";
 /// Parent/child adjacency index.

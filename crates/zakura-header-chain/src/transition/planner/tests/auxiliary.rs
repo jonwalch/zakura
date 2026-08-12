@@ -59,10 +59,10 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
 
     let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let easy = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -76,7 +76,7 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
             frontier: anchor,
             header: store
                 .graph
-                .node(anchor.hash)
+                .header_node(anchor.hash)
                 .expect("the anchor remains retained")
                 .header
                 .clone(),
@@ -286,7 +286,7 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
 
     let mut unretained_aux = vec![crate::AuxDelta::Put(Box::new(delivery))];
     unretained_aux.retain(|change| match change {
-        crate::AuxDelta::Put(delivery) => store.graph.node(delivery.header_hash).is_some(),
+        crate::AuxDelta::Put(delivery) => store.graph.header_node(delivery.header_hash).is_some(),
         crate::AuxDelta::Delete { .. } => true,
     });
     assert!(

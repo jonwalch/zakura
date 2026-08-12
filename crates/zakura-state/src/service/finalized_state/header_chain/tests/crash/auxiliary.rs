@@ -209,7 +209,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
         let child_node = observation
             .reopened
             .store
-            .node(child.hash)
+            .header_node(child.hash)
             .expect("the selected repair node read succeeds")
             .expect("the selected repair target remains retained");
         assert_eq!(
@@ -251,7 +251,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
         let reopened_child = observation
             .reopened
             .store
-            .node(child.hash)
+            .header_node(child.hash)
             .expect("the reopened selected repair node read succeeds")
             .expect("the reopened selected repair target remains retained");
         assert_eq!(
@@ -495,7 +495,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         let current_node = observation
             .reopened
             .store
-            .node(current.hash)
+            .header_node(current.hash)
             .expect("the auxiliary header node read succeeds")
             .expect("the auxiliary header remains retained");
         assert_eq!(
@@ -695,7 +695,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             observation
                 .reopened
                 .store
-                .node(anchor.hash)
+                .header_node(anchor.hash)
                 .expect("the rejection anchor node read succeeds")
                 .expect("the rejection anchor remains retained")
                 .aux_delivery_ids,

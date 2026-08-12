@@ -356,7 +356,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
             observation
                 .reopened
                 .store
-                .node(child.hash)
+                .header_node(child.hash)
                 .expect("the reopened child row read succeeds")
                 .is_some(),
             committed,

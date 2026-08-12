@@ -95,7 +95,7 @@ impl HeaderChainEngine {
         verified: Vec<Frontier>,
         deliveries: impl IntoIterator<Item = AuxDelivery>,
     ) -> Result<Self, EngineHydrationError> {
-        if graph.finalized() != metadata.frontiers.finalized {
+        if graph.finalized_frontier() != metadata.frontiers.finalized {
             return Err(EngineHydrationError::Incoherent(
                 "graph finality disagrees with metadata",
             ));
@@ -114,7 +114,7 @@ impl HeaderChainEngine {
                 "headers-only verified projection extends past finality",
             ));
         }
-        let (selected_frontier, score) = graph.select_header_best()?;
+        let (selected_frontier, score) = graph.select_best_header_chain()?;
         if selected_frontier != metadata.frontiers.header_best
             || score != metadata.header_best_score
         {
@@ -126,11 +126,12 @@ impl HeaderChainEngine {
         let mut aux_deliveries: HashMap<_, Vec<_>> = HashMap::new();
         let mut delivery_ids = HashSet::new();
         for delivery in deliveries {
-            let node = graph
-                .node(delivery.header_hash)
-                .ok_or(EngineHydrationError::Incoherent(
-                    "auxiliary delivery has no retained header",
-                ))?;
+            let node =
+                graph
+                    .header_node(delivery.header_hash)
+                    .ok_or(EngineHydrationError::Incoherent(
+                        "auxiliary delivery has no retained header",
+                    ))?;
             if !delivery_ids.insert(delivery.delivery_id)
                 || !node.aux_delivery_ids.contains(&delivery.delivery_id)
             {
@@ -143,7 +144,7 @@ impl HeaderChainEngine {
                 .or_default()
                 .push(delivery);
         }
-        for node in graph.nodes() {
+        for node in graph.header_nodes() {
             if node.aux_delivery_ids.iter().any(|delivery_id| {
                 !aux_deliveries
                     .get(&node.hash)
@@ -298,7 +299,7 @@ fn verify_projection(
     tip: Frontier,
     require_verified_bodies: bool,
 ) -> Result<(), EngineHydrationError> {
-    if projection.first().copied() != Some(graph.finalized())
+    if projection.first().copied() != Some(graph.finalized_frontier())
         || projection.last().copied() != Some(tip)
     {
         return Err(EngineHydrationError::Incoherent(
@@ -308,13 +309,13 @@ fn verify_projection(
 
     for frontier in projection {
         let node = graph
-            .node(frontier.hash)
+            .header_node(frontier.hash)
             .filter(|node| node.height == frontier.height)
             .ok_or(EngineHydrationError::Incoherent(
                 "projection frontier height disagrees with graph",
             ))?;
         if require_verified_bodies
-            && *frontier != graph.finalized()
+            && *frontier != graph.finalized_frontier()
             && !matches!(
                 node.body_validation_state,
                 crate::BodyValidationState::Verified { .. }
@@ -329,7 +330,7 @@ fn verify_projection(
     for pair in projection.windows(2) {
         if pair[1].height.0 != pair[0].height.0 + 1
             || graph
-                .node(pair[1].hash)
+                .header_node(pair[1].hash)
                 .is_none_or(|node| node.parent_hash != pair[0].hash)
         {
             return Err(EngineHydrationError::Incoherent(
@@ -456,7 +457,7 @@ mod tests {
     #[test]
     fn projection_validation_accepts_only_a_contiguous_graph_path() {
         let (graph, child) = graph_with_child();
-        let anchor = graph.finalized();
+        let anchor = graph.finalized_frontier();
         assert_eq!(
             verify_projection(&graph, &[anchor, child], child, false),
             Ok(())

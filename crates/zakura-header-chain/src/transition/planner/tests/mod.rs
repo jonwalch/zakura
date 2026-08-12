@@ -56,7 +56,9 @@ impl TestStore {
             CheckpointSet::default(),
         )
         .expect("the fixture configuration is coherent");
-        let score = graph.score(frontier.hash).expect("the anchor is retained");
+        let score = graph
+            .header_chain_score(frontier.hash)
+            .expect("the anchor is retained");
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion(1),
             mode,
@@ -119,12 +121,14 @@ impl TestStore {
     }
 
     fn commit(&mut self, plan: &TransitionPlan) {
-        for node in self.graph.nodes() {
+        for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
         }
-        self.graph = plan.projected.clone();
-        for node in self.graph.nodes() {
+        self.graph
+            .apply_delta(plan.graph_delta())
+            .expect("the verified transition delta applies to its base graph");
+        for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
         }
@@ -157,7 +161,7 @@ impl TestStore {
         while predecessors.len() < required {
             let (height, header) = self
                 .graph
-                .node(hash)
+                .header_node(hash)
                 .map(|node| (node.height, node.header.clone()))
                 .or_else(|| self.context_archive.get(&hash).cloned())
                 .expect("the test archive retains every contextual predecessor");
@@ -174,6 +178,14 @@ impl TestStore {
             self.lease.trust_anchor_digest(),
         );
     }
+}
+
+fn projected_graph(base_graph: &MemHeaderStore, plan: &TransitionPlan) -> MemHeaderStore {
+    let mut projected_graph = base_graph.clone();
+    projected_graph
+        .apply_delta(plan.graph_delta())
+        .expect("the planned graph transition applies to its base graph");
+    projected_graph
 }
 
 struct ManualClock(DateTime<Utc>);
@@ -405,7 +417,7 @@ fn assert_next_child_commits(
     assert_eq!(
         committed
             .graph
-            .node(child)
+            .header_node(child)
             .expect("the committed next child is retained")
             .parent_hash,
         expected_parent.hash
@@ -448,11 +460,11 @@ fn insert_verified_branch(
 fn synchronize_fixture(store: &mut TestStore, verified_tip: Frontier) {
     store
         .graph
-        .recompute_all_eligibility()
+        .recompute_all_header_eligibility()
         .expect("the fixture eligibility cache recomputes");
     let header_best = store
         .graph
-        .select_header_best()
+        .select_best_header_chain()
         .expect("the fixture has an eligible tip")
         .0;
     store.selected = path(&store.graph, header_best).expect("the selected path is retained");
@@ -461,7 +473,7 @@ fn synchronize_fixture(store: &mut TestStore, verified_tip: Frontier) {
     store.metadata.frontiers.verified_best = verified_tip;
     store.metadata.header_best_score = store
         .graph
-        .score(header_best.hash)
+        .header_chain_score(header_best.hash)
         .expect("the selected score is exact");
 }
 
@@ -493,7 +505,7 @@ fn operator_reconsider(
     id: crate::OperatorInvalidationId,
     evidence: u8,
 ) -> TransitionRequest {
-    let invalidation_evidence = store.graph.node(target).and_then(|node| {
+    let invalidation_evidence = store.graph.header_node(target).and_then(|node| {
         node.eligibility
             .direct_reasons
             .iter()

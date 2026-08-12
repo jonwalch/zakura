@@ -220,7 +220,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
     store
         .initialize(metadata.clone(), anchor.clone())
         .expect("an empty header schema initializes atomically");
-    assert_eq!(store.node(anchor.hash), Ok(Some(anchor.clone())));
+    assert_eq!(store.header_node(anchor.hash), Ok(Some(anchor.clone())));
     assert_eq!(store.selected_hash(anchor.height), Ok(Some(anchor.hash)));
     assert_eq!(store.verified_hash(anchor.height), Ok(Some(anchor.hash)));
     let (runtime, startup) = store
@@ -277,7 +277,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
         Some(availability)
     );
     assert!(matches!(
-        runtime.store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body_validation_state,
+        runtime.store.header_node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body_validation_state,
         BodyValidationState::Unavailable(summary)
             if summary == availability
     ));
@@ -314,7 +314,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
     assert!(matches!(
         reopened
             .store
-            .node(anchor.hash)
+            .header_node(anchor.hash)
             .expect("the reopened node row decodes")
             .expect("the reopened anchor exists")
             .body_validation_state,
@@ -382,7 +382,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
     let changes = ChangeSet {
         put_nodes: vec![anchor],
         delete_nodes: Vec::new(),
-        put_consensus_invalid_tombstones: Vec::new(),
+        put_consensus_invalid_body_tombstones: Vec::new(),
         index_changes: zakura_header_chain::IndexChanges::default(),
         selected_projection: zakura_header_chain::ProjectionDelta::default(),
         verified_projection: zakura_header_chain::ProjectionDelta::default(),
@@ -696,7 +696,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
     assert_eq!(
         runtime
             .store
-            .node(anchor.hash)
+            .header_node(anchor.hash)
             .expect("the rebased anchor row decodes")
             .expect("the rebased anchor remains")
             .work_coordinate(),
@@ -713,7 +713,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
     assert_eq!(
         reopened
             .store
-            .node(child.hash)
+            .header_node(child.hash)
             .expect("the rebased child row decodes")
             .expect("the rebased child remains")
             .work_coordinate()
@@ -847,7 +847,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     assert_eq!(
         runtime
             .store
-            .all_nodes()
+            .all_header_nodes()
             .expect("the retained graph is readable"),
         vec![anchor]
     );
@@ -1111,7 +1111,7 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
         "already admitted checkpoint headers must not rebuild predecessor leases per block"
     );
     assert!(
-        implementation.contains("transition_engine.graph().node(header.hash).is_some()"),
+        implementation.contains("transition_engine.graph().header_node(header.hash).is_some()"),
         "the predecessor-lease fast path must be justified by the coherent retained graph"
     );
 }

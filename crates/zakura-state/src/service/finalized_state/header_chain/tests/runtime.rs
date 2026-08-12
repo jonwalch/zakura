@@ -532,7 +532,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     };
     let mut child_node = runtime
         .store
-        .node(child.hash)
+        .header_node(child.hash)
         .expect("the selected child row decodes")
         .expect("the selected child is retained");
     child_node.aux_delivery_ids.push(delivery.delivery_id);

@@ -6,17 +6,23 @@ use super::*;
 fn operator_invalidation_promotes_alternate_and_preserves_nested_reasons() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
     let left = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x11);
     let right = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x22);
-    let (winner, loser) = if store.graph.score(left.hash).expect("left score exists")
-        > store.graph.score(right.hash).expect("right score exists")
+    let (winner, loser) = if store
+        .graph
+        .header_chain_score(left.hash)
+        .expect("left score exists")
+        > store
+            .graph
+            .header_chain_score(right.hash)
+            .expect("right score exists")
     {
         (left, right)
     } else {
@@ -63,9 +69,9 @@ fn operator_invalidation_promotes_alternate_and_preserves_nested_reasons() {
         reconsider_first.change_set.metadata.frontiers.verified_best,
         loser
     );
-    let winner_node = reconsider_first
-        .projected_graph()
-        .node(winner.hash)
+    let reconsidered_graph = projected_graph(&store.graph, &reconsider_first);
+    let winner_node = reconsidered_graph
+        .header_node(winner.hash)
         .expect("the losing node remains retained");
     assert!(!winner_node.eligibility.direct_reasons.iter().any(
         |reason| matches!(reason, EligibilityReason::OperatorInvalid { id, .. } if *id == first_id)
@@ -111,10 +117,10 @@ fn operator_reconsider_restores_shorter_higher_work_verified_branch() {
 
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let easy = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -126,8 +132,14 @@ fn operator_reconsider_restores_shorter_higher_work_verified_branch() {
     let longer = insert_verified_branch(&mut store.graph, anchor, 2, easy, 0x41);
     let shorter = insert_verified_branch(&mut store.graph, anchor, 1, hard, 0x42);
     assert!(
-        store.graph.score(shorter.hash).expect("short score exists")
-            > store.graph.score(longer.hash).expect("long score exists")
+        store
+            .graph
+            .header_chain_score(shorter.hash)
+            .expect("short score exists")
+            > store
+                .graph
+                .header_chain_score(longer.hash)
+                .expect("long score exists")
     );
     synchronize_fixture(&mut store, shorter);
     let id = crate::OperatorInvalidationId::new([3; 16]);
@@ -168,10 +180,10 @@ fn operator_reconsider_restores_shorter_higher_work_verified_branch() {
 fn replay_identity_is_domain_payload_and_authority_bound() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -248,10 +260,10 @@ fn full_state_authority_is_bound_to_the_complete_event_payload() {
 
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -293,10 +305,10 @@ fn full_state_authority_is_bound_to_the_complete_event_payload() {
 fn old_reconsideration_cannot_remove_a_new_invalidation_episode() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -336,9 +348,9 @@ fn old_reconsideration_cannot_remove_a_new_invalidation_episode() {
     .expect("old reconsideration evidence has no effect on the new episode");
 
     assert!(replay.is_no_change());
-    assert!(replay
-        .projected_graph()
-        .node(tip.hash)
+    let replayed_graph = projected_graph(&store.graph, &replay);
+    assert!(replayed_graph
+        .header_node(tip.hash)
         .expect("the target remains retained")
         .eligibility
         .direct_reasons
@@ -356,10 +368,10 @@ fn old_reconsideration_cannot_remove_a_new_invalidation_episode() {
 fn invalidating_verified_path_preserves_independent_header_best() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
-    let anchor = store.graph.finalized();
+    let anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -372,7 +384,7 @@ fn invalidating_verified_path_preserves_independent_header_best() {
     {
         store
             .graph
-            .set_body_state(frontier.hash, BodyValidationState::Unknown)
+            .set_body_validation_state(frontier.hash, BodyValidationState::Unknown)
             .expect("the independent candidate deliberately has no verified body");
     }
     synchronize_fixture(&mut store, verified_tip);
@@ -424,7 +436,7 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
     };
     store
         .graph
-        .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
         .expect("the selected fixture body exists");
     store.metadata.alarms.header_best_body_unavailable = Some(old);
     let fresh = crate::BodyUnavailableSummary {
@@ -450,6 +462,7 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("an authenticated operator can restart the same supplier set");
+    let projected_graph = projected_graph(&store.graph, &plan);
     assert_eq!(plan.change_set.metadata.frontiers, store.metadata.frontiers);
     assert_eq!(
         plan.change_set.metadata.header_generation,
@@ -460,8 +473,8 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
         store.metadata.verified_generation
     );
     assert_eq!(
-        plan.projected
-            .node(selected.hash)
+        projected_graph
+            .header_node(selected.hash)
             .expect("the selected node remains retained")
             .body_validation_state,
         BodyValidationState::Unavailable(fresh)
@@ -481,7 +494,7 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
     )
     .expect("the exact operator evidence replays idempotently");
     assert!(replay.is_no_change());
-    assert_eq!(replay.graph_delta, crate::graph::GraphDelta::default());
+    assert!(replay.graph_delta.is_empty());
 }
 
 #[test]
@@ -499,7 +512,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     };
     store
         .graph
-        .set_body_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
         .expect("the selected fixture body exists");
     store.metadata.alarms.header_best_body_unavailable = Some(old);
     let fresh = crate::BodyUnavailableSummary {
@@ -545,7 +558,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     ));
     store
         .graph
-        .set_body_state(selected.hash, BodyValidationState::Unknown)
+        .set_body_validation_state(selected.hash, BodyValidationState::Unknown)
         .expect("the selected fixture body exists");
     let non_alarmed = apply_transition(
         &store,

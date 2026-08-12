@@ -176,7 +176,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
             let event_node = observation
                 .reopened
                 .store
-                .node(event_frontier.hash)
+                .header_node(event_frontier.hash)
                 .expect("the event node read succeeds");
             assert_eq!(event_node.is_some(), committed, "{target:?}, reset={reset}");
             if let Some(event_node) = event_node {
@@ -218,7 +218,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
                 observation
                     .reopened
                     .store
-                    .node(event_frontier.hash)
+                    .header_node(event_frontier.hash)
                     .expect("the reopened event node read succeeds")
                     .is_some(),
                 committed,
@@ -428,7 +428,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 observation
                     .reopened
                     .store
-                    .node(anchor.hash)
+                    .header_node(anchor.hash)
                     .expect("the retry node read succeeds")
                     .expect("the selected retry node remains retained")
                     .body_validation_state,
@@ -465,7 +465,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 observation
                     .reopened
                     .store
-                    .node(anchor.hash)
+                    .header_node(anchor.hash)
                     .expect("the reopened retry node read succeeds")
                     .expect("the reopened selected retry node remains retained")
                     .body_validation_state,
@@ -558,7 +558,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
             assert_eq!(
                 runtime
                     .store
-                    .node(child.hash)
+                    .header_node(child.hash)
                     .expect("the child node read succeeds")
                     .expect("the selected child is retained")
                     .body_validation_state,
@@ -684,7 +684,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
             let child_node = observation
                 .reopened
                 .store
-                .node(child.hash)
+                .header_node(child.hash)
                 .expect("the body-conclusion node read succeeds")
                 .expect("the body-conclusion child remains retained");
             let expected_body = if committed {
@@ -705,7 +705,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
             );
             if committed {
                 assert!(
-                    StoreAuditRead::body_evidence_is_authoritative(
+                    StoreAuditRead::full_state_attests_to_body_validation_state(
                         &observation.reopened.store,
                         child.hash,
                         &expected_body,
@@ -721,15 +721,15 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
             let tombstone = observation
                 .reopened
                 .store
-                .get_value::<zakura_header_chain::ConsensusInvalidTombstone>(
-                    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+                .get_value::<zakura_header_chain::ConsensusInvalidBodyTombstone>(
+                    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
                     child.hash.0,
                 )
                 .expect("the durable tombstone row decodes");
             assert_eq!(
                 tombstone,
                 (committed && consensus_invalid).then(|| {
-                    zakura_header_chain::ConsensusInvalidTombstone {
+                    zakura_header_chain::ConsensusInvalidBodyTombstone {
                         hash: child.hash,
                         evidence,
                         rule: rule.clone(),
@@ -754,7 +754,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
             let reopened_child = observation
                 .reopened
                 .store
-                .node(child.hash)
+                .header_node(child.hash)
                 .expect("the reopened body-conclusion node read succeeds")
                 .expect("the reopened body-conclusion child remains retained");
             assert_eq!(

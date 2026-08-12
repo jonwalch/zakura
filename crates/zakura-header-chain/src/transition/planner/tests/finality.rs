@@ -27,18 +27,18 @@ fn validation_lease_for(store: &TestStore, parent: Frontier) -> ValidationLease 
     loop {
         let node = store
             .graph
-            .node(current.hash)
+            .header_node(current.hash)
             .expect("the validation fixture path is retained");
         facts.push(HeaderContextFact {
             frontier: current,
             header: node.header.clone(),
         });
-        if current.height == store.graph.finalized().height {
+        if current.height == store.graph.finalized_frontier().height {
             break;
         }
         let parent_node = store
             .graph
-            .node(node.parent_hash)
+            .header_node(node.parent_hash)
             .expect("the validation fixture parent is retained");
         current = Frontier::new(parent_node.height, parent_node.hash);
     }
@@ -75,7 +75,7 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
         let authority = Authority;
-        let original_anchor = store.graph.finalized();
+        let original_anchor = store.graph.finalized_frontier();
         let prepared = batch(
             original_anchor,
             3,
@@ -210,11 +210,11 @@ fn header_insert_rebase_rejects_a_competing_finalized_branch() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let original_anchor = store.graph.finalized();
+    let original_anchor = store.graph.finalized_frontier();
     let held = insertion(&store, 2, EvidenceId::from_digest([0x91; 32]));
     let difficulty = store
         .graph
-        .node(original_anchor.hash)
+        .header_node(original_anchor.hash)
         .expect("the anchor is retained")
         .header
         .difficulty_threshold;
@@ -247,10 +247,10 @@ fn header_insert_rebase_preserves_a_retained_parent_after_new_finality() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let original_anchor = store.graph.finalized();
+    let original_anchor = store.graph.finalized_frontier();
     let difficulty = store
         .graph
-        .node(original_anchor.hash)
+        .header_node(original_anchor.hash)
         .expect("the anchor is retained")
         .header
         .difficulty_threshold;
@@ -317,10 +317,10 @@ fn finalization_and_replacement_match_serial_histories() {
     let (mut base, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let anchor = base.graph.finalized();
+    let anchor = base.graph.finalized_frontier();
     let easy = base
         .graph
-        .node(anchor.hash)
+        .header_node(anchor.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -334,7 +334,7 @@ fn finalization_and_replacement_match_serial_histories() {
     let shared_finalized = incumbent_path[1];
     let replacement = insert_verified_branch(&mut base.graph, shared_finalized, 1, hard, 0x62);
     base.graph
-        .set_body_state(replacement.hash, BodyValidationState::Unknown)
+        .set_body_validation_state(replacement.hash, BodyValidationState::Unknown)
         .expect("the replacement deliberately has no verified body");
     synchronize_fixture(&mut base, incumbent);
     assert_eq!(base.metadata.frontiers.header_best, replacement);
@@ -434,7 +434,7 @@ fn finalization_and_replacement_match_serial_histories() {
     finality_then_replacement.commit(&replacement_plan);
 
     let logical_state = |store: &TestStore| {
-        let mut nodes: Vec<_> = store.graph.nodes().cloned().collect();
+        let mut nodes: Vec<_> = store.graph.header_nodes().cloned().collect();
         nodes.sort_by_key(|node| node.hash.0);
         (
             store.snapshot(),
@@ -506,10 +506,10 @@ fn finality_atomic_prune_rebase_projection_generation() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
-    let old_finalized = store.graph.finalized();
+    let old_finalized = store.graph.finalized_frontier();
     let easy = store
         .graph
-        .node(old_finalized.hash)
+        .header_node(old_finalized.hash)
         .expect("the anchor exists")
         .header
         .difficulty_threshold;
@@ -535,12 +535,12 @@ fn finality_atomic_prune_rebase_projection_generation() {
     let before = store.snapshot();
     let retained_tip_coordinate = store
         .graph
-        .node(verified_tip.hash)
+        .header_node(verified_tip.hash)
         .expect("the retained tip exists")
         .work_coordinate();
     let new_anchor_coordinate = store
         .graph
-        .node(new_finalized.hash)
+        .header_node(new_finalized.hash)
         .expect("the new anchor exists")
         .work_coordinate();
 
@@ -682,7 +682,7 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
             hash: frontier.hash,
             header: store
                 .graph
-                .node(frontier.hash)
+                .header_node(frontier.hash)
                 .expect("path nodes exist")
                 .header
                 .clone(),
@@ -746,7 +746,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     let checkpoint = store.selected[1];
     let header = store
         .graph
-        .node(checkpoint.hash)
+        .header_node(checkpoint.hash)
         .expect("the checkpoint header was inserted")
         .header
         .clone();
@@ -786,13 +786,11 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
 
     let mut unverified = plan.clone();
     unverified.change_set.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
-    unverified.graph_delta.test_put_nodes_mut()[0].body_validation_state =
-        BodyValidationState::Unknown;
-    unverified
-        .projected
-        .test_corrupt_node(checkpoint.hash)
-        .expect("the projected checkpoint is retained")
-        .body_validation_state = BodyValidationState::Unknown;
+    crate::graph::test_support::mutate_updated_header(
+        &mut unverified.graph_delta,
+        checkpoint.hash,
+        |header_node| header_node.body_validation_state = BodyValidationState::Unknown,
+    );
     assert_eq!(
         verify_plan(&test_engine(&store), &unverified),
         Err(InvariantViolation::VerifiedProjection(checkpoint.hash))
@@ -809,10 +807,10 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         .index_changes
         .deleted
         .push(selected_tip.hash);
-    evicted_selected
-        .graph_delta
-        .test_delete_nodes_mut()
-        .push(selected_tip.hash);
+    crate::graph::test_support::add_deleted_header(
+        &mut evicted_selected.graph_delta,
+        selected_tip.hash,
+    );
     assert_eq!(
         verify_plan(&test_engine(&store), &evicted_selected),
         Err(InvariantViolation::SelectedProjection(selected_tip.hash))

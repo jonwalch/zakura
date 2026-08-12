@@ -342,14 +342,14 @@ mod tests {
     fn composite_key_discriminants_and_lengths_fail_closed() {
         use crate::service::finalized_state::{
             HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD,
-            HEADER_CONSENSUS_INVALID_TOMBSTONE, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
+            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
             HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH, HEADER_SELECTED,
             HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED, STATE_COLUMN_FAMILIES_IN_CODE,
         };
 
         let required = [
             HEADER_NODE_BY_HASH,
-            HEADER_CONSENSUS_INVALID_TOMBSTONE,
+            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
             HEADER_BODY_EVIDENCE_AUTHORITY,
             HEADER_CHILD,
             HEADER_SELECTED,
@@ -452,7 +452,7 @@ mod tests {
             .expect("the open RocksDB column-family manifest is readable");
         for expected in [
             crate::service::finalized_state::HEADER_NODE_BY_HASH,
-            crate::service::finalized_state::HEADER_CONSENSUS_INVALID_TOMBSTONE,
+            crate::service::finalized_state::HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
             crate::service::finalized_state::HEADER_BODY_EVIDENCE_AUTHORITY,
             crate::service::finalized_state::HEADER_CHILD,
             crate::service::finalized_state::HEADER_SELECTED,

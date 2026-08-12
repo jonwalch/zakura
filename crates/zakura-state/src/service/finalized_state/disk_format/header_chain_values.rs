@@ -17,7 +17,7 @@ use zakura_chain::{
 use zakura_header_chain::{
     AlarmSet, AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary,
     BodyValidationState, BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore,
-    ConsensusInvalidTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
+    ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
     EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
     HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
     HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
@@ -349,7 +349,7 @@ fn put_frontier(encoder: &mut Encoder, frontier: Frontier) {
     encoder.fixed(&frontier.hash.0);
 }
 
-impl FallibleDiskValue for ConsensusInvalidTombstone {
+impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
     type Error = HeaderChainValueError;
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error> {
@@ -390,9 +390,9 @@ impl FallibleDiskValue for ConsensusInvalidTombstone {
     }
 }
 
-/// Durable full-state evidence authority for one retained body projection.
+/// Durable full-state evidence authority for one retained body-validation projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeaderBodyEvidenceAuthorityDisk {
+pub enum FullStateBodyValidationEvidenceAuthorityDisk {
     /// Full state accepted the exact block hash under this evidence identity.
     Verified {
         /// Canonical block hash.
@@ -401,20 +401,23 @@ pub enum HeaderBodyEvidenceAuthorityDisk {
         evidence: EvidenceId,
     },
     /// Full state rejected the exact block hash under this evidence and rule.
-    ConsensusInvalid(ConsensusInvalidTombstone),
+    ConsensusInvalid(ConsensusInvalidBodyTombstone),
 }
 
-impl HeaderBodyEvidenceAuthorityDisk {
-    /// Build authority for a body state that requires full-state authentication.
-    pub fn from_domain(hash: block::Hash, state: &BodyValidationState) -> Option<Self> {
-        match state {
+impl FullStateBodyValidationEvidenceAuthorityDisk {
+    /// Build authority for a body-validation state that requires full-state authentication.
+    pub fn from_body_validation_state(
+        header_hash: block::Hash,
+        body_validation_state: &BodyValidationState,
+    ) -> Option<Self> {
+        match body_validation_state {
             BodyValidationState::Verified { evidence } => Some(Self::Verified {
-                hash,
+                hash: header_hash,
                 evidence: *evidence,
             }),
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                Some(Self::ConsensusInvalid(ConsensusInvalidTombstone {
-                    hash,
+                Some(Self::ConsensusInvalid(ConsensusInvalidBodyTombstone {
+                    hash: header_hash,
                     evidence: *evidence,
                     rule: rule.clone(),
                 }))
@@ -423,28 +426,34 @@ impl HeaderBodyEvidenceAuthorityDisk {
         }
     }
 
-    /// Return whether this authority attests to the exact domain body state.
-    pub fn attests(&self, hash: block::Hash, state: &BodyValidationState) -> bool {
-        match (self, state) {
+    /// Return whether this authority attests to the exact body-validation state.
+    pub fn attests_to_body_validation_state(
+        &self,
+        header_hash: block::Hash,
+        body_validation_state: &BodyValidationState,
+    ) -> bool {
+        match (self, body_validation_state) {
             (
                 Self::Verified {
                     hash: authority_hash,
                     evidence: authority_evidence,
                 },
                 BodyValidationState::Verified { evidence },
-            ) => *authority_hash == hash && authority_evidence == evidence,
+            ) => *authority_hash == header_hash && authority_evidence == evidence,
             (
                 Self::ConsensusInvalid(authority),
                 BodyValidationState::ConsensusInvalid { evidence, rule },
             ) => {
-                authority.hash == hash && authority.evidence == *evidence && authority.rule == *rule
+                authority.hash == header_hash
+                    && authority.evidence == *evidence
+                    && authority.rule == *rule
             }
             _ => false,
         }
     }
 }
 
-impl FallibleDiskValue for HeaderBodyEvidenceAuthorityDisk {
+impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
     type Error = HeaderChainValueError;
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error> {
@@ -487,7 +496,7 @@ impl FallibleDiskValue for HeaderBodyEvidenceAuthorityDisk {
                 let rule =
                     std::str::from_utf8(decoder.bounded("body_evidence_rule", MAX_RULE_ID_BYTES)?)
                         .map_err(|_| HeaderChainValueError::RuleId)?;
-                Self::ConsensusInvalid(ConsensusInvalidTombstone {
+                Self::ConsensusInvalid(ConsensusInvalidBodyTombstone {
                     hash,
                     evidence,
                     rule: BodyRuleId::new(rule),
@@ -695,7 +704,7 @@ impl FallibleDiskValue for HeaderEligibilityReasonDisk {
 
 /// Body state stored inside one node value.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeaderBodyStateDisk {
+pub enum HeaderBodyValidationStateDisk {
     /// No body conclusion.
     Unknown,
     /// Header/body commitments matched.
@@ -729,8 +738,8 @@ pub struct HeaderNodeDisk {
     pub deferred_until: Option<DateTime<Utc>>,
     /// Cached nearest ineligible ancestor.
     pub inherited_from: Option<block::Hash>,
-    /// Body evidence state.
-    pub body: HeaderBodyStateDisk,
+    /// Body-validation state.
+    pub body_validation_state: HeaderBodyValidationStateDisk,
     /// Bounded hash-keyed auxiliary delivery IDs.
     pub aux_delivery_ids: Vec<EvidenceId>,
 }
@@ -738,17 +747,23 @@ pub struct HeaderNodeDisk {
 impl HeaderNodeDisk {
     /// Convert one domain node into its version-one durable representation.
     pub fn from_domain(node: &HeaderNode) -> Self {
-        let body = match &node.body_validation_state {
-            BodyValidationState::Unknown => HeaderBodyStateDisk::Unknown,
-            BodyValidationState::CommitmentMatched => HeaderBodyStateDisk::CommitmentMatched,
-            BodyValidationState::Verified { evidence } => HeaderBodyStateDisk::Verified(*evidence),
+        let body_validation_state = match &node.body_validation_state {
+            BodyValidationState::Unknown => HeaderBodyValidationStateDisk::Unknown,
+            BodyValidationState::CommitmentMatched => {
+                HeaderBodyValidationStateDisk::CommitmentMatched
+            }
+            BodyValidationState::Verified { evidence } => {
+                HeaderBodyValidationStateDisk::Verified(*evidence)
+            }
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                HeaderBodyStateDisk::ConsensusInvalid {
+                HeaderBodyValidationStateDisk::ConsensusInvalid {
                     evidence: *evidence,
                     rule: rule.as_str().to_owned(),
                 }
             }
-            BodyValidationState::Unavailable(summary) => HeaderBodyStateDisk::Unavailable(*summary),
+            BodyValidationState::Unavailable(summary) => {
+                HeaderBodyValidationStateDisk::Unavailable(*summary)
+            }
         };
         Self {
             header: node.header.clone(),
@@ -763,7 +778,7 @@ impl HeaderNodeDisk {
                 HeaderValidationState::DeferredUntil(until) => Some(until),
             },
             inherited_from: node.eligibility.inherited_from,
-            body,
+            body_validation_state,
             aux_delivery_ids: node.aux_delivery_ids.clone(),
         }
     }
@@ -779,17 +794,23 @@ impl HeaderNodeDisk {
             .to_work()
             .filter(|work| work.as_u256() == self.block_work)
             .ok_or(HeaderChainValueError::Header)?;
-        let body = match self.body {
-            HeaderBodyStateDisk::Unknown => BodyValidationState::Unknown,
-            HeaderBodyStateDisk::CommitmentMatched => BodyValidationState::CommitmentMatched,
-            HeaderBodyStateDisk::Verified(evidence) => BodyValidationState::Verified { evidence },
-            HeaderBodyStateDisk::ConsensusInvalid { evidence, rule } => {
+        let body_validation_state = match self.body_validation_state {
+            HeaderBodyValidationStateDisk::Unknown => BodyValidationState::Unknown,
+            HeaderBodyValidationStateDisk::CommitmentMatched => {
+                BodyValidationState::CommitmentMatched
+            }
+            HeaderBodyValidationStateDisk::Verified(evidence) => {
+                BodyValidationState::Verified { evidence }
+            }
+            HeaderBodyValidationStateDisk::ConsensusInvalid { evidence, rule } => {
                 BodyValidationState::ConsensusInvalid {
                     evidence,
                     rule: BodyRuleId::new(rule),
                 }
             }
-            HeaderBodyStateDisk::Unavailable(summary) => BodyValidationState::Unavailable(summary),
+            HeaderBodyValidationStateDisk::Unavailable(summary) => {
+                BodyValidationState::Unavailable(summary)
+            }
         };
         HeaderNode::from_durable_parts(
             self.header,
@@ -806,7 +827,7 @@ impl HeaderNodeDisk {
                 direct_reasons: direct_reasons.into_iter().collect(),
                 inherited_from: self.inherited_from,
             },
-            body,
+            body_validation_state,
             self.aux_delivery_ids,
         )
         .map_err(|_| HeaderChainValueError::Header)
@@ -833,7 +854,7 @@ impl FallibleDiskValue for HeaderNodeDisk {
         encoder.optional(self.inherited_from, |encoder, hash| {
             encoder.fixed(&hash.0);
         });
-        put_body(&mut encoder, &self.body)?;
+        put_body_validation_state(&mut encoder, &self.body_validation_state)?;
         encoder.counted(
             "aux_delivery_ids",
             &self.aux_delivery_ids,
@@ -867,7 +888,7 @@ impl FallibleDiskValue for HeaderNodeDisk {
         let cumulative_work = U256::from_big_endian(&decoder.array::<32>()?);
         let deferred_until = decoder.optional(get_time)?;
         let inherited_from = decoder.optional(|decoder| decoder.array().map(block::Hash))?;
-        let body = get_body(&mut decoder)?;
+        let body_validation_state = get_body_validation_state(&mut decoder)?;
         let aux_delivery_ids =
             decoder.counted("aux_delivery_ids", MAX_AUX_DELIVERY_IDS, |decoder| {
                 decoder.array().map(EvidenceId::from_digest)
@@ -883,29 +904,29 @@ impl FallibleDiskValue for HeaderNodeDisk {
             cumulative_work,
             deferred_until,
             inherited_from,
-            body,
+            body_validation_state,
             aux_delivery_ids,
         })
     }
 }
 
-fn put_body(
+fn put_body_validation_state(
     encoder: &mut Encoder,
-    body: &HeaderBodyStateDisk,
+    body: &HeaderBodyValidationStateDisk,
 ) -> Result<(), HeaderChainValueError> {
     match body {
-        HeaderBodyStateDisk::Unknown => encoder.u8(0),
-        HeaderBodyStateDisk::CommitmentMatched => encoder.u8(1),
-        HeaderBodyStateDisk::Verified(evidence) => {
+        HeaderBodyValidationStateDisk::Unknown => encoder.u8(0),
+        HeaderBodyValidationStateDisk::CommitmentMatched => encoder.u8(1),
+        HeaderBodyValidationStateDisk::Verified(evidence) => {
             encoder.u8(2);
             encoder.fixed(&evidence.digest());
         }
-        HeaderBodyStateDisk::ConsensusInvalid { evidence, rule } => {
+        HeaderBodyValidationStateDisk::ConsensusInvalid { evidence, rule } => {
             encoder.u8(3);
             encoder.fixed(&evidence.digest());
             encoder.bounded("body_rule", rule.as_bytes(), MAX_RULE_ID_BYTES)?;
         }
-        HeaderBodyStateDisk::Unavailable(summary) => {
+        HeaderBodyValidationStateDisk::Unavailable(summary) => {
             encoder.u8(4);
             put_unavailable(encoder, *summary);
         }
@@ -913,20 +934,24 @@ fn put_body(
     Ok(())
 }
 
-fn get_body(decoder: &mut Decoder<'_>) -> Result<HeaderBodyStateDisk, HeaderChainValueError> {
+fn get_body_validation_state(
+    decoder: &mut Decoder<'_>,
+) -> Result<HeaderBodyValidationStateDisk, HeaderChainValueError> {
     match decoder.u8()? {
-        0 => Ok(HeaderBodyStateDisk::Unknown),
-        1 => Ok(HeaderBodyStateDisk::CommitmentMatched),
-        2 => Ok(HeaderBodyStateDisk::Verified(EvidenceId::from_digest(
-            decoder.array()?,
-        ))),
-        3 => Ok(HeaderBodyStateDisk::ConsensusInvalid {
+        0 => Ok(HeaderBodyValidationStateDisk::Unknown),
+        1 => Ok(HeaderBodyValidationStateDisk::CommitmentMatched),
+        2 => Ok(HeaderBodyValidationStateDisk::Verified(
+            EvidenceId::from_digest(decoder.array()?),
+        )),
+        3 => Ok(HeaderBodyValidationStateDisk::ConsensusInvalid {
             evidence: EvidenceId::from_digest(decoder.array()?),
             rule: std::str::from_utf8(decoder.bounded("body_rule", MAX_RULE_ID_BYTES)?)
                 .map_err(|_| HeaderChainValueError::RuleId)?
                 .to_owned(),
         }),
-        4 => Ok(HeaderBodyStateDisk::Unavailable(get_unavailable(decoder)?)),
+        4 => Ok(HeaderBodyValidationStateDisk::Unavailable(get_unavailable(
+            decoder,
+        )?)),
         value => Err(HeaderChainValueError::UnknownDiscriminant {
             field: "body_state",
             value,
@@ -1428,20 +1453,22 @@ mod tests {
                     .expect("valid fixture time"),
             ),
             inherited_from: Some(block::Hash([3; 32])),
-            body: HeaderBodyStateDisk::Unavailable(BodyUnavailableSummary {
-                started_at: Utc
-                    .timestamp_opt(30, 40)
-                    .single()
-                    .expect("valid fixture time"),
-                attempts: 1,
-                suppliers: 2,
-                supplier_set_digest: [7; 32],
-                alarmed: true,
-                next_probe_at: Utc
-                    .timestamp_opt(50, 60)
-                    .single()
-                    .expect("valid fixture time"),
-            }),
+            body_validation_state: HeaderBodyValidationStateDisk::Unavailable(
+                BodyUnavailableSummary {
+                    started_at: Utc
+                        .timestamp_opt(30, 40)
+                        .single()
+                        .expect("valid fixture time"),
+                    attempts: 1,
+                    suppliers: 2,
+                    supplier_set_digest: [7; 32],
+                    alarmed: true,
+                    next_probe_at: Utc
+                        .timestamp_opt(50, 60)
+                        .single()
+                        .expect("valid fixture time"),
+                },
+            ),
             aux_delivery_ids: vec![EvidenceId::from_digest([4; 32])],
         };
         let bytes = node.encode().expect("the fixture node encodes");
@@ -1669,7 +1696,7 @@ mod tests {
             Err(HeaderChainValueError::Trailing)
         );
         assert!(matches!(
-            get_body(&mut Decoder::new(&[9])),
+            get_body_validation_state(&mut Decoder::new(&[9])),
             Err(HeaderChainValueError::UnknownDiscriminant {
                 field: "body_state",
                 value: 9
@@ -1772,7 +1799,7 @@ mod tests {
             .expect("the persistent fixture reopens through raw RocksDB");
         for name in [
             crate::service::finalized_state::HEADER_NODE_BY_HASH,
-            crate::service::finalized_state::HEADER_CONSENSUS_INVALID_TOMBSTONE,
+            crate::service::finalized_state::HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
             crate::service::finalized_state::HEADER_BODY_EVIDENCE_AUTHORITY,
             crate::service::finalized_state::HEADER_CHILD,
             crate::service::finalized_state::HEADER_SELECTED,
