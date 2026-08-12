@@ -344,13 +344,22 @@ pub(super) fn apply_transition_engine(
         crate::AuxDelta::Put(delivery) => graph.view_header_node(delivery.header_hash).is_some(),
         crate::AuxDelta::Delete { .. } => true,
     });
-    for hash in &evicted {
-        for delivery in engine.aux_deliveries(*hash) {
-            aux_changes.push(crate::AuxDelta::Delete {
-                header_hash: *hash,
-                delivery_id: delivery.delivery_id,
-            });
-        }
+    let mut aux_deletes: Vec<_> = evicted
+        .iter()
+        .flat_map(|hash| {
+            engine
+                .aux_deliveries(*hash)
+                .iter()
+                .map(|delivery| (*hash, delivery.delivery_id))
+        })
+        .collect();
+    // HashSet iteration is nondeterministic; match adjacent ChangeSet ordering.
+    aux_deletes.sort_unstable_by_key(|(hash, delivery_id)| (hash.0, *delivery_id));
+    for (header_hash, delivery_id) in aux_deletes {
+        aux_changes.push(crate::AuxDelta::Delete {
+            header_hash,
+            delivery_id,
+        });
     }
     let plan = derive_plan(DerivePlanInputs {
         before,
@@ -1330,6 +1339,11 @@ fn apply_event<G: HeaderGraphEdit>(
                     "operator invalidation identity is not bound to its target",
                 ));
             }
+            if event.target == graph.view_finalized_frontier().hash {
+                return Err(TransitionFailure::InvalidEvidence(
+                    "operator invalidation cannot target the finalized anchor",
+                ));
+            }
             *operator_reason_changed = graph.edit_add_header_eligibility_reason(
                 event.target,
                 EligibilityReason::operator_invalid(event.target, event.id, event.evidence),
@@ -1731,17 +1745,27 @@ fn invariant_pins(context: &TransitionContext<'_>) -> Arc<[Frontier]> {
 }
 
 fn path<G: HeaderGraphView>(graph: &G, tip: Frontier) -> Result<Vec<Frontier>, TransitionFailure> {
+    let finalized = graph.view_finalized_frontier();
     let mut path = Vec::new();
     let mut current = tip;
     loop {
         path.push(current);
-        if current == graph.view_finalized_frontier() {
+        if current == finalized {
             break;
         }
         let node = graph
             .view_header_node(current.hash)
             .ok_or(GraphError::UnknownHeaderNode(current.hash))?;
-        current = Frontier::new(block::Height(current.height.0 - 1), node.parent_hash);
+        current = Frontier::new(
+            current
+                .height
+                .previous()
+                .map_err(|_| GraphError::FinalizedFrontierNotDescendant {
+                    current: finalized.hash,
+                    candidate: tip.hash,
+                })?,
+            node.parent_hash,
+        );
     }
     path.reverse();
     Ok(path)

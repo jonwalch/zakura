@@ -295,9 +295,15 @@ fn apply_transition(
         }
         _ => DurableTransitionFacts::None,
     };
-    engine
+    let plan = engine
         .apply(request, context, durable)
-        .map(crate::EngineTransition::into_plan)
+        .map(crate::EngineTransition::into_plan)?;
+    if let Err(error) = crate::verify_plan_production(&engine, &plan) {
+        panic!(
+            "production overlay and boundary-node verification must accept plans that pass the exhaustive verifier: {error:?}"
+        );
+    }
+    Ok(plan)
 }
 
 fn batch(
@@ -537,4 +543,23 @@ fn apply_projection(projection: &mut Vec<Frontier>, delta: &ProjectionDelta) {
         projection.retain(|frontier| frontier.height < height);
     }
     projection.extend(delta.put.iter().copied());
+}
+
+#[test]
+fn path_rejects_zero_height_tip_that_is_not_finalized() {
+    let (mut store, _) = TestStore::new(EngineMode::HeadersOnly);
+    let anchor = store.metadata.frontiers.finalized;
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let child = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0xa1);
+    let malformed = Frontier::new(block::Height::MIN, child.hash);
+
+    assert_eq!(
+        path(&store.graph, malformed),
+        Err(TransitionFailure::Graph(
+            GraphError::FinalizedFrontierNotDescendant {
+                current: anchor.hash,
+                candidate: child.hash,
+            }
+        ))
+    );
 }
