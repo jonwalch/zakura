@@ -63,19 +63,19 @@ pub enum DurableTransitionFacts {
 /// and publishes each verified transition.
 #[derive(Clone, Debug)]
 pub struct HeaderChainEngine {
-    // Full header graph
+    /// Complete retained header graph.
     graph: MemHeaderStore,
     metadata: EngineMetadata,
-    // Best header chain
+    /// Selected header path from finality to the selected tip.
     selected_projection: Vec<Frontier>,
-    // Header chain verified by block bodies
+    /// Body-verified path from finality to the verified tip.
     verified_projection: Vec<Frontier>,
-    // Auxiliary deliveries for retained headers
+    /// Auxiliary deliveries keyed by retained header hash.
     aux_deliveries: HashMap<block::Hash, Vec<AuxDelivery>>,
 }
 
 impl HeaderChainEngine {
-    /// Constructs an engine from state produced by a successful durable recovery audit.
+    /// The engine constructs coherent state from a successful durable recovery audit.
     ///
     /// Rechecks the coherence required for safe transition planning:
     /// - graph finality agrees with metadata;
@@ -306,7 +306,6 @@ fn verify_projection(
         ));
     }
 
-    // Verify that each frontier is a valid node in the graph and that the projection is contiguous.
     for frontier in projection {
         let node = graph
             .node(frontier.hash)
@@ -327,7 +326,6 @@ fn verify_projection(
         }
     }
 
-    // Verify that the projection is contiguous.
     for pair in projection.windows(2) {
         if pair[1].height.0 != pair[0].height.0 + 1
             || graph

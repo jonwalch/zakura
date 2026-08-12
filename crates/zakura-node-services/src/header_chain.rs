@@ -383,49 +383,60 @@ pub enum ApplyHeaderTargetOutcome {
     ResourceStalled(CommittedStallReceipt),
 }
 
-/// Header-chain operations needed by header-sync policy.
+/// Header-chain operations that header-sync policy requires.
 ///
-/// Each request and its typed reply share one future.
-/// Implementations own local deadlines and translations to backing service protocols.
+/// Each operation returns one typed future for its request and reply.
+/// An implementation enforces its local deadline.
+/// An implementation translates its backing service protocol into this contract.
 pub trait Port: Send + Sync + 'static {
-    /// Read one coherent selected-path continuation locator.
+    /// Return a coherent locator for the current selected path.
     fn continuation_locator(
         &self,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>>;
 
-    /// Resolve one exact selected-header auxiliary repair.
+    /// Resolve selected-path context for the auxiliary repair at `height`.
     fn vct_repair_context(
         &self,
         owner: BodyWorkOwner,
         height: block::Height,
     ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>>;
 
-    /// Acquire an immutable retained target path.
+    /// Retain the target path identified by `request`.
+    ///
+    /// An acquired reply pins the path until the caller releases it.
     fn acquire_header_path(
         &self,
         request: AcquirePath,
     ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>>;
 
-    /// Read one bounded page from an immutable retained target path.
+    /// Return one bounded page from a retained target path.
+    ///
+    /// The port returns [`ReadPathReply::Unavailable`] when the path is no longer retained.
     fn read_header_path(
         &self,
         path: RetainedHeaderPath,
         request: ReadPath,
     ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>>;
 
-    /// Idempotently release an immutable retained target path.
+    /// Release a retained target path.
+    ///
+    /// The port accepts repeated releases for the same path.
     fn release_header_path(
         &self,
         path: RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), PortError>>;
 
-    /// Validate and seal one complete target outside the serialized writer.
+    /// Validate and seal a complete target outside the serialized state writer.
+    ///
+    /// The port returns a target that only its issuing adapter can apply.
     fn prepare_header_target(
         &self,
         request: PrepareHeaderTarget,
     ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply>;
 
-    /// Atomically apply one sealed target.
+    /// Atomically apply a sealed target.
+    ///
+    /// The port returns the committed state result or the transition failure.
     fn apply_header_target(
         &self,
         target: PreparedHeaderTarget,
@@ -438,7 +449,7 @@ impl std::fmt::Debug for dyn Port {
     }
 }
 
-/// Nodes use this explicit unavailable port when they have no durable header-chain state.
+/// A node uses this port when it has no durable header-chain state.
 #[derive(Debug, Default)]
 pub struct UnavailablePort;
 

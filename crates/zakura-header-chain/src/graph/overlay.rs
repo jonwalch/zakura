@@ -34,10 +34,10 @@ impl OverlayTestStatistics {
     }
 }
 
-// Changes made by an overlay relative to the base graph.
+/// Changes that an overlay stages relative to its base graph.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GraphDelta {
-    // If None, the finalized frontier is unchanged.
+    /// New finality frontier, or `None` when the base finality frontier is unchanged.
     pub(crate) finalized: Option<Frontier>,
     pub(crate) put_nodes: Vec<HeaderNode>,
     pub(crate) delete_nodes: Vec<block::Hash>,
@@ -81,8 +81,7 @@ impl<'a> GraphOverlay<'a> {
         }
     }
 
-    /// Reconstructs the projected graph view represented by `delta` over `base`
-    /// without modifying the base store.
+    /// The overlay reconstructs `delta` over `base` without modifying the base store.
     pub(crate) fn from_delta(
         base: &'a MemHeaderStore,
         delta: &GraphDelta,
@@ -140,7 +139,7 @@ impl<'a> GraphOverlay<'a> {
         self.node_count
     }
 
-    /// Returns the node with the given hash, if it is retained.
+    /// The overlay returns the retained node with `hash`.
     pub(crate) fn node(&self, hash: block::Hash) -> Option<&HeaderNode> {
         if self.deletes.contains(&hash) {
             return None;
@@ -148,7 +147,9 @@ impl<'a> GraphOverlay<'a> {
         self.puts.get(&hash).or_else(|| self.base.nodes.get(&hash))
     }
 
-    /// Returns a mutable reference to the node with the given hash, creating it if it is not present.
+    /// The overlay returns a mutable retained node with `hash`.
+    ///
+    /// The overlay stages a copy when the base graph owns the node.
     pub(crate) fn node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
         if self.deletes.contains(&hash) {
             return Err(GraphError::UnknownNode(hash));
@@ -170,8 +171,9 @@ impl<'a> GraphOverlay<'a> {
             .expect("overlay node exists because it was staged above"))
     }
 
-    /// Iterates over all nodes visible through the overlay, excluding deleted
-    /// nodes and replacing base nodes with their staged versions.
+    /// The overlay iterates over its retained nodes.
+    ///
+    /// The iterator excludes deletions and replaces base nodes with staged nodes.
     pub(crate) fn nodes(&self) -> impl Iterator<Item = &HeaderNode> {
         self.base
             .nodes
@@ -186,12 +188,12 @@ impl<'a> GraphOverlay<'a> {
             )
     }
 
-    /// Returns an iterator over all hashes that are currently retained.
+    /// The overlay iterates over all retained hashes.
     pub(crate) fn retained_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
         self.nodes().map(|node| node.hash)
     }
 
-    /// Returns all hashes at the given height, including both base and staged nodes.
+    /// The overlay returns retained hashes at `height` in deterministic order.
     pub(crate) fn hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
         let mut hashes: HashSet<_> = self
             .base
@@ -213,7 +215,7 @@ impl<'a> GraphOverlay<'a> {
         hashes
     }
 
-    /// Returns all children of the given parent, including both base and staged nodes.
+    /// The overlay returns retained children of `parent` in deterministic order.
     pub(crate) fn children(&self, parent: block::Hash) -> Vec<block::Hash> {
         if self.node(parent).is_none() {
             return Vec::new();
@@ -250,12 +252,12 @@ impl<'a> GraphOverlay<'a> {
     /// from the parent. A consensus-invalid body-validation state makes the new
     /// header ineligible.
     ///
-    /// This method returns [`InsertResult::AlreadyPresent`] for an identical
-    /// existing header. It rejects conflicting duplicates, unknown parents,
-    /// height or work overflow, and invalid graph structure.
+    /// The overlay returns [`InsertResult::AlreadyPresent`] for an identical
+    /// retained header. The overlay rejects conflicting duplicates, unknown
+    /// parents, height or work overflow, and invalid graph structure.
     ///
-    /// This method does not perform header consensus or proof-of-work validation;
-    /// it records the caller-supplied validation result and work.
+    /// The overlay does not perform header consensus or proof-of-work validation.
+    /// The overlay records the caller-supplied validation result and work.
     pub(crate) fn insert(
         &mut self,
         header: Arc<block::Header>,
@@ -266,7 +268,6 @@ impl<'a> GraphOverlay<'a> {
     ) -> Result<InsertResult, GraphError> {
         let hash = header.hash();
 
-        // If already present, return the existing frontier.
         if let Some(existing) = self.node(hash) {
             if existing.header == header {
                 return Ok(InsertResult::AlreadyPresent(Frontier::new(
@@ -277,7 +278,6 @@ impl<'a> GraphOverlay<'a> {
             return Err(GraphError::ConflictingDuplicate(hash));
         }
 
-        // Ensure the parent is visible through the overlay.
         let parent_hash = header.previous_block_hash;
         let parent = self.node(parent_hash).ok_or(GraphError::UnknownParent {
             header: hash,
@@ -292,16 +292,13 @@ impl<'a> GraphOverlay<'a> {
         let inherited_from = (!parent.is_eligible()).then_some(parent_hash);
         let work_coordinate = parent.work_coordinate().checked_add(block_work)?;
 
-        // Collect the direct reasons into a set.
         let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
 
-        // If the header is valid, has no direct reasons, and no inherited eligibility, it is eligible.
         let eligible = validation == HeaderValidationState::Valid
             && direct_reasons.is_empty()
             && inherited_from.is_none()
             && !matches!(body, BodyValidationState::ConsensusInvalid { .. });
 
-        // Insert the node into the overlay.
         self.puts.insert(
             hash,
             HeaderNode {
@@ -321,22 +318,17 @@ impl<'a> GraphOverlay<'a> {
             },
         );
 
-        // Remove the parent from the eligible tips if it is no longer eligible.
         self.deletes.remove(&hash);
 
-        // Record the new child-parent edge.
         self.record_child_add(parent_hash, hash);
 
-        // Update the node count.
         self.node_count = self.node_count.saturating_add(1);
 
-        // If the header is eligible, add it to the eligible tips.
         if eligible {
             self.eligible_tips.remove(&parent_hash);
             self.eligible_tips.insert(hash);
         }
 
-        // Return the new frontier.
         Ok(InsertResult::Inserted(Frontier::new(height, hash)))
     }
 
@@ -554,7 +546,6 @@ impl<'a> GraphOverlay<'a> {
             });
         }
 
-        // Collect the removed hashes.
         let mut deleted = HashSet::new();
         for (ancestor, retained_child) in finalized_path {
             deleted.insert(ancestor);
@@ -593,7 +584,6 @@ impl<'a> GraphOverlay<'a> {
         self.delete_node(hash)
     }
 
-    // Include only nodes whose final projected value differs from the base.
     pub(crate) fn delta(&self) -> GraphDelta {
         let mut put_nodes: Vec<_> = self
             .puts
@@ -613,7 +603,7 @@ impl<'a> GraphOverlay<'a> {
         }
     }
 
-    /// Removes a node from the overlay.
+    /// The overlay stages removal of a leaf node.
     fn delete_node(&mut self, hash: block::Hash) -> Result<(), GraphError> {
         let node = self
             .node(hash)
@@ -630,14 +620,14 @@ impl<'a> GraphOverlay<'a> {
         Ok(())
     }
 
-    /// Propagates an eligibility change at `root` through its descendants.
+    /// The overlay propagates an eligibility change at `root` through its descendants.
     ///
-    /// The root's own validation or direct reasons must already be updated. This
-    /// recomputes each affected descendant's inherited ineligibility and refreshes
-    /// eligible-tip membership for changed nodes and their parents.
+    /// The caller must update the root validation state or direct reasons first.
+    /// The overlay recomputes inherited ineligibility for each affected descendant.
+    /// The overlay refreshes eligible-tip membership for changed nodes and parents.
     ///
-    /// Stops traversing a branch once its inherited state is unchanged, because no
-    /// descendant on that branch can be affected.
+    /// The overlay stops traversing a branch when the inherited state is unchanged.
+    /// No descendant on that branch can change after that point.
     fn recompute_descendant_eligibility(&mut self, root: block::Hash) -> Result<(), GraphError> {
         let mut affected = HashSet::from([root]);
         affected.insert(
@@ -650,21 +640,18 @@ impl<'a> GraphOverlay<'a> {
             #[cfg(test)]
             OverlayTestStatistics::increment(&self.test_statistics.eligibility_nodes_visited);
 
-            // Get the parent hash.
             let parent_hash = self
                 .node(hash)
                 .ok_or(GraphError::UnknownNode(hash))?
                 .parent_hash;
             affected.insert(parent_hash);
 
-            // Check if the parent is eligible.
             let inherited_from = (!self
                 .node(parent_hash)
                 .ok_or(GraphError::UnknownNode(parent_hash))?
                 .is_eligible())
             .then_some(parent_hash);
 
-            // Check if the node is already eligible.
             if self
                 .node(hash)
                 .is_some_and(|node| node.eligibility.inherited_from == inherited_from)
@@ -672,29 +659,26 @@ impl<'a> GraphOverlay<'a> {
                 continue;
             }
 
-            // Update the node's inherited eligibility.
             self.node_mut(hash)?.eligibility.inherited_from = inherited_from;
             affected.insert(hash);
 
-            // Add the children to the queue.
             queue.extend(self.children(hash));
         }
 
-        // Refresh the eligible tips for the affected nodes.
         for hash in affected {
             self.refresh_eligible_tip(hash);
         }
         Ok(())
     }
 
-    /// Checks if the given node has any eligible children.
+    /// The overlay checks whether `hash` has an eligible child.
     fn has_eligible_child(&self, hash: block::Hash) -> bool {
         self.children(hash)
             .into_iter()
             .any(|child| self.node(child).is_some_and(HeaderNode::is_eligible))
     }
 
-    /// Refreshes the eligible tips for the given node.
+    /// The overlay refreshes eligible-tip membership for `hash`.
     fn refresh_eligible_tip(&mut self, hash: block::Hash) {
         self.eligible_tips.remove(&hash);
         if self
@@ -705,7 +689,7 @@ impl<'a> GraphOverlay<'a> {
         }
     }
 
-    /// Records a new child-parent edge.
+    /// The overlay stages a new child-parent edge.
     fn record_child_add(&mut self, parent: block::Hash, child: block::Hash) {
         if self
             .remove_children
@@ -717,7 +701,7 @@ impl<'a> GraphOverlay<'a> {
         self.add_children.entry(parent).or_default().insert(child);
     }
 
-    /// Records a removed child-parent edge.
+    /// The overlay stages removal of a child-parent edge.
     fn record_child_remove(&mut self, parent: block::Hash, child: block::Hash) {
         if self
             .add_children

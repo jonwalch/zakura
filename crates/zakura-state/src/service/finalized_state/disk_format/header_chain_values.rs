@@ -905,9 +905,9 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
 }
 
 fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
-    // Preserve the version-one byte layout.
-    // Version one never consulted this field when deciding whether asynchronous work was current.
-    // The encoder now reserves the field as zero.
+    // The encoder preserves the version-one byte layout.
+    // Version one did not use this field to authorize asynchronous work.
+    // The encoder reserves the field as zero.
     encoder.u64(0);
     let header = owner.header_authority();
     encoder.u64(header.header_generation.get());
@@ -924,9 +924,9 @@ fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
 }
 
 fn get_owner(decoder: &mut Decoder<'_>) -> Result<HeaderSyncWorkOwner, HeaderChainValueError> {
-    // Legacy rows contain their former global state version here.
+    // Legacy rows store their former global state version here.
     // The state version did not authorize work.
-    // The decoder therefore accepts and discards it.
+    // The decoder accepts and discards the legacy value.
     let _reserved_state_version = decoder.u64()?;
     let header_generation = HeaderGeneration::new(decoder.u64()?);
     let verified_generation =

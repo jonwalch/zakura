@@ -451,8 +451,8 @@ mod tests {
     }
 
     #[test]
-    // AUD-09: enumerate every repair policy state to prove a generation change
-    // retires all old work, rather than sampling only the active state.
+    // The test enumerates each repair policy state.
+    // A generation change must retire all prior work.
     fn generation_change_retires_every_repair_state() {
         let snapshot = snapshot();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);

@@ -1159,10 +1159,10 @@ impl HeaderSyncReactor {
             staged_entry_count,
             "every staged header retains exactly one owned budget unit",
         );
-        // A target can be arbitrarily far ahead. Response staging remains bounded.
-        // Admit a validated prefix when the aggregate cap is full. Limit continuations
-        // to the remaining capacity. This limit prevents one peer from forcing small
-        // prefix commits by returning pages smaller than requested.
+        // A peer can advertise an arbitrarily distant target.
+        // The reactor bounds response staging by admitting a validated prefix at capacity.
+        // The reactor limits continuations to remaining capacity.
+        // This limit prevents a peer from forcing small prefix commits with short pages.
         let durable_prefix_full = self.committed_snapshot.as_ref().is_some_and(|snapshot| {
             Self::request_header_prefix_remaining(
                 snapshot,

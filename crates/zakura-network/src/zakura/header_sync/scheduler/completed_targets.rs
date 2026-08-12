@@ -84,8 +84,8 @@ mod tests {
     }
 
     #[test]
-    // AUD-08: generation and branch identity form the completion key.
-    // Changing either value prevents reuse until the new target completes.
+    // The completion key includes the generation and branch identity.
+    // A changed value prevents reuse until the new target completes.
     fn completed_target_is_scoped_to_exact_generation_and_branch() {
         let old_generation = HeaderGeneration::new(4);
         let new_generation = HeaderGeneration::new(5);

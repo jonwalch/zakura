@@ -548,7 +548,7 @@ impl Service for HeaderSyncService {
             .contains(&node_id)
         {
             // The reactor publishes the backed-off set without per-node deadlines.
-            // Re-offer after one conservative backoff window.
+            // The service re-offers each target after one conservative backoff window.
             return OrderedSessionDemand::RetryAt(
                 std::time::Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF,
             );

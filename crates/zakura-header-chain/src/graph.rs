@@ -169,14 +169,13 @@ pub enum InsertResult {
 #[derive(Clone, Debug)]
 pub struct MemHeaderStore {
     finalized: Frontier,
-    // Nodes by hash.
+    /// Retained header nodes keyed by consensus hash.
     nodes: HashMap<block::Hash, HeaderNode>,
-    // Children by parent hash.
+    /// Retained child hashes keyed by parent hash.
     children: HashMap<block::Hash, HashSet<block::Hash>>,
     heights: HashMap<block::Height, HashSet<block::Hash>>,
 
-    // A hash belongs to this when: a header is eligible (validated, no exclusion reasons, no ineligible ancestors)
-    // and has no eligible children.
+    /// Eligible headers without an eligible retained child.
     eligible_tips: HashSet<block::Hash>,
 }
 
@@ -278,7 +277,6 @@ impl MemHeaderStore {
         direct_reasons: impl IntoIterator<Item = EligibilityReason>,
         body: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
-        // Check if the header already exists in the graph. If so, return the existing frontier.
         let hash = header.hash();
         if let Some(existing) = self.nodes.get(&hash) {
             if existing.header == header {
@@ -642,19 +640,15 @@ impl MemHeaderStore {
         if !node.is_eligible() {
             return Err(GraphError::IneligibleFinalized(finalized.hash));
         }
-        // Visited hashes
         let mut retained = HashSet::new();
-        // Nodes to visit
         let mut pending = vec![finalized.hash];
 
-        // Traverse the graph in depth-first order, starting from the new finalized frontier.
         while let Some(hash) = pending.pop() {
             if retained.insert(hash) {
                 pending.extend(self.children(hash));
             }
         }
 
-        // Remove all nodes that were left behind the frontier after it moved.
         let mut deleted: Vec<_> = self
             .nodes
             .keys()
@@ -796,7 +790,7 @@ impl MemHeaderStore {
     pub(crate) fn apply_delta(&mut self, delta: &GraphDelta) -> Result<(), GraphError> {
         let indexes = self.derive_index_changes(delta)?;
 
-        // Apply deletions
+        // The store removes nodes that the transition deleted.
         for hash in &delta.delete_nodes {
             let node = self
                 .nodes
@@ -811,7 +805,7 @@ impl MemHeaderStore {
             }
         }
 
-        // Apply replacements
+        // The store installs staged node values after it validates their identities.
         for node in &delta.put_nodes {
             let old = self.nodes.insert(node.hash, node.clone());
             if old.is_none() {
@@ -822,7 +816,7 @@ impl MemHeaderStore {
             }
         }
 
-        // Apply child-edge removals and additions
+        // The store removes child edges for deleted nodes.
         for (parent, child) in &indexes.remove_children {
             if let Some(children) = self.children.get_mut(parent) {
                 children.remove(child);
@@ -832,12 +826,12 @@ impl MemHeaderStore {
             }
         }
 
-        // Apply child-edge additions
+        // The store adds child edges for inserted nodes.
         for (parent, child) in &indexes.add_children {
             self.children.entry(*parent).or_default().insert(*child);
         }
 
-        // Apply eligible-tip removals and additions
+        // The store updates eligible tips after it updates the node and child indexes.
         for hash in &indexes.remove_eligible_tips {
             self.eligible_tips.remove(hash);
         }

@@ -17,7 +17,7 @@ use super::super::{
 };
 
 /// Exact aggregate header count owned across receiving, preparation, and application.
-// `MAX_HS_RANGE` is 4,000 and therefore fits every supported `usize` target.
+// The conversion is safe because `MAX_HS_RANGE` is 4,000 on every supported target.
 pub(in crate::zakura::header_sync) const HEADER_CHUNK_BUDGET_CAPACITY_V1: usize =
     MAX_HS_RANGE as usize;
 
@@ -147,7 +147,7 @@ impl HeaderChunkBudget {
 
     fn publish(&self, usage: HeaderChunkUsage) {
         debug_assert!(usage.reserved.saturating_add(usage.owned) <= self.0.capacity);
-        // Counts are bounded by 4,000 and are exactly representable as f64.
+        // The conversion is exact because the count is at most 4,000.
         metrics::gauge!("sync.header.chunk_budget.capacity").set(self.0.capacity as f64);
         metrics::gauge!("sync.header.chunk_budget.reserved").set(usage.reserved as f64);
         metrics::gauge!("sync.header.chunk_budget.owned").set(usage.owned as f64);
@@ -836,7 +836,7 @@ impl PeerWorkQueue {
                 HeaderTargetPhase::Applying => applying = applying.saturating_add(count),
             }
         }
-        // Counts are bounded by 4,000 and are exactly representable as f64.
+        // The conversion is exact because the count is at most 4,000.
         metrics::gauge!("sync.header.chunk_budget.receiving").set(receiving as f64);
         metrics::gauge!("sync.header.chunk_budget.preparing").set(preparing as f64);
         metrics::gauge!("sync.header.chunk_budget.applying").set(applying as f64);

@@ -298,12 +298,10 @@ fn record_published_snapshot(snapshot: &EngineSnapshot) {
             .0
             .saturating_sub(snapshot.frontiers.verified_best.height.0),
     ));
-    // Metric gauges provide approximate floating-point telemetry.
-    // The durable counters remain exact.
+    // Metrics expose approximate floating-point generations.
+    // The durable counters retain the exact generation values.
     metrics::gauge!("sync.header_chain.generation.header")
         .set(snapshot.header_generation.get() as f64);
-    // Metric gauges provide approximate floating-point telemetry.
-    // The durable counters remain exact.
     metrics::gauge!("sync.header_chain.generation.verified")
         .set(snapshot.verified_generation.get() as f64);
     metrics::gauge!("sync.header_chain.alarm.resource_stalled").set(
@@ -540,10 +538,10 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn add_references(&mut self, cursor: &CanonicalHeaderPathCursor) {
-        // Retention walks from each target to finality.
-        // One target hash therefore protects the complete immutable suffix.
-        // Expanding a lease into every path hash makes this bounded owner list grow with chain
-        // length. The expanded list eventually rejects ordinary transitions.
+        // The retention algorithm walks from each target to finality.
+        // This registry counts the target hash because it protects the full immutable suffix.
+        // A path-hash entry would grow the bounded owner list with chain length.
+        // That growth would reject ordinary transitions.
         *self.reference_counts.entry(cursor.target.hash).or_default() += 1;
         self.references_dirty = true;
     }
@@ -1852,8 +1850,8 @@ impl HeaderChainRuntime {
                 .all(|header| transition_engine.graph().node(header.hash).is_some()),
             _ => false,
         };
-        // Native checkpoint growth normally promotes headers already admitted by header sync.
-        // Only a missing header can enter contextual header validation and require a lease.
+        // Header sync normally admits headers before native checkpoint growth promotes them.
+        // Only a missing header needs contextual validation and a validation lease.
         let validation_leases = if checkpoint_headers_are_retained {
             Vec::new()
         } else {
@@ -1882,10 +1880,10 @@ impl HeaderChainRuntime {
         let batch = self
             .store
             .batch_for_combined(first.change_set(), full_state_batch)?;
-        // The engine mutex provides the coherent read boundary.
-        // The publisher remains on the durable snapshot.
-        // These boundaries let the writer stage the first transition without exposing it.
-        // Any error before the atomic database write reloads the unchanged durable engine.
+        // The runtime uses the engine mutex as its coherent read boundary.
+        // The publisher continues to expose the durable snapshot.
+        // The writer can stage the first transition without exposing it.
+        // The runtime reloads the unchanged durable engine after an error before the atomic write.
         if let Err(error) = transition_engine.apply_committed(first) {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
@@ -3217,7 +3215,7 @@ impl HeaderChainStore {
             )?;
         }
 
-        // The adapter deliberately enqueues the singleton logical root last in the atomic batch.
+        // The adapter enqueues the singleton logical root last in the atomic batch.
         self.put_value(
             &mut batch,
             HEADER_ENGINE_META,
