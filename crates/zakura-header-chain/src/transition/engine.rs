@@ -175,17 +175,7 @@ impl HeaderChainEngine {
         durable: DurableTransitionFacts,
     ) -> Result<EngineTransition, TransitionFailure> {
         let plan = apply_transition_engine(self, &durable, request, context)?;
-        #[cfg(test)]
-        let projected = {
-            let mut projected = self.clone();
-            projected.apply_verified_plan(&plan)?;
-            projected
-        };
-        Ok(EngineTransition {
-            plan,
-            #[cfg(test)]
-            projected,
-        })
+        Ok(EngineTransition { plan })
     }
 
     /// Apply a verified graph delta after its durable batch has committed.
@@ -264,8 +254,6 @@ impl HeaderChainEngine {
 #[derive(Clone, Debug)]
 pub struct EngineTransition {
     plan: TransitionPlan,
-    #[cfg(test)]
-    projected: HeaderChainEngine,
 }
 
 impl EngineTransition {
@@ -287,12 +275,6 @@ impl EngineTransition {
     /// Return the classified transition cause.
     pub const fn cause(&self) -> crate::TransitionCause {
         self.plan.cause()
-    }
-
-    /// Consume the verified transition and return its complete projected engine state.
-    #[cfg(test)]
-    pub fn into_projected_engine(self) -> HeaderChainEngine {
-        self.projected
     }
 
     #[cfg(any(test, feature = "fuzz-impl"))]
@@ -406,5 +388,174 @@ fn apply_aux_delta(aux: &mut HashMap<block::Hash, Vec<AuxDelivery>>, changes: &[
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU64, sync::Arc};
+
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    use super::*;
+    use crate::{
+        AuxAuthentication, BodySizeHint, BodyValidationState, BranchId, HeaderGeneration,
+        HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId,
+    };
+
+    fn graph_with_child() -> (MemHeaderStore, Frontier) {
+        let genesis = regtest_genesis_block();
+        let anchor = Frontier::new(block::Height(0), genesis.hash());
+        let work = genesis
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the regtest target has valid work");
+        let mut graph = MemHeaderStore::new(anchor, genesis.header.clone(), work, work.as_u256())
+            .expect("the anchor is coherent");
+        let mut header = *genesis.header;
+        header.previous_block_hash = anchor.hash;
+        header.nonce = [1; 32].into();
+        let header = Arc::new(header);
+        let child_work = header
+            .difficulty_threshold
+            .to_work()
+            .expect("the child target has valid work");
+        let child = match graph
+            .insert(
+                header,
+                child_work,
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the child inserts")
+        {
+            InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        };
+        (graph, child)
+    }
+
+    fn delivery(
+        delivery_id: crate::EvidenceId,
+        header_hash: block::Hash,
+        source: SourceId,
+    ) -> AuxDelivery {
+        let owner = HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(0),
+            branch: BranchId::new(header_hash, header_hash),
+        }
+        .bind(
+            1,
+            NonZeroU64::new(1).expect("the fixture request ID is nonzero"),
+        );
+        AuxDelivery {
+            delivery_id,
+            header_hash,
+            source,
+            owner: owner.into(),
+            body_size: BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: AuxAuthentication::Unauthenticated,
+        }
+    }
+
+    #[test]
+    fn projection_validation_accepts_only_a_contiguous_graph_path() {
+        let (graph, child) = graph_with_child();
+        let anchor = graph.finalized();
+        assert_eq!(
+            verify_projection(&graph, &[anchor, child], child, false),
+            Ok(())
+        );
+        assert_eq!(
+            verify_projection(&graph, &[child], child, false),
+            Err(EngineHydrationError::Incoherent(
+                "projection endpoints disagree with metadata"
+            ))
+        );
+        assert_eq!(
+            verify_projection(&graph, &[anchor, child], anchor, false),
+            Err(EngineHydrationError::Incoherent(
+                "projection endpoints disagree with metadata"
+            ))
+        );
+        assert_eq!(
+            verify_projection(&graph, &[anchor, anchor, child], child, false),
+            Err(EngineHydrationError::Incoherent(
+                "projection is not a contiguous graph path"
+            ))
+        );
+        assert_eq!(
+            verify_projection(&graph, &[anchor, child], child, true),
+            Err(EngineHydrationError::Incoherent(
+                "verified projection contains an unverified body"
+            ))
+        );
+    }
+
+    #[test]
+    fn projection_delta_retires_prefix_and_replaces_suffix() {
+        let hashes = [
+            block::Hash([1; 32]),
+            block::Hash([2; 32]),
+            block::Hash([3; 32]),
+            block::Hash([4; 32]),
+        ];
+        let mut projection = vec![
+            Frontier::new(block::Height(1), hashes[0]),
+            Frontier::new(block::Height(2), hashes[1]),
+            Frontier::new(block::Height(3), hashes[2]),
+        ];
+        apply_delta_to_projection(
+            &mut projection,
+            &ProjectionDelta {
+                remove_before: Some(block::Height(2)),
+                remove_from: Some(block::Height(3)),
+                put: vec![Frontier::new(block::Height(3), hashes[3])],
+            },
+        );
+        assert_eq!(
+            projection,
+            vec![
+                Frontier::new(block::Height(2), hashes[1]),
+                Frontier::new(block::Height(3), hashes[3]),
+            ]
+        );
+    }
+
+    #[test]
+    fn auxiliary_delta_upserts_sorts_and_removes_empty_buckets() {
+        let hash = block::Hash([0x11; 32]);
+        let first_id = crate::EvidenceId::from_digest([1; 32]);
+        let second_id = crate::EvidenceId::from_digest([2; 32]);
+        let original = delivery(first_id, hash, SourceId::from_digest([3; 32]));
+        let replacement = delivery(first_id, hash, SourceId::from_digest([4; 32]));
+        let second = delivery(second_id, hash, SourceId::from_digest([5; 32]));
+        let mut aux = HashMap::from([(hash, vec![original])]);
+
+        apply_aux_delta(
+            &mut aux,
+            &[
+                AuxDelta::Put(Box::new(second)),
+                AuxDelta::Put(Box::new(replacement)),
+            ],
+        );
+        assert_eq!(aux[&hash], vec![replacement, second]);
+
+        apply_aux_delta(
+            &mut aux,
+            &[
+                AuxDelta::Delete {
+                    header_hash: hash,
+                    delivery_id: first_id,
+                },
+                AuxDelta::Delete {
+                    header_hash: hash,
+                    delivery_id: second_id,
+                },
+            ],
+        );
+        assert!(!aux.contains_key(&hash));
     }
 }

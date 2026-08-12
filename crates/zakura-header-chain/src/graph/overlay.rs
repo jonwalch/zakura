@@ -11,6 +11,29 @@ use crate::{
     HeaderNode, HeaderValidationState, OperatorInvalidationId,
 };
 
+#[cfg(test)]
+#[derive(Default)]
+struct OverlayTestStatistics {
+    base_nodes_cloned: Cell<usize>,
+    eligibility_nodes_visited: Cell<usize>,
+    finality_nodes_visited: Cell<usize>,
+}
+
+#[cfg(test)]
+impl OverlayTestStatistics {
+    fn increment(counter: &Cell<usize>) {
+        counter.set(counter.get().saturating_add(1));
+    }
+
+    fn operation_counts(&self, changed_nodes: usize) -> (usize, usize, usize) {
+        (
+            self.base_nodes_cloned.get(),
+            changed_nodes,
+            self.eligibility_nodes_visited.get(),
+        )
+    }
+}
+
 // Changes made by an overlay relative to the base graph.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GraphDelta {
@@ -34,11 +57,7 @@ pub(crate) struct GraphOverlay<'a> {
     eligible_tips: HashSet<block::Hash>,
     node_count: usize,
     #[cfg(test)]
-    base_nodes_cloned: Cell<usize>,
-    #[cfg(test)]
-    eligibility_nodes_visited: Cell<usize>,
-    #[cfg(test)]
-    finality_nodes_visited: Cell<usize>,
+    test_statistics: OverlayTestStatistics,
 }
 
 impl<'a> GraphOverlay<'a> {
@@ -53,11 +72,7 @@ impl<'a> GraphOverlay<'a> {
             eligible_tips: base.eligible_tips.clone(),
             node_count: base.nodes.len(),
             #[cfg(test)]
-            base_nodes_cloned: Cell::new(0),
-            #[cfg(test)]
-            eligibility_nodes_visited: Cell::new(0),
-            #[cfg(test)]
-            finality_nodes_visited: Cell::new(0),
+            test_statistics: OverlayTestStatistics::default(),
         }
     }
 
@@ -108,11 +123,7 @@ impl<'a> GraphOverlay<'a> {
                 )
                 .saturating_sub(delta.delete_nodes.len()),
             #[cfg(test)]
-            base_nodes_cloned: Cell::new(0),
-            #[cfg(test)]
-            eligibility_nodes_visited: Cell::new(0),
-            #[cfg(test)]
-            finality_nodes_visited: Cell::new(0),
+            test_statistics: OverlayTestStatistics::default(),
         })
     }
 
@@ -145,8 +156,7 @@ impl<'a> GraphOverlay<'a> {
                 .cloned()
                 .ok_or(GraphError::UnknownNode(hash))?;
             #[cfg(test)]
-            self.base_nodes_cloned
-                .set(self.base_nodes_cloned.get().saturating_add(1));
+            OverlayTestStatistics::increment(&self.test_statistics.base_nodes_cloned);
             self.puts.insert(hash, node);
         }
         Ok(self
@@ -520,8 +530,7 @@ impl<'a> GraphOverlay<'a> {
         let mut cursor = finalized;
         while cursor.height > current.height {
             #[cfg(test)]
-            self.finality_nodes_visited
-                .set(self.finality_nodes_visited.get().saturating_add(1));
+            OverlayTestStatistics::increment(&self.test_statistics.finality_nodes_visited);
             let parent_hash = self
                 .node(cursor.hash)
                 .ok_or(GraphError::UnknownNode(cursor.hash))?
@@ -548,8 +557,9 @@ impl<'a> GraphOverlay<'a> {
                 while let Some(hash) = pending.pop() {
                     if deleted.insert(hash) {
                         #[cfg(test)]
-                        self.finality_nodes_visited
-                            .set(self.finality_nodes_visited.get().saturating_add(1));
+                        OverlayTestStatistics::increment(
+                            &self.test_statistics.finality_nodes_visited,
+                        );
                         pending.extend(self.children(hash));
                     }
                 }
@@ -629,8 +639,7 @@ impl<'a> GraphOverlay<'a> {
         let mut queue = VecDeque::from(self.children(root));
         while let Some(hash) = queue.pop_front() {
             #[cfg(test)]
-            self.eligibility_nodes_visited
-                .set(self.eligibility_nodes_visited.get().saturating_add(1));
+            OverlayTestStatistics::increment(&self.test_statistics.eligibility_nodes_visited);
 
             // Get the parent hash.
             let parent_hash = self
@@ -723,16 +732,13 @@ impl<'a> GraphOverlay<'a> {
 
     #[cfg(test)]
     fn operation_counts(&self) -> (usize, usize, usize) {
-        (
-            self.base_nodes_cloned.get(),
-            self.puts.len().saturating_add(self.deletes.len()),
-            self.eligibility_nodes_visited.get(),
-        )
+        self.test_statistics
+            .operation_counts(self.puts.len().saturating_add(self.deletes.len()))
     }
 
     #[cfg(test)]
     fn finality_nodes_visited(&self) -> usize {
-        self.finality_nodes_visited.get()
+        self.test_statistics.finality_nodes_visited.get()
     }
 }
 

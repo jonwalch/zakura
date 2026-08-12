@@ -196,7 +196,7 @@ fn apply_transition_is_the_only_public_dag_mutation_entry_point() {
 }
 
 #[test]
-fn stateful_engine_returns_its_complete_projected_state() {
+fn committed_transition_applies_to_a_cloned_source_engine() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let engine = test_engine(&store);
     let clock = ManualClock(Utc::now());
@@ -215,7 +215,10 @@ fn stateful_engine_returns_its_complete_projected_state() {
 
     assert_eq!(transition.before(), &before);
     let expected = transition.change_set().metadata.snapshot();
-    let projected = transition.into_projected_engine();
+    let mut projected = engine.clone();
+    projected
+        .apply_committed(transition)
+        .expect("the transition still has its exact source");
     assert_eq!(projected.snapshot(), expected);
     assert_eq!(
         projected.selected_projection().last().copied(),
