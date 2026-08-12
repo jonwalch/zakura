@@ -87,7 +87,8 @@ fn verify_plan_exhaustive(
         .validate_delta(plan.graph_delta())
         .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
     let source_metadata = before.metadata();
-    let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta());
+    let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta())
+        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
     let delta_finalized = delta_graph.view_finalized();
     #[cfg(any(test, feature = "fuzz-impl"))]
     let graph = plan.projected_graph().clone();
@@ -143,7 +144,7 @@ fn verify_plan_exhaustive(
     #[cfg(any(test, feature = "fuzz-impl"))]
     let nodes = graph.view_nodes();
     #[cfg(not(any(test, feature = "fuzz-impl")))]
-    let nodes = changed_boundary_nodes(&graph, plan);
+    let nodes = changed_boundary_nodes(before, &graph, plan);
     for node in nodes {
         verify_node(&graph, node, metadata.work_origin.hash)?;
     }
@@ -302,12 +303,6 @@ pub(super) fn is_incremental_checkpoint_finality(
             .iter()
             .all(|change| matches!(change, AuxDelta::Delete { .. }))
         && plan.graph_delta().finalized == Some(finalized)
-        && plan.graph_delta().add_children.is_empty()
-        && plan
-            .graph_delta()
-            .remove_children
-            .iter()
-            .all(|(parent, _)| plan.graph_delta().delete_nodes.contains(parent))
 }
 
 fn verify_incremental_checkpoint_finality(
@@ -322,7 +317,8 @@ fn verify_incremental_checkpoint_finality(
         .graph()
         .validate_delta(plan.graph_delta())
         .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
-    let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta());
+    let delta_graph = GraphOverlay::from_delta(before.graph(), plan.graph_delta())
+        .map_err(|_| InvariantViolation::Index(block::Hash([0; 32])))?;
     let delta_finalized = delta_graph.view_finalized();
     #[cfg(any(test, feature = "fuzz-impl"))]
     let graph = plan.projected_graph().clone();
@@ -832,6 +828,7 @@ fn verify_aux<G: HeaderGraphView>(
 
 #[cfg(not(any(test, feature = "fuzz-impl")))]
 fn changed_boundary_nodes<'a, G: HeaderGraphView>(
+    before: &HeaderChainEngine,
     graph: &'a G,
     plan: &TransitionPlan,
 ) -> Vec<&'a HeaderNode> {
@@ -845,14 +842,11 @@ fn changed_boundary_nodes<'a, G: HeaderGraphView>(
         hashes.insert(node.parent_hash);
         hashes.extend(graph.view_children(node.hash));
     }
-    for (parent, child) in plan
-        .graph_delta()
-        .add_children
-        .iter()
-        .chain(&plan.graph_delta().remove_children)
-    {
-        hashes.insert(*parent);
-        hashes.insert(*child);
+    for hash in &plan.graph_delta().delete_nodes {
+        if let Some(node) = before.graph().node(*hash) {
+            hashes.insert(node.parent_hash);
+            hashes.extend(before.graph().children(*hash));
+        }
     }
     hashes
         .into_iter()

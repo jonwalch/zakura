@@ -276,10 +276,10 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     corrupt.change_set.delete_nodes.push(finalized);
     corrupt.change_set.index_changes.deleted.push(finalized);
     corrupt.graph_delta.delete_nodes.push(finalized);
-    assert_eq!(
+    assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::Protected(finalized))
-    );
+        Err(InvariantViolation::Index(_))
+    ));
 
     let mut corrupt = plan.clone();
     corrupt.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");

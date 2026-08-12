@@ -18,10 +18,6 @@ pub(crate) struct GraphDelta {
     pub(crate) finalized: Option<Frontier>,
     pub(crate) put_nodes: Vec<HeaderNode>,
     pub(crate) delete_nodes: Vec<block::Hash>,
-    pub(crate) add_children: Vec<(block::Hash, block::Hash)>,
-    pub(crate) remove_children: Vec<(block::Hash, block::Hash)>,
-    pub(crate) add_eligible_tips: Vec<block::Hash>,
-    pub(crate) remove_eligible_tips: Vec<block::Hash>,
 }
 
 /// A mutable view that stages graph changes over a borrowed base store.
@@ -67,7 +63,11 @@ impl<'a> GraphOverlay<'a> {
 
     /// Reconstructs the projected graph view represented by `delta` over `base`
     /// without modifying the base store.
-    pub(crate) fn from_delta(base: &'a MemHeaderStore, delta: &GraphDelta) -> Self {
+    pub(crate) fn from_delta(
+        base: &'a MemHeaderStore,
+        delta: &GraphDelta,
+    ) -> Result<Self, GraphError> {
+        let indexes = base.derive_index_changes(delta)?;
         let puts = delta
             .put_nodes
             .iter()
@@ -77,18 +77,18 @@ impl<'a> GraphOverlay<'a> {
         let deletes = delta.delete_nodes.iter().copied().collect();
         let mut add_children: HashMap<_, HashSet<_>> = HashMap::new();
         let mut remove_children: HashMap<_, HashSet<_>> = HashMap::new();
-        for (parent, child) in &delta.add_children {
+        for (parent, child) in &indexes.add_children {
             add_children.entry(*parent).or_default().insert(*child);
         }
-        for (parent, child) in &delta.remove_children {
+        for (parent, child) in &indexes.remove_children {
             remove_children.entry(*parent).or_default().insert(*child);
         }
         let mut eligible_tips = base.eligible_tips.clone();
-        for hash in &delta.remove_eligible_tips {
+        for hash in &indexes.remove_eligible_tips {
             eligible_tips.remove(hash);
         }
-        eligible_tips.extend(delta.add_eligible_tips.iter().copied());
-        Self {
+        eligible_tips.extend(indexes.add_eligible_tips.iter().copied());
+        Ok(Self {
             base,
             finalized: delta.finalized.unwrap_or(base.finalized),
             puts,
@@ -113,7 +113,7 @@ impl<'a> GraphOverlay<'a> {
             eligibility_nodes_visited: Cell::new(0),
             #[cfg(test)]
             finality_nodes_visited: Cell::new(0),
-        }
+        })
     }
 
     pub(crate) const fn finalized(&self) -> Frontier {
@@ -586,31 +586,10 @@ impl<'a> GraphOverlay<'a> {
         put_nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
         let mut delete_nodes: Vec<_> = self.deletes.iter().copied().collect();
         delete_nodes.sort_unstable_by_key(|hash| hash.0);
-        let mut add_children = flatten_edges(&self.add_children);
-        let mut remove_children = flatten_edges(&self.remove_children);
-        add_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
-        remove_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
-        let mut add_eligible_tips: Vec<_> = self
-            .eligible_tips
-            .difference(&self.base.eligible_tips)
-            .copied()
-            .collect();
-        let mut remove_eligible_tips: Vec<_> = self
-            .base
-            .eligible_tips
-            .difference(&self.eligible_tips)
-            .copied()
-            .collect();
-        add_eligible_tips.sort_unstable_by_key(|hash| hash.0);
-        remove_eligible_tips.sort_unstable_by_key(|hash| hash.0);
         GraphDelta {
             finalized: (self.finalized != self.base.finalized).then_some(self.finalized),
             put_nodes,
             delete_nodes,
-            add_children,
-            remove_children,
-            add_eligible_tips,
-            remove_eligible_tips,
         }
     }
 
@@ -757,15 +736,6 @@ impl<'a> GraphOverlay<'a> {
     }
 }
 
-fn flatten_edges(
-    edges: &HashMap<block::Hash, HashSet<block::Hash>>,
-) -> Vec<(block::Hash, block::Hash)> {
-    edges
-        .iter()
-        .flat_map(|(parent, children)| children.iter().map(|child| (*parent, *child)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,9 +810,6 @@ mod tests {
         assert_eq!(delta.put_nodes.len(), 1);
         assert_eq!(delta.put_nodes[0].hash, child.hash);
         assert_eq!(delta.delete_nodes, Vec::<block::Hash>::new());
-        assert_eq!(delta.add_children, vec![(anchor.hash, child.hash)]);
-        assert_eq!(delta.remove_eligible_tips, vec![anchor.hash]);
-        assert_eq!(delta.add_eligible_tips, vec![child.hash]);
         assert_eq!(overlay.node_count(), base.node_count().saturating_add(1));
     }
 
@@ -957,6 +924,86 @@ mod tests {
             applied.node(third.hash).map(|node| node.parent_hash),
             Some(second.hash)
         );
+    }
+
+    #[test]
+    fn canonical_deletion_removes_child_and_tip_indexes() {
+        let mut base = store();
+        let anchor = base.finalized();
+        let child = insert_child(&mut base, anchor.hash, 1);
+        let delta = GraphDelta {
+            finalized: None,
+            put_nodes: Vec::new(),
+            delete_nodes: vec![child.hash],
+        };
+
+        let projected = GraphOverlay::from_delta(&base, &delta)
+            .expect("canonical deletion reconstructs an overlay");
+        assert!(projected.node(child.hash).is_none());
+        assert!(projected.children(anchor.hash).is_empty());
+        assert_eq!(projected.eligible_tips(), vec![anchor]);
+
+        base.apply_delta(&delta)
+            .expect("canonical deletion applies to the store");
+        assert!(base.node(child.hash).is_none());
+        assert!(base.children(anchor.hash).is_empty());
+        assert_eq!(base.eligible_tips(), vec![anchor]);
+    }
+
+    #[test]
+    fn conflicting_node_changes_fail_before_store_mutation() {
+        let mut base = store();
+        let anchor = base.finalized();
+        let child = insert_child(&mut base, anchor.hash, 1);
+        let child_node = base
+            .node(child.hash)
+            .expect("the fixture child is retained")
+            .clone();
+        let before_nodes = base.nodes.clone();
+        let before_children = base.children.clone();
+        let before_heights = base.heights.clone();
+        let before_tips = base.eligible_tips.clone();
+        let delta = GraphDelta {
+            finalized: None,
+            put_nodes: vec![child_node],
+            delete_nodes: vec![child.hash],
+        };
+
+        assert_eq!(
+            base.apply_delta(&delta),
+            Err(GraphError::ConflictingDuplicate(child.hash))
+        );
+        assert_eq!(base.nodes, before_nodes);
+        assert_eq!(base.children, before_children);
+        assert_eq!(base.heights, before_heights);
+        assert_eq!(base.eligible_tips, before_tips);
+    }
+
+    #[test]
+    fn finality_delta_keeps_the_new_root_after_deleting_its_parent() {
+        let mut base = store();
+        let old_root = base.finalized();
+        let new_root = insert_child(&mut base, old_root.hash, 1);
+        let retained_tip = insert_child(&mut base, new_root.hash, 2);
+        let mut overlay = GraphOverlay::new(&base);
+        overlay
+            .advance_finalized(new_root)
+            .expect("the eligible child becomes finalized");
+        let delta = overlay.delta();
+
+        assert!(delta.delete_nodes.contains(&old_root.hash));
+        let projected = GraphOverlay::from_delta(&base, &delta)
+            .expect("the new root may outlive its deleted parent");
+        assert_eq!(projected.finalized(), new_root);
+        assert!(projected.node(new_root.hash).is_some());
+        assert!(projected.node(retained_tip.hash).is_some());
+
+        base.apply_delta(&delta)
+            .expect("the finality delta applies atomically");
+        assert_eq!(base.finalized(), new_root);
+        assert!(base.node(old_root.hash).is_none());
+        assert!(base.node(new_root.hash).is_some());
+        assert!(base.node(retained_tip.hash).is_some());
     }
 
     #[test]

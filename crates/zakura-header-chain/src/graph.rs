@@ -176,6 +176,13 @@ pub struct MemHeaderStore {
     eligible_tips: HashSet<block::Hash>,
 }
 
+struct DerivedIndexChanges {
+    add_children: Vec<(block::Hash, block::Hash)>,
+    remove_children: Vec<(block::Hash, block::Hash)>,
+    add_eligible_tips: Vec<block::Hash>,
+    remove_eligible_tips: Vec<block::Hash>,
+}
+
 impl MemHeaderStore {
     /// Construct a store rooted at one trusted, already-validated work origin.
     pub fn new(
@@ -768,18 +775,15 @@ impl MemHeaderStore {
 
     /// Validates and installs a complete overlay-produced graph delta.
     ///
-    /// Applies node deletions and replacements together with their corresponding
-    /// height-index, child-edge, eligible-tip, and finality changes. Existing node
-    /// replacements must preserve immutable identity fields such as height.
+    /// Derives and applies height, child, and eligible-tip indexes from canonical
+    /// node deletions and replacements. Existing node replacements must preserve
+    /// immutable identity fields such as height.
     ///
     /// Returns an error without modifying the store if a deletion references an
     /// unknown node or the delta both deletes and replaces the same hash.
     ///
-    /// This method does not recompute or fully validate derived indexes. The caller
-    /// must supply a coherent `GraphDelta`, normally produced and invariant-checked
-    /// through `GraphOverlay`.
     pub(crate) fn apply_delta(&mut self, delta: &GraphDelta) -> Result<(), GraphError> {
-        self.validate_delta(delta)?;
+        let indexes = self.derive_index_changes(delta)?;
 
         // Apply deletions
         for hash in &delta.delete_nodes {
@@ -808,7 +812,7 @@ impl MemHeaderStore {
         }
 
         // Apply child-edge removals and additions
-        for (parent, child) in &delta.remove_children {
+        for (parent, child) in &indexes.remove_children {
             if let Some(children) = self.children.get_mut(parent) {
                 children.remove(child);
                 if children.is_empty() {
@@ -818,36 +822,198 @@ impl MemHeaderStore {
         }
 
         // Apply child-edge additions
-        for (parent, child) in &delta.add_children {
+        for (parent, child) in &indexes.add_children {
             self.children.entry(*parent).or_default().insert(*child);
         }
 
         // Apply eligible-tip removals and additions
-        for hash in &delta.remove_eligible_tips {
+        for hash in &indexes.remove_eligible_tips {
             self.eligible_tips.remove(hash);
         }
         self.eligible_tips
-            .extend(delta.add_eligible_tips.iter().copied());
+            .extend(indexes.add_eligible_tips.iter().copied());
         if let Some(finalized) = delta.finalized {
             self.finalized = finalized;
         }
         Ok(())
     }
 
-    /// Validates a complete overlay-produced graph delta. Returns an error if a deletion references an
-    /// unknown node or the delta both deletes and replaces the same hash.
+    /// Validates a complete overlay-produced graph delta.
     pub(crate) fn validate_delta(&self, delta: &GraphDelta) -> Result<(), GraphError> {
-        for hash in &delta.delete_nodes {
-            if !self.nodes.contains_key(hash) {
-                return Err(GraphError::UnknownNode(*hash));
-            }
-        }
+        self.derive_index_changes(delta).map(|_| ())
+    }
+
+    fn derive_index_changes(&self, delta: &GraphDelta) -> Result<DerivedIndexChanges, GraphError> {
+        let mut puts = HashMap::new();
         for node in &delta.put_nodes {
-            if delta.delete_nodes.contains(&node.hash) {
+            if puts.insert(node.hash, node).is_some() {
                 return Err(GraphError::ConflictingDuplicate(node.hash));
             }
         }
-        Ok(())
+        let mut deletes = HashSet::new();
+        for hash in &delta.delete_nodes {
+            if !deletes.insert(*hash) {
+                return Err(GraphError::ConflictingDuplicate(*hash));
+            }
+            if !self.nodes.contains_key(hash) {
+                return Err(GraphError::UnknownNode(*hash));
+            }
+            if puts.contains_key(hash) {
+                return Err(GraphError::ConflictingDuplicate(*hash));
+            }
+        }
+
+        let projected_node = |hash: block::Hash| {
+            (!deletes.contains(&hash))
+                .then(|| puts.get(&hash).copied().or_else(|| self.nodes.get(&hash)))
+                .flatten()
+        };
+        let finalized = delta.finalized.unwrap_or(self.finalized);
+        let finalized_node =
+            projected_node(finalized.hash).ok_or(GraphError::UnknownNode(finalized.hash))?;
+        if finalized_node.height != finalized.height {
+            return Err(GraphError::UnknownNode(finalized.hash));
+        }
+        if !finalized_node.is_eligible() {
+            return Err(GraphError::IneligibleFinalized(finalized.hash));
+        }
+
+        for node in &delta.put_nodes {
+            if node.header.hash() != node.hash
+                || node.header.previous_block_hash != node.parent_hash
+                || node.header.difficulty_threshold.to_work() != Some(node.block_work)
+            {
+                return Err(GraphError::ConflictingDuplicate(node.hash));
+            }
+            if let Some(old) = self.nodes.get(&node.hash) {
+                if old.header != node.header
+                    || old.parent_hash != node.parent_hash
+                    || old.height != node.height
+                    || old.block_work != node.block_work
+                {
+                    return Err(GraphError::ConflictingDuplicate(node.hash));
+                }
+            } else if node.hash != finalized.hash {
+                let parent = projected_node(node.parent_hash).ok_or(GraphError::UnknownParent {
+                    header: node.hash,
+                    parent: node.parent_hash,
+                })?;
+                if parent.height.next().ok() != Some(node.height) {
+                    return Err(GraphError::UnknownParent {
+                        header: node.hash,
+                        parent: node.parent_hash,
+                    });
+                }
+            }
+        }
+
+        for parent in &deletes {
+            for child in self.children.get(parent).into_iter().flatten() {
+                if !deletes.contains(child) && *child != finalized.hash {
+                    return Err(GraphError::UnknownParent {
+                        header: *child,
+                        parent: *parent,
+                    });
+                }
+            }
+        }
+
+        let mut add_children = HashSet::new();
+        let mut remove_children = HashSet::new();
+        for hash in &deletes {
+            let node = self
+                .nodes
+                .get(hash)
+                .expect("delta deletions were validated above");
+            if self
+                .children
+                .get(&node.parent_hash)
+                .is_some_and(|children| children.contains(hash))
+            {
+                remove_children.insert((node.parent_hash, *hash));
+            }
+            for child in self.children.get(hash).into_iter().flatten() {
+                remove_children.insert((*hash, *child));
+            }
+        }
+        if finalized != self.finalized {
+            if let Some(node) = self.nodes.get(&finalized.hash) {
+                if self
+                    .children
+                    .get(&node.parent_hash)
+                    .is_some_and(|children| children.contains(&finalized.hash))
+                {
+                    remove_children.insert((node.parent_hash, finalized.hash));
+                }
+            }
+        }
+        for node in &delta.put_nodes {
+            if !self.nodes.contains_key(&node.hash) && node.hash != finalized.hash {
+                add_children.insert((node.parent_hash, node.hash));
+            }
+        }
+
+        let mut affected = HashSet::from([self.finalized.hash, finalized.hash]);
+        for node in &delta.put_nodes {
+            affected.insert(node.hash);
+            affected.insert(node.parent_hash);
+        }
+        for hash in &delta.delete_nodes {
+            affected.insert(*hash);
+            if let Some(node) = self.nodes.get(hash) {
+                affected.insert(node.parent_hash);
+            }
+        }
+        for (parent, child) in add_children.iter().chain(&remove_children) {
+            affected.insert(*parent);
+            affected.insert(*child);
+        }
+
+        let is_projected_tip = |hash: block::Hash| {
+            let Some(node) = projected_node(hash) else {
+                return false;
+            };
+            if !node.is_eligible() {
+                return false;
+            }
+            let has_eligible_base_child = self
+                .children
+                .get(&hash)
+                .into_iter()
+                .flatten()
+                .filter(|child| !remove_children.contains(&(hash, **child)))
+                .any(|child| projected_node(*child).is_some_and(HeaderNode::is_eligible));
+            let has_eligible_added_child = add_children
+                .iter()
+                .filter(|(parent, _)| *parent == hash)
+                .any(|(_, child)| projected_node(*child).is_some_and(HeaderNode::is_eligible));
+            !has_eligible_base_child && !has_eligible_added_child
+        };
+
+        let mut add_eligible_tips = Vec::new();
+        let mut remove_eligible_tips = Vec::new();
+        for hash in affected {
+            let was_tip = self.eligible_tips.contains(&hash);
+            let is_tip = is_projected_tip(hash);
+            if is_tip && !was_tip {
+                add_eligible_tips.push(hash);
+            } else if was_tip && !is_tip {
+                remove_eligible_tips.push(hash);
+            }
+        }
+
+        let mut add_children: Vec<_> = add_children.into_iter().collect();
+        let mut remove_children: Vec<_> = remove_children.into_iter().collect();
+        add_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+        remove_children.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+        add_eligible_tips.sort_unstable_by_key(|hash| hash.0);
+        remove_eligible_tips.sort_unstable_by_key(|hash| hash.0);
+        Ok(DerivedIndexChanges {
+            add_children,
+            remove_children,
+            add_eligible_tips,
+            remove_eligible_tips,
+        })
     }
 }
 
