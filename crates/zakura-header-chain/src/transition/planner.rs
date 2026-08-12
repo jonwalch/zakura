@@ -317,10 +317,10 @@ pub(super) fn apply_transition_engine(
             });
         }
     }
-    let plan = derive_plan(
+    let plan = derive_plan(DerivePlanInputs {
         before,
         metadata,
-        engine.graph(),
+        base_graph: engine.graph(),
         graph,
         old_selected,
         old_verified,
@@ -329,11 +329,11 @@ pub(super) fn apply_transition_engine(
         aux_changes,
         finality_append,
         retention,
-        request.event.fingerprint(),
+        fingerprint: request.event.fingerprint(),
         cause,
-        invariant_pins(context),
-        context.config.limits,
-    )?;
+        trust_pins: invariant_pins(context),
+        limits: context.config.limits,
+    })?;
     super::verify_plan(engine, &plan)?;
     Ok(plan)
 }
@@ -1295,7 +1295,7 @@ fn apply_event<G: HeaderGraphEdit>(
                     "operator invalidation identity is not bound to its target",
                 ));
             }
-            *operator_reason_changed = graph.edit_add_reason(
+            *operator_reason_changed = graph.edit_add_eligibility_reason(
                 event.target,
                 EligibilityReason::operator_invalid(event.target, event.id, event.evidence),
             )?;
@@ -1464,12 +1464,11 @@ fn anchor_reasons(
     reasons
 }
 
-#[allow(clippy::too_many_arguments)]
-fn derive_plan(
+struct DerivePlanInputs<'a> {
     before: EngineSnapshot,
-    mut metadata: EngineMetadata,
-    base_graph: &MemHeaderStore,
-    graph: GraphOverlay<'_>,
+    metadata: EngineMetadata,
+    base_graph: &'a MemHeaderStore,
+    graph: GraphOverlay<'a>,
     old_selected: Vec<Frontier>,
     old_verified: Vec<Frontier>,
     selected: Vec<Frontier>,
@@ -1481,7 +1480,26 @@ fn derive_plan(
     cause: TransitionCause,
     trust_pins: Vec<Frontier>,
     limits: EngineLimits,
-) -> Result<TransitionPlan, TransitionFailure> {
+}
+
+fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, TransitionFailure> {
+    let DerivePlanInputs {
+        before,
+        mut metadata,
+        base_graph,
+        graph,
+        old_selected,
+        old_verified,
+        selected,
+        verified,
+        aux_changes,
+        finality_append,
+        retention,
+        fingerprint,
+        cause,
+        trust_pins,
+        limits,
+    } = inputs;
     let graph_delta = graph.delta();
     let put_nodes = graph_delta.put_nodes.clone();
     let delete_nodes = graph_delta.delete_nodes.clone();

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use zakura_chain::{block, work::difficulty::Work};
 
-use super::{GraphError, InsertResult, MemHeaderStore};
+use super::{GraphError, HeaderGraphEdit, HeaderGraphView, InsertResult, MemHeaderStore};
 use crate::{
     BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId, Frontier,
     HeaderNode, HeaderValidationState, OperatorInvalidationId,
@@ -149,9 +149,10 @@ impl<'a> GraphOverlay<'a> {
                 .set(self.base_nodes_cloned.get().saturating_add(1));
             self.puts.insert(hash, node);
         }
-        self.puts
+        Ok(self
+            .puts
             .get_mut(&hash)
-            .ok_or(GraphError::UnknownNode(hash))
+            .expect("overlay node exists because it was staged above"))
     }
 
     /// Iterates over all nodes visible through the overlay, excluding deleted
@@ -329,7 +330,7 @@ impl<'a> GraphOverlay<'a> {
     /// its descendants. Returns whether the reason was newly added.
     ///
     /// Rejects unknown headers.
-    pub(crate) fn add_reason(
+    pub(crate) fn add_eligibility_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
@@ -620,6 +621,11 @@ impl<'a> GraphOverlay<'a> {
     /// descendant on that branch can be affected.
     fn recompute_descendant_eligibility(&mut self, root: block::Hash) -> Result<(), GraphError> {
         let mut affected = HashSet::from([root]);
+        affected.insert(
+            self.node(root)
+                .ok_or(GraphError::UnknownNode(root))?
+                .parent_hash,
+        );
         let mut queue = VecDeque::from(self.children(root));
         while let Some(hash) = queue.pop_front() {
             #[cfg(test)]
@@ -631,6 +637,7 @@ impl<'a> GraphOverlay<'a> {
                 .node(hash)
                 .ok_or(GraphError::UnknownNode(hash))?
                 .parent_hash;
+            affected.insert(parent_hash);
 
             // Check if the parent is eligible.
             let inherited_from = (!self
@@ -654,13 +661,6 @@ impl<'a> GraphOverlay<'a> {
             // Add the children to the queue.
             queue.extend(self.children(hash));
         }
-
-        // Get the parents of the affected nodes.
-        let parents: Vec<_> = affected
-            .iter()
-            .filter_map(|hash| self.node(*hash).map(|node| node.parent_hash))
-            .collect();
-        affected.extend(parents);
 
         // Refresh the eligible tips for the affected nodes.
         for hash in affected {
@@ -733,6 +733,117 @@ impl<'a> GraphOverlay<'a> {
     #[cfg(test)]
     fn finality_nodes_visited(&self) -> usize {
         self.finality_nodes_visited.get()
+    }
+}
+
+impl HeaderGraphView for GraphOverlay<'_> {
+    fn view_finalized(&self) -> Frontier {
+        self.finalized()
+    }
+
+    fn view_node_count(&self) -> usize {
+        self.node_count()
+    }
+
+    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
+        self.node(hash)
+    }
+
+    fn view_nodes(&self) -> Vec<&HeaderNode> {
+        self.nodes().collect()
+    }
+
+    fn view_retained_hashes(&self) -> Vec<block::Hash> {
+        self.retained_hashes().collect()
+    }
+
+    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
+        self.hashes_at_height(height)
+    }
+
+    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash> {
+        self.children(parent)
+    }
+
+    fn view_eligible_tips(&self) -> Vec<Frontier> {
+        self.eligible_tips()
+    }
+
+    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError> {
+        self.select_header_best()
+    }
+
+    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
+        self.score(hash)
+    }
+
+    fn view_ancestor(
+        &self,
+        descendant: block::Hash,
+        height: block::Height,
+    ) -> Result<Option<Frontier>, GraphError> {
+        self.ancestor(descendant, height)
+    }
+}
+
+impl HeaderGraphEdit for GraphOverlay<'_> {
+    fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
+        self.node_mut(hash)
+    }
+
+    fn edit_insert(
+        &mut self,
+        header: Arc<block::Header>,
+        block_work: Work,
+        validation: HeaderValidationState,
+        direct_reasons: Vec<EligibilityReason>,
+        body: BodyValidationState,
+    ) -> Result<InsertResult, GraphError> {
+        self.insert(header, block_work, validation, direct_reasons, body)
+    }
+
+    fn edit_add_eligibility_reason(
+        &mut self,
+        hash: block::Hash,
+        reason: EligibilityReason,
+    ) -> Result<bool, GraphError> {
+        self.add_eligibility_reason(hash, reason)
+    }
+
+    fn edit_remove_operator_invalidation(
+        &mut self,
+        hash: block::Hash,
+        id: OperatorInvalidationId,
+        evidence: Option<EvidenceId>,
+    ) -> Result<bool, GraphError> {
+        self.remove_operator_invalidation(hash, id, evidence)
+    }
+
+    fn edit_set_body_state(
+        &mut self,
+        hash: block::Hash,
+        body: BodyValidationState,
+    ) -> Result<bool, GraphError> {
+        self.set_body_state(hash, body)
+    }
+
+    fn edit_set_validation(
+        &mut self,
+        hash: block::Hash,
+        validation: HeaderValidationState,
+    ) -> Result<bool, GraphError> {
+        self.set_validation(hash, validation)
+    }
+
+    fn edit_advance_finalized(
+        &mut self,
+        finalized: Frontier,
+    ) -> Result<Vec<block::Hash>, GraphError> {
+        self.advance_finalized(finalized)
+    }
+
+    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
+        self.remove_leaf(hash)
     }
 }
 
@@ -864,7 +975,7 @@ mod tests {
         let mut overlay = GraphOverlay::new(&base);
         let operator = OperatorInvalidationId::new([9; 16]);
         overlay
-            .add_reason(
+            .add_eligibility_reason(
                 first.hash,
                 EligibilityReason::operator_invalid(
                     first.hash,
@@ -1103,7 +1214,7 @@ mod tests {
 
         let mut eligibility = GraphOverlay::new(&base);
         eligibility
-            .add_reason(
+            .add_eligibility_reason(
                 left.hash,
                 EligibilityReason::operator_invalid(
                     left.hash,

@@ -7,9 +7,9 @@ mod config;
 mod error;
 mod frontier;
 mod graph;
+mod header_node;
 mod ids;
 mod locator;
-mod node;
 mod ownership;
 mod retention;
 mod transition;
@@ -31,16 +31,16 @@ pub use frontier::{
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
 pub use graph::{GraphError, InsertResult, MemHeaderStore};
+pub use header_node::{
+    BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
+    EligibilityState, HeaderNode, HeaderValidationState,
+};
 pub use ids::{
     BodyWorkAuthority, BodyWorkOwner, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
     HeaderGeneration, HeaderId, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
 pub use locator::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
-pub use node::{
-    BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
-    EligibilityState, HeaderNode, HeaderValidationState,
-};
 pub use ownership::{CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason};
 pub use transition::*;
 pub use validation::{

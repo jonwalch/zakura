@@ -67,11 +67,11 @@ pub struct HeaderChainEngine {
     graph: MemHeaderStore,
     metadata: EngineMetadata,
     // Best header chain
-    selected: Vec<Frontier>,
+    selected_projection: Vec<Frontier>,
     // Header chain verified by block bodies
-    verified: Vec<Frontier>,
+    verified_projection: Vec<Frontier>,
     // Auxiliary deliveries for retained headers
-    aux: HashMap<block::Hash, Vec<AuxDelivery>>,
+    aux_deliveries: HashMap<block::Hash, Vec<AuxDelivery>>,
 }
 
 impl HeaderChainEngine {
@@ -123,7 +123,7 @@ impl HeaderChainEngine {
             ));
         }
 
-        let mut aux: HashMap<_, Vec<_>> = HashMap::new();
+        let mut aux_deliveries: HashMap<_, Vec<_>> = HashMap::new();
         let mut delivery_ids = HashSet::new();
         for delivery in deliveries {
             let node = graph
@@ -138,11 +138,15 @@ impl HeaderChainEngine {
                     "auxiliary delivery index disagrees with graph",
                 ));
             }
-            aux.entry(delivery.header_hash).or_default().push(delivery);
+            aux_deliveries
+                .entry(delivery.header_hash)
+                .or_default()
+                .push(delivery);
         }
         for node in graph.nodes() {
             if node.aux_delivery_ids.iter().any(|delivery_id| {
-                !aux.get(&node.hash)
+                !aux_deliveries
+                    .get(&node.hash)
                     .is_some_and(|rows| rows.iter().any(|row| row.delivery_id == *delivery_id))
             }) {
                 return Err(EngineHydrationError::Incoherent(
@@ -150,16 +154,16 @@ impl HeaderChainEngine {
                 ));
             }
         }
-        for rows in aux.values_mut() {
+        for rows in aux_deliveries.values_mut() {
             rows.sort_unstable_by_key(|delivery| delivery.delivery_id);
         }
 
         Ok(Self {
             graph,
             metadata,
-            selected,
-            verified,
-            aux,
+            selected_projection: selected,
+            verified_projection: verified,
+            aux_deliveries,
         })
     }
 
@@ -199,9 +203,15 @@ impl HeaderChainEngine {
     fn apply_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
         self.graph.apply_delta(plan.graph_delta())?;
         self.metadata = plan.change_set().metadata.clone();
-        apply_delta_to_projection(&mut self.selected, &plan.change_set().selected_projection);
-        apply_delta_to_projection(&mut self.verified, &plan.change_set().verified_projection);
-        apply_aux_delta(&mut self.aux, &plan.change_set().aux_changes);
+        apply_delta_to_projection(
+            &mut self.selected_projection,
+            &plan.change_set().selected_projection,
+        );
+        apply_delta_to_projection(
+            &mut self.verified_projection,
+            &plan.change_set().verified_projection,
+        );
+        apply_aux_delta(&mut self.aux_deliveries, &plan.change_set().aux_changes);
         Ok(())
     }
 
@@ -222,25 +232,28 @@ impl HeaderChainEngine {
 
     /// Return the complete selected projection.
     pub fn selected_projection(&self) -> &[Frontier] {
-        &self.selected
+        &self.selected_projection
     }
 
     /// Return the complete verified projection.
     pub fn verified_projection(&self) -> &[Frontier] {
-        &self.verified
+        &self.verified_projection
     }
 
     /// Return bounded auxiliary deliveries for one retained header.
     pub fn aux_deliveries(&self, hash: block::Hash) -> &[AuxDelivery] {
-        self.aux.get(&hash).map(Vec::as_slice).unwrap_or_default()
+        self.aux_deliveries
+            .get(&hash)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub(crate) fn aux_delivery_count(&self) -> usize {
-        self.aux.values().map(Vec::len).sum()
+        self.aux_deliveries.values().map(Vec::len).sum()
     }
 
     pub(crate) fn aux_delivery(&self, delivery_id: crate::EvidenceId) -> Option<&AuxDelivery> {
-        self.aux
+        self.aux_deliveries
             .values()
             .flatten()
             .find(|delivery| delivery.delivery_id == delivery_id)
@@ -321,7 +334,10 @@ fn verify_projection(
             ))?;
         if require_verified_bodies
             && *frontier != graph.finalized()
-            && !matches!(node.body_validation_state, crate::BodyValidationState::Verified { .. })
+            && !matches!(
+                node.body_validation_state,
+                crate::BodyValidationState::Verified { .. }
+            )
         {
             return Err(EngineHydrationError::Incoherent(
                 "verified projection contains an unverified body",

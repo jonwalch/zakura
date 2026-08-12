@@ -61,7 +61,7 @@ pub(crate) trait HeaderGraphEdit: HeaderGraphView {
         direct_reasons: Vec<EligibilityReason>,
         body: BodyValidationState,
     ) -> Result<InsertResult, GraphError>;
-    fn edit_add_reason(
+    fn edit_add_eligibility_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
@@ -334,7 +334,7 @@ impl MemHeaderStore {
     /// Marks an already-retained header as newly ineligible without deleting it.
     /// Its descendants also become ineligible, so the method recomputes ancestry
     /// eligibility and eligible-tip indexes.
-    pub(crate) fn add_reason(
+    pub(crate) fn add_eligibility_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
@@ -714,6 +714,12 @@ impl MemHeaderStore {
 
     fn recompute_descendant_eligibility(&mut self, root: block::Hash) -> Result<(), GraphError> {
         let mut affected = HashSet::from([root]);
+        affected.insert(
+            self.nodes
+                .get(&root)
+                .ok_or(GraphError::UnknownNode(root))?
+                .parent_hash,
+        );
         let mut queue = VecDeque::from(self.children(root));
         while let Some(hash) = queue.pop_front() {
             affected.insert(hash);
@@ -722,6 +728,7 @@ impl MemHeaderStore {
                 .get(&hash)
                 .ok_or(GraphError::UnknownNode(hash))?
                 .parent_hash;
+            affected.insert(parent_hash);
             let parent = self
                 .nodes
                 .get(&parent_hash)
@@ -734,11 +741,6 @@ impl MemHeaderStore {
                 .inherited_from = inherited_from;
             queue.extend(self.children(hash));
         }
-        let parents: Vec<_> = affected
-            .iter()
-            .filter_map(|hash| self.nodes.get(hash).map(|node| node.parent_hash))
-            .collect();
-        affected.extend(parents);
         for hash in affected {
             self.refresh_eligible_tip(hash);
         }
@@ -1083,123 +1085,12 @@ impl HeaderGraphEdit for MemHeaderStore {
         self.insert(header, block_work, validation, direct_reasons, body)
     }
 
-    fn edit_add_reason(
+    fn edit_add_eligibility_reason(
         &mut self,
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
-        self.add_reason(hash, reason)
-    }
-
-    fn edit_remove_operator_invalidation(
-        &mut self,
-        hash: block::Hash,
-        id: OperatorInvalidationId,
-        evidence: Option<EvidenceId>,
-    ) -> Result<bool, GraphError> {
-        self.remove_operator_invalidation(hash, id, evidence)
-    }
-
-    fn edit_set_body_state(
-        &mut self,
-        hash: block::Hash,
-        body: BodyValidationState,
-    ) -> Result<bool, GraphError> {
-        self.set_body_state(hash, body)
-    }
-
-    fn edit_set_validation(
-        &mut self,
-        hash: block::Hash,
-        validation: HeaderValidationState,
-    ) -> Result<bool, GraphError> {
-        self.set_validation(hash, validation)
-    }
-
-    fn edit_advance_finalized(
-        &mut self,
-        finalized: Frontier,
-    ) -> Result<Vec<block::Hash>, GraphError> {
-        self.advance_finalized(finalized)
-    }
-
-    fn edit_remove_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
-        self.remove_leaf(hash)
-    }
-}
-
-impl HeaderGraphView for GraphOverlay<'_> {
-    fn view_finalized(&self) -> Frontier {
-        self.finalized()
-    }
-
-    fn view_node_count(&self) -> usize {
-        self.node_count()
-    }
-
-    fn view_node(&self, hash: block::Hash) -> Option<&HeaderNode> {
-        self.node(hash)
-    }
-
-    fn view_nodes(&self) -> Vec<&HeaderNode> {
-        self.nodes().collect()
-    }
-
-    fn view_retained_hashes(&self) -> Vec<block::Hash> {
-        self.retained_hashes().collect()
-    }
-
-    fn view_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
-        self.hashes_at_height(height)
-    }
-
-    fn view_children(&self, parent: block::Hash) -> Vec<block::Hash> {
-        self.children(parent)
-    }
-
-    fn view_eligible_tips(&self) -> Vec<Frontier> {
-        self.eligible_tips()
-    }
-
-    fn view_select_header_best(&self) -> Result<(Frontier, ChainScore), GraphError> {
-        self.select_header_best()
-    }
-
-    fn view_score(&self, hash: block::Hash) -> Result<ChainScore, GraphError> {
-        self.score(hash)
-    }
-
-    fn view_ancestor(
-        &self,
-        descendant: block::Hash,
-        height: block::Height,
-    ) -> Result<Option<Frontier>, GraphError> {
-        self.ancestor(descendant, height)
-    }
-}
-
-impl HeaderGraphEdit for GraphOverlay<'_> {
-    fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
-        self.node_mut(hash)
-    }
-
-    fn edit_insert(
-        &mut self,
-        header: Arc<block::Header>,
-        block_work: Work,
-        validation: HeaderValidationState,
-        direct_reasons: Vec<EligibilityReason>,
-        body: BodyValidationState,
-    ) -> Result<InsertResult, GraphError> {
-        self.insert(header, block_work, validation, direct_reasons, body)
-    }
-
-    fn edit_add_reason(
-        &mut self,
-        hash: block::Hash,
-        reason: EligibilityReason,
-    ) -> Result<bool, GraphError> {
-        self.add_reason(hash, reason)
+        self.add_eligibility_reason(hash, reason)
     }
 
     fn edit_remove_operator_invalidation(
@@ -1421,7 +1312,7 @@ mod tests {
         let anchor = store.finalized();
         let candidate = insert_child(&mut store, anchor.hash, 1);
         store
-            .add_reason(
+            .add_eligibility_reason(
                 candidate.hash,
                 EligibilityReason::CheckpointConflict {
                     height: candidate.height,
@@ -1583,10 +1474,10 @@ mod tests {
             EvidenceId::from_digest([2; 32]),
         );
         store
-            .add_reason(left.hash, first)
+            .add_eligibility_reason(left.hash, first)
             .expect("left is retained");
         store
-            .add_reason(left.hash, second)
+            .add_eligibility_reason(left.hash, second)
             .expect("left is retained");
         assert_eq!(
             store
@@ -1653,12 +1544,12 @@ mod tests {
         ];
         for reason in permanent_reasons.clone() {
             store
-                .add_reason(target.hash, reason)
+                .add_eligibility_reason(target.hash, reason)
                 .expect("the operator target is retained");
         }
         for id in [first_id, second_id] {
             store
-                .add_reason(
+                .add_eligibility_reason(
                     target.hash,
                     EligibilityReason::operator_invalid(
                         target.hash,
@@ -1961,7 +1852,7 @@ mod tests {
                     1 => {
                         if target_hash != model.anchor {
                             store
-                                .add_reason(target_hash, reason.clone())
+                                .add_eligibility_reason(target_hash, reason.clone())
                                 .expect("target is retained");
                             model.nodes.get_mut(&target_hash).expect("target exists").direct_reasons.insert(reason);
                         }

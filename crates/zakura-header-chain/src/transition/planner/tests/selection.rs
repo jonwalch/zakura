@@ -179,7 +179,7 @@ fn apply_transition_is_the_only_public_dag_mutation_entry_point() {
     let graph_source = include_str!("../../../graph.rs");
     for old_entry in [
         "pub fn insert(",
-        "pub fn add_reason(",
+        "pub fn add_eligibility_reason(",
         "pub fn remove_operator_invalidation(",
         "pub fn set_consensus_body_invalid(",
         "pub fn set_body_state(",
