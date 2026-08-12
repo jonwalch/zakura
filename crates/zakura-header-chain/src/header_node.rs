@@ -35,7 +35,11 @@ pub enum HeaderValidationState {
     DeferredUntil(DateTime<Utc>),
 }
 
-/// One durable reason that a header cannot participate in selection.
+/// An `EligibilityReason` excludes an admitted header from selection.
+///
+/// The graph admits the header before it attaches an eligibility reason. Each
+/// eligibility reason excludes the header and its descendants from selection.
+/// The graph retains the header and its header-validation state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EligibilityReason {
     /// Header conflicts with a compiled settled-upgrade pin.
@@ -160,7 +164,7 @@ impl EligibilityReason {
 /// Direct and ancestry-derived selection eligibility.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EligibilityState {
-    /// Independent durable reasons attached directly to this header.
+    /// The graph attaches these independent eligibility reasons to this header.
     pub direct_reasons: BTreeSet<EligibilityReason>,
     /// Nearest ineligible ancestor, if any.
     pub inherited_from: Option<block::Hash>,

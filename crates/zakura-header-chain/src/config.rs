@@ -29,7 +29,7 @@ pub const MAX_HEADERS_PER_TRANSITION_V1: usize = 4_000;
 pub const MAX_AUX_DELIVERIES_PER_HEADER_V1: usize = 16;
 /// Exact v1 maximum auxiliary deliveries retained across the graph.
 pub const MAX_AUX_DELIVERIES_TOTAL_V1: usize = MAX_NON_FINALIZED_NODES_V1;
-/// Exact v1 maximum number of candidate tips.
+/// Full-state fork policy sets the exact v1 candidate-tip cap.
 pub const MAX_CANDIDATE_TIPS_V1: usize = MAX_NON_FINALIZED_CHAIN_FORKS;
 /// Exact v1 maximum active retained-path references supplied to one transition.
 pub const MAX_RETENTION_REFERENCES_V1: usize = MAX_STAGED_TARGETS_V1 + MAX_CANDIDATE_TIPS_V1;
@@ -207,7 +207,7 @@ pub struct EngineConfig {
     pub limits: EngineLimits,
     /// Cached digest of the immutable trust-anchor fields.
     trust_anchor_digest: [u8; 32],
-    /// Cached sorted immutable trust pins used by transition verification.
+    /// Transition verification uses these cached, sorted, immutable trust pins.
     trust_pins: Arc<[Frontier]>,
 }
 
@@ -272,7 +272,7 @@ impl EngineConfig {
         self.trust_anchor_digest
     }
 
-    /// Return the sorted immutable trust pins used by transition verification.
+    /// This method returns the cached trust pins for transition verification.
     pub(crate) fn trust_pins(&self) -> Arc<[Frontier]> {
         self.trust_pins.clone()
     }

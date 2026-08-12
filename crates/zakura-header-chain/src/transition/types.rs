@@ -1359,7 +1359,9 @@ pub struct TransitionRequest {
     pub event: TransitionEvent,
 }
 
-/// Selected or verified height projection replacement.
+/// A `ProjectionDelta` replaces a selected or verified chain-prefix projection.
+///
+/// Each `put` entry records the [`Frontier`] of the chain prefix at that height.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProjectionDelta {
     /// Exclusive upper height for retired prefix rows.

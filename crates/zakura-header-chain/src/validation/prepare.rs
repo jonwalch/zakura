@@ -175,7 +175,36 @@ fn invalid(offset: usize, rule: HeaderRule, error: impl std::fmt::Display) -> He
     }
 }
 
-/// Validate a complete batch without reading retained graph state.
+/// This function validates and seals a complete batch without reading retained
+/// graph state.
+///
+/// The function establishes these context-free properties:
+///
+/// - The batch contains at least one header and stays within the per-transition
+///   header limit.
+/// - Each header uses a supported encoded version.
+/// - The function computes each header hash locally.
+/// - Checked arithmetic infers each height from the supplied parent height.
+/// - Each height uses the required commitment interpretation.
+/// - Each compact target uses canonical encoding and stays within the network
+///   limit.
+/// - Each hash satisfies its target unless authenticated custom policy waives
+///   proof of work.
+/// - Each Equihash solution satisfies the authenticated proof-of-work policy.
+/// - The function accepts each current timestamp or assigns an exact deadline to
+///   each future timestamp.
+/// - The function converts each compact target to exact per-block work.
+///
+/// A successful call returns a nonempty [`PreparedHeaderBatch`]. Each entry
+/// contains the canonical header, its computed hash, inferred height, exact work,
+/// and local validation state. The receipt binds the result to the supplied
+/// parent, network policy, and trust-anchor digest.
+///
+/// The transition planner checks the retained parent and batch linkage. The
+/// planner recomputes each hash, height, and work value. The planner checks
+/// contextual difficulty and median time against retained ancestry. The planner
+/// also applies finality, checkpoint, settled-pin, target-completion, and
+/// auxiliary-provenance rules.
 pub fn prepare_context_free_headers(
     input: HeaderBatchInput<'_>,
     parent: crate::Frontier,

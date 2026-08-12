@@ -30,13 +30,9 @@ pub const SLOW_START_SHIFT: Height = Height(SLOW_START_INTERVAL.0 / 2);
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
 
 /// The maximum number of non-finalized chain forks Zakura will track.
-/// Zakura drops the chain with the lowest work when the fork count reaches this limit.
 ///
-/// Heavy transaction load produces about five active forks per 100 blocks.
-/// Efficient block propagation produces about one active fork per 300 blocks.
-///
-/// The fork cap limits non-finalized chain memory to around:
-/// `10 forks * 1000 blocks * 2 MB per block = 20 GB`
+/// The header-chain engine inherits this cap from full-state fork policy. Zakura
+/// drops the chain with the lowest work when the fork count reaches this cap.
 pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
 
 /// Magic numbers used to identify different Zcash networks.

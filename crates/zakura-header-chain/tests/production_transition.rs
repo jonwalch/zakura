@@ -1,4 +1,4 @@
-//! Black-box coverage for production transition verification and application.
+//! This integration test covers production transition verification and application.
 
 use std::{num::NonZeroU64, sync::Arc};
 

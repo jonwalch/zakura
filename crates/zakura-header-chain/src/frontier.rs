@@ -8,7 +8,10 @@ use zakura_chain::{
     work::difficulty::{Work, U256},
 };
 
-/// One exact height/hash frontier.
+/// A `Frontier` identifies one chain prefix by its exact height and tip hash.
+///
+/// Each projection entry uses a frontier to identify the selected or verified
+/// chain prefix that ends at that height.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Frontier {
     /// Frontier height.

@@ -220,12 +220,12 @@ impl HeaderChainEngine {
         &self.graph
     }
 
-    /// Return the complete selected projection.
+    /// This method returns the frontier for each selected chain prefix from finality to the tip.
     pub fn selected_projection(&self) -> &[Frontier] {
         &self.selected_projection
     }
 
-    /// Return the complete verified projection.
+    /// This method returns the frontier for each verified chain prefix from finality to the tip.
     pub fn verified_projection(&self) -> &[Frontier] {
         &self.verified_projection
     }

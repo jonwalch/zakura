@@ -47,6 +47,11 @@ pub(crate) struct GraphDelta {
 ///
 /// Reads reflect both the base and staged changes. The changes can later be
 /// extracted as a [`GraphDelta`] without modifying the base.
+///
+/// A staged deletion hides a base node from every overlay read. When the overlay
+/// deletes a node that it inserted, the deletion cancels the insertion. The final
+/// delta contains only base-node deletions and node values that differ from the
+/// base graph.
 pub(crate) struct GraphOverlay<'a> {
     base: &'a MemHeaderStore,
     finalized: Frontier,
@@ -241,12 +246,13 @@ impl<'a> GraphOverlay<'a> {
 
     /// Stages one admitted header whose parent is visible through the overlay.
     ///
-    /// Derives its height, cumulative work, and inherited eligibility from the
-    /// parent. Consensus-invalid body state makes the new header ineligible.
+    /// The overlay derives the height, cumulative work, and inherited eligibility
+    /// from the parent. A consensus-invalid body-validation state makes the new
+    /// header ineligible.
     ///
-    /// Returns [`InsertResult::AlreadyPresent`] for an identical existing header.
-    /// Rejects conflicting duplicates, unknown parents, height/work overflow, and
-    /// invalid graph structure.
+    /// This method returns [`InsertResult::AlreadyPresent`] for an identical
+    /// existing header. It rejects conflicting duplicates, unknown parents,
+    /// height or work overflow, and invalid graph structure.
     ///
     /// This method does not perform header consensus or proof-of-work validation;
     /// it records the caller-supplied validation result and work.
@@ -334,12 +340,13 @@ impl<'a> GraphOverlay<'a> {
         Ok(InsertResult::Inserted(Frontier::new(height, hash)))
     }
 
-    /// Adds a reason that directly makes the header ineligible.
+    /// This method adds an eligibility reason that directly excludes the header.
     ///
-    /// If the reason is new, recomputes inherited eligibility for the header and
-    /// its descendants. Returns whether the reason was newly added.
+    /// A new eligibility reason triggers inherited-eligibility recomputation for
+    /// the header and its descendants. The return value reports whether the
+    /// method added the eligibility reason.
     ///
-    /// Rejects unknown headers.
+    /// An unknown header produces an error.
     pub(crate) fn add_eligibility_reason(
         &mut self,
         hash: block::Hash,
@@ -384,7 +391,8 @@ impl<'a> GraphOverlay<'a> {
         Ok(changed)
     }
 
-    /// Replaces body-validation state while preserving permanent invalidity.
+    /// This method replaces body-validation state while preserving permanent
+    /// invalidity.
     pub(crate) fn set_body_state(
         &mut self,
         hash: block::Hash,
@@ -498,19 +506,20 @@ impl<'a> GraphOverlay<'a> {
 
     /// Advances the overlay’s finality anchor to an eligible retained descendant.
     ///
-    /// Removes the previous anchor, intermediate ancestors, and every competing
-    /// branch forked before the new anchor. The new anchor and its entire descendant
-    /// subtree remain retained. The returned removed hashes are sorted by raw bytes
-    /// for deterministic output.
+    /// This method walks the parent path from the new anchor to the current
+    /// anchor. At each path node, it traverses and removes discarded sibling
+    /// subtrees. The traversal does not assume that the retained graph is a linked
+    /// list. The graph retains the new anchor and its entire descendant subtree.
+    /// The method sorts the returned hashes by raw bytes for deterministic output.
     ///
-    /// Rejects an unknown or height-mismatched frontier, an ineligible node, or a
-    /// node that is not a descendant of the current anchor. These validation
-    /// failures leave the overlay unchanged.
+    /// This method rejects an unknown or height-mismatched frontier. It also
+    /// rejects an ineligible node or a node outside the current anchor's
+    /// descendants. These validation failures leave the overlay unchanged.
     ///
-    /// This operation stages the graph changes only; the transition layer is
-    /// responsible for authorizing and durably committing the finality advance.
+    /// This method only stages the graph changes. The transition layer authorizes
+    /// and durably commits the finality advance.
     ///
-    /// The retained descendant subtree is not traversed.
+    /// The method does not traverse the retained descendant subtree.
     pub(crate) fn advance_finalized(
         &mut self,
         finalized: Frontier,

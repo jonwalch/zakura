@@ -136,7 +136,7 @@ pub enum GraphError {
     /// Retention attempted to remove a node that still has retained children.
     #[error("cannot remove non-leaf header {0:?}")]
     NodeHasChildren(block::Hash),
-    /// A permanent consensus-invalid body state was replaced with different evidence or state.
+    /// A caller tried to replace a permanent consensus-invalid body-validation state.
     #[error("consensus-invalid body state is permanent for {0:?}")]
     PermanentBodyInvalidity(block::Hash),
     /// A requested ancestor height is above its descendant.
@@ -161,7 +161,11 @@ pub enum InsertResult {
     AlreadyPresent(Frontier),
 }
 
-/// Pure hash-keyed in-memory implementation of the header DAG contract.
+/// `MemHeaderStore` stores admitted headers in an in-memory domain graph.
+///
+/// `MemHeaderStore` owns canonical node state and reconstructible graph indexes.
+/// It supports header selection, ancestry, finality, and retention policy.
+/// It is not a durable store or a generic CRUD interface.
 #[derive(Clone, Debug)]
 pub struct MemHeaderStore {
     finalized: Frontier,
@@ -382,15 +386,19 @@ impl MemHeaderStore {
         Ok(changed)
     }
 
-    /// Replaces the body-validation state for retained header `hash`.
+    /// This method replaces the body-validation state for retained header `hash`.
     ///
     /// Returns `true` when the state changes and `false` when it is unchanged.
-    /// Consensus-invalid state makes the node and its descendants ineligible.
-    /// Identical invalid evidence is idempotent. Different evidence or any later
-    /// non-invalid state fails because consensus invalidity is permanent.
+    /// A consensus-invalid body-validation state makes the node and its
+    /// descendants ineligible. Replaying the same consensus-invalid
+    /// body-validation state leaves the node unchanged. This method rejects a
+    /// different consensus-invalid body-validation state. It also rejects any
+    /// later non-invalid body-validation state.
+    /// Consensus invalidity is permanent.
     ///
-    /// This method does not enforce legal body-state transitions; the caller must
-    /// ensure each initial replacement is authoritative.
+    /// This method does not enforce transitions between non-invalid
+    /// body-validation states. The caller must supply an authoritative
+    /// body-validation state.
     pub(crate) fn set_body_state(
         &mut self,
         hash: block::Hash,
@@ -775,15 +783,16 @@ impl MemHeaderStore {
             .collect();
     }
 
-    /// Validates and installs a complete overlay-produced graph delta.
+    /// This method validates and installs a complete overlay-produced graph delta.
     ///
-    /// Derives and applies height, child, and eligible-tip indexes from canonical
-    /// node deletions and replacements. Existing node replacements must preserve
-    /// immutable identity fields such as height.
+    /// It derives and applies height, child, and eligible-tip indexes from
+    /// canonical node deletions and replacements. The caller must preserve
+    /// immutable identity fields such as height when it replaces an existing
+    /// node.
     ///
-    /// Returns an error without modifying the store if a deletion references an
-    /// unknown node or the delta both deletes and replaces the same hash.
-    ///
+    /// A deletion that references an unknown node produces an error without
+    /// modifying the store. A delta that deletes and replaces the same hash also
+    /// produces an error without modifying the store.
     pub(crate) fn apply_delta(&mut self, delta: &GraphDelta) -> Result<(), GraphError> {
         let indexes = self.derive_index_changes(delta)?;
 
@@ -840,7 +849,7 @@ impl MemHeaderStore {
         Ok(())
     }
 
-    /// Validates a complete overlay-produced graph delta.
+    /// This method validates a complete overlay-produced graph delta.
     pub(crate) fn validate_delta(&self, delta: &GraphDelta) -> Result<(), GraphError> {
         self.derive_index_changes(delta).map(|_| ())
     }
