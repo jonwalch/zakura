@@ -277,7 +277,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
         Some(availability)
     );
     assert!(matches!(
-        runtime.store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body,
+        runtime.store.node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body_validation_state,
         BodyValidationState::Unavailable(summary)
             if summary == availability
     ));
@@ -317,7 +317,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
             .node(anchor.hash)
             .expect("the reopened node row decodes")
             .expect("the reopened anchor exists")
-            .body,
+            .body_validation_state,
         BodyValidationState::Unavailable(summary)
             if summary == availability
     ));
@@ -369,7 +369,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
 
     let evidence = EvidenceId::from_digest([9; 32]);
     let rule = BodyRuleId::new("x".repeat(129));
-    anchor.body = BodyValidationState::ConsensusInvalid {
+    anchor.body_validation_state = BodyValidationState::ConsensusInvalid {
         evidence,
         rule: rule.clone(),
     };
@@ -382,6 +382,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
     let changes = ChangeSet {
         put_nodes: vec![anchor],
         delete_nodes: Vec::new(),
+        put_consensus_invalid_tombstones: Vec::new(),
         index_changes: zakura_header_chain::IndexChanges::default(),
         selected_projection: zakura_header_chain::ProjectionDelta::default(),
         verified_projection: zakura_header_chain::ProjectionDelta::default(),
@@ -600,6 +601,125 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
 
     assert_eq!(result, ApplyResult::Committed);
     assert_eq!(runtime.publisher().snapshot().frontiers.header_best, child);
+}
+
+#[test]
+fn lazy_work_rebase_commits_coordinates_and_reopens() {
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let (engine_config, anchor, metadata) = fixture();
+    let anchor = HeaderNode::from_durable_parts(
+        anchor.header.clone(),
+        anchor.hash,
+        anchor.parent_hash,
+        anchor.height,
+        anchor.block_work,
+        WorkCoordinate::new(anchor.hash, zakura_chain::work::difficulty::U256::MAX),
+        anchor.validation,
+        anchor.eligibility.clone(),
+        anchor.body_validation_state.clone(),
+        anchor.aux_delivery_ids.clone(),
+    )
+    .expect("the near-overflow anchor retains its canonical identity");
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the near-overflow coordinate fixture initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the near-overflow coordinate fixture starts");
+    let initial = runtime.publisher().snapshot();
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the initialized anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated regtest policy is valid");
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time += chrono::Duration::seconds(1);
+    let child_header = Arc::new(child_header);
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&child_header)),
+        &lease,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the overflow-triggering child prepares through production validation");
+    let child = Frontier::new(block::Height(1), child_header.hash());
+    let context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+
+    assert_eq!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: initial.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&initial, child.hash, 1, 1),
+                        source: SourceId::from_digest([0x6a; 32]),
+                        parent_hash: anchor.hash,
+                        target_tip_hash: child.hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: initial.frontiers.finalized,
+                        },
+                        batch,
+                        aux: Vec::new(),
+                    })),
+                },
+                &context,
+            )
+            .expect("the valid insertion lazily rebases before it commits"),
+        ApplyResult::Committed
+    );
+    let committed = runtime.publisher().snapshot();
+    assert_eq!(committed.frontiers.header_best, child);
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the rebased metadata row decodes")
+            .work_origin,
+        initial.frontiers.finalized
+    );
+    assert_eq!(
+        runtime
+            .store
+            .node(anchor.hash)
+            .expect("the rebased anchor row decodes")
+            .expect("the rebased anchor remains")
+            .work_coordinate(),
+        WorkCoordinate::new(anchor.hash, Default::default())
+    );
+
+    drop(runtime);
+    drop(db);
+    let (reopened, report) = HeaderChainStore::new(open(&db_config, &engine_config.network))
+        .startup(&engine_config)
+        .expect("recovery authenticates the durable rebased coordinates");
+    assert_eq!(report.current, committed);
+    assert_eq!(reopened.publisher().snapshot(), committed);
+    assert_eq!(
+        reopened
+            .store
+            .node(child.hash)
+            .expect("the rebased child row decodes")
+            .expect("the rebased child remains")
+            .work_coordinate()
+            .origin_hash(),
+        anchor.hash
+    );
 }
 
 #[test]

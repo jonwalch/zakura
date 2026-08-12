@@ -427,14 +427,9 @@ fn insert_verified_branch(
         header.nonce.0[0] = nonce_seed;
         header.nonce.0[1..5].copy_from_slice(&offset.to_be_bytes());
         let header = Arc::new(header);
-        let work = header
-            .difficulty_threshold
-            .to_work()
-            .expect("the fixture target has valid work");
         parent = match graph
             .insert(
                 header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Verified {

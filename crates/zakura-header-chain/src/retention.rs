@@ -273,11 +273,9 @@ mod tests {
         header.previous_block_hash = parent;
         header.nonce = [seed; 32].into();
         let header = Arc::new(header);
-        let work = header.difficulty_threshold.to_work().expect("valid work");
         match store
             .insert(
                 header,
-                work,
                 HeaderValidationState::Valid,
                 reasons,
                 BodyValidationState::Unknown,

@@ -1443,6 +1443,8 @@ pub struct ChangeSet {
     pub put_nodes: Vec<HeaderNode>,
     /// Evicted or finalized-away nodes.
     pub delete_nodes: Vec<block::Hash>,
+    /// New append-only consensus-invalid tombstones.
+    pub put_consensus_invalid_tombstones: Vec<crate::ConsensusInvalidTombstone>,
     /// Reconstructible indexes changed with the nodes.
     pub index_changes: IndexChanges,
     /// Selected-header height projection change.

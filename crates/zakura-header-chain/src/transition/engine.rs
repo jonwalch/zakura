@@ -415,14 +415,9 @@ mod tests {
         header.previous_block_hash = anchor.hash;
         header.nonce = [1; 32].into();
         let header = Arc::new(header);
-        let child_work = header
-            .difficulty_threshold
-            .to_work()
-            .expect("the child target has valid work");
         let child = match graph
             .insert(
                 header,
-                child_work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,

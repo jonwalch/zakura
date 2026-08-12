@@ -92,7 +92,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
     assert!(matches!(
         runtime.store.node(child.hash),
         Ok(Some(HeaderNode {
-            body: BodyValidationState::Verified { .. },
+            body_validation_state: BodyValidationState::Verified { .. },
             ..
         }))
     ));
@@ -535,5 +535,33 @@ fn authoritative_corruption_fails_before_publisher_construction() {
         Err(HeaderChainStoreError::Recovery(
             RecoveryFailure::Source { .. }
         ))
+    ));
+}
+
+#[test]
+fn startup_rejects_verified_projection_without_exact_body_authority() {
+    let db_config = Config::ephemeral();
+    let (engine_config, mut anchor, metadata) = fixture();
+    let evidence = EvidenceId::from_digest([0xa5; 32]);
+    anchor.body_validation_state = BodyValidationState::Verified { evidence };
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the verified fixture initializes with body authority");
+
+    let mut corrupt = DiskWriteBatch::new();
+    store
+        .delete_raw(&mut corrupt, HEADER_BODY_EVIDENCE_AUTHORITY, anchor.hash.0)
+        .expect("the body authority row is addressable");
+    store
+        .db
+        .write(corrupt)
+        .expect("the missing authority row is durable");
+
+    assert!(matches!(
+        store.startup(&engine_config),
+        Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source {
+            violations,
+        })) if violations.contains(&zakura_header_chain::AuditViolation::BodyEvidenceAuthority(anchor.hash))
     ));
 }

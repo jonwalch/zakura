@@ -181,7 +181,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
             assert_eq!(event_node.is_some(), committed, "{target:?}, reset={reset}");
             if let Some(event_node) = event_node {
                 assert!(matches!(
-                    event_node.body,
+                    event_node.body_validation_state,
                     BodyValidationState::Verified {
                         evidence: node_evidence
                     } if node_evidence == evidence
@@ -431,7 +431,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     .node(anchor.hash)
                     .expect("the retry node read succeeds")
                     .expect("the selected retry node remains retained")
-                    .body,
+                    .body_validation_state,
                 BodyValidationState::Unavailable(if committed { fresh } else { old }),
                 "{target:?}, operator_retry={operator_retry}"
             );
@@ -468,7 +468,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     .node(anchor.hash)
                     .expect("the reopened retry node read succeeds")
                     .expect("the reopened selected retry node remains retained")
-                    .body,
+                    .body_validation_state,
                 BodyValidationState::Unavailable(if committed { fresh } else { old }),
                 "{target:?}, operator_retry={operator_retry}"
             );
@@ -561,7 +561,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                     .node(child.hash)
                     .expect("the child node read succeeds")
                     .expect("the selected child is retained")
-                    .body,
+                    .body_validation_state,
                 BodyValidationState::Unknown
             );
 
@@ -700,19 +700,41 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 BodyValidationState::Unknown
             };
             assert_eq!(
-                child_node.body, expected_body,
+                child_node.body_validation_state, expected_body,
                 "{target:?}, consensus_invalid={consensus_invalid}"
             );
-            let invalid_reason = EligibilityReason::ConsensusBodyInvalid {
-                evidence,
-                rule: rule.clone(),
-            };
+            if committed {
+                assert!(
+                    StoreAuditRead::body_evidence_is_authoritative(
+                        &observation.reopened.store,
+                        child.hash,
+                        &expected_body,
+                    )
+                    .expect("the body evidence authority row decodes"),
+                    "{target:?}, consensus_invalid={consensus_invalid}"
+                );
+            }
+            assert!(
+                child_node.eligibility.direct_reasons.is_empty(),
+                "body invalidity controls eligibility without a header reason"
+            );
+            let tombstone = observation
+                .reopened
+                .store
+                .get_value::<zakura_header_chain::ConsensusInvalidTombstone>(
+                    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+                    child.hash.0,
+                )
+                .expect("the durable tombstone row decodes");
             assert_eq!(
-                child_node
-                    .eligibility
-                    .direct_reasons
-                    .contains(&invalid_reason),
-                committed && consensus_invalid,
+                tombstone,
+                (committed && consensus_invalid).then(|| {
+                    zakura_header_chain::ConsensusInvalidTombstone {
+                        hash: child.hash,
+                        evidence,
+                        rule: rule.clone(),
+                    }
+                }),
                 "{target:?}, consensus_invalid={consensus_invalid}"
             );
             assert_eq!(
@@ -736,16 +758,12 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 .expect("the reopened body-conclusion node read succeeds")
                 .expect("the reopened body-conclusion child remains retained");
             assert_eq!(
-                reopened_child.body, expected_body,
+                reopened_child.body_validation_state, expected_body,
                 "{target:?}, consensus_invalid={consensus_invalid}"
             );
-            assert_eq!(
-                reopened_child
-                    .eligibility
-                    .direct_reasons
-                    .contains(&invalid_reason),
-                committed && consensus_invalid,
-                "{target:?}, consensus_invalid={consensus_invalid}"
+            assert!(
+                reopened_child.eligibility.direct_reasons.is_empty(),
+                "recovery does not synthesize a redundant header reason"
             );
         }
     }

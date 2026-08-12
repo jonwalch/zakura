@@ -42,7 +42,8 @@ use crate::{
                 transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
                 ZakuraDb,
             },
-            HEADER_AUX_DELIVERY, HEADER_CHILD, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
+            HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD,
+            HEADER_CONSENSUS_INVALID_TOMBSTONE, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
             HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH, HEADER_SELECTED,
             HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED, STATE_COLUMN_FAMILIES_IN_CODE,
         },
@@ -538,6 +539,8 @@ fn clear_header_chain_engine(
 ) -> Result<(), RollbackFinalizedStateError> {
     for family in [
         HEADER_NODE_BY_HASH,
+        HEADER_CONSENSUS_INVALID_TOMBSTONE,
+        HEADER_BODY_EVIDENCE_AUTHORITY,
         HEADER_CHILD,
         HEADER_SELECTED,
         HEADER_VERIFIED,
@@ -1217,6 +1220,8 @@ mod tests {
         let db = ephemeral_mainnet_db();
         let families = [
             HEADER_NODE_BY_HASH,
+            HEADER_CONSENSUS_INVALID_TOMBSTONE,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
             HEADER_CHILD,
             HEADER_SELECTED,
             HEADER_VERIFIED,

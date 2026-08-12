@@ -1,6 +1,5 @@
 ---
-source: zebra-state/src/service/finalized_state/disk_format/tests/snapshot.rs
-assertion_line: 77
+source: crates/zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
 expression: cf_names
 ---
 [
@@ -12,7 +11,9 @@ expression: cf_names
   "hash_by_height",
   "hash_by_tx_loc",
   "header_aux_delivery_v1",
+  "header_body_evidence_authority_v1",
   "header_child_v1",
+  "header_consensus_invalid_tombstone_v1",
   "header_deferred_v1",
   "header_eligibility_root_v1",
   "header_engine_meta_v1",

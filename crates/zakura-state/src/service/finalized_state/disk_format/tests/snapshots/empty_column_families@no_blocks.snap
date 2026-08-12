@@ -1,5 +1,5 @@
 ---
-source: zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+source: crates/zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
 expression: empty_column_families
 ---
 [
@@ -10,7 +10,9 @@ expression: empty_column_families
   "hash_by_height: no entries",
   "hash_by_tx_loc: no entries",
   "header_aux_delivery_v1: no entries",
+  "header_body_evidence_authority_v1: no entries",
   "header_child_v1: no entries",
+  "header_consensus_invalid_tombstone_v1: no entries",
   "header_deferred_v1: no entries",
   "header_eligibility_root_v1: no entries",
   "header_engine_meta_v1: no entries",

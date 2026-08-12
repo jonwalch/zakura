@@ -220,15 +220,10 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     descendant_header.previous_block_hash = conflicting_child.hash;
     descendant_header.nonce.0[0] ^= 1;
     let descendant_header = Arc::new(descendant_header);
-    let descendant_work = descendant_header
-        .difficulty_threshold
-        .to_work()
-        .expect("the fixture target has exact work");
     let mut descendant_graph = conflicting.projected.clone();
     let descendant = descendant_graph
         .insert(
             descendant_header,
-            descendant_work,
             HeaderValidationState::Valid,
             [],
             BodyValidationState::Unknown,

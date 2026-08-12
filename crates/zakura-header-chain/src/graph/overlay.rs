@@ -3,12 +3,15 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use zakura_chain::{block, work::difficulty::Work};
+use zakura_chain::block;
 
-use super::{GraphError, HeaderGraphEdit, HeaderGraphView, InsertResult, MemHeaderStore};
+use super::{
+    ConsensusInvalidTombstone, GraphError, HeaderGraphEdit, HeaderGraphView, InsertResult,
+    MemHeaderStore,
+};
 use crate::{
     BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId, Frontier,
-    HeaderNode, HeaderValidationState, OperatorInvalidationId,
+    HeaderNode, HeaderValidationState, OperatorInvalidationId, WorkCoordinate, WorkCoordinateError,
 };
 
 #[cfg(test)]
@@ -34,13 +37,73 @@ impl OverlayTestStatistics {
     }
 }
 
-/// Changes that an overlay stages relative to its base graph.
+// Changes made by an overlay relative to the base graph.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) enum GraphDeltaKind {
+    #[default]
+    Ordinary,
+    WorkRebase,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GraphDelta {
-    /// New finality frontier, or `None` when the base finality frontier is unchanged.
-    pub(crate) finalized: Option<Frontier>,
-    pub(crate) put_nodes: Vec<HeaderNode>,
-    pub(crate) delete_nodes: Vec<block::Hash>,
+    pub(super) base_revision: u64,
+    pub(super) kind: GraphDeltaKind,
+    pub(super) finalized: Option<Frontier>,
+    pub(super) put_nodes: Vec<HeaderNode>,
+    pub(super) delete_nodes: Vec<block::Hash>,
+    pub(super) put_tombstones: Vec<ConsensusInvalidTombstone>,
+}
+
+impl GraphDelta {
+    pub(crate) fn empty(base: &MemHeaderStore) -> Self {
+        Self {
+            base_revision: base.revision,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.finalized.is_none()
+            && self.put_nodes.is_empty()
+            && self.delete_nodes.is_empty()
+            && self.put_tombstones.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn base_revision(&self) -> u64 {
+        self.base_revision
+    }
+
+    pub(crate) const fn finalized(&self) -> Option<Frontier> {
+        self.finalized
+    }
+
+    pub(crate) fn put_nodes(&self) -> &[HeaderNode] {
+        &self.put_nodes
+    }
+
+    pub(crate) fn delete_nodes(&self) -> &[block::Hash] {
+        &self.delete_nodes
+    }
+
+    pub(crate) fn put_tombstones(&self) -> &[ConsensusInvalidTombstone] {
+        &self.put_tombstones
+    }
+
+    pub(crate) const fn is_work_rebase(&self) -> bool {
+        matches!(self.kind, GraphDeltaKind::WorkRebase)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_put_nodes_mut(&mut self) -> &mut Vec<HeaderNode> {
+        &mut self.put_nodes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_nodes_mut(&mut self) -> &mut Vec<block::Hash> {
+        &mut self.delete_nodes
+    }
 }
 
 /// A mutable view that stages graph changes over a borrowed base store.
@@ -54,12 +117,15 @@ pub(crate) struct GraphDelta {
 /// base graph.
 pub(crate) struct GraphOverlay<'a> {
     base: &'a MemHeaderStore,
+    base_revision: u64,
     finalized: Frontier,
     puts: HashMap<block::Hash, HeaderNode>,
     deletes: HashSet<block::Hash>,
     add_children: HashMap<block::Hash, HashSet<block::Hash>>,
     remove_children: HashMap<block::Hash, HashSet<block::Hash>>,
     eligible_tips: HashSet<block::Hash>,
+    tombstones: HashMap<block::Hash, ConsensusInvalidTombstone>,
+    work_rebased: bool,
     node_count: usize,
     #[cfg(test)]
     test_statistics: OverlayTestStatistics,
@@ -69,19 +135,23 @@ impl<'a> GraphOverlay<'a> {
     pub(crate) fn new(base: &'a MemHeaderStore) -> Self {
         Self {
             base,
+            base_revision: base.revision,
             finalized: base.finalized,
             puts: HashMap::new(),
             deletes: HashSet::new(),
             add_children: HashMap::new(),
             remove_children: HashMap::new(),
             eligible_tips: base.eligible_tips.clone(),
+            tombstones: HashMap::new(),
+            work_rebased: false,
             node_count: base.nodes.len(),
             #[cfg(test)]
             test_statistics: OverlayTestStatistics::default(),
         }
     }
 
-    /// The overlay reconstructs `delta` over `base` without modifying the base store.
+    /// Reconstructs the projected graph view represented by `delta` over `base`
+    /// without modifying the base store.
     pub(crate) fn from_delta(
         base: &'a MemHeaderStore,
         delta: &GraphDelta,
@@ -109,12 +179,20 @@ impl<'a> GraphOverlay<'a> {
         eligible_tips.extend(indexes.add_eligible_tips.iter().copied());
         Ok(Self {
             base,
+            base_revision: delta.base_revision,
             finalized: delta.finalized.unwrap_or(base.finalized),
             puts,
             deletes,
             add_children,
             remove_children,
             eligible_tips,
+            tombstones: delta
+                .put_tombstones
+                .iter()
+                .cloned()
+                .map(|tombstone| (tombstone.hash, tombstone))
+                .collect(),
+            work_rebased: delta.kind == GraphDeltaKind::WorkRebase,
             node_count: base
                 .nodes
                 .len()
@@ -139,7 +217,7 @@ impl<'a> GraphOverlay<'a> {
         self.node_count
     }
 
-    /// The overlay returns the retained node with `hash`.
+    /// Returns the node with the given hash, if it is retained.
     pub(crate) fn node(&self, hash: block::Hash) -> Option<&HeaderNode> {
         if self.deletes.contains(&hash) {
             return None;
@@ -147,10 +225,8 @@ impl<'a> GraphOverlay<'a> {
         self.puts.get(&hash).or_else(|| self.base.nodes.get(&hash))
     }
 
-    /// The overlay returns a mutable retained node with `hash`.
-    ///
-    /// The overlay stages a copy when the base graph owns the node.
-    pub(crate) fn node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
+    /// Returns a mutable reference to the node with the given hash, creating it if it is not present.
+    fn stage_node(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
         if self.deletes.contains(&hash) {
             return Err(GraphError::UnknownNode(hash));
         }
@@ -171,9 +247,8 @@ impl<'a> GraphOverlay<'a> {
             .expect("overlay node exists because it was staged above"))
     }
 
-    /// The overlay iterates over its retained nodes.
-    ///
-    /// The iterator excludes deletions and replaces base nodes with staged nodes.
+    /// Iterates over all nodes visible through the overlay, excluding deleted
+    /// nodes and replacing base nodes with their staged versions.
     pub(crate) fn nodes(&self) -> impl Iterator<Item = &HeaderNode> {
         self.base
             .nodes
@@ -188,12 +263,12 @@ impl<'a> GraphOverlay<'a> {
             )
     }
 
-    /// The overlay iterates over all retained hashes.
+    /// Returns an iterator over all hashes that are currently retained.
     pub(crate) fn retained_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
         self.nodes().map(|node| node.hash)
     }
 
-    /// The overlay returns retained hashes at `height` in deterministic order.
+    /// Returns all hashes at the given height, including both base and staged nodes.
     pub(crate) fn hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
         let mut hashes: HashSet<_> = self
             .base
@@ -215,7 +290,7 @@ impl<'a> GraphOverlay<'a> {
         hashes
     }
 
-    /// The overlay returns retained children of `parent` in deterministic order.
+    /// Returns all children of the given parent, including both base and staged nodes.
     pub(crate) fn children(&self, parent: block::Hash) -> Vec<block::Hash> {
         if self.node(parent).is_none() {
             return Vec::new();
@@ -252,22 +327,26 @@ impl<'a> GraphOverlay<'a> {
     /// from the parent. A consensus-invalid body-validation state makes the new
     /// header ineligible.
     ///
-    /// The overlay returns [`InsertResult::AlreadyPresent`] for an identical
-    /// retained header. The overlay rejects conflicting duplicates, unknown
-    /// parents, height or work overflow, and invalid graph structure.
+    /// This method returns [`InsertResult::AlreadyPresent`] for an identical
+    /// existing header. It rejects conflicting duplicates, unknown parents,
+    /// height or work overflow, and invalid graph structure.
     ///
-    /// The overlay does not perform header consensus or proof-of-work validation.
-    /// The overlay records the caller-supplied validation result and work.
+    /// This method does not perform header consensus or proof-of-work validation;
+    /// it records the caller-supplied validation result and work.
     pub(crate) fn insert(
         &mut self,
         header: Arc<block::Header>,
-        block_work: Work,
         validation: HeaderValidationState,
         direct_reasons: impl IntoIterator<Item = EligibilityReason>,
-        body: BodyValidationState,
+        mut body: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
         let hash = header.hash();
+        let block_work = header
+            .difficulty_threshold
+            .to_work()
+            .ok_or(GraphError::InvalidNode(hash))?;
 
+        // If already present, return the existing frontier.
         if let Some(existing) = self.node(hash) {
             if existing.header == header {
                 return Ok(InsertResult::AlreadyPresent(Frontier::new(
@@ -278,6 +357,7 @@ impl<'a> GraphOverlay<'a> {
             return Err(GraphError::ConflictingDuplicate(hash));
         }
 
+        // Ensure the parent is visible through the overlay.
         let parent_hash = header.previous_block_hash;
         let parent = self.node(parent_hash).ok_or(GraphError::UnknownParent {
             header: hash,
@@ -290,15 +370,38 @@ impl<'a> GraphOverlay<'a> {
                 parent: parent_hash,
             })?;
         let inherited_from = (!parent.is_eligible()).then_some(parent_hash);
-        let work_coordinate = parent.work_coordinate().checked_add(block_work)?;
+        let work_coordinate = match parent.work_coordinate().checked_add(block_work) {
+            Ok(coordinate) => coordinate,
+            Err(WorkCoordinateError::Overflow) if validation == HeaderValidationState::Valid => {
+                self.rebase_work_to_finalized()?;
+                self.node(parent_hash)
+                    .expect("the work rebase retains every graph node")
+                    .work_coordinate()
+                    .checked_add(block_work)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(tombstone) = self
+            .tombstones
+            .get(&hash)
+            .or_else(|| self.base.consensus_invalid_tombstones.get(&hash))
+        {
+            body = BodyValidationState::ConsensusInvalid {
+                evidence: tombstone.evidence,
+                rule: tombstone.rule.clone(),
+            };
+        }
 
+        // Collect the direct reasons into a set.
         let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
 
+        // If the header is valid, has no direct reasons, and no inherited eligibility, it is eligible.
         let eligible = validation == HeaderValidationState::Valid
             && direct_reasons.is_empty()
             && inherited_from.is_none()
             && !matches!(body, BodyValidationState::ConsensusInvalid { .. });
 
+        // Insert the node into the overlay.
         self.puts.insert(
             hash,
             HeaderNode {
@@ -318,17 +421,22 @@ impl<'a> GraphOverlay<'a> {
             },
         );
 
+        // Remove the parent from the eligible tips if it is no longer eligible.
         self.deletes.remove(&hash);
 
+        // Record the new child-parent edge.
         self.record_child_add(parent_hash, hash);
 
+        // Update the node count.
         self.node_count = self.node_count.saturating_add(1);
 
+        // If the header is eligible, add it to the eligible tips.
         if eligible {
             self.eligible_tips.remove(&parent_hash);
             self.eligible_tips.insert(hash);
         }
 
+        // Return the new frontier.
         Ok(InsertResult::Inserted(Frontier::new(height, hash)))
     }
 
@@ -345,7 +453,7 @@ impl<'a> GraphOverlay<'a> {
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
         let changed = self
-            .node_mut(hash)?
+            .stage_node(hash)?
             .eligibility
             .direct_reasons
             .insert(reason);
@@ -369,7 +477,7 @@ impl<'a> GraphOverlay<'a> {
         id: OperatorInvalidationId,
         evidence: Option<EvidenceId>,
     ) -> Result<bool, GraphError> {
-        let reasons = &mut self.node_mut(hash)?.eligibility.direct_reasons;
+        let reasons = &mut self.stage_node(hash)?.eligibility.direct_reasons;
         let before = reasons.len();
         reasons.retain(|reason| {
             !matches!(reason,
@@ -390,8 +498,27 @@ impl<'a> GraphOverlay<'a> {
         hash: block::Hash,
         body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
+        let tombstone = match &body_validation_state {
+            BodyValidationState::ConsensusInvalid { evidence, rule } => {
+                Some(ConsensusInvalidTombstone {
+                    hash,
+                    evidence: *evidence,
+                    rule: rule.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(existing) = self
+            .tombstones
+            .get(&hash)
+            .or_else(|| self.base.consensus_invalid_tombstones.get(&hash))
+        {
+            if tombstone.as_ref() != Some(existing) {
+                return Err(GraphError::PermanentBodyInvalidity(hash));
+            }
+        }
         let (changed, eligibility_changed) = {
-            let node = self.node_mut(hash)?;
+            let node = self.stage_node(hash)?;
             if matches!(
                 node.body_validation_state,
                 BodyValidationState::ConsensusInvalid { .. }
@@ -410,6 +537,9 @@ impl<'a> GraphOverlay<'a> {
         if eligibility_changed {
             self.recompute_descendant_eligibility(hash)?;
         }
+        if let Some(tombstone) = tombstone {
+            self.tombstones.insert(hash, tombstone);
+        }
         Ok(changed)
     }
 
@@ -418,13 +548,54 @@ impl<'a> GraphOverlay<'a> {
         hash: block::Hash,
         validation: HeaderValidationState,
     ) -> Result<bool, GraphError> {
-        let node = self.node_mut(hash)?;
+        let node = self.stage_node(hash)?;
         let changed = node.validation != validation;
         node.validation = validation;
         if changed {
             self.recompute_descendant_eligibility(hash)?;
         }
         Ok(changed)
+    }
+
+    pub(crate) fn record_aux_delivery(
+        &mut self,
+        hash: block::Hash,
+        delivery_id: EvidenceId,
+    ) -> Result<bool, GraphError> {
+        let ids = &mut self.stage_node(hash)?.aux_delivery_ids;
+        if ids.contains(&delivery_id) {
+            return Ok(false);
+        }
+        ids.push(delivery_id);
+        Ok(true)
+    }
+
+    pub(crate) fn rebase_work_to_finalized(&mut self) -> Result<(), GraphError> {
+        let anchor = self
+            .node(self.finalized.hash)
+            .ok_or(GraphError::UnknownNode(self.finalized.hash))?
+            .work_coordinate();
+        let rebased: Vec<_> = self
+            .nodes()
+            .map(|node| {
+                Ok((
+                    node.hash,
+                    WorkCoordinate::new(
+                        self.finalized.hash,
+                        node.work_coordinate().suffix_after(anchor)?.as_u256(),
+                    ),
+                ))
+            })
+            .collect::<Result<_, GraphError>>()?;
+        for (hash, coordinate) in rebased {
+            self.stage_node(hash)?.work_coordinate = coordinate;
+        }
+        self.work_rebased = true;
+        Ok(())
+    }
+
+    pub(crate) const fn work_rebased(&self) -> bool {
+        self.work_rebased
     }
 
     pub(crate) fn ancestor(
@@ -546,6 +717,7 @@ impl<'a> GraphOverlay<'a> {
             });
         }
 
+        // Collect the removed hashes.
         let mut deleted = HashSet::new();
         for (ancestor, retained_child) in finalized_path {
             deleted.insert(ancestor);
@@ -571,7 +743,7 @@ impl<'a> GraphOverlay<'a> {
             self.delete_node(*hash)?;
         }
         self.finalized = finalized;
-        self.node_mut(finalized.hash)?.eligibility.inherited_from = None;
+        self.stage_node(finalized.hash)?.eligibility.inherited_from = None;
         self.refresh_eligible_tip(finalized.hash);
         Ok(deleted)
     }
@@ -584,6 +756,7 @@ impl<'a> GraphOverlay<'a> {
         self.delete_node(hash)
     }
 
+    // Include only nodes whose final projected value differs from the base.
     pub(crate) fn delta(&self) -> GraphDelta {
         let mut put_nodes: Vec<_> = self
             .puts
@@ -597,13 +770,35 @@ impl<'a> GraphOverlay<'a> {
         let mut delete_nodes: Vec<_> = self.deletes.iter().copied().collect();
         delete_nodes.sort_unstable_by_key(|hash| hash.0);
         GraphDelta {
+            base_revision: self.base_revision,
+            kind: if self.work_rebased {
+                GraphDeltaKind::WorkRebase
+            } else {
+                GraphDeltaKind::Ordinary
+            },
             finalized: (self.finalized != self.base.finalized).then_some(self.finalized),
             put_nodes,
             delete_nodes,
+            put_tombstones: {
+                let mut tombstones: Vec<_> = self.tombstones.values().cloned().collect();
+                tombstones.sort_unstable_by_key(|tombstone| tombstone.hash.0);
+                tombstones
+            },
         }
     }
 
-    /// The overlay stages removal of a leaf node.
+    #[cfg(any(test, feature = "fuzz-impl"))]
+    pub(crate) fn consensus_invalid_tombstones(&self) -> Vec<ConsensusInvalidTombstone> {
+        self.base
+            .consensus_invalid_tombstones
+            .values()
+            .filter(|tombstone| !self.tombstones.contains_key(&tombstone.hash))
+            .chain(self.tombstones.values())
+            .cloned()
+            .collect()
+    }
+
+    /// Removes a node from the overlay.
     fn delete_node(&mut self, hash: block::Hash) -> Result<(), GraphError> {
         let node = self
             .node(hash)
@@ -620,14 +815,14 @@ impl<'a> GraphOverlay<'a> {
         Ok(())
     }
 
-    /// The overlay propagates an eligibility change at `root` through its descendants.
+    /// Propagates an eligibility change at `root` through its descendants.
     ///
-    /// The caller must update the root validation state or direct reasons first.
-    /// The overlay recomputes inherited ineligibility for each affected descendant.
-    /// The overlay refreshes eligible-tip membership for changed nodes and parents.
+    /// The root's own validation or direct reasons must already be updated. This
+    /// recomputes each affected descendant's inherited ineligibility and refreshes
+    /// eligible-tip membership for changed nodes and their parents.
     ///
-    /// The overlay stops traversing a branch when the inherited state is unchanged.
-    /// No descendant on that branch can change after that point.
+    /// Stops traversing a branch once its inherited state is unchanged, because no
+    /// descendant on that branch can be affected.
     fn recompute_descendant_eligibility(&mut self, root: block::Hash) -> Result<(), GraphError> {
         let mut affected = HashSet::from([root]);
         affected.insert(
@@ -640,18 +835,21 @@ impl<'a> GraphOverlay<'a> {
             #[cfg(test)]
             OverlayTestStatistics::increment(&self.test_statistics.eligibility_nodes_visited);
 
+            // Get the parent hash.
             let parent_hash = self
                 .node(hash)
                 .ok_or(GraphError::UnknownNode(hash))?
                 .parent_hash;
             affected.insert(parent_hash);
 
+            // Check if the parent is eligible.
             let inherited_from = (!self
                 .node(parent_hash)
                 .ok_or(GraphError::UnknownNode(parent_hash))?
                 .is_eligible())
             .then_some(parent_hash);
 
+            // Check if the node is already eligible.
             if self
                 .node(hash)
                 .is_some_and(|node| node.eligibility.inherited_from == inherited_from)
@@ -659,26 +857,29 @@ impl<'a> GraphOverlay<'a> {
                 continue;
             }
 
-            self.node_mut(hash)?.eligibility.inherited_from = inherited_from;
+            // Update the node's inherited eligibility.
+            self.stage_node(hash)?.eligibility.inherited_from = inherited_from;
             affected.insert(hash);
 
+            // Add the children to the queue.
             queue.extend(self.children(hash));
         }
 
+        // Refresh the eligible tips for the affected nodes.
         for hash in affected {
             self.refresh_eligible_tip(hash);
         }
         Ok(())
     }
 
-    /// The overlay checks whether `hash` has an eligible child.
+    /// Checks if the given node has any eligible children.
     fn has_eligible_child(&self, hash: block::Hash) -> bool {
         self.children(hash)
             .into_iter()
             .any(|child| self.node(child).is_some_and(HeaderNode::is_eligible))
     }
 
-    /// The overlay refreshes eligible-tip membership for `hash`.
+    /// Refreshes the eligible tips for the given node.
     fn refresh_eligible_tip(&mut self, hash: block::Hash) {
         self.eligible_tips.remove(&hash);
         if self
@@ -689,7 +890,7 @@ impl<'a> GraphOverlay<'a> {
         }
     }
 
-    /// The overlay stages a new child-parent edge.
+    /// Records a new child-parent edge.
     fn record_child_add(&mut self, parent: block::Hash, child: block::Hash) {
         if self
             .remove_children
@@ -701,7 +902,7 @@ impl<'a> GraphOverlay<'a> {
         self.add_children.entry(parent).or_default().insert(child);
     }
 
-    /// The overlay stages removal of a child-parent edge.
+    /// Records a removed child-parent edge.
     fn record_child_remove(&mut self, parent: block::Hash, child: block::Hash) {
         if self
             .add_children
@@ -786,19 +987,14 @@ impl HeaderGraphView for GraphOverlay<'_> {
 }
 
 impl HeaderGraphEdit for GraphOverlay<'_> {
-    fn edit_node_mut(&mut self, hash: block::Hash) -> Result<&mut HeaderNode, GraphError> {
-        self.node_mut(hash)
-    }
-
     fn edit_insert(
         &mut self,
         header: Arc<block::Header>,
-        block_work: Work,
         validation: HeaderValidationState,
         direct_reasons: Vec<EligibilityReason>,
         body: BodyValidationState,
     ) -> Result<InsertResult, GraphError> {
-        self.insert(header, block_work, validation, direct_reasons, body)
+        self.insert(header, validation, direct_reasons, body)
     }
 
     fn edit_add_eligibility_reason(
@@ -832,6 +1028,14 @@ impl HeaderGraphEdit for GraphOverlay<'_> {
         validation: HeaderValidationState,
     ) -> Result<bool, GraphError> {
         self.set_validation(hash, validation)
+    }
+
+    fn edit_record_aux_delivery(
+        &mut self,
+        hash: block::Hash,
+        delivery_id: EvidenceId,
+    ) -> Result<bool, GraphError> {
+        self.record_aux_delivery(hash, delivery_id)
     }
 
     fn edit_advance_finalized(
@@ -876,14 +1080,9 @@ mod tests {
 
     fn insert_child(store: &mut MemHeaderStore, parent: block::Hash, marker: u8) -> Frontier {
         let header = header(parent, marker);
-        let work = header
-            .difficulty_threshold
-            .to_work()
-            .expect("the fixture target has valid work");
         match store
             .insert(
                 header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -900,14 +1099,9 @@ mod tests {
         let anchor = base.finalized();
         let mut overlay = GraphOverlay::new(&base);
         let child_header = header(anchor.hash, 1);
-        let work = child_header
-            .difficulty_threshold
-            .to_work()
-            .expect("the child target has valid work");
         let child = match overlay
             .insert(
                 child_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -928,14 +1122,9 @@ mod tests {
         let mut base = store();
         let anchor = base.finalized();
         let first_header = header(anchor.hash, 1);
-        let work = first_header
-            .difficulty_threshold
-            .to_work()
-            .expect("the fixture target has valid work");
         let first = match base
             .insert(
                 first_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -948,7 +1137,6 @@ mod tests {
         let second = match base
             .insert(
                 second_header.clone(),
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -961,7 +1149,6 @@ mod tests {
         let fork = match base
             .insert(
                 fork_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -997,7 +1184,6 @@ mod tests {
         let third = match overlay
             .insert(
                 third_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -1014,8 +1200,14 @@ mod tests {
             .expect("the eligible descendant becomes the new anchor");
 
         let delta = overlay.delta();
-        let projected = MemHeaderStore::from_nodes(first, overlay.nodes().cloned())
-            .expect("the overlay materializes as a coherent graph");
+        let projected = MemHeaderStore::reconstruct(
+            first,
+            overlay.nodes().cloned(),
+            base.tombstones()
+                .chain(overlay.tombstones.values())
+                .cloned(),
+        )
+        .expect("the overlay materializes as a coherent graph");
         let mut applied = base.clone();
         applied
             .apply_delta(&delta)
@@ -1042,9 +1234,11 @@ mod tests {
         let anchor = base.finalized();
         let child = insert_child(&mut base, anchor.hash, 1);
         let delta = GraphDelta {
+            base_revision: base.revision,
             finalized: None,
             put_nodes: Vec::new(),
             delete_nodes: vec![child.hash],
+            ..GraphDelta::default()
         };
 
         let projected = GraphOverlay::from_delta(&base, &delta)
@@ -1074,19 +1268,56 @@ mod tests {
         let before_heights = base.heights.clone();
         let before_tips = base.eligible_tips.clone();
         let delta = GraphDelta {
+            base_revision: base.revision,
             finalized: None,
             put_nodes: vec![child_node],
             delete_nodes: vec![child.hash],
+            ..GraphDelta::default()
         };
 
         assert_eq!(
             base.apply_delta(&delta),
-            Err(GraphError::ConflictingDuplicate(child.hash))
+            Err(GraphError::DuplicateNode(child.hash))
         );
         assert_eq!(base.nodes, before_nodes);
         assert_eq!(base.children, before_children);
         assert_eq!(base.heights, before_heights);
         assert_eq!(base.eligible_tips, before_tips);
+    }
+
+    #[test]
+    fn stale_delta_cannot_erase_newer_consensus_invalidity() {
+        let mut base = store();
+        let anchor = base.finalized();
+        let child = insert_child(&mut base, anchor.hash, 1);
+        let mut overlay = GraphOverlay::new(&base);
+        overlay
+            .set_validation(child.hash, HeaderValidationState::Valid)
+            .expect("the staged validation is idempotent");
+        overlay
+            .record_aux_delivery(child.hash, EvidenceId::from_digest([3; 32]))
+            .expect("the overlay stages a node replacement");
+        let delta = overlay.delta();
+        drop(overlay);
+        base.set_body_state(
+            child.hash,
+            BodyValidationState::ConsensusInvalid {
+                evidence: EvidenceId::from_digest([4; 32]),
+                rule: crate::BodyRuleId::new("test.stale-delta"),
+            },
+        )
+        .expect("newer consensus invalidity advances the graph revision");
+        let before = base.clone();
+
+        assert_eq!(
+            base.apply_delta(&delta),
+            Err(GraphError::StaleDelta {
+                current: before.revision,
+                delta: delta.base_revision(),
+            })
+        );
+        assert_eq!(base.nodes, before.nodes);
+        assert_eq!(base.eligible_tips, before.eligible_tips);
     }
 
     #[test]
@@ -1142,15 +1373,10 @@ mod tests {
     fn insertion_clones_no_base_nodes_and_eligibility_skips_unaffected_branches() {
         let mut base = store();
         let anchor = base.finalized();
-        let work = base
-            .node(anchor.hash)
-            .expect("the anchor is retained")
-            .block_work;
         let left_header = header(anchor.hash, 1);
         let left = match base
             .insert(
                 left_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -1163,7 +1389,6 @@ mod tests {
         let right = match base
             .insert(
                 right_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -1176,7 +1401,6 @@ mod tests {
         let right_child = match base
             .insert(
                 right_child_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -1189,7 +1413,6 @@ mod tests {
         let left_child = match base
             .insert(
                 left_child_header,
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,
@@ -1203,7 +1426,6 @@ mod tests {
         insertion
             .insert(
                 header(left_child.hash, 5),
-                work,
                 HeaderValidationState::Valid,
                 [],
                 BodyValidationState::Unknown,

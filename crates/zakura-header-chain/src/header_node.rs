@@ -61,6 +61,13 @@ pub enum EligibilityReason {
         /// Current exact finality anchor.
         finalized: Frontier,
     },
+    /// A full-state verifier proved that the corresponding body failed consensus.
+    ConsensusBodyInvalid {
+        /// Exact authoritative evidence identity.
+        evidence: EvidenceId,
+        /// Exact failed consensus rule.
+        rule: BodyRuleId,
+    },
     /// One independently reversible operator invalidation.
     OperatorInvalid {
         /// Exact invalidation to remove on reconsideration.
@@ -80,7 +87,8 @@ impl Ord for EligibilityReason {
             SettledUpgradeConflict { .. } => 0,
             CheckpointConflict { .. } => 1,
             FinalityConflict { .. } => 2,
-            OperatorInvalid { .. } => 3,
+            ConsensusBodyInvalid { .. } => 3,
+            OperatorInvalid { .. } => 4,
         };
         rank(self)
             .cmp(&rank(other))
@@ -112,6 +120,18 @@ impl Ord for EligibilityReason {
                         .cmp(&right.height)
                         .then_with(|| left.hash.0.cmp(&right.hash.0))
                 }
+                (
+                    ConsensusBodyInvalid {
+                        evidence: left_evidence,
+                        rule: left_rule,
+                    },
+                    ConsensusBodyInvalid {
+                        evidence: right_evidence,
+                        rule: right_rule,
+                    },
+                ) => left_evidence
+                    .cmp(right_evidence)
+                    .then_with(|| left_rule.as_str().cmp(right_rule.as_str())),
                 (
                     OperatorInvalid {
                         id: left,

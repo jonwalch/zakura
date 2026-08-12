@@ -39,13 +39,14 @@ use super::{
             HeaderEligibilityRootKey, HeaderFinalityKey, HeaderHeightKey,
         },
         header_chain_values::{
-            HeaderChainValueError, HeaderEligibilityReasonDisk, HeaderNodeDisk,
-            HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk,
+            HeaderBodyEvidenceAuthorityDisk, HeaderChainValueError, HeaderEligibilityReasonDisk,
+            HeaderNodeDisk, HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk,
             HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
-    DiskDb, DiskWriteBatch, ReadDisk, WriteDisk, HEADER_AUX_DELIVERY, HEADER_CHILD,
+    DiskDb, DiskWriteBatch, ReadDisk, WriteDisk, HEADER_AUX_DELIVERY,
+    HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_TOMBSTONE,
     HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
     HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
 };
@@ -367,9 +368,12 @@ fn load_transition_engine(
     store: &HeaderChainStore,
 ) -> Result<HeaderChainEngine, HeaderChainStoreError> {
     let metadata = store.metadata()?;
-    let graph =
-        MemHeaderStore::from_audited_nodes(metadata.frontiers.finalized, store.all_nodes()?)
-            .map_err(|_| HeaderChainStoreError::Incoherent("audited node graph is invalid"))?;
+    let graph = MemHeaderStore::reconstruct(
+        metadata.frontiers.finalized,
+        store.all_nodes()?,
+        store.all_consensus_invalid_tombstones()?,
+    )
+    .map_err(|_| HeaderChainStoreError::Incoherent("audited node graph is invalid"))?;
     HeaderChainEngine::from_audited_state(
         graph,
         metadata,
@@ -2997,6 +3001,7 @@ impl HeaderChainStore {
         let change_set = ChangeSet {
             put_nodes: vec![anchor.clone()],
             delete_nodes: Vec::new(),
+            put_consensus_invalid_tombstones: Vec::new(),
             index_changes: zakura_header_chain::IndexChanges {
                 inserted: vec![metadata.frontiers.finalized],
                 deleted: Vec::new(),
@@ -3108,6 +3113,12 @@ impl HeaderChainStore {
                 )?;
                 self.delete_deferred_for(&mut batch, &node)?;
                 self.delete_reason_rows(&mut batch, &node)?;
+                if !matches!(
+                    node.body_validation_state,
+                    zakura_header_chain::BodyValidationState::ConsensusInvalid { .. }
+                ) {
+                    self.delete_raw(&mut batch, HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)?;
+                }
             }
             for (key, _) in self.scan_prefix(HEADER_CHILD, &hash.0)? {
                 self.delete_raw(&mut batch, HEADER_CHILD, key)?;
@@ -3127,6 +3138,18 @@ impl HeaderChainStore {
                 node.hash.0,
                 &HeaderNodeDisk::from_domain(node),
             )?;
+            if let Some(authority) =
+                HeaderBodyEvidenceAuthorityDisk::from_domain(node.hash, &node.body_validation_state)
+            {
+                self.put_value(
+                    &mut batch,
+                    HEADER_BODY_EVIDENCE_AUTHORITY,
+                    node.hash.0,
+                    &authority,
+                )?;
+            } else {
+                self.delete_raw(&mut batch, HEADER_BODY_EVIDENCE_AUTHORITY, node.hash.0)?;
+            }
             if node.hash != changes.metadata.frontiers.finalized.hash {
                 self.put_empty(
                     &mut batch,
@@ -3152,6 +3175,28 @@ impl HeaderChainStore {
             for reason in &node.eligibility.direct_reasons {
                 self.put_reason(&mut batch, node.hash, reason)?;
             }
+        }
+
+        for tombstone in &changes.put_consensus_invalid_tombstones {
+            if let Some(existing) = self
+                .get_value::<zakura_header_chain::ConsensusInvalidTombstone>(
+                    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+                    tombstone.hash.0,
+                )?
+            {
+                if existing != *tombstone {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "consensus-invalid tombstone changed",
+                    ));
+                }
+                continue;
+            }
+            self.put_value(
+                &mut batch,
+                HEADER_CONSENSUS_INVALID_TOMBSTONE,
+                tombstone.hash.0,
+                tombstone,
+            )?;
         }
 
         let selected_bounds = current_metadata.as_ref().map(|metadata| {
@@ -3876,6 +3921,38 @@ impl StoreAuditRead for HeaderChainStore {
             return Err(StoreError::Incoherent("eligibility root has no node"));
         }
         Ok(nodes)
+    }
+
+    fn all_consensus_invalid_tombstones(
+        &self,
+    ) -> Result<Vec<zakura_header_chain::ConsensusInvalidTombstone>, StoreError> {
+        let mut tombstones = Vec::new();
+        for (key, value) in self
+            .scan_raw(HEADER_CONSENSUS_INVALID_TOMBSTONE)
+            .map_err(store_error)?
+        {
+            if key.len() != 32 {
+                return Err(StoreError::Incoherent("invalid tombstone key width"));
+            }
+            let tombstone = zakura_header_chain::ConsensusInvalidTombstone::decode(&value)
+                .map_err(|_| StoreError::Incoherent("invalid tombstone value"))?;
+            if key.as_slice() != tombstone.hash.0 {
+                return Err(StoreError::Incoherent("tombstone key/hash mismatch"));
+            }
+            tombstones.push(tombstone);
+        }
+        Ok(tombstones)
+    }
+
+    fn body_evidence_is_authoritative(
+        &self,
+        hash: block::Hash,
+        state: &zakura_header_chain::BodyValidationState,
+    ) -> Result<bool, StoreError> {
+        let authority = self
+            .get_value::<HeaderBodyEvidenceAuthorityDisk>(HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)
+            .map_err(store_error)?;
+        Ok(authority.is_some_and(|authority| authority.attests(hash, state)))
     }
 
     fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {

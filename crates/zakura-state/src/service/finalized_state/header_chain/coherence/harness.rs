@@ -31,15 +31,17 @@ use super::{
             DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY,
-        HEADER_CHILD, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META,
-        HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
-        HEADER_VERIFIED,
+        HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_TOMBSTONE,
+        HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+        HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
     },
     fabricate::{FabHeader, Universe},
 };
 
-const HEADER_FAMILIES: [&str; 10] = [
+const HEADER_FAMILIES: [&str; 12] = [
     HEADER_NODE_BY_HASH,
+    HEADER_CONSENSUS_INVALID_TOMBSTONE,
+    HEADER_BODY_EVIDENCE_AUTHORITY,
     HEADER_CHILD,
     HEADER_SELECTED,
     HEADER_VERIFIED,
@@ -736,7 +738,10 @@ impl Harness {
             assert_eq!(node.height, expected.height);
             assert_eq!(node.block_work, expected.block_work);
             assert_eq!(
-                matches!(node.body, BodyValidationState::Verified { .. }),
+                matches!(
+                    node.body_validation_state,
+                    BodyValidationState::Verified { .. }
+                ),
                 expected.body_verified
             );
             assert_eq!(

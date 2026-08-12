@@ -95,9 +95,14 @@ fn verify_plan_exhaustive(
     #[cfg(not(any(test, feature = "fuzz-impl")))]
     let graph = delta_graph;
     let metadata = &plan.change_set.metadata;
+    let expected_work_origin = if plan.graph_delta().is_work_rebase() {
+        source.frontiers.finalized
+    } else {
+        source_metadata.work_origin
+    };
     if source_metadata.state_version != source.state_version
         || metadata.mode != source.mode
-        || metadata.work_origin != source_metadata.work_origin
+        || metadata.work_origin != expected_work_origin
     {
         return Err(InvariantViolation::SourceSnapshot);
     }
@@ -302,7 +307,7 @@ pub(super) fn is_incremental_checkpoint_finality(
             .aux_changes
             .iter()
             .all(|change| matches!(change, AuxDelta::Delete { .. }))
-        && plan.graph_delta().finalized == Some(finalized)
+        && plan.graph_delta().finalized() == Some(finalized)
 }
 
 fn verify_incremental_checkpoint_finality(
@@ -476,8 +481,9 @@ fn verify_indexes(
     before: &HeaderChainEngine,
     plan: &TransitionPlan,
 ) -> Result<(), InvariantViolation> {
-    if plan.change_set.put_nodes != plan.graph_delta().put_nodes
-        || plan.change_set.delete_nodes != plan.graph_delta().delete_nodes
+    if plan.change_set.put_nodes != plan.graph_delta().put_nodes()
+        || plan.change_set.delete_nodes != plan.graph_delta().delete_nodes()
+        || plan.change_set.put_consensus_invalid_tombstones != plan.graph_delta().put_tombstones()
     {
         return Err(InvariantViolation::Index(block::Hash([0; 32])));
     }
@@ -837,12 +843,12 @@ fn changed_boundary_nodes<'a, G: HeaderGraphView>(
         plan.change_set.metadata.frontiers.header_best.hash,
         plan.change_set.metadata.frontiers.verified_best.hash,
     ]);
-    for node in &plan.graph_delta().put_nodes {
+    for node in plan.graph_delta().put_nodes() {
         hashes.insert(node.hash);
         hashes.insert(node.parent_hash);
         hashes.extend(graph.view_children(node.hash));
     }
-    for hash in &plan.graph_delta().delete_nodes {
+    for hash in plan.graph_delta().delete_nodes() {
         if let Some(node) = before.graph().node(*hash) {
             hashes.insert(node.parent_hash);
             hashes.extend(before.graph().children(*hash));

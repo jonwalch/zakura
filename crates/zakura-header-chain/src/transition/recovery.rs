@@ -10,9 +10,9 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, BodyValidationState, CounterExhausted, EligibilityReason, EngineConfig,
-    EngineMetadata, EngineMode, EngineSnapshot, FinalityRecord, FinalitySource, Frontier,
-    HeaderNode, MemHeaderStore, StoreError,
+    AuxDelivery, BodyValidationState, ConsensusInvalidTombstone, CounterExhausted,
+    EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, FinalityRecord,
+    FinalitySource, Frontier, HeaderNode, MemHeaderStore, StoreError,
 };
 
 /// One immutable predecessor record stored below the selectable finalized anchor.
@@ -32,6 +32,16 @@ pub trait StoreAuditRead {
     fn metadata(&self) -> Result<EngineMetadata, StoreError>;
     /// Every node row, including disconnected rows.
     fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError>;
+    /// Every append-only consensus-invalid tombstone, including pruned hashes.
+    fn all_consensus_invalid_tombstones(
+        &self,
+    ) -> Result<Vec<ConsensusInvalidTombstone>, StoreError>;
+    /// Return whether authoritative full-state evidence attests to this exact body state.
+    fn body_evidence_is_authoritative(
+        &self,
+        hash: block::Hash,
+        state: &BodyValidationState,
+    ) -> Result<bool, StoreError>;
     /// Every persisted parent/child edge.
     fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError>;
     /// Complete selected projection.
@@ -69,6 +79,10 @@ pub enum AuditViolation {
     Work(block::Hash),
     /// The audit found header validation state that contradicted deterministic header facts.
     HeaderValidation(block::Hash),
+    /// The audit found a missing or contradictory permanent invalidity tombstone.
+    ConsensusInvalidTombstone(block::Hash),
+    /// The audit found a body projection without exact full-state evidence authority.
+    BodyEvidenceAuthority(block::Hash),
     /// The audit found an absent trust pin or an absent conflict reason.
     TrustPin(block::Height, block::Hash),
     /// The audit found authoritative reason roots that disagreed with node source rows.
@@ -200,17 +214,42 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         || metadata.mode != config.mode
         || metadata.network_id != config.network.kind()
         || trust_anchor_changed && !allow_trust_anchor_update
-        || metadata.work_origin != config.bootstrap_anchor().frontier
     {
         violations.push(AuditViolation::Configuration);
     }
 
     let mut source_nodes = store.all_nodes()?;
+    let tombstones = store.all_consensus_invalid_tombstones()?;
+    let tombstones_by_hash: HashMap<_, _> = tombstones
+        .iter()
+        .map(|tombstone| (tombstone.hash, tombstone))
+        .collect();
+    if tombstones_by_hash.len() != tombstones.len() {
+        violations.push(AuditViolation::ConsensusInvalidTombstone(
+            metadata.frontiers.finalized.hash,
+        ));
+    }
+    for tombstone in &tombstones {
+        let state = BodyValidationState::ConsensusInvalid {
+            evidence: tombstone.evidence,
+            rule: tombstone.rule.clone(),
+        };
+        if !store.body_evidence_is_authoritative(tombstone.hash, &state)? {
+            violations.push(AuditViolation::BodyEvidenceAuthority(tombstone.hash));
+        }
+    }
     source_nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
     let mut unique = HashSet::new();
     for node in &source_nodes {
         if !unique.insert(node.hash) || node.header.hash() != node.hash {
             violations.push(AuditViolation::NodeHash(node.hash));
+        }
+        if matches!(
+            node.body_validation_state,
+            BodyValidationState::Verified { .. } | BodyValidationState::ConsensusInvalid { .. }
+        ) && !store.body_evidence_is_authoritative(node.hash, &node.body_validation_state)?
+        {
+            violations.push(AuditViolation::BodyEvidenceAuthority(node.hash));
         }
     }
     let by_hash: HashMap<_, _> = source_nodes.iter().map(|node| (node.hash, node)).collect();
@@ -235,6 +274,19 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         now,
         &mut violations,
     );
+    for node in &source_nodes {
+        match (
+            &node.body_validation_state,
+            tombstones_by_hash.get(&node.hash),
+        ) {
+            (BodyValidationState::ConsensusInvalid { evidence, rule }, Some(tombstone))
+                if *evidence == tombstone.evidence && *rule == tombstone.rule => {}
+            (BodyValidationState::ConsensusInvalid { .. }, _) | (_, Some(_)) => {
+                violations.push(AuditViolation::ConsensusInvalidTombstone(node.hash));
+            }
+            (_, None) => {}
+        }
+    }
     check_finalized_connectivity(&source_nodes, finalized, &mut violations);
     check_trust_pins(&source_nodes, finalized, config, &mut violations);
     check_authoritative_rows(
@@ -265,11 +317,10 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
         }
     }
 
-    let mut graph = MemHeaderStore::from_nodes(finalized, source_nodes.clone()).map_err(|_| {
-        RecoveryFailure::Source {
+    let mut graph = MemHeaderStore::reconstruct(finalized, source_nodes.clone(), tombstones)
+        .map_err(|_| RecoveryFailure::Source {
             violations: vec![AuditViolation::ProtectedPath(finalized.hash)],
-        }
-    })?;
+        })?;
     graph
         .recompute_all_eligibility()
         .map_err(|_| RecoveryFailure::Source {
@@ -531,6 +582,13 @@ fn check_trust_pins(
                         && node.height <= reason_finalized.height
                         && node.hash != reason_finalized.hash
                 }
+                EligibilityReason::ConsensusBodyInvalid { evidence, rule } => matches!(
+                    &node.body_validation_state,
+                    BodyValidationState::ConsensusInvalid {
+                        evidence: body_evidence,
+                        rule: body_rule,
+                    } if body_evidence == evidence && body_rule == rule
+                ),
                 EligibilityReason::OperatorInvalid {
                     id, reason_digest, ..
                 } => {
@@ -680,6 +738,7 @@ fn check_authoritative_rows<S: StoreAuditRead>(
     let mut first = None;
     let mut last = None;
     let mut invalid_history = false;
+    let mut work_origin_seen = metadata.work_origin == config.bootstrap_anchor().frontier;
     store.visit_finality_history(&mut |record| {
         first.get_or_insert(record);
         if previous.is_some_and(|previous: FinalityRecord| {
@@ -692,6 +751,7 @@ fn check_authoritative_rows<S: StoreAuditRead>(
         }
         previous = Some(record);
         last = Some(record);
+        work_origin_seen |= record.current == metadata.work_origin;
         Ok(())
     })?;
     if first.is_none_or(|record| {
@@ -707,6 +767,12 @@ fn check_authoritative_rows<S: StoreAuditRead>(
         || last.is_none()
     {
         violations.push(AuditViolation::Finality);
+    }
+    let work_origin_is_authenticated = metadata.work_origin == config.bootstrap_anchor().frontier
+        || store.authenticated_canonical_hash(metadata.work_origin.height)?
+            == Some(metadata.work_origin.hash);
+    if !work_origin_seen || !work_origin_is_authenticated {
+        violations.push(AuditViolation::Configuration);
     }
 
     let finalized = metadata.frontiers.finalized;
@@ -827,14 +893,16 @@ fn violation_key(violation: &AuditViolation) -> (u8, u32, [u8; 32]) {
         AuditViolation::Parent(hash) => (1, 0, hash.0),
         AuditViolation::Work(hash) => (2, 0, hash.0),
         AuditViolation::HeaderValidation(hash) => (3, 0, hash.0),
-        AuditViolation::TrustPin(height, hash) => (4, height.0, hash.0),
-        AuditViolation::EligibilityRoot(hash) => (5, 0, hash.0),
-        AuditViolation::Auxiliary(hash) => (6, 0, hash.0),
-        AuditViolation::ValidationContext(hash) => (7, 0, hash.0),
-        AuditViolation::Finality => (8, 0, [0; 32]),
-        AuditViolation::Configuration => (9, 0, [0; 32]),
-        AuditViolation::ProtectedPath(hash) => (10, 0, hash.0),
-        AuditViolation::Limits => (11, 0, [0; 32]),
+        AuditViolation::ConsensusInvalidTombstone(hash) => (4, 0, hash.0),
+        AuditViolation::BodyEvidenceAuthority(hash) => (5, 0, hash.0),
+        AuditViolation::TrustPin(height, hash) => (6, height.0, hash.0),
+        AuditViolation::EligibilityRoot(hash) => (7, 0, hash.0),
+        AuditViolation::Auxiliary(hash) => (8, 0, hash.0),
+        AuditViolation::ValidationContext(hash) => (9, 0, hash.0),
+        AuditViolation::Finality => (10, 0, [0; 32]),
+        AuditViolation::Configuration => (11, 0, [0; 32]),
+        AuditViolation::ProtectedPath(hash) => (12, 0, hash.0),
+        AuditViolation::Limits => (13, 0, [0; 32]),
     }
 }
 
@@ -889,6 +957,33 @@ mod tests {
 
         fn all_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
             Ok(self.nodes.clone())
+        }
+
+        fn all_consensus_invalid_tombstones(
+            &self,
+        ) -> Result<Vec<ConsensusInvalidTombstone>, StoreError> {
+            Ok(self
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.body_validation_state {
+                    BodyValidationState::ConsensusInvalid { evidence, rule } => {
+                        Some(ConsensusInvalidTombstone {
+                            hash: node.hash,
+                            evidence: *evidence,
+                            rule: rule.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect())
+        }
+
+        fn body_evidence_is_authoritative(
+            &self,
+            _hash: block::Hash,
+            _state: &BodyValidationState,
+        ) -> Result<bool, StoreError> {
+            Ok(true)
         }
 
         fn child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
@@ -1231,6 +1326,47 @@ mod tests {
         assert!(
             violations(&store, &config).contains(&AuditViolation::HeaderValidation(invalid_hash))
         );
+    }
+
+    #[test]
+    fn rebased_work_origin_requires_finality_history_and_canonical_authentication() {
+        let (mut store, config) = fixture();
+        let anchor_node = store.nodes[0].clone();
+        let child = store.metadata.frontiers.header_best;
+        let child_node = &mut store.nodes[1];
+        child_node.work_coordinate = WorkCoordinate::new(child.hash, Default::default());
+        child_node.eligibility.inherited_from = None;
+        store.nodes.remove(0);
+        store.children.clear();
+        store.selected = vec![child];
+        store.verified = vec![child];
+        store.contexts = vec![ValidationContextRecord {
+            header: anchor_node.header,
+            height: anchor_node.height,
+        }];
+        store.metadata.work_origin = child;
+        store.metadata.frontiers.finalized = child;
+        store.metadata.frontiers.header_best = child;
+        store.metadata.frontiers.verified_best = child;
+        store.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), child.hash);
+        store.metadata.oldest_retained_height = child.height;
+        store.metadata.finality_epoch = FinalityEpoch::new(1);
+        store.finality.push(FinalityRecord {
+            previous: config.bootstrap_anchor().frontier,
+            current: child,
+            source: FinalitySource::FullState {
+                evidence: EvidenceId::from_digest([0x91; 32]),
+            },
+            epoch: FinalityEpoch::new(1),
+        });
+        store.snapshot = store.metadata.snapshot();
+
+        audit_store(&store, &config).expect("the authenticated rebased origin recovers");
+
+        store
+            .canonical
+            .insert(child.height, block::Hash([0x92; 32]));
+        assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
     }
 
     #[test]

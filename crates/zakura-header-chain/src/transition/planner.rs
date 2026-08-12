@@ -198,6 +198,10 @@ pub(super) fn apply_transition_engine(
         &request.event,
         &event_context,
     )?;
+    let work_rebased = graph.work_rebased();
+    if work_rebased {
+        metadata.work_origin = graph.view_finalized();
+    }
     if let Some(pin) = migrated_pin_refuted {
         metadata.alarms.migrated_pin_refuted = Some(pin);
     }
@@ -253,7 +257,7 @@ pub(super) fn apply_transition_engine(
         }
     }
 
-    let mut cause = if header_rebase == HeaderInsertionRebase::Rebased {
+    let mut cause = if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
         TransitionCause::HeaderWorkRebased
     } else if matches!(
         request.event,
@@ -333,7 +337,7 @@ pub(super) fn apply_transition_engine(
     };
     let verified = trim_projection(&graph, verified)?;
     let graph_delta = graph.delta();
-    let evicted: HashSet<_> = graph_delta.delete_nodes.iter().copied().collect();
+    let evicted: HashSet<_> = graph_delta.delete_nodes().iter().copied().collect();
     aux_changes.retain(|change| match change {
         crate::AuxDelta::Put(delivery) => graph.view_node(delivery.header_hash).is_some(),
         crate::AuxDelta::Delete { .. } => true,
@@ -990,7 +994,6 @@ fn apply_event<G: HeaderGraphEdit>(
                 let reasons = anchor_reasons(context, prepared.height, prepared.hash);
                 parent = match graph.edit_insert(
                     prepared.header.clone(),
-                    prepared.block_work,
                     validation,
                     reasons,
                     BodyValidationState::Unknown,
@@ -1094,10 +1097,7 @@ fn apply_event<G: HeaderGraphEdit>(
                         ));
                     }
                 }
-                graph
-                    .edit_node_mut(delivery.header_hash)?
-                    .aux_delivery_ids
-                    .push(delivery.delivery_id);
+                graph.edit_record_aux_delivery(delivery.header_hash, delivery.delivery_id)?;
                 aux_changes.push(crate::AuxDelta::Put(Box::new(*delivery)));
             }
         }
@@ -1131,10 +1131,9 @@ fn apply_event<G: HeaderGraphEdit>(
                     ));
                 }
                 if graph.view_node(header.hash).is_none() {
-                    let work = validate_full_state_header(graph, parent, header, durable, context)?;
+                    validate_full_state_header(graph, parent, header, durable, context)?;
                     graph.edit_insert(
                         header.header.clone(),
-                        work,
                         HeaderValidationState::Valid,
                         anchor_reasons(context, header.height, header.hash),
                         BodyValidationState::Verified {
@@ -1177,10 +1176,9 @@ fn apply_event<G: HeaderGraphEdit>(
                     ));
                 }
                 if graph.view_node(header.hash).is_none() {
-                    let work = validate_full_state_header(graph, parent, header, durable, context)?;
+                    validate_full_state_header(graph, parent, header, durable, context)?;
                     graph.edit_insert(
                         header.header.clone(),
-                        work,
                         HeaderValidationState::Valid,
                         anchor_reasons(context, header.height, header.hash),
                         BodyValidationState::Verified {
@@ -1533,8 +1531,9 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
         trust_pins,
         limits,
     } = inputs;
-    let put_nodes = graph_delta.put_nodes.clone();
-    let delete_nodes = graph_delta.delete_nodes.clone();
+    let put_nodes = graph_delta.put_nodes().to_vec();
+    let delete_nodes = graph_delta.delete_nodes().to_vec();
+    let put_consensus_invalid_tombstones = graph_delta.put_tombstones().to_vec();
     let mut eligibility_changes: Vec<_> = put_nodes
         .iter()
         .filter_map(|node| {
@@ -1636,6 +1635,7 @@ fn derive_plan(inputs: DerivePlanInputs<'_>) -> Result<TransitionPlan, Transitio
     let change_set = ChangeSet {
         put_nodes,
         delete_nodes: delete_nodes.clone(),
+        put_consensus_invalid_tombstones,
         index_changes: IndexChanges {
             inserted,
             deleted: delete_nodes,
@@ -1675,6 +1675,7 @@ fn no_change(
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
+            put_consensus_invalid_tombstones: Vec::new(),
             index_changes: IndexChanges::default(),
             selected_projection: ProjectionDelta::default(),
             verified_projection: ProjectionDelta::default(),
@@ -1683,7 +1684,7 @@ fn no_change(
             finality_append: None,
             metadata,
         },
-        graph_delta: GraphDelta::default(),
+        graph_delta: GraphDelta::empty(_engine.graph()),
         #[cfg(any(test, feature = "fuzz-impl"))]
         projected: _engine.graph().clone(),
         cause,
@@ -1707,6 +1708,7 @@ fn resource_stalled(
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
+            put_consensus_invalid_tombstones: Vec::new(),
             index_changes: IndexChanges::default(),
             selected_projection: ProjectionDelta::default(),
             verified_projection: ProjectionDelta::default(),
@@ -1715,7 +1717,7 @@ fn resource_stalled(
             finality_append: None,
             metadata,
         },
-        graph_delta: GraphDelta::default(),
+        graph_delta: GraphDelta::empty(engine.graph()),
         #[cfg(any(test, feature = "fuzz-impl"))]
         projected: engine.graph().clone(),
         cause: TransitionCause::ResourceStalled,
@@ -1729,10 +1731,11 @@ fn invariant_pins(context: &TransitionContext<'_>) -> Arc<[Frontier]> {
 }
 
 #[cfg(any(test, feature = "fuzz-impl"))]
-fn materialize_graph<G: HeaderGraphView>(graph: &G) -> Result<MemHeaderStore, GraphError> {
-    MemHeaderStore::from_nodes(
+fn materialize_graph(graph: &GraphOverlay<'_>) -> Result<MemHeaderStore, GraphError> {
+    MemHeaderStore::reconstruct(
         graph.view_finalized(),
         graph.view_nodes().into_iter().cloned(),
+        graph.consensus_invalid_tombstones(),
     )
 }
 

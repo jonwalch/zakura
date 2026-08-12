@@ -16,12 +16,13 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     AlarmSet, AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary,
-    BodyValidationState, BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, EligibilityReason,
-    EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord,
-    FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderContextFact,
-    HeaderGeneration, HeaderNode, HeaderSyncWorkOwner, HeaderValidationState, HeaderWorkAuthority,
-    HeaderWorkOwner, OperatorInvalidationId, SourceId, StateVersion, SuffixWork, TransitionDomain,
-    TransitionFingerprint, TreeAuxRecordV1, VerifiedGeneration, WorkCoordinate,
+    BodyValidationState, BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore,
+    ConsensusInvalidTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
+    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
+    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
+    HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
+    StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
+    VerifiedGeneration, WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -348,6 +349,162 @@ fn put_frontier(encoder: &mut Encoder, frontier: Frontier) {
     encoder.fixed(&frontier.hash.0);
 }
 
+impl FallibleDiskValue for ConsensusInvalidTombstone {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        encoder.fixed(&self.hash.0);
+        encoder.fixed(&self.evidence.digest());
+        encoder.bounded(
+            "consensus_invalid_rule",
+            self.rule.as_str().as_bytes(),
+            MAX_RULE_ID_BYTES,
+        )?;
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        match decoder.u8()? {
+            1 => {}
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "consensus_invalid_tombstone_version",
+                    value,
+                })
+            }
+        }
+        let hash = block::Hash(decoder.array()?);
+        let evidence = EvidenceId::from_digest(decoder.array()?);
+        let rule =
+            std::str::from_utf8(decoder.bounded("consensus_invalid_rule", MAX_RULE_ID_BYTES)?)
+                .map_err(|_| HeaderChainValueError::RuleId)?;
+        decoder.finish()?;
+        Ok(Self {
+            hash,
+            evidence,
+            rule: BodyRuleId::new(rule),
+        })
+    }
+}
+
+/// Durable full-state evidence authority for one retained body projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeaderBodyEvidenceAuthorityDisk {
+    /// Full state accepted the exact block hash under this evidence identity.
+    Verified {
+        /// Canonical block hash.
+        hash: block::Hash,
+        /// Exact full-state evidence identity.
+        evidence: EvidenceId,
+    },
+    /// Full state rejected the exact block hash under this evidence and rule.
+    ConsensusInvalid(ConsensusInvalidTombstone),
+}
+
+impl HeaderBodyEvidenceAuthorityDisk {
+    /// Build authority for a body state that requires full-state authentication.
+    pub fn from_domain(hash: block::Hash, state: &BodyValidationState) -> Option<Self> {
+        match state {
+            BodyValidationState::Verified { evidence } => Some(Self::Verified {
+                hash,
+                evidence: *evidence,
+            }),
+            BodyValidationState::ConsensusInvalid { evidence, rule } => {
+                Some(Self::ConsensusInvalid(ConsensusInvalidTombstone {
+                    hash,
+                    evidence: *evidence,
+                    rule: rule.clone(),
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return whether this authority attests to the exact domain body state.
+    pub fn attests(&self, hash: block::Hash, state: &BodyValidationState) -> bool {
+        match (self, state) {
+            (
+                Self::Verified {
+                    hash: authority_hash,
+                    evidence: authority_evidence,
+                },
+                BodyValidationState::Verified { evidence },
+            ) => *authority_hash == hash && authority_evidence == evidence,
+            (
+                Self::ConsensusInvalid(authority),
+                BodyValidationState::ConsensusInvalid { evidence, rule },
+            ) => {
+                authority.hash == hash && authority.evidence == *evidence && authority.rule == *rule
+            }
+            _ => false,
+        }
+    }
+}
+
+impl FallibleDiskValue for HeaderBodyEvidenceAuthorityDisk {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        match self {
+            Self::Verified { hash, evidence } => {
+                encoder.u8(0);
+                encoder.fixed(&hash.0);
+                encoder.fixed(&evidence.digest());
+            }
+            Self::ConsensusInvalid(tombstone) => {
+                encoder.u8(1);
+                encoder.fixed(&tombstone.hash.0);
+                encoder.fixed(&tombstone.evidence.digest());
+                encoder.bounded(
+                    "body_evidence_rule",
+                    tombstone.rule.as_str().as_bytes(),
+                    MAX_RULE_ID_BYTES,
+                )?;
+            }
+        }
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.u8()? != 1 {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "body_evidence_authority_version",
+                value: bytes.first().copied().unwrap_or_default(),
+            });
+        }
+        let kind = decoder.u8()?;
+        let hash = block::Hash(decoder.array()?);
+        let evidence = EvidenceId::from_digest(decoder.array()?);
+        let authority = match kind {
+            0 => Self::Verified { hash, evidence },
+            1 => {
+                let rule =
+                    std::str::from_utf8(decoder.bounded("body_evidence_rule", MAX_RULE_ID_BYTES)?)
+                        .map_err(|_| HeaderChainValueError::RuleId)?;
+                Self::ConsensusInvalid(ConsensusInvalidTombstone {
+                    hash,
+                    evidence,
+                    rule: BodyRuleId::new(rule),
+                })
+            }
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "body_evidence_authority_kind",
+                    value,
+                })
+            }
+        };
+        decoder.finish()?;
+        Ok(authority)
+    }
+}
+
 fn get_frontier(decoder: &mut Decoder<'_>) -> Result<Frontier, HeaderChainValueError> {
     Ok(Frontier::new(
         block::Height(decoder.u32()?),
@@ -581,7 +738,7 @@ pub struct HeaderNodeDisk {
 impl HeaderNodeDisk {
     /// Convert one domain node into its version-one durable representation.
     pub fn from_domain(node: &HeaderNode) -> Self {
-        let body = match &node.body {
+        let body = match &node.body_validation_state {
             BodyValidationState::Unknown => HeaderBodyStateDisk::Unknown,
             BodyValidationState::CommitmentMatched => HeaderBodyStateDisk::CommitmentMatched,
             BodyValidationState::Verified { evidence } => HeaderBodyStateDisk::Verified(*evidence),
@@ -1615,6 +1772,8 @@ mod tests {
             .expect("the persistent fixture reopens through raw RocksDB");
         for name in [
             crate::service::finalized_state::HEADER_NODE_BY_HASH,
+            crate::service::finalized_state::HEADER_CONSENSUS_INVALID_TOMBSTONE,
+            crate::service::finalized_state::HEADER_BODY_EVIDENCE_AUTHORITY,
             crate::service::finalized_state::HEADER_CHILD,
             crate::service::finalized_state::HEADER_SELECTED,
             crate::service::finalized_state::HEADER_VERIFIED,

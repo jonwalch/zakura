@@ -191,7 +191,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let mut corrupt = plan.clone();
     corrupt
         .projected
-        .node_mut(tip.hash)
+        .test_corrupt_node(tip.hash)
         .expect("tip exists")
         .hash = block::Hash([0; 32]);
     assert!(matches!(
@@ -202,7 +202,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let mut corrupt = plan.clone();
     corrupt
         .projected
-        .node_mut(tip.hash)
+        .test_corrupt_node(tip.hash)
         .expect("tip exists")
         .parent_hash = block::Hash([0; 32]);
     assert!(matches!(
@@ -220,7 +220,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let mut corrupt = plan.clone();
     corrupt
         .projected
-        .node_mut(tip.hash)
+        .test_corrupt_node(tip.hash)
         .expect("tip exists")
         .work_coordinate = WorkCoordinate::new(block::Hash([0; 32]), U256::zero());
     assert!(matches!(
@@ -231,7 +231,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let mut corrupt = plan.clone();
     corrupt
         .projected
-        .node_mut(tip.hash)
+        .test_corrupt_node(tip.hash)
         .expect("tip exists")
         .eligibility
         .inherited_from = Some(block::Hash([0; 32]));
@@ -279,7 +279,7 @@ fn every_named_invariant_category_rejects_its_projected_corruption() {
     let finalized = store.metadata.frontiers.finalized.hash;
     corrupt.change_set.delete_nodes.push(finalized);
     corrupt.change_set.index_changes.deleted.push(finalized);
-    corrupt.graph_delta.delete_nodes.push(finalized);
+    corrupt.graph_delta.test_delete_nodes_mut().push(finalized);
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Index(_))

@@ -114,7 +114,6 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
                 .graph
                 .insert(
                     header.header.clone(),
-                    header.block_work,
                     header.validation,
                     [],
                     BodyValidationState::Verified {
@@ -787,10 +786,11 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
 
     let mut unverified = plan.clone();
     unverified.change_set.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
-    unverified.graph_delta.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
+    unverified.graph_delta.test_put_nodes_mut()[0].body_validation_state =
+        BodyValidationState::Unknown;
     unverified
         .projected
-        .node_mut(checkpoint.hash)
+        .test_corrupt_node(checkpoint.hash)
         .expect("the projected checkpoint is retained")
         .body_validation_state = BodyValidationState::Unknown;
     assert_eq!(
@@ -811,7 +811,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         .push(selected_tip.hash);
     evicted_selected
         .graph_delta
-        .delete_nodes
+        .test_delete_nodes_mut()
         .push(selected_tip.hash);
     assert_eq!(
         verify_plan(&test_engine(&store), &evicted_selected),
