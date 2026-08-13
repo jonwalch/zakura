@@ -28,9 +28,31 @@ without asking an AI to reconstruct intent.
 
 ## Black-Box Contracts
 
-- Document core traits and non-obvious methods with concise specifications covering purpose, validations, important side effects, and postconditions or invariants.
-- Explain domain terms and enum variants whose meaning is not self-evident.
-- Organize long implementations into clearly named logical groups. Comments should explain intent and constraints, not restate syntax.
+Treat documented functions as black boxes: a reader should know when to call
+them, what changes, and what must remain true—without reading the body.
+Comments explain intent and constraints, not syntax. Prefer key details over
+completeness; omit anything inferable from the signature or name. Explain
+domain terms and enum variants whose meaning is not self-evident. Organize
+long implementations into clearly named logical groups.
+
+### Public APIs
+
+Document crate-public and other caller-facing entry points with a focused
+specification:
+
+- purpose and caller ownership before/after the call;
+- important effects (success vs failure; what durable or in-memory state
+  changes, and what does not);
+- invariants, postconditions, and freshness/stale rules the caller must respect.
+
+Use short structured sections such as `# Returns` only when they clarify the
+caller path. Avoid narrative walkthroughs of internal phases.
+
+### Internal APIs
+
+Keep `pub(crate)`, `pub(super)`, and private helpers brief: purpose plus the
+one or two constraints a future editor must not violate. Do not restate the
+public caller lifecycle or install/publish contract on internal helpers.
 
 ## Cohesive Abstractions
 
