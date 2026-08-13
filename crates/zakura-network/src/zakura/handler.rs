@@ -3379,6 +3379,7 @@ pub async fn spawn_zakura_endpoint_with_services(
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
+    let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
     // Log our own dial address once iroh has resolved it, so operators can hand
     // out `<node_id>@<direct_addr>` for other nodes' `zakura.bootstrap_peers`.
@@ -3423,6 +3424,7 @@ pub async fn spawn_zakura_endpoint_with_services(
     let discovery_dialer =
         discovery::spawn_native_discovery_dialer(endpoint.clone(), discovery, limits);
     endpoint.push_header_sync_task(discovery_dialer).await;
+    startup_shutdown.disarm();
     Ok(Some(endpoint))
 }
 
