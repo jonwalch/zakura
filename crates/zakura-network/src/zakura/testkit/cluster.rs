@@ -3223,18 +3223,37 @@ mod tests {
         cluster.nodes.push(node1);
         cluster.nodes.push(node2);
 
-        cluster.connect_full_mesh(Duration::from_secs(5)).await?;
-        cluster.await_all_connected(Duration::from_secs(5)).await?;
+        cluster.connect_full_mesh(TEST_NET_TIMEOUT).await?;
+        cluster.await_all_connected(TEST_NET_TIMEOUT).await?;
+        // Wait for every row the assertions below read, not only node 02's
+        // received status. Node 01's accepted-stream row is written when node 02
+        // opens its own header-sync stream, which is a separate exchange that can
+        // land after node 02 has already recorded the status it received.
         await_until(
-            "native header-sync status received",
-            Duration::from_secs(5),
+            "native header-sync status exchange traced on both nodes",
+            TEST_NET_TIMEOUT,
             || {
                 capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("02")
-                        .table("header_sync")
-                        .count(hs_trace::HEADER_STATUS_RECEIVED)
-                        >= 1
+                    let accepted_header_sync_stream = |node| {
+                        reader.node(node).table("stream").rows().iter().any(|row| {
+                            row.get("event").and_then(|event| event.as_str()) == Some("accepted")
+                                && row.get("stream_kind").and_then(|kind| kind.as_str())
+                                    == Some("header_sync")
+                        })
+                    };
+
+                    accepted_header_sync_stream("01")
+                        && accepted_header_sync_stream("02")
+                        && reader
+                            .node("01")
+                            .table("header_sync")
+                            .count(hs_trace::HEADER_STATUS_SENT)
+                            >= 1
+                        && reader
+                            .node("02")
+                            .table("header_sync")
+                            .count(hs_trace::HEADER_STATUS_RECEIVED)
+                            >= 1
                 })
             },
         )

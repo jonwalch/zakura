@@ -3268,6 +3268,15 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
     Ok(())
 }
 
+/// Deadline for the mining phase of
+/// [`pruned_storage_mode_prunes_during_regtest_sync`].
+///
+/// Mining the retention window takes roughly a minute on an unloaded developer
+/// machine, and several times that on a contended CI runner. This covers the whole
+/// mining phase, so it is set well above the observed worst case while staying
+/// inside the `zakura-pruned-storage` nextest slow timeout.
+const PRUNED_STORAGE_MINING_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Pruned storage mode deletes historical raw transaction data during regtest
 /// sync, while the node keeps committing new blocks.
 ///
@@ -3325,18 +3334,38 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
     // `tx_retention + MAX_BLOCK_REORG_HEIGHT`. Mine a margin past that so several
     // heights are pruned.
     let blocks_to_mine = tx_retention + MAX_BLOCK_REORG_HEIGHT + 50;
-    let mut mined = 0;
-    while mined < blocks_to_mine {
-        // Mine in batches to keep each `generate` RPC call bounded.
-        let batch = (blocks_to_mine - mined).min(250);
-        client.generate(batch).await?;
-        mined += batch;
-    }
+
+    // `with_timeout` arms an absolute deadline rather than a per-call one, and
+    // mining this many blocks takes longer than the launch deadline. Re-arm the
+    // deadline so it covers the whole mining phase; otherwise the wait for the
+    // pruning line below expires before it reads a single line of output.
+    zakurad = zakurad.with_timeout(PRUNED_STORAGE_MINING_TIMEOUT);
+
+    // Mine on a background task while this thread reads the node's log stream.
+    // Nothing drains the child's stdout while a `generate` call is in flight, so
+    // mining the whole window first fills the stdout pipe and blocks the node's
+    // log writer, which stops the pruning line from being emitted at all.
+    let mining = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let mut mined = 0;
+            while mined < blocks_to_mine {
+                // Mine in batches to keep each `generate` RPC call bounded.
+                let batch = (blocks_to_mine - mined).min(250);
+                client.generate(batch).await?;
+                mined += batch;
+            }
+
+            Ok::<(), eyre::Report>(())
+        }
+    });
 
     // Commit-time pruning logs a line each time it deletes a height range.
     zakurad.expect_stdout_line_matches(
         "pruning raw transaction history outside the retention window",
     )?;
+
+    mining.await??;
 
     // The node keeps validating and committing new blocks over the partially
     // pruned history (this is what proves pruning didn't break future validation).
