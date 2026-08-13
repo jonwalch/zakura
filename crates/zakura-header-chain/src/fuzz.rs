@@ -20,17 +20,16 @@ use crate::{
     AlarmSet, AuxDelivery, AuxDelta, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch,
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
     Clock, ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
+    EngineTransition, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    FrontierSet, FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
     HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact, HeaderFailure, HeaderGeneration,
     HeaderInsertionFacts, HeaderRule, HeaderRules, HeaderValidationFacts, HeaderValidationState,
     HeaderWorkAuthority, HeaderWorkOwner, InsertHeaders, MemHeaderStore, OperatorInvalidate,
     OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
     ProjectionDelta, SourceId, StateVersion, SuffixWork, TargetCompletion, TransientBodyFailure,
     TransientBodyFailureKind, TransitionContext, TransitionFailure, TransitionInput,
-    TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
-    MAX_CANDIDATE_TIPS_V1,
+    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -112,6 +111,7 @@ impl FuzzStore {
             header_generation: HeaderGeneration::new(0),
             verified_generation: VerifiedGeneration::new(0),
             finality_epoch: FinalityEpoch::new(0),
+            headers_only_migration_epoch: None,
             frontiers: FrontierSet {
                 finalized: frontier,
                 header_best: frontier,
@@ -147,7 +147,7 @@ impl FuzzStore {
         self.metadata.snapshot()
     }
 
-    fn commit(&mut self, plan: &TransitionPlan) {
+    fn commit(&mut self, plan: &EngineTransition) {
         for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
@@ -492,7 +492,7 @@ fn apply_transition(
     store: &FuzzStore,
     request: TransitionRequest,
     context: &TransitionContext<'_>,
-) -> Result<TransitionPlan, TransitionFailure> {
+) -> Result<EngineTransition, TransitionFailure> {
     let engine = HeaderChainEngine::from_audited_state(
         store.graph.clone(),
         store.metadata.clone(),
@@ -501,9 +501,7 @@ fn apply_transition(
         store.aux.clone(),
     )
     .expect("the fuzz fixture engine is coherent");
-    engine
-        .plan_transition(fuzz_transition_input(store, request), context)
-        .map(crate::EngineTransition::into_plan)
+    engine.plan_transition(fuzz_transition_input(store, request), context)
 }
 
 struct ManualClock(AtomicI64);
@@ -838,7 +836,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         };
         match apply_transition(&store, request, &context) {
             Ok(plan) => {
-                assert_eq!(plan.before(), &before);
+                assert_eq!(plan.snapshot_before_commit(), &before);
                 let no_change = plan.is_no_change();
                 let eligibility_changed = !plan.change_set().eligibility_changes.is_empty();
                 let header_graph_changed = !plan.change_set().index_changes.inserted.is_empty()
@@ -884,7 +882,8 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
             | Err(TransitionFailure::InvalidEvidence(_))
             | Err(TransitionFailure::Mode)
             | Err(TransitionFailure::StalePreparation)
-            | Err(TransitionFailure::AuxiliaryLimitExceeded) => {
+            | Err(TransitionFailure::AuxiliaryLimitExceeded)
+            | Err(TransitionFailure::MissingDurableFacts(_)) => {
                 assert_eq!(store.snapshot(), before);
                 refused = refused.saturating_add(1);
             }
@@ -1194,7 +1193,7 @@ fn assert_incident_recovery() -> [u8; 32] {
     };
     let held_a_plan = apply_transition(&store, late_a.clone(), &held_context)
         .expect("A's held insertion is valid before B replaces it");
-    assert_eq!(held_a_plan.before(), &store.snapshot());
+    assert_eq!(held_a_plan.snapshot_before_commit(), &store.snapshot());
 
     let losing_b = commit_fixture_insertion(&mut store, &clock, &authority, anchor, 2, 102, 0xb1);
     assert_eq!(
@@ -1475,7 +1474,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
         let plan = apply_transition(&store, request, &context)
             .expect("every typed payload mismatch is informational to the header DAG");
         assert!(plan.is_no_change());
-        assert_eq!(plan.before(), &before);
+        assert_eq!(plan.snapshot_before_commit(), &before);
         assert_eq!(retained_digest(&store), before_digest);
         hasher.update([match kind {
             BodyCommitmentKind::HeaderHash => 0,

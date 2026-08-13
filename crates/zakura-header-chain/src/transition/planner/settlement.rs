@@ -21,7 +21,7 @@ pub(super) struct SettlementInputs<'engine, 'ctx> {
     pub(super) engine: &'engine HeaderChainEngine,
     pub(super) projected: ProjectedTransitionState<'engine>,
     pub(super) metadata: EngineMetadata,
-    pub(super) before: &'ctx EngineSnapshot,
+    pub(super) snapshot_before_commit: &'ctx EngineSnapshot,
     pub(super) event: &'ctx TransitionEvent,
     pub(super) header_rebase: HeaderInsertionRebase,
     pub(super) context: &'ctx TransitionContext<'ctx>,
@@ -60,7 +60,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         engine,
         mut projected,
         mut metadata,
-        before,
+        snapshot_before_commit,
         event,
         header_rebase,
         context,
@@ -72,7 +72,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
     projected.refresh_verified_after_operator_change()?;
 
-    let (mut header_best, _) = projected.graph().view_select_best_header_chain()?;
+    let (mut selected_tip, _) = projected.graph().view_select_best_header_chain()?;
     let full_state_finalized = match event {
         TransitionEvent::FullStateFinalized(event) => {
             Some((event.new_finalized, event.full_state_transition_id))
@@ -92,7 +92,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 
     let mut finality = None;
     if let Some((new_finalized, evidence)) = full_state_finalized {
-        if new_finalized.height < before.frontiers.finalized.height {
+        if new_finalized.height < snapshot_before_commit.frontiers.finalized.height {
             return Err(InvalidTransitionEvidence::Finality(FinalityViolation::Retreated).into());
         }
         if !projected.verified().contains(&new_finalized) {
@@ -104,16 +104,16 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         finality = Some((new_finalized, FinalitySource::FullState { evidence }));
     } else if context.config.mode == EngineMode::HeadersOnly {
         let depth = context.config.limits.local_finality_depth.get();
-        if header_best
+        if selected_tip
             .height
             .0
             .saturating_sub(projected.graph().view_finalized_frontier().height.0)
             > depth
         {
-            let height = zakura_chain::block::Height(header_best.height.0 - depth);
+            let height = zakura_chain::block::Height(selected_tip.height.0 - depth);
             let new_finalized = projected
                 .graph()
-                .view_header_ancestor(header_best.hash, height)?
+                .view_header_ancestor(selected_tip.hash, height)?
                 .ok_or(TransitionFailure::InvalidEvidence(
                     InvalidTransitionEvidence::Planner(
                         PlannerCoherenceViolation::IncompleteSelectedAncestry,
@@ -121,16 +121,18 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 ))?;
             finality = Some((
                 new_finalized,
-                FinalitySource::HeadersOnlyDepth {
-                    selected_tip: header_best,
-                },
+                FinalitySource::HeadersOnlyDepth { selected_tip },
             ));
         }
     }
 
     let mut effect = TransitionEffect::none();
-    if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
+    // HeaderInsertionRebase::header_work_effect is the sole rebase→effect map;
+    // work-coordinate rebase from finality settlement may still force Rebased.
+    if work_rebased {
         effect.header_work = Some(HeaderWorkEffect::Rebased);
+    } else {
+        effect.header_work = header_rebase.header_work_effect();
     }
     if matches!(
         event,
@@ -156,7 +158,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 source,
                 epoch,
             });
-            header_best = projected.graph().view_select_best_header_chain()?.0;
+            selected_tip = projected.graph().view_select_best_header_chain()?.0;
             match source {
                 FinalitySource::HeadersOnlyDepth { .. } => {
                     effect.finality = Some(FinalityEffect::HeadersOnlyDepth);
@@ -176,7 +178,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let retention = projected.enforce_retention(
-        header_best,
+        selected_tip,
         context.retention_references.iter().copied(),
         context.config.limits,
     )?;
@@ -184,9 +186,9 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         return Ok(FinalityRetentionOutcome::ResourceStalled);
     }
 
-    header_best = projected.graph().view_select_best_header_chain()?.0;
+    selected_tip = projected.graph().view_select_best_header_chain()?.0;
     let selected = if effect.is_checkpoint_finality()
-        && header_best == before.frontiers.header_best
+        && selected_tip == snapshot_before_commit.frontiers.header_best
         && finality_append.is_some_and(|record| {
             old_selected
                 .binary_search_by_key(&record.current.height, |frontier| frontier.height)
@@ -208,7 +210,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             })?;
         Cow::Borrowed(&old_selected[index..])
     } else {
-        Cow::Owned(path(projected.graph(), header_best)?)
+        Cow::Owned(path(projected.graph(), selected_tip)?)
     };
 
     let projected = projected.finish_after_retention(engine)?;

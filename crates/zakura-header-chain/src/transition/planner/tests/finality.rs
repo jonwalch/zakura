@@ -59,24 +59,22 @@ fn apply_with_header_rebase_facts(
     config: &EngineConfig,
     clock: &ManualClock,
     validation: ValidationLease,
-) -> Result<TransitionPlan, TransitionFailure> {
+) -> Result<EngineTransition, TransitionFailure> {
     let TransitionEvent::InsertHeaders(event) = request.event else {
         panic!("rebase fixtures insert headers");
     };
-    test_engine(store)
-        .plan_transition(
-            TransitionInput::InsertHeaders {
-                event,
-                facts: HeaderInsertionFacts {
-                    validation: HeaderValidationFacts {
-                        validation_leases: vec![validation],
-                    },
-                    finality_rebase_history: store.finality.clone(),
+    test_engine(store).plan_transition(
+        TransitionInput::InsertHeaders {
+            event,
+            facts: HeaderInsertionFacts {
+                validation: HeaderValidationFacts {
+                    validation_leases: vec![validation],
                 },
+                finality_rebase_history: store.finality.clone(),
             },
-            &context(config, clock, None),
-        )
-        .map(crate::EngineTransition::into_plan)
+        },
+        &context(config, clock, None),
+    )
 }
 
 #[test]
@@ -384,8 +382,14 @@ fn finalization_and_replacement_match_serial_histories() {
         &context(&config, &clock, Some(&authority)),
     )
     .expect("finalization can pause after planning");
-    assert_eq!(held_replacement_plan.before(), &base.snapshot());
-    assert_eq!(held_finality_plan.before(), &base.snapshot());
+    assert_eq!(
+        held_replacement_plan.snapshot_before_commit(),
+        &base.snapshot()
+    );
+    assert_eq!(
+        held_finality_plan.snapshot_before_commit(),
+        &base.snapshot()
+    );
 
     let mut replacement_then_finality = base.clone();
     let replacement_plan = apply_transition(
@@ -804,7 +808,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         |header_node| header_node.body_validation_state = BodyValidationState::Unknown,
     );
     assert_eq!(
-        verify_plan(&test_engine(&store), &unverified),
+        crate::verify_plan_production(&test_engine(&store), &unverified),
         Err(InvariantViolation::VerifiedProjection(checkpoint.hash))
     );
 
@@ -826,6 +830,18 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     assert_eq!(
         verify_plan(&test_engine(&store), &evicted_selected),
         Err(InvariantViolation::SelectedProjection(selected_tip.hash))
+    );
+
+    let mut retained_pin_conflict = plan.clone();
+    retained_pin_conflict.trust_pins =
+        vec![Frontier::new(selected_tip.height, block::Hash([0xfe; 32]))].into();
+    assert_eq!(
+        crate::verify_plan_production(&test_engine(&store), &retained_pin_conflict),
+        Err(InvariantViolation::TrustPin(selected_tip.height))
+    );
+    assert_eq!(
+        verify_plan(&test_engine(&store), &retained_pin_conflict),
+        Err(InvariantViolation::TrustPin(selected_tip.height))
     );
 
     let mut pin_conflict = plan;

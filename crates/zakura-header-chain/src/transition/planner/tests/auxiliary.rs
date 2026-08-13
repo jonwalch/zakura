@@ -469,8 +469,8 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
         );
         assert_eq!(
             store.snapshot(),
-            without_plan.before,
-            "{label} changed the source snapshot"
+            without_plan.snapshot_before_commit,
+            "{label} changed the snapshot before commit"
         );
     }
 }
@@ -603,7 +603,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     };
     corrupt_delivery.source = SourceId::from_digest([0xee; 32]);
     assert_eq!(
-        verify_plan(&test_engine(&store), &corrupt),
+        crate::verify_plan_production(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Auxiliary(header_hash))
     );
     store.commit(&authenticated);
