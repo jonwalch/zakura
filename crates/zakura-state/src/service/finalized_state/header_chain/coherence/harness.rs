@@ -391,7 +391,7 @@ impl Harness {
         let headers: Vec<_> = rows.iter().map(|row| row.header.clone()).collect();
         let Ok(batch) = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         ) else {
@@ -444,12 +444,14 @@ impl Harness {
             result,
             Err(HeaderChainStoreError::Transition(
                 TransitionFailure::ConflictingReplay
+            )) | Err(HeaderChainStoreError::Transition(
+                TransitionFailure::InvalidEvidence(_)
             ))
         ) {
             assert_eq!(
                 self.logical_dump(),
                 before,
-                "a conflicting replay must not mutate any header family"
+                "a rejected insertion must not mutate any header family"
             );
             self.rejections += 1;
             return;
