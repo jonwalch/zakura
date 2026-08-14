@@ -1,12 +1,12 @@
-# How one request moves through the header chain
+# Header-chain request lifecycle
 
-This guide follows one delivery of headers from the socket to the planner and back. It
-explains why the path crosses several boundaries and what each boundary prevents. The
-[fork-aware header-chain specification](../../specs/fork-aware-header-chain-engine.md)
-remains authoritative; rules appear here as `LC-*` citations. The companion guide
-`production_code_header-chain.md` names the files that implement each part.
+This guide follows one delivery of headers from the socket to the planner and back. It explains
+why the path crosses several boundaries and what each boundary prevents. The [fork-aware
+header-chain specification](../../specs/fork-aware-header-chain-engine.md) remains
+authoritative; rules appear here as `LC-*` citations and use the casual name of each. The
+companion guide `production_code_header-chain.md` names the files that implement each part.
 
-## Why one planner decides the chain
+## Single-planner fork choice
 
 Four sources can move the tip. Peers deliver headers. Full state verifies bodies. A node
 administrator excludes or restores a block through `invalidateblock` and
@@ -26,10 +26,10 @@ against can restate fork choice in its own terms. The node then has two planners
 type therefore carries each boundary instead of a convention, and the value that crosses has
 no way to express the mistake the boundary prevents.
 
-Each section below names what crosses, what the sender cannot do, what the receiver
-guarantees, and the types that enforce it.
+Each section below names the interface, the sender's constraints, the receiver's
+guarantees, and the types that enforce them.
 
-## The round trip
+## Request round trip
 
 ```mermaid
 sequenceDiagram
@@ -64,7 +64,7 @@ Two methods share the name `apply`, and they promise opposite things.
 may drop. `HeaderChainRuntime::apply` writes a batch, installs the plan, and publishes.
 This document always writes both names in full.
 
-## Who decides what
+## Decision authority by layer
 
 Each layer decides one thing. The reactor owns peers, sockets, and timers, and decides
 nothing about the chain. The state writer decides when a transition runs and what else
@@ -84,27 +84,27 @@ reactor has no method that names the database. A direct call from `zakura-networ
 `architecture_dependencies_stay_sync_only_and_layered` test fails the build when the
 engine manifest names `tokio`, `tower`, `zakura-state`, `zakura-network`, or
 `zakura-consensus`, so the dependency graph enforces purity rather than review
-(LC-SCOPE-06).
+(block-sync concerns excluded, LC-SCOPE-06).
 
 ## Peer to reactor
 
-**What crosses.** A `Headers` message on the header-sync stream. The message set is
-closed, so new wire data needs an advertised auxiliary schema bit or a successor stream
-version (LC-WIRE-15). A peer that does not support the current stream version fails
+**Interface.** A `Headers` message on the header-sync stream. The message set is closed, so new
+wire data needs an advertised auxiliary schema bit or a successor stream version (immutable
+schema evolution, LC-WIRE-15). A peer that does not support the current stream version fails
 negotiation instead of speaking part of the protocol.
 
-**What the sender cannot do.** The reactor derives no chain fact from the message. The
-height a peer attaches to a header is never evidence, because height comes from a checked
-parent increment further down. A request id is nonzero by wire construction (LC-WIRE-01),
-so zero decodes as a failure rather than matching every outstanding request. The codec
-bounds every collection before it allocates.
+**Sender constraints.** The reactor derives no chain fact from the message. The height a peer
+attaches to a header is never evidence, because height comes from a checked parent increment
+further down. A request id is nonzero by wire construction (bounded decoding, LC-WIRE-01), so
+zero decodes as a failure rather than matching every outstanding request. The codec bounds every
+collection before it allocates.
 
-**What the receiver guarantees.** The reactor decides when to ask, whom to ask, and how
+**Receiver guarantees.** The reactor decides when to ask, whom to ask, and how
 much to ask for. Those are timing questions, and the reactor holds the only timer. Lower
 layers decide whether a header is valid, which chain is best, and whether a late response
 still counts.
 
-**The types.** The reactor owns no chain state. Its scheduler keys every unit of work by
+**Enforcing types.** The reactor owns no chain state. Its scheduler keys every unit of work by
 generation and branch, so one retirement pass retires exactly the work a reset invalidated
 and leaves the rest alive.
 
@@ -114,7 +114,7 @@ and leaves the rest alive.
 | `Gate` | `zakura-header-chain/src/ownership.rs` | a response acting before anyone asked whether it still owns its branch. It is the sole decision point over `PendingOwners` |
 | `PendingOwners` | `zakura-header-chain/src/ownership.rs` | an owner surviving its peer's reconnect. The key is `(SourceId, request_id)` and the owner carries the session id, so a reply on a new session for an old request is `OwnerMismatch` |
 
-### When a late response is stale
+### Late-response staleness
 
 `Gate::check` compares the durable coordinates first: the branch anchor,
 `header_generation`, and, for body-authorized work, `verified_generation`. It then consults
@@ -126,14 +126,14 @@ never touches. Binding header work to it would cancel in-flight requests faster 
 complete, and it would gain no correctness.
 
 A stale decision produces no frontier, coverage, retry, repair, scheduling, publication,
-body-task, or peer-score effect (LC-GEN-04, LC-ACCEPT-03). A peer that answered honestly a
-moment too late is not misbehaving. This gate only avoids wasted work. The planner repeats
-the same comparison against the pre-transition snapshot with `validate_header_sync_owner`,
-and that check is the authority.
+body-task, or peer-score effect (stale-result rejection, LC-GEN-04; zero stale-generation
+effects, LC-ACCEPT-03). A peer that answered honestly a moment too late is not misbehaving. This
+gate only avoids wasted work. The planner repeats the same comparison against the pre-transition
+snapshot with `validate_header_sync_owner`, and that check is the authority.
 
 ## Reactor to state writer
 
-**What crosses.** `prepare_header_target` outbound, a sealed `PreparedHeaderTarget`
+**Interface.** `prepare_header_target` outbound, a sealed `PreparedHeaderTarget`
 inbound, and `apply_header_target` outbound again. Both are port operations. The driver in
 `zakurad` implements them, and it is the only place that names both header-sync policy and
 the state service.
@@ -144,15 +144,15 @@ from that lease, and runs `prepare_context_free_headers`. Those are exactly the 
 read no ancestor, such as canonical version and hash, checked height inference, commitment
 structure, compact-target domain, and Equihash.
 
-**What the sender cannot do.** The reactor cannot forge or substitute a prepared batch
-between the two calls. A header whose time runs more than two hours ahead of the local
-clock comes back `DeferredUntil` rather than rejected (LC-VAL-08), so local clock skew
+**Sender constraints.** The reactor cannot forge or substitute a prepared batch between the two
+calls. A header whose time runs more than two hours ahead of the local clock comes back
+`DeferredUntil` rather than rejected (future-header deferral, LC-VAL-08), so local clock skew
 never becomes a peer fault.
 
-**What the receiver guarantees.** Preparation off the lock weakens nothing. Once the lock
+**Receiver guarantees.** Preparation off the lock weakens nothing. Once the lock
 is held, the planner trusts no conclusion preparation reached: it rechecks the receipt
 against the live config, and a batch prepared under a config that has since moved fails
-with `StalePreparation` (LC-VAL-11).
+with `StalePreparation` (validation before admission, LC-VAL-11).
 
 | Abstraction | Location | Unrepresentable mistake |
 | --- | --- | --- |
@@ -161,7 +161,7 @@ with `StalePreparation` (LC-VAL-11).
 
 ## State writer to runtime
 
-**What crosses.** `HeaderChainRuntime::apply(request, context)`, or one of two wider
+**Interface.** `HeaderChainRuntime::apply(request, context)`, or one of two wider
 shapes. Every production call is in `crates/zakura-state/src/service/write.rs`, and nothing
 outside `zakura-state` holds a runtime, so transitions serialize by construction.
 
@@ -171,20 +171,20 @@ auxiliary results, verified-chain changes, finality, and operator actions. The w
 timer submits `ReevaluateDeferred` when the deadline from `earliest_deferred()` elapses,
 which is the one transition no component observed.
 
-**What the sender cannot do.** The state writer decides when a transition runs and what
-else lands in the same write. It does not decide what the transition means, and it cannot
-publish: the reactor holds no runtime, and the runtime is the sole publisher (LC-GEN-05).
+**Sender constraints.** The state writer decides when a transition runs and what else lands in
+the same write. It does not decide what the transition means, and it cannot publish: the reactor
+holds no runtime, and the runtime is the sole publisher (single frontier publisher, LC-GEN-05).
 
-**What the receiver guarantees.** One committed transition makes one `db.write`
-(LC-TXN-01). The runtime writes the store once per transition, inside the writer lock, with
-no accumulation and no background flush. The three call shapes differ only in how much goes
+**Receiver guarantees.** One committed transition makes one `db.write` (atomic frontier
+mutation, LC-TXN-01). The runtime writes the store once per transition, inside the writer lock,
+with no accumulation and no background flush. The three call shapes differ only in how much goes
 into that one write.
 
-`apply` writes the header-chain rows alone. `apply_combined` appends those rows to the
-block batch the state writer already filled. A block and the header node it depends on must
-not disagree across a crash, and one batch is the only way to guarantee that (LC-INT-03).
-`apply_aux_then_checkpoint_combined` plans auxiliary authentication and the checkpoint
-advance that depends on it into that same batch.
+`apply` writes the header-chain rows alone. `apply_combined` appends those rows to the block
+batch the state writer already filled. A block and the header node it depends on must not
+disagree across a crash, and one batch is the only way to guarantee that (full-block
+integration, LC-INT-03). `apply_aux_then_checkpoint_combined` plans auxiliary authentication and
+the checkpoint advance that depends on it into that same batch.
 
 That range of widths is also why the engine hands its write set back instead of performing
 it. The engine cannot open the batch, because the batch spans full-state column families in
@@ -202,12 +202,12 @@ the migration batch that builds the initial nodes and the migrated finality pin.
 
 ## Runtime to engine
 
-**What crosses.** Three values cross: the typed event, the transition context, and the
+**Interface.** Three values cross: the typed event, the transition context, and the
 durable facts (`HeaderValidationFacts`, `HeaderInsertionFacts`). The context holds still
 across the run, and the facts are the durable rows this one transition reads. The engine
 fetches nothing, so a gap in either is a refusal, never a default the planner invents.
 
-### Why the runtime supplies the context
+### Provenance of the validation context
 
 A header is not valid or invalid by itself. Zcash derives expected difficulty from
 `MedianTime(height) - MedianTime(height - PoWAveragingWindow)`. Checking one header
@@ -226,23 +226,24 @@ So the runtime chooses it. Under the lock that will commit the transition, the r
 the parent and the predecessors below it from its own committed store. It seals them with
 the network policy and the trust-anchor digest into one validation lease.
 
-The runtime supplies a second thing, because finality moves that history while requests are
-in flight. Advancing `finalized` moves the anchor, so a batch authorized below the old
-anchor no longer roots anywhere. `validate_finality_rebase_path` walks the durable finality
-history back from the current anchor to the owner's original one, all or nothing. A second
-lease for the pre-transition anchor travels with it, so the planner re-roots only after that
-walk proves the move (LC-FINAL-01). The runtime supplies retention third: merged
-serving-lease references stop the eviction of a page a peer is reading (LC-WIRE-05).
+The runtime supplies a second thing, because finality moves that history while requests are in
+flight. Advancing `finalized` moves the anchor, so a batch authorized below the old anchor no
+longer roots anywhere. `validate_finality_rebase_path` walks the durable finality history back
+from the current anchor to the owner's original one, all or nothing. A second lease for the
+pre-transition anchor travels with it, so the planner re-roots only after that walk proves the
+move (atomic finalization transition, LC-FINAL-01). The runtime supplies retention third: merged
+serving-lease references stop the eviction of a page a peer is reading (snapshot-bound path
+serving, LC-WIRE-05).
 
 The division is the same for every event. The caller supplies what it observed, and the
 runtime supplies the history the planner judges that observation against.
 
-**The types.** This boundary carries the capability model. The runtime vouches for the
+**Enforcing types.** This boundary carries the capability model. The runtime vouches for the
 evidence it hands over, and the engine refuses evidence nobody vouched for.
 
 | Abstraction | Location | Unrepresentable mistake |
 | --- | --- | --- |
-| `ValidationLease` | `zakura-header-chain/src/transition/types/preparation.rs` | predecessor facts arriving loose. The runtime seals the parent, the predecessor facts, the network policy, and the trust-anchor digest under one `context_digest`, and `is_coherent` re-derives that digest and re-walks the backward hash links (LC-ANCHOR-03) |
+| `ValidationLease` | `zakura-header-chain/src/transition/types/preparation.rs` | predecessor facts arriving loose. The runtime seals the parent, the predecessor facts, the network policy, and the trust-anchor digest under one `context_digest`, and `is_coherent` re-derives that digest and re-walks the backward hash links (post-anchor validation context, LC-ANCHOR-03) |
 | `StateIssuedAuthority` | `zakura-state/src/service/finalized_state/header_chain.rs` | a lease from anywhere but this call. It wraps the caller's authority over exactly the leases the runtime just issued |
 | `FullStateEvidenceAuthority` | `zakura-header-chain/src/transition/authority.rs` | an implementation that admits evidence by omission. Every method except `authorizes_full_state` defaults to `false`, and the transition context holds the authority as an `Option`, so absent authority has no representation but `TransitionFailure::Authority` |
 
@@ -257,10 +258,11 @@ lease can seal it, and that evidence never travels through a lease.
 The state writer owns a durable ascending root-authentication frontier instead, advances it
 against its own history-tree frontier, and reports each verdict back as ordinary auxiliary
 evidence. The delivery is unauthenticated until that frontier clears it, and it drives no
-validity and no fork choice in the meantime (LC-AUX-02, LC-AUX-04).
+validity and no fork choice in the meantime (unauthenticated metadata isolation, LC-AUX-02;
+cryptographic metadata authentication, LC-AUX-04).
 `docs/design/header-sync-vct-root-authentication.md` carries that design in full.
 
-### How much history each event needs
+### History requirements by event
 
 What the runtime must prove about the past sorts the events into three groups.
 
@@ -273,9 +275,9 @@ What the runtime must prove about the past sorts the events into three groups.
   sits here despite doing the most: it moves the anchor and prunes every non-descendant
   while reading nothing, because the caller hands over the verified ancestry with it.
 
-## Inside the engine
+## Engine internals
 
-**What the engine cannot do.** The engine cannot reach a disk, a socket, a task, or a clock
+**Engine constraints.** The engine cannot reach a disk, a socket, a task, or a clock
 of its own. Time arrives through `Clock` and durable rows through the facts types, so the
 engine can observe nothing it was not handed.
 
@@ -299,10 +301,10 @@ state.
 | `before()` and `StaleSource` | `src/transition/engine.rs` | installing a plan against state it was not derived from. `HeaderChainEngine::apply` takes `&self`, so two planners can race, and only one can install |
 | `Frontier` | `src/frontier.rs` | naming a position on a chain by height alone. It is a height and a hash together, and it is the only way this design names a position |
 | `WorkCoordinate` | `src/frontier.rs` | comparing accumulated work across origins. It carries the origin hash, so a mismatched pair raises an error instead of yielding a smaller number that decides fork choice with nothing logged |
-| `RetentionPlan` | `src/retention.rs` | a resource limit passing for a verdict about a chain. When protected paths alone fill the node bound it sets `admission_refused` and `resource_stalled` rather than evicting protected state or synthesizing finality for room (LC-RETAIN-01) |
+| `RetentionPlan` | `src/retention.rs` | a resource limit passing for a verdict about a chain. When protected paths alone fill the node bound it sets `admission_refused` and `resource_stalled` rather than evicting protected state or synthesizing finality for room (fork and node limits, LC-RETAIN-01) |
 | eligibility as durable reasons | `src/header_node.rs` | fork choice depending on arrival order. Ineligibility is a set of reasons rather than a flag, and a flag would make eligibility depend on update order |
 
-### The four validation passes
+### Validation passes
 
 Validation runs four times before disk, each pass against more context than the last.
 
@@ -327,13 +329,13 @@ staged. A disagreement between the planner and the verifier is an `InvariantViol
 that batch never reaches disk. Startup adds one more pass that no caller triggers:
 `audit_store` re-derives what the DAG determines before the engine exists.
 
-**What crosses back.** `TransitionPlan`: the change set the store will write, the private
+**Return interface.** `TransitionPlan`: the change set the store will write, the private
 graph delta the engine will install, and `before()`, the snapshot the planner derived it
 from.
 
 ## Engine to disk, memory, and observers
 
-**What crosses, and in what order.** The runtime writes disk, then memory, then observers.
+**Interface and ordering.** The runtime writes disk, then memory, then observers.
 Disk is what the next restart reads. A crash in that order leaves disk ahead of memory,
 which the startup audit repairs by rehydrating from the authoritative node rows. In any
 other order a crash can leave an observer holding a frontier that is not on disk, which
@@ -351,39 +353,42 @@ headers against the projected DAG before the write. Three outcomes then leave ea
 - A no-change plan commits the caller's batch alone and publishes nothing.
 - A `ResourceStalled` plan commits its alarm-only change set with a fresh batch, so the
   state writer maps that outcome to `FullStateResourceStalled` and stops rather than
-  treating its own rows as written (LC-RETAIN-01).
+  treating its own rows as written (fork and node limits, LC-RETAIN-01).
 - A plan carrying `migrated_pin_refuted` commits and installs, then returns without
-  publishing, so the node fails closed on the alarm it just made durable (LC-FINAL-04).
+  publishing, so the node fails closed on the alarm it just made durable (mode and finality
+  provenance, LC-FINAL-04).
 
 A failure between the write and the install fails closed: the runtime returns the store
 error, publishes nothing, and the next open rehydrates the engine from disk.
 
 | Abstraction | Location | Unrepresentable mistake |
 | --- | --- | --- |
-| `FaultPoint` | `zakura-state/src/service/finalized_state/header_chain.rs` | an untested crash window. Ordered fault points let the recovery tests interrupt each step and check that reopening finds the complete before state or the complete after state (LC-ACCEPT-02, LC-RECOVER-02) |
-| `audit_store`, `RecoveryPlan` | `src/transition/recovery/` | startup trusting a stored answer. It re-derives what the DAG determines, recomputes selection, and repairs only reconstructible categories, and it fails closed with publication still disabled on a store that is not one coherent chain (LC-RECOVER-01) |
+| `FaultPoint` | `zakura-state/src/service/finalized_state/header_chain.rs` | an untested crash window. Ordered fault points let the recovery tests interrupt each step and check that reopening finds the complete before state or the complete after state (durable deterministic frontiers, LC-ACCEPT-02; deterministic startup reconstruction, LC-RECOVER-02) |
+| `audit_store`, `RecoveryPlan` | `src/transition/recovery/` | startup trusting a stored answer. It re-derives what the DAG determines, recomputes selection, and repairs only reconstructible categories, and it fails closed with publication still disabled on a store that is not one coherent chain (startup integrity audit, LC-RECOVER-01) |
 | `apply_committed` | `src/transition/engine.rs` | memory disagreeing with disk. It is the only mutator, and it refuses a plan whose `before()` no longer matches |
 
 ## Runtime to peer
 
-**What crosses.** A committed snapshot on a latest-value watch channel. `snapshot()` and
-`subscribe()` are the entire published surface, and nothing else may publish (LC-GEN-05).
+**Interface.** A committed snapshot on a latest-value watch channel. `snapshot()` and
+`subscribe()` are the entire published surface, and nothing else may publish (single frontier
+publisher, LC-GEN-05).
 
-**Why the loop closes here and not on the return value.** The sole-publisher rule is the
-direct fix for the failure this design replaced. A driver that published the raw result of
-its own range commit could announce a frontier derived from work whose branch had already
-been reset, and that obsolete completion undid the reset. Any component that publishes a
+**Sole-publisher rule.** The loop closes on the publisher rather than on the return value,
+and that rule is the direct fix for the failure this design replaced. A driver that
+published the raw result of its own range commit could announce a frontier derived from
+work whose branch had already been reset, and that obsolete completion undid the reset.
+Any component that publishes a
 commit result it did not obtain from the serialized writer reintroduces the defect. The
 reactor therefore learns what committed from the publisher. Every frontier it acts on is one
 the writer committed, in the order the writer committed them.
 
-**What the reactor must do before acting.** A committed transition returns `RetiredWork`:
-the two generation-changed flags plus the exact owners retired for narrower causes. The
-reactor applies retirement before scheduling any forward work for the new branch
-(LC-WORK-01, LC-AUX-03). Retiring afterwards would either cancel a just-scheduled request
-or leave a dead one alive. The reactor then schedules from committed state alone, because a
-projected value escaping the read surface would put peers to work on a frontier that may
-never commit.
+**Reactor obligations.** A committed transition returns `RetiredWork`: the two
+generation-changed flags plus the exact owners retired for narrower causes. The reactor applies
+retirement before scheduling any forward work for the new branch (generation-scoped forward
+work, LC-WORK-01; branch-scoped VCT repair, LC-AUX-03). Retiring afterwards would either cancel
+a just-scheduled request or leave a dead one alive. The reactor then schedules from committed
+state alone, because a projected value escaping the read surface would put peers to work on a
+frontier that may never commit.
 
 | Abstraction | Location | Unrepresentable mistake |
 | --- | --- | --- |
