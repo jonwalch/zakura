@@ -1395,6 +1395,7 @@ mod tests {
             Some(tree_aux),
             zakura_header_chain::AuxAuthentication::Rejected {
                 evidence: zakura_header_chain::EvidenceId::from_digest([7; 32]),
+                boundary_hash: block::Hash([9; 32]),
             },
         );
         let unauthenticated = delivery(
