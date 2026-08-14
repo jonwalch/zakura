@@ -1124,6 +1124,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4df6f98652d30167eaeea34d77b730e07c8caba6df17bd4551842b9b8da01deb"
 
 [[package]]
+name = "cpu-equihash-solver"
+version = "0.3.0"
+source = "git+https://github.com/valargroup/librustzcash?rev=658533c4c604818610657d9699e82102e7379c76#658533c4c604818610657d9699e82102e7379c76"
+dependencies = [
+ "blake2b_simd",
+ "cc",
+ "corez",
+ "document-features",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1776,17 +1787,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
 dependencies = [
  "blake2b_simd",
- "corez",
- "document-features",
-]
-
-[[package]]
-name = "cpu-equihash-solver"
-version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=658533c4c604818610657d9699e82102e7379c76#658533c4c604818610657d9699e82102e7379c76"
-dependencies = [
- "blake2b_simd",
- "cc",
  "corez",
  "document-features",
 ]
@@ -8381,12 +8381,12 @@ dependencies = [
  "byteorder",
  "chrono",
  "color-eyre",
+ "cpu-equihash-solver",
  "criterion",
  "derive-getters",
  "dirs",
  "ed25519-zebra",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "cpu-equihash-solver",
+ "equihash",
  "futures",
  "group",
  "halo2_proofs",
@@ -8700,6 +8700,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zakura-chain",
+ "zakura-jsonl-trace",
  "zakura-node-services",
  "zakura-test",
 ]
@@ -8886,7 +8887,7 @@ dependencies = [
  "corez",
  "crypto-common 0.2.0-rc.1",
  "document-features",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "equihash",
  "ff",
  "hex",
  "incrementalmerkletree",
