@@ -1431,6 +1431,7 @@ fn synthetic_headers_from_state(
                 &network,
                 context.iter().copied(),
             )
+            .expect("the fabricated chain supplies the complete difficulty context")
             .expected_difficulty_threshold();
 
             let mut header = *template.header;

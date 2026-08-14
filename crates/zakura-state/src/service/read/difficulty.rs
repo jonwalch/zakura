@@ -253,7 +253,8 @@ fn difficulty_time_and_history_tree(
         tip_height,
         network,
         relevant_data.iter().cloned(),
-    );
+    )
+    .expect("the mining template requires a complete committed difficulty context");
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
 
     let mut result = GetBlockTemplateChainInfo {
@@ -371,6 +372,7 @@ fn adjust_difficulty_and_time_for_testnet(
             network,
             relevant_data.iter().cloned(),
         )
+        .expect("the testnet mining template retains the same complete difficulty context")
         .expected_difficulty_threshold();
     }
 }

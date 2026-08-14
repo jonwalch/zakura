@@ -8703,6 +8703,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-test",
 ]

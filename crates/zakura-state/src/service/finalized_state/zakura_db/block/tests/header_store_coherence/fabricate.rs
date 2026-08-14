@@ -107,6 +107,7 @@ pub(crate) fn fabricate_headers(
                 network,
                 context.iter().copied(),
             )
+            .expect("the fabricated chain supplies the complete difficulty context")
             .expected_difficulty_threshold();
 
             let mut header = *template.header;
