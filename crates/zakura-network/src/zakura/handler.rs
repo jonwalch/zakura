@@ -519,10 +519,11 @@ pub struct CustomService {
     /// Custom p2p service
     pub service: Arc<dyn Service>,
 
-    /// Service ids to include in this node's discovery.
-    ///
-    /// Leave empty to skip discovery.
-    pub advertised_services: Vec<ZakuraServiceId>,
+    /// Service ids to advertise to the network.
+    pub provides: Vec<ZakuraServiceId>,
+
+    /// Remote service ids to prefer when selecting outbound discovery peers.
+    pub seeks: Vec<ZakuraServiceId>,
 }
 
 impl From<CustomService> for Arc<dyn Service> {
@@ -3142,14 +3143,24 @@ fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId
         .len()
 }
 
-fn advertised_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
-    let mut advertised_services = discovery::default_advertised_services();
-    advertised_services.extend(
+fn provided_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
+    let mut provided_services = discovery::default_advertised_services();
+    provided_services.extend(
         custom_services
             .iter()
-            .flat_map(|custom| custom.advertised_services.iter().cloned()),
+            .flat_map(|custom| custom.provides.iter().cloned()),
     );
-    advertised_services
+    provided_services
+}
+
+fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
+    let mut sought_services: Vec<_> = custom_services
+        .iter()
+        .flat_map(|custom| custom.seeks.iter().cloned())
+        .collect();
+    sought_services.sort_unstable();
+    sought_services.dedup();
+    sought_services
 }
 
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
@@ -3209,10 +3220,11 @@ pub async fn spawn_zakura_endpoint_with_services(
         &config.network,
         config.zakura.dev_network.as_deref(),
     );
+    let sought_services = sought_services_with_custom(&custom_services);
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
         discovery_direct_addrs(config, local_node_id),
-        advertised_services_with_custom(&custom_services),
+        provided_services_with_custom(&custom_services),
         &handshake_config,
         config.zakura.max_connections,
         remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
@@ -3421,8 +3433,12 @@ pub async fn spawn_zakura_endpoint_with_services(
     ) {
         endpoint.push_header_sync_task(task).await;
     }
-    let discovery_dialer =
-        discovery::spawn_native_discovery_dialer(endpoint.clone(), discovery, limits);
+    let discovery_dialer = discovery::spawn_native_discovery_dialer(
+        endpoint.clone(),
+        discovery,
+        limits,
+        sought_services,
+    );
     endpoint.push_header_sync_task(discovery_dialer).await;
     startup_shutdown.disarm();
     Ok(Some(endpoint))
@@ -6210,6 +6226,7 @@ mod tests {
             endpoint.clone(),
             discovery,
             limits,
+            Vec::new(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6411,12 +6428,34 @@ mod tests {
             service: Arc::new(DeclaredStreamService {
                 streams: vec![CUSTOM_STREAM],
             }),
-            advertised_services: vec![service_id.clone()],
+            provides: vec![service_id.clone()],
+            seeks: vec![ZakuraServiceId::new("zakura.test.remote.v1")?],
         };
-        let advertised_services = advertised_services_with_custom(std::slice::from_ref(&custom));
-        assert!(advertised_services.contains(&service_id));
-
+        let provided_services = provided_services_with_custom(std::slice::from_ref(&custom));
+        assert_eq!(
+            sought_services_with_custom(&[custom.clone(), custom.clone()]),
+            custom.seeks
+        );
         let supervisor = ZakuraSupervisorHandle::new(1);
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let discovery = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[8u8; 32]),
+                direct_addrs: Vec::new(),
+                services: provided_services,
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            supervisor.subscribe(),
+        )?;
+        let self_record = discovery.current_self_record();
+        assert!(self_record.body.services.contains(&service_id));
+        assert!(!self_record.body.services.contains(&custom.seeks[0]));
+
         let registry = service_registry(
             &supervisor,
             None,
@@ -6446,6 +6485,7 @@ mod tests {
         };
 
         let _guard = zakura_test::init();
+        let service_id = ZakuraServiceId::new("zakura.test.ordered.v1")?;
         let listen_addr = "127.0.0.1:0".parse().expect("valid loopback address");
         let server_identity = tempfile::tempdir()?;
         let client_identity = tempfile::tempdir()?;
@@ -6465,7 +6505,8 @@ mod tests {
                     stream: CUSTOM_STREAM,
                     sessions: server_sessions,
                 }),
-                advertised_services: Vec::new(),
+                provides: vec![service_id.clone()],
+                seeks: Vec::new(),
             }],
         )
         .await?
@@ -6491,7 +6532,8 @@ mod tests {
                     stream: CUSTOM_STREAM,
                     sessions: client_sessions,
                 }),
-                advertised_services: Vec::new(),
+                provides: Vec::new(),
+                seeks: vec![service_id],
             }],
         )
         .await?
