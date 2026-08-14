@@ -6,6 +6,11 @@ header-chain specification](../../specs/fork-aware-header-chain-engine.md) remai
 authoritative; rules appear here as `LC-*` citations and use the casual name of each. The
 companion guide `production_code_header-chain.md` names the files that implement each part.
 
+Two methods share the name `apply`, and they promise opposite things.
+`HeaderChainEngine::apply` takes `&self`, mutates nothing, and returns a plan the caller
+may drop. `HeaderChainRuntime::apply` writes a batch, installs the plan, and publishes.
+This document always writes both names in full.
+
 ## Single-planner fork choice
 
 Four sources can move the tip. Peers deliver headers. Full state verifies bodies. A node
@@ -59,11 +64,6 @@ The reactor does not learn what happened from the value its own call returned. I
 from the publisher, so every scheduling decision it makes uses a frontier that is already
 on disk.
 
-Two methods share the name `apply`, and they promise opposite things.
-`HeaderChainEngine::apply` takes `&self`, mutates nothing, and returns a plan the caller
-may drop. `HeaderChainRuntime::apply` writes a batch, installs the plan, and publishes.
-This document always writes both names in full.
-
 ## Decision authority by layer
 
 Each layer decides one thing. The reactor owns peers, sockets, and timers, and decides
@@ -86,7 +86,7 @@ engine manifest names `tokio`, `tower`, `zakura-state`, `zakura-network`, or
 `zakura-consensus`, so the dependency graph enforces purity rather than review
 (block-sync concerns excluded, LC-SCOPE-06).
 
-## Peer to reactor
+## Peer to reactor: untrusted input
 
 **Interface.** A `Headers` message on the header-sync stream. The message set is closed, so new
 wire data needs an advertised auxiliary schema bit or a successor stream version (immutable
@@ -131,7 +131,7 @@ effects, LC-ACCEPT-03). A peer that answered honestly a moment too late is not m
 gate only avoids wasted work. The planner repeats the same comparison against the pre-transition
 snapshot with `validate_header_sync_owner`, and that check is the authority.
 
-## Reactor to state writer
+## Reactor to state writer: the state port
 
 **Interface.** `prepare_header_target` outbound, a sealed `PreparedHeaderTarget`
 inbound, and `apply_header_target` outbound again. Both are port operations. The driver in
@@ -159,7 +159,7 @@ with `StalePreparation` (validation before admission, LC-VAL-11).
 | `AdapterKey` | `zakura-node-services/src/header_chain.rs` | a prepared batch substituted between the two calls. The adapter seals the target on the way out and is the only holder that can open it on the way back, so two calls are as safe as one |
 | `PreparedHeaderBatch` and its receipt | `zakura-header-chain/src/transition/types/preparation.rs` | a result that does not say what it was prepared against. The receipt names the parent frontier, the network, and the trust-anchor digest, all three rechecked in the planner |
 
-## State writer to runtime
+## State writer to runtime: one write per transition
 
 **Interface.** `HeaderChainRuntime::apply(request, context)`, or one of two wider
 shapes. Every production call is in `crates/zakura-state/src/service/write.rs`, and nothing
@@ -200,14 +200,14 @@ the migration batch that builds the initial nodes and the migrated finality pin.
 | `HeaderChainRuntime` | `zakura-state/src/service/finalized_state/header_chain.rs` | a second writer or a second publisher. It holds the store, the engine mutex, the publisher, and the lease registry, and nothing outside the crate holds one |
 | `ApplyResult` | `zakura-header-chain` | an ambiguous outcome. `Committed`, `NoChange`, `Stale`, and `ResourceStalled` are distinct, so `FullStateResourceStalled` is a case the writer must handle rather than a success it can assume |
 
-## Runtime to engine
+## Runtime to engine: the validation context
 
 **Interface.** Three values cross: the typed event, the transition context, and the
 durable facts (`HeaderValidationFacts`, `HeaderInsertionFacts`). The context holds still
 across the run, and the facts are the durable rows this one transition reads. The engine
 fetches nothing, so a gap in either is a refusal, never a default the planner invents.
 
-### Provenance of the validation context
+### Context provenance
 
 A header is not valid or invalid by itself. Zcash derives expected difficulty from
 `MedianTime(height) - MedianTime(height - PoWAveragingWindow)`. Checking one header
@@ -247,13 +247,13 @@ evidence it hands over, and the engine refuses evidence nobody vouched for.
 | `StateIssuedAuthority` | `zakura-state/src/service/finalized_state/header_chain.rs` | a lease from anywhere but this call. It wraps the caller's authority over exactly the leases the runtime just issued |
 | `FullStateEvidenceAuthority` | `zakura-header-chain/src/transition/authority.rs` | an implementation that admits evidence by omission. Every method except `authorizes_full_state` defaults to `false`, and the transition context holds the authority as an `Option`, so absent authority has no representation but `TransitionFailure::Authority` |
 
-### Evidence with no bounded window
+### Note-commitment roots and unbounded history
 
-Some evidence depends on no fixed number of predecessors. Peer-supplied note-commitment
-roots are the example. Nothing below the last checkpoint verifies the header commitment
-field they feed. Authenticating one root takes a running ZIP-221 history tree over the
-committed body tip and every selected header above it. That history has no bound, so no
-lease can seal it, and that evidence never travels through a lease.
+Peer-supplied note-commitment roots depend on no fixed number of predecessors. Nothing
+below the last checkpoint verifies the header commitment field they feed. Authenticating
+one root takes a running ZIP-221 history tree over the committed body tip and every
+selected header above it. That history has no bound, so no lease can seal it, and that
+evidence never travels through a lease.
 
 The state writer owns a durable ascending root-authentication frontier instead, advances it
 against its own history-tree frontier, and reports each verdict back as ordinary auxiliary
@@ -275,7 +275,7 @@ What the runtime must prove about the past sorts the events into three groups.
   sits here despite doing the most: it moves the anchor and prunes every non-descendant
   while reading nothing, because the caller hands over the verified ancestry with it.
 
-## Engine internals
+## Engine purity and planning
 
 **Engine constraints.** The engine cannot reach a disk, a socket, a task, or a clock
 of its own. Time arrives through `Clock` and durable rows through the facts types, so the
@@ -333,7 +333,7 @@ that batch never reaches disk. Startup adds one more pass that no caller trigger
 graph delta the engine will install, and `before()`, the snapshot the planner derived it
 from.
 
-## Engine to disk, memory, and observers
+## Engine to disk, memory, and observers: commit order
 
 **Interface and ordering.** The runtime writes disk, then memory, then observers.
 Disk is what the next restart reads. A crash in that order leaves disk ahead of memory,
@@ -367,7 +367,7 @@ error, publishes nothing, and the next open rehydrates the engine from disk.
 | `audit_store`, `RecoveryPlan` | `src/transition/recovery/` | startup trusting a stored answer. It re-derives what the DAG determines, recomputes selection, and repairs only reconstructible categories, and it fails closed with publication still disabled on a store that is not one coherent chain (startup integrity audit, LC-RECOVER-01) |
 | `apply_committed` | `src/transition/engine.rs` | memory disagreeing with disk. It is the only mutator, and it refuses a plan whose `before()` no longer matches |
 
-## Runtime to peer
+## Runtime to peer: publication and retirement
 
 **Interface.** A committed snapshot on a latest-value watch channel. `snapshot()` and
 `subscribe()` are the entire published surface, and nothing else may publish (single frontier
