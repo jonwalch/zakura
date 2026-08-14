@@ -44,9 +44,9 @@ fn measured_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     (result, allocations)
 }
 
-fn pr586_allocation_limit(group: &str, percent: usize) -> usize {
-    let baseline: toml::Value = toml::from_str(include_str!("retention-pr586-baseline.toml"))
-        .expect("the checked-in PR 586 benchmark baseline is valid TOML");
+fn retention_allocation_limit(group: &str, percent: usize) -> usize {
+    let baseline: toml::Value = toml::from_str(include_str!("retention-allocation-baseline.toml"))
+        .expect("the checked-in retention allocation baseline is valid TOML");
     baseline[group][format!("percent_{percent}")]["allocations"]
         .as_integer()
         .and_then(|value| usize::try_from(value).ok())
@@ -61,7 +61,7 @@ fn retention(c: &mut Criterion) {
             .expect("the benchmark graph is coherent");
         let (structural, allocations) = measured_allocations(|| fixture.ordinary_check());
         let structural = structural.expect("the ordinary exact-limit check succeeds");
-        assert!(allocations <= pr586_allocation_limit("ordinary", percent));
+        assert!(allocations <= retention_allocation_limit("ordinary", percent));
         assert_eq!(
             allocations, 0,
             "ordinary admission must remain allocation-free"
@@ -85,8 +85,8 @@ fn retention(c: &mut Criterion) {
         let (structural, allocations) = measured_allocations(|| fixture.protected_refusal());
         let structural = structural.expect("the protected refusal check succeeds");
         assert!(
-            allocations <= pr586_allocation_limit("protected_refusal", percent),
-            "protected refusal allocations exceeded the PR 586 baseline"
+            allocations <= retention_allocation_limit("protected_refusal", percent),
+            "protected refusal allocations exceeded the retention baseline"
         );
         assert!(structural.admission_refused);
         assert_eq!(
