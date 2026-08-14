@@ -128,7 +128,10 @@ pub(super) fn derive_plan(
             metadata.finality_epoch = record.epoch;
         }
         if let Some(fingerprint) = fingerprint {
-            metadata.last_transition = Some(fingerprint);
+            metadata.last_transition = Some(crate::PolicyBoundFingerprint::bind(
+                fingerprint,
+                &metadata.policy,
+            ));
         }
     }
     let verified_tip = *verified.last().ok_or(TransitionFailure::InvalidEvidence(

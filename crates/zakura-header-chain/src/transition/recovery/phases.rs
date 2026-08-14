@@ -7,7 +7,8 @@ use zakura_chain::block;
 
 use crate::{
     BodyValidationState, ChainScore, ConsensusInvalidBodyTombstone, EngineConfig, EngineMetadata,
-    EngineSnapshot, Frontier, HeaderNode, RowLimit, StoreError,
+    EngineSnapshot, Frontier, HeaderNode, PolicyBindingMatch, RowLimit, StoreError,
+    TrustSetExtension,
 };
 
 use super::contracts::{
@@ -21,7 +22,8 @@ pub(super) struct PreAuditStoreRows {
     pub(super) source_header_nodes: Vec<HeaderNode>,
     pub(super) consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
     pub(super) validation_contexts: Vec<ValidationContextRecord>,
-    pub(super) trust_anchor_changed: bool,
+    pub(super) policy_binding_changed: bool,
+    pub(super) trust_extension: Option<TrustSetExtension>,
     pub(super) early_violations: Vec<AuditViolation>,
 }
 
@@ -31,7 +33,8 @@ pub(super) struct AuditedSource {
     pub(super) metadata: EngineMetadata,
     pub(super) source_header_nodes: Vec<HeaderNode>,
     pub(super) consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
-    pub(super) trust_anchor_changed: bool,
+    pub(super) policy_binding_changed: bool,
+    pub(super) trust_extension: Option<TrustSetExtension>,
 }
 
 /// Deterministic derived views reconstructed only from an audited source.
@@ -61,12 +64,35 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
 ) -> Result<PreAuditStoreRows, RecoveryFailure> {
     let snapshot_before_repair = store.snapshot()?;
     let metadata = store.metadata()?;
-    let trust_anchor_changed = metadata.anchor_manifest_digest != config.trust_anchor_digest();
+    let (policy_binding_changed, trust_extension) = match metadata.policy.classify(config.policy())
+    {
+        Ok(PolicyBindingMatch::Exact) => (false, None),
+        Ok(PolicyBindingMatch::ProvenanceUpdate) if allow_trust_anchor_update => (true, None),
+        Ok(PolicyBindingMatch::MonotonicExtension(extension)) if allow_trust_anchor_update => {
+            (true, Some(extension))
+        }
+        Ok(PolicyBindingMatch::ProvenanceUpdate)
+        | Ok(PolicyBindingMatch::MonotonicExtension(_))
+        | Err(_) => {
+            return Err(source_failure(AuditViolation::Configuration));
+        }
+    };
+    if let Some(extension) = &trust_extension {
+        for entry in extension
+            .added()
+            .iter()
+            .filter(|entry| entry.frontier().height <= metadata.frontiers.finalized.height)
+        {
+            if store.authenticated_canonical_hash(entry.frontier().height)?
+                != Some(entry.frontier().hash)
+            {
+                return Err(source_failure(AuditViolation::Configuration));
+            }
+        }
+    }
     if snapshot_before_repair != metadata.snapshot()
         || metadata.disk_format != crate::HeaderChainDiskVersion::CURRENT
         || metadata.mode != config.mode
-        || metadata.network_id != config.network.kind()
-        || trust_anchor_changed && !allow_trust_anchor_update
     {
         return Err(source_failure(AuditViolation::Configuration));
     }
@@ -144,7 +170,8 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
         source_header_nodes,
         consensus_invalid_body_tombstones,
         validation_contexts,
-        trust_anchor_changed,
+        policy_binding_changed,
+        trust_extension,
         early_violations,
     })
 }

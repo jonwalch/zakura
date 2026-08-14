@@ -65,8 +65,8 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
-        network_id: config.network.kind(),
-        anchor_manifest_digest: config.trust_anchor_digest(),
+        policy: config.durable_policy_binding(),
+        trust_set_extension: None,
         work_origin: anchor,
         state_version: StateVersion::new(0),
         header_generation: HeaderGeneration::new(0),
@@ -91,8 +91,7 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
             frontier: anchor,
             header: genesis.header.clone(),
         }],
-        config.network.clone(),
-        config.trust_anchor_digest(),
+        config.policy(),
     );
     let engine =
         HeaderChainEngine::from_audited_state(graph, metadata, vec![anchor], vec![anchor], [])

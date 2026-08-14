@@ -139,8 +139,8 @@ fn immutable_metadata_changed(
     projected: &crate::EngineMetadata,
 ) -> bool {
     projected.disk_format != source.disk_format
-        || projected.network_id != source.network_id
-        || projected.anchor_manifest_digest != source.anchor_manifest_digest
+        || projected.policy != source.policy
+        || projected.trust_set_extension != source.trust_set_extension
 }
 
 /// Independently check that `plan`'s projection obeys every transition invariant under `engine_before_commit`.
@@ -404,15 +404,26 @@ pub(crate) fn verify_plan_production(
 mod tests {
     use std::sync::Arc;
 
-    use zakura_chain::{block::genesis::regtest_genesis_block, parameters::Network};
+    use zakura_chain::block::genesis::regtest_genesis_block;
 
     use super::test_support::{candidate_with_delta, fixture, hash, no_change_candidate};
     use super::*;
     use crate::graph::GraphOverlay;
     use crate::{
-        BodyRuleId, BodyValidationState, EligibilityReason, EngineMode, EvidenceId,
-        HeaderNodeInvariant, WorkCoordinateError,
+        BodyRuleId, BodyValidationState, EligibilityReason, EngineMode, EnginePolicyBinding,
+        EvidenceId, HeaderNodeInvariant, WorkCoordinateError,
     };
+
+    fn changed_policy(policy: &EnginePolicyBinding, marker: u8) -> EnginePolicyBinding {
+        let mut consensus = policy.consensus_policy_digest();
+        consensus[0] ^= marker;
+        EnginePolicyBinding::from_untrusted_durable(
+            consensus,
+            policy.trust_set_digest(),
+            policy.trust_entries().iter().cloned(),
+        )
+        .expect("the unchanged trust transcript remains valid")
+    }
 
     fn stage_tombstone_only(
         overlay: &mut GraphOverlay<'_>,
@@ -627,13 +638,15 @@ mod tests {
             crate::HeaderChainDiskVersion(crate::HeaderChainDiskVersion::CURRENT.0 + 1);
         cases.push(disk_format);
 
-        let mut network = no_change_candidate(&fixture.engine);
-        network.change_set.metadata.network_id = Network::Mainnet.kind();
-        cases.push(network);
+        let mut consensus = no_change_candidate(&fixture.engine);
+        consensus.change_set.metadata.policy =
+            changed_policy(&consensus.change_set.metadata.policy, 0x55);
+        cases.push(consensus);
 
-        let mut manifest = no_change_candidate(&fixture.engine);
-        manifest.change_set.metadata.anchor_manifest_digest = [0xff; 32];
-        cases.push(manifest);
+        let mut second_policy = no_change_candidate(&fixture.engine);
+        second_policy.change_set.metadata.policy =
+            changed_policy(&second_policy.change_set.metadata.policy, 0xaa);
+        cases.push(second_policy);
 
         for plan in cases {
             for mode in [VerificationMode::Production, VerificationMode::Exhaustive] {
@@ -659,7 +672,8 @@ mod tests {
         );
 
         let mut corrupt = valid;
-        corrupt.change_set.metadata.anchor_manifest_digest = [0xfe; 32];
+        corrupt.change_set.metadata.policy =
+            changed_policy(&corrupt.change_set.metadata.policy, 0xfe);
         assert_eq!(
             verify_plan_with_mode(&fixture.engine, &corrupt, VerificationMode::Production),
             verify_plan_with_mode(&fixture.engine, &corrupt, VerificationMode::Exhaustive)

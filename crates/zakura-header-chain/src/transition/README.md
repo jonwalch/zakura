@@ -168,6 +168,26 @@ For a fixed store snapshot, configuration, and recovery time, the audit returns
 the same plan. `audit_store_for_trust_anchor_update` permits only the audited
 manifest-digest rebind in addition to ordinary reconstructible repairs.
 
+## Policy identity and trust ownership
+
+`EngineConfig::new` constructs the complete checked `EnginePolicy`. The policy
+module alone encodes `ConsensusPolicyId` and `TrustSetId`. Consumers must not
+derive another policy identity from `NetworkKind`, selected network fields, or
+trust-source digests.
+
+`ConsensusPolicyId` binds every network field that changes header validity or
+upgrade interpretation. `TrustSetId` binds the normalized height and hash of
+each bootstrap, settled-upgrade, and local-checkpoint entry. `TrustSet` rejects
+different hashes at one height before the engine opens durable state for
+mutation.
+
+Metadata, preparation leases, preparation receipts, and replay records bind
+both identifiers. Recovery compares the identifiers before it reads graph
+collections. Recovery accepts a trust-set mismatch only when the requested set
+preserves every durable entry. Recovery authenticates new entries at or below
+finality through the canonical full-state index. The store commits the new
+binding and the exact extension record in one transaction.
+
 ## Changing the transition model
 
 When you add or change an event, update each part of the model that owns a

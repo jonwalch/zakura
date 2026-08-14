@@ -190,8 +190,8 @@ fn engine_rejects_context_free_batch_with_invalid_retained_time() {
     insert.batch = PreparedHeaderBatch::new(
         vec![prepared],
         store.lease.parent,
-        store.lease.network().clone(),
-        store.lease.trust_anchor_digest,
+        store.lease.consensus_policy_id,
+        store.lease.trust_set_id,
         EvidenceId::from_digest([0x31; 32]),
     )
     .expect("the context-free fixture is nonempty");
@@ -230,12 +230,11 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     matching_config.replace_local_checkpoints(
         CheckpointSet::new([child]).expect("the matching checkpoint fixture is unique"),
     );
-    matching_store.metadata.anchor_manifest_digest = matching_config.trust_anchor_digest();
+    matching_store.metadata.policy = matching_config.durable_policy_binding();
     matching_store.lease = ValidationLease::new(
         matching_store.lease.parent,
         matching_store.lease.predecessors.clone(),
-        matching_config.network.clone(),
-        matching_config.trust_anchor_digest(),
+        matching_config.policy(),
     );
     let matching_request = insertion(&matching_store, 1, EvidenceId::from_digest([0x44; 32]));
     let matching = apply_transition(
@@ -259,12 +258,11 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     conflicting_config.replace_local_checkpoints(
         CheckpointSet::new([expected]).expect("the conflicting checkpoint fixture is unique"),
     );
-    conflicting_store.metadata.anchor_manifest_digest = conflicting_config.trust_anchor_digest();
+    conflicting_store.metadata.policy = conflicting_config.durable_policy_binding();
     conflicting_store.lease = ValidationLease::new(
         conflicting_store.lease.parent,
         conflicting_store.lease.predecessors.clone(),
-        conflicting_config.network.clone(),
-        conflicting_config.trust_anchor_digest(),
+        conflicting_config.policy(),
     );
     let conflicting_request = insertion(&conflicting_store, 1, EvidenceId::from_digest([0x44; 32]));
     let conflicting = apply_transition(

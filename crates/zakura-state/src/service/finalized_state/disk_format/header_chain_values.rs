@@ -17,12 +17,14 @@ use zakura_chain::{
 use zakura_header_chain::{
     AlarmSet, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BodyValidationState,
     BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, ConsensusInvalidBodyTombstone,
-    EligibilityReason, EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
+    DurableTrustEntry, DurableTrustSetExtension, EligibilityReason, EligibilityState,
+    EngineMetadata, EngineMode, EnginePolicyBinding, EvidenceId, FinalityEpoch,
     FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier, FrontierSet,
     HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
-    HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
-    StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
-    UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
+    HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId,
+    PolicyBoundFingerprint, SourceId, StateVersion, SuffixWork, TransitionDomain,
+    TransitionFingerprint, TreeAuxRecordV1, TrustSource, UntrustedAuxDeliveryRow,
+    VerifiedGeneration, WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -30,6 +32,7 @@ use super::FallibleDiskValue;
 const MAX_HEADER_BYTES: usize = 2 * 1024;
 const MAX_RULE_ID_BYTES: usize = 128;
 const MAX_AUX_DELIVERY_IDS: usize = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS * 16;
+const MAX_DURABLE_TRUST_ENTRIES: usize = zakura_header_chain::MAX_TRUST_ENTRIES_V1;
 
 /// Bounded collection count stored with the atomic header-chain root.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -114,6 +117,9 @@ pub enum HeaderChainValueError {
     /// The decoder found a malformed sealed auxiliary outcome.
     #[error("invalid auxiliary outcome")]
     InvalidAuxOutcome,
+    /// The decoder found an invalid checked policy binding.
+    #[error("invalid engine policy binding")]
+    InvalidPolicyBinding,
 }
 
 /// Durable phase of bounded full-state/header reconciliation.
@@ -1364,12 +1370,46 @@ impl FallibleDiskValue for EngineMetadata {
             EngineMode::Integrated => 0,
             EngineMode::HeadersOnly => 1,
         });
-        encoder.u8(match value.network_id {
-            NetworkKind::Mainnet => 0,
-            NetworkKind::Testnet => 1,
-            NetworkKind::Regtest => 2,
+        encoder.fixed(&value.policy.consensus_policy_digest());
+        encoder.fixed(&value.policy.trust_set_digest());
+        encoder.counted(
+            "policy_trust_entries",
+            value.policy.trust_entries(),
+            MAX_DURABLE_TRUST_ENTRIES,
+            |encoder, entry| {
+                put_frontier(encoder, entry.frontier());
+                let sources = entry.sources().iter().fold(0_u8, |mask, source| {
+                    mask | match source {
+                        TrustSource::Bootstrap => 1,
+                        TrustSource::SettledUpgrade => 2,
+                        TrustSource::LocalCheckpoint => 4,
+                    }
+                });
+                encoder.u8(sources);
+            },
+        )?;
+        encoder.optional(value.trust_set_extension.as_ref(), |encoder, extension| {
+            encoder.fixed(&extension.previous_trust_set_digest());
+            encoder.fixed(&extension.requested_trust_set_digest());
+            encoder
+                .counted(
+                    "trust_extension_entries",
+                    extension.added(),
+                    MAX_DURABLE_TRUST_ENTRIES,
+                    |encoder, entry| {
+                        put_frontier(encoder, entry.frontier());
+                        let sources = entry.sources().iter().fold(0_u8, |mask, source| {
+                            mask | match source {
+                                TrustSource::Bootstrap => 1,
+                                TrustSource::SettledUpgrade => 2,
+                                TrustSource::LocalCheckpoint => 4,
+                            }
+                        });
+                        encoder.u8(sources);
+                    },
+                )
+                .expect("a checked extension stays within the trust-set bound");
         });
-        encoder.fixed(&value.anchor_manifest_digest);
         put_frontier(&mut encoder, value.work_origin);
         encoder.u64(value.state_version.get());
         encoder.u64(value.header_generation.get());
@@ -1396,6 +1436,8 @@ impl FallibleDiskValue for EngineMetadata {
             encoder.u8(fingerprint.domain().code());
             encoder.fixed(&fingerprint.evidence().digest());
             encoder.fixed(&fingerprint.payload_digest());
+            encoder.fixed(&fingerprint.consensus_policy_digest());
+            encoder.fixed(&fingerprint.trust_set_digest());
         });
         encoder.optional(value.alarms.migrated_pin_refuted, put_frontier);
         Ok(encoder.0)
@@ -1418,18 +1460,68 @@ impl FallibleDiskValue for EngineMetadata {
                 })
             }
         };
-        let network_id = match decoder.u8()? {
-            0 => NetworkKind::Mainnet,
-            1 => NetworkKind::Testnet,
-            2 => NetworkKind::Regtest,
-            value => {
-                return Err(HeaderChainValueError::UnknownDiscriminant {
-                    field: "network_kind",
-                    value,
-                })
-            }
-        };
-        let anchor_manifest_digest = decoder.array()?;
+        let consensus_policy_digest = decoder.array()?;
+        let trust_set_digest = decoder.array()?;
+        let trust_entries = decoder.counted(
+            "policy_trust_entries",
+            MAX_DURABLE_TRUST_ENTRIES,
+            |decoder| {
+                let frontier = get_frontier(decoder)?;
+                let mask = decoder.u8()?;
+                if mask == 0 || mask & !0b111 != 0 {
+                    return Err(HeaderChainValueError::UnknownDiscriminant {
+                        field: "trust_source_mask",
+                        value: mask,
+                    });
+                }
+                let sources = [
+                    (1, TrustSource::Bootstrap),
+                    (2, TrustSource::SettledUpgrade),
+                    (4, TrustSource::LocalCheckpoint),
+                ]
+                .into_iter()
+                .filter_map(|(bit, source)| (mask & bit != 0).then_some(source));
+                DurableTrustEntry::from_untrusted_durable(frontier, sources)
+                    .map_err(|_| HeaderChainValueError::InvalidPolicyBinding)
+            },
+        )?;
+        let policy = EnginePolicyBinding::from_untrusted_durable(
+            consensus_policy_digest,
+            trust_set_digest,
+            trust_entries,
+        )
+        .map_err(|_| HeaderChainValueError::InvalidPolicyBinding)?;
+        let trust_set_extension = decoder.optional(|decoder| {
+            let previous = decoder.array()?;
+            let requested = decoder.array()?;
+            let added = decoder.counted(
+                "trust_extension_entries",
+                MAX_DURABLE_TRUST_ENTRIES,
+                |decoder| {
+                    let frontier = get_frontier(decoder)?;
+                    let mask = decoder.u8()?;
+                    if mask == 0 || mask & !0b111 != 0 {
+                        return Err(HeaderChainValueError::UnknownDiscriminant {
+                            field: "trust_source_mask",
+                            value: mask,
+                        });
+                    }
+                    DurableTrustEntry::from_untrusted_durable(
+                        frontier,
+                        [
+                            (1, TrustSource::Bootstrap),
+                            (2, TrustSource::SettledUpgrade),
+                            (4, TrustSource::LocalCheckpoint),
+                        ]
+                        .into_iter()
+                        .filter_map(|(bit, source)| (mask & bit != 0).then_some(source)),
+                    )
+                    .map_err(|_| HeaderChainValueError::InvalidPolicyBinding)
+                },
+            )?;
+            DurableTrustSetExtension::from_untrusted_durable(previous, requested, added, &policy)
+                .ok_or(HeaderChainValueError::InvalidPolicyBinding)
+        })?;
         let work_origin = get_frontier(&mut decoder)?;
         let state_version = StateVersion::new(decoder.u64()?);
         let header_generation = HeaderGeneration::new(decoder.u64()?);
@@ -1457,19 +1549,26 @@ impl FallibleDiskValue for EngineMetadata {
                     value: code,
                 },
             )?;
-            Ok(TransitionFingerprint::from_parts(
+            let fingerprint = TransitionFingerprint::from_parts(
                 domain,
                 EvidenceId::from_digest(decoder.array()?),
                 decoder.array()?,
-            ))
+            );
+            PolicyBoundFingerprint::from_untrusted_durable(
+                fingerprint,
+                decoder.array()?,
+                decoder.array()?,
+                &policy,
+            )
+            .ok_or(HeaderChainValueError::InvalidPolicyBinding)
         })?;
         let migrated_pin_refuted = decoder.optional(get_frontier)?;
         decoder.finish()?;
         Ok(EngineMetadata {
             disk_format,
             mode,
-            network_id,
-            anchor_manifest_digest,
+            policy,
+            trust_set_extension,
             work_origin,
             state_version,
             header_generation,
@@ -1496,6 +1595,7 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use zakura_chain::block::genesis::regtest_genesis_block;
+    use zakura_header_chain::{CheckpointSet, EngineConfig, TrustedAnchor};
 
     fn frontier(height: u32, byte: u8) -> Frontier {
         Frontier::new(block::Height(height), block::Hash([byte; 32]))
@@ -1727,11 +1827,22 @@ mod tests {
             Ok(finality)
         );
 
+        let genesis = block::genesis::regtest_genesis_block();
+        let config = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            zakura_chain::parameters::Network::new_regtest(Default::default()),
+            TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), genesis.hash()),
+                header: genesis.header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the fixture policy is valid");
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::HeadersOnly,
-            network_id: NetworkKind::Regtest,
-            anchor_manifest_digest: [13; 32],
+            policy: config.durable_policy_binding(),
+            trust_set_extension: None,
             work_origin: frontier(0, 1),
             state_version: StateVersion::new(2),
             header_generation: HeaderGeneration::new(3),
@@ -1766,14 +1877,22 @@ mod tests {
                 }),
                 migrated_pin_refuted: Some(frontier(1, 2)),
             },
-            last_transition: Some(TransitionFingerprint::from_parts(
-                TransitionDomain::OperatorInvalidate,
-                EvidenceId::from_digest([14; 32]),
-                [15; 32],
-            )),
+            last_transition: Some(
+                PolicyBoundFingerprint::from_untrusted_durable(
+                    TransitionFingerprint::from_parts(
+                        TransitionDomain::OperatorInvalidate,
+                        EvidenceId::from_digest([14; 32]),
+                        [15; 32],
+                    ),
+                    config.consensus_policy_id().digest(),
+                    config.trust_set_id().digest(),
+                    &config.durable_policy_binding(),
+                )
+                .expect("the replay fixture matches the policy"),
+            ),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 2, 1, 2]);
+        assert_eq!(&bytes[..5], &[0, 0, 0, 2, 1]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
         let mut version_one_bytes = bytes.clone();
         version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
@@ -1781,6 +1900,33 @@ mod tests {
             EngineMetadata::decode(&version_one_bytes),
             Err(HeaderChainValueError::UnsupportedDiskFormat(1))
         );
+        let policy_digest = config.consensus_policy_id().digest();
+        let policy_digest_offsets: Vec<_> = bytes
+            .windows(policy_digest.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == policy_digest).then_some(offset))
+            .collect();
+        assert_eq!(policy_digest_offsets.len(), 2);
+        let mut mismatched_replay_policy = bytes.clone();
+        mismatched_replay_policy[*policy_digest_offsets
+            .last()
+            .expect("the replay identity repeats the metadata policy digest")] ^= 1;
+        assert_eq!(
+            EngineMetadata::decode(&mismatched_replay_policy),
+            Err(HeaderChainValueError::InvalidPolicyBinding),
+            "a durable replay identity cannot cross its metadata policy",
+        );
+        const FIRST_TRUST_SOURCE_MASK_OFFSET: usize = 4 + 1 + 32 + 32 + 4 + 4 + 32;
+        assert_eq!(bytes[FIRST_TRUST_SOURCE_MASK_OFFSET], 1);
+        let mut missing_trust_provenance = bytes.clone();
+        missing_trust_provenance[FIRST_TRUST_SOURCE_MASK_OFFSET] = 0;
+        assert!(matches!(
+            EngineMetadata::decode(&missing_trust_provenance),
+            Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "trust_source_mask",
+                value: 0,
+            })
+        ));
         let mut legacy_bytes = bytes.clone();
         legacy_bytes.truncate(
             legacy_bytes
@@ -1804,7 +1950,7 @@ mod tests {
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "3f4965a634583e651b4904de0601c44e934719dbcb4e22a783bf052b7c21e9eb",
+                "068b161d9391339d98f8cdb2b32304b3790cfd236303153aa1986c1138023dc5",
             ]
         );
     }

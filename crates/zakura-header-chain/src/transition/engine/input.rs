@@ -258,10 +258,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        BodyRuleId, BodyUnavailableSummary, BranchId, EvidenceId, FinalityEpoch, FinalitySource,
-        HeaderContextFact, HeaderGeneration, HeaderValidationState, HeaderWorkAuthority,
-        OperatorInvalidationId, PreparedHeader, PreparedHeaderBatch, SourceId, TargetCompletion,
-        VerifiedBodyEvidence, VerifiedChangeCause,
+        BodyRuleId, BodyUnavailableSummary, BranchId, CheckpointSet, EngineConfig, EngineMode,
+        EvidenceId, FinalityEpoch, FinalitySource, HeaderContextFact, HeaderGeneration,
+        HeaderValidationState, HeaderWorkAuthority, OperatorInvalidationId, PreparedHeader,
+        PreparedHeaderBatch, SourceId, TargetCompletion, TrustedAnchor, VerifiedBodyEvidence,
+        VerifiedChangeCause,
     };
 
     fn frontier(byte: u8, height: u32) -> Frontier {
@@ -278,6 +279,20 @@ mod tests {
             NonZeroU64::new(5).expect("the fixture request ID is nonzero"),
         )
         .into()
+    }
+
+    fn config() -> EngineConfig {
+        let genesis = regtest_genesis_block();
+        EngineConfig::new(
+            EngineMode::Integrated,
+            Network::new_regtest(RegtestParameters::default()),
+            TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), genesis.hash()),
+                header: genesis.header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the fixture policy is valid")
     }
 
     fn prepared_batch() -> PreparedHeaderBatch {
@@ -297,11 +312,12 @@ mod tests {
             validation: HeaderValidationState::Valid,
             header,
         };
+        let config = config();
         PreparedHeaderBatch::new(
             vec![prepared],
             parent,
-            Network::new_regtest(RegtestParameters::default()),
-            [10; 32],
+            config.consensus_policy_id(),
+            config.trust_set_id(),
             EvidenceId::from_digest([11; 32]),
         )
         .expect("the fixture batch is nonempty")
@@ -310,6 +326,7 @@ mod tests {
     fn validation_facts() -> HeaderValidationFacts {
         let genesis = regtest_genesis_block();
         let parent = Frontier::new(block::Height(0), genesis.hash());
+        let config = config();
         HeaderValidationFacts {
             validation_leases: vec![ValidationLease::new(
                 parent,
@@ -317,8 +334,7 @@ mod tests {
                     frontier: parent,
                     header: genesis.header.clone(),
                 }],
-                Network::new_regtest(RegtestParameters::default()),
-                [10; 32],
+                config.policy(),
             )],
         }
     }

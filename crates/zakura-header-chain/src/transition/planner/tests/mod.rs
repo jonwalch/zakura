@@ -72,8 +72,8 @@ impl TestStore {
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode,
-            network_id: config.network.kind(),
-            anchor_manifest_digest: config.trust_anchor_digest(),
+            policy: config.durable_policy_binding(),
+            trust_set_extension: None,
             work_origin: frontier,
             state_version: StateVersion::new(0),
             header_generation: HeaderGeneration::new(0),
@@ -90,16 +90,14 @@ impl TestStore {
             alarms: AlarmSet::default(),
             last_transition: None,
         };
-        let lease = ValidationLease {
-            parent: frontier,
-            predecessors: vec![HeaderContextFact {
+        let lease = ValidationLease::new(
+            frontier,
+            vec![HeaderContextFact {
                 frontier,
                 header: block.header.clone(),
             }],
-            network: config.network.clone(),
-            trust_anchor_digest: config.trust_anchor_digest(),
-            context_digest: [7; 32],
-        };
+            config.policy(),
+        );
         (
             Self {
                 graph,
@@ -182,12 +180,7 @@ impl TestStore {
             });
             hash = header.previous_block_hash;
         }
-        self.lease = ValidationLease::new(
-            parent,
-            predecessors,
-            self.lease.network().clone(),
-            self.lease.trust_anchor_digest(),
-        );
+        self.lease = ValidationLease::reissue_from(parent, predecessors, &self.lease);
     }
 }
 
@@ -405,7 +398,7 @@ fn apply_transition(
 fn batch(
     parent: Frontier,
     count: u32,
-    trust_anchor_digest: [u8; 32],
+    lease: &ValidationLease,
     evidence: EvidenceId,
 ) -> PreparedHeaderBatch {
     let mut headers = Vec::new();
@@ -441,20 +434,15 @@ fn batch(
     PreparedHeaderBatch::new(
         headers,
         parent,
-        Network::new_regtest(RegtestParameters::default()),
-        trust_anchor_digest,
+        lease.consensus_policy_id,
+        lease.trust_set_id,
         evidence,
     )
     .expect("the fixture batch is nonempty")
 }
 
 fn insertion(store: &TestStore, count: u32, evidence: EvidenceId) -> TransitionRequest {
-    let batch = batch(
-        store.lease.parent,
-        count,
-        store.lease.trust_anchor_digest,
-        evidence,
-    );
+    let batch = batch(store.lease.parent, count, &store.lease, evidence);
     let target = batch.headers().last().expect("the batch is nonempty").hash;
     TransitionRequest {
         expected_version: store.metadata.state_version,

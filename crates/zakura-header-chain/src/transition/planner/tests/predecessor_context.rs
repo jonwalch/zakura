@@ -64,7 +64,7 @@ fn lease_for_path(
     parent: Frontier,
     path: &[(Frontier, Arc<zakura_chain::block::Header>)],
 ) -> ValidationLease {
-    ValidationLease::new(
+    ValidationLease::reissue_from(
         parent,
         path.iter()
             .map(|(frontier, header)| HeaderContextFact {
@@ -72,8 +72,7 @@ fn lease_for_path(
                 header: header.clone(),
             })
             .collect(),
-        store.lease.network().clone(),
-        store.lease.trust_anchor_digest(),
+        &store.lease,
     )
 }
 
@@ -122,18 +121,8 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
         .collect();
     let matching_lease = lease_for_path(&store, parent, &lease_path);
     let short_lease = lease_for_path(&store, parent, &lease_path[..3]);
-    let wrong_digest = ValidationLease::new(
-        parent,
-        lease_path
-            .iter()
-            .map(|(frontier, header)| HeaderContextFact {
-                frontier: *frontier,
-                header: header.clone(),
-            })
-            .collect(),
-        store.lease.network().clone(),
-        [0x55; 32],
-    );
+    let mut wrong_digest = matching_lease.clone();
+    wrong_digest.context_digest[0] ^= 0x55;
     let genesis_path = header_path(&store, frontiers[0]);
     let genesis_lease = lease_for_path(&store, frontiers[0], &genesis_path);
     let expected: Vec<_> = lease_path

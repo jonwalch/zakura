@@ -12,7 +12,7 @@ pub(super) fn check_trust_pins(
     config: &EngineConfig,
     violations: &mut Vec<AuditViolation>,
 ) {
-    let settled = config.settled_manifest().pin_for_network(&config.network);
+    let settled = config.settled_manifest().pin_for_network(config.network());
     for node in nodes {
         for reason in &node.eligibility.direct_reasons {
             let valid = match reason {
@@ -107,19 +107,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        CheckpointSet, EligibilityState, EngineMode, HeaderValidationState, TrustedAnchor,
-        WorkCoordinate,
-    };
+    use crate::{CheckpointSet, EngineConfigError, EngineMode, TrustSource, TrustedAnchor};
 
     #[test]
-    fn settled_pin_does_not_mask_checkpoint_conflict_at_the_same_height() {
+    fn f225510_checked_policy_rejects_conflicting_trust_sources() {
         let genesis = Arc::<Block>::zcash_deserialize(
             zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
         )
         .expect("the mainnet genesis vector is canonical");
         let anchor = Frontier::new(block::Height(0), genesis.hash());
-        let mut config = EngineConfig::new(
+        let release = EngineConfig::new(
             EngineMode::Integrated,
             Network::Mainnet,
             TrustedAnchor {
@@ -129,52 +126,27 @@ mod tests {
             CheckpointSet::default(),
         )
         .expect("the mainnet configuration has a settled pin");
-        let settled = config
+        let settled = release
             .settled_manifest()
-            .pin_for_network(&config.network)
+            .pin_for_network(release.network())
             .expect("mainnet has a settled pin")
             .activation;
         let checkpoint = Frontier::new(settled.height, block::Hash([0x5c; 32]));
-        config.replace_local_checkpoints(
-            CheckpointSet::new([checkpoint]).expect("the checkpoint fixture is unique"),
-        );
-
-        let block_work = genesis
-            .header
-            .difficulty_threshold
-            .to_work()
-            .expect("the genesis target has work");
-        let mut node = HeaderNode::from_durable_parts(
-            genesis.header.clone(),
-            genesis.hash(),
-            genesis.header.previous_block_hash,
-            anchor.height,
-            block_work,
-            WorkCoordinate::new(anchor.hash, block_work.as_u256()),
-            HeaderValidationState::Valid,
-            EligibilityState::default(),
-            BodyValidationState::Unknown,
-            Vec::new(),
-        )
-        .expect("the genesis node fields agree");
-        node.height = settled.height;
-        node.hash = settled.hash;
-
-        let mut violations = Vec::new();
-        check_trust_pins(&[node.clone()], anchor, &config, &mut violations);
         assert_eq!(
-            violations,
-            vec![AuditViolation::TrustPin(settled.height, settled.hash)]
+            EngineConfig::new(
+                EngineMode::Integrated,
+                Network::Mainnet,
+                TrustedAnchor {
+                    frontier: anchor,
+                    header: genesis.header.clone(),
+                },
+                CheckpointSet::new([checkpoint]).expect("the checkpoint fixture is unique"),
+            ),
+            Err(EngineConfigError::ConflictingTrustEntry {
+                height: settled.height,
+                first: TrustSource::SettledUpgrade,
+                second: TrustSource::LocalCheckpoint,
+            }),
         );
-
-        node.eligibility
-            .direct_reasons
-            .insert(EligibilityReason::CheckpointConflict {
-                height: checkpoint.height,
-                expected: checkpoint.hash,
-            });
-        violations.clear();
-        check_trust_pins(&[node], anchor, &config, &mut violations);
-        assert!(violations.is_empty());
     }
 }

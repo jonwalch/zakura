@@ -395,8 +395,8 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
-        network_id: config.network.kind(),
-        anchor_manifest_digest: config.trust_anchor_digest(),
+        policy: config.durable_policy_binding(),
+        trust_set_extension: None,
         work_origin: anchor,
         state_version: StateVersion::new(1),
         header_generation: HeaderGeneration::new(1),

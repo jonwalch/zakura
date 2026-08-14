@@ -3,13 +3,11 @@
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use zakura_chain::{
-    block,
-    parameters::NetworkKind,
-    work::difficulty::{ParameterDifficulty, Work},
-};
+use zakura_chain::{block, work::difficulty::Work};
 
-use crate::{EvidenceId, Frontier, HeaderValidationState};
+use crate::{
+    ConsensusPolicyId, EnginePolicy, EvidenceId, Frontier, HeaderValidationState, TrustSetId,
+};
 
 use super::error::TransitionTypeError;
 
@@ -31,8 +29,10 @@ pub struct ValidationLease {
     pub(crate) predecessors: Vec<HeaderContextFact>,
     /// Exact network policy used by the issuing engine.
     pub(crate) network: zakura_chain::parameters::Network,
-    /// Digest of current trust anchors.
-    pub(crate) trust_anchor_digest: [u8; 32],
+    /// Complete consensus-policy identity used by the issuing engine.
+    pub(crate) consensus_policy_id: ConsensusPolicyId,
+    /// Complete trust-set identity used by the issuing engine.
+    pub(crate) trust_set_id: TrustSetId,
     /// Digest binding the complete lease contents.
     pub(crate) context_digest: [u8; 32],
 }
@@ -42,15 +42,18 @@ impl ValidationLease {
     pub fn new(
         parent: Frontier,
         predecessors: Vec<HeaderContextFact>,
-        network: zakura_chain::parameters::Network,
-        trust_anchor_digest: [u8; 32],
+        policy: &EnginePolicy,
     ) -> Self {
+        let network = policy.network().clone();
+        let consensus_policy_id = policy.consensus_policy_id();
+        let trust_set_id = policy.trust_set_id();
         let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-chain-validation-lease-v1");
+        hasher.update(b"zakura-header-chain-validation-lease");
+        hasher.update([2]);
         hasher.update(parent.height.0.to_le_bytes());
         hasher.update(parent.hash.0);
-        hasher.update(trust_anchor_digest);
-        hash_network_policy(&mut hasher, &network);
+        hasher.update(consensus_policy_id.digest());
+        hasher.update(trust_set_id.digest());
         for fact in &predecessors {
             hasher.update(fact.frontier.height.0.to_le_bytes());
             hasher.update(fact.frontier.hash.0);
@@ -60,7 +63,36 @@ impl ValidationLease {
             parent,
             predecessors,
             network,
-            trust_anchor_digest,
+            consensus_policy_id,
+            trust_set_id,
+            context_digest: hasher.finalize().into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reissue_from(
+        parent: Frontier,
+        predecessors: Vec<HeaderContextFact>,
+        source: &Self,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-validation-lease");
+        hasher.update([2]);
+        hasher.update(parent.height.0.to_le_bytes());
+        hasher.update(parent.hash.0);
+        hasher.update(source.consensus_policy_id.digest());
+        hasher.update(source.trust_set_id.digest());
+        for fact in &predecessors {
+            hasher.update(fact.frontier.height.0.to_le_bytes());
+            hasher.update(fact.frontier.hash.0);
+            hasher.update(fact.header.hash().0);
+        }
+        Self {
+            parent,
+            predecessors,
+            network: source.network.clone(),
+            consensus_policy_id: source.consensus_policy_id,
+            trust_set_id: source.trust_set_id,
             context_digest: hasher.finalize().into(),
         }
     }
@@ -80,9 +112,14 @@ impl ValidationLease {
         &self.network
     }
 
-    /// Return the digest of the trust anchors used to issue this lease.
-    pub const fn trust_anchor_digest(&self) -> [u8; 32] {
-        self.trust_anchor_digest
+    /// Return the complete consensus-policy identity used to issue this lease.
+    pub const fn consensus_policy_id(&self) -> ConsensusPolicyId {
+        self.consensus_policy_id
+    }
+
+    /// Return the complete trust-set identity used to issue this lease.
+    pub const fn trust_set_id(&self) -> TrustSetId {
+        self.trust_set_id
     }
 
     /// Return the digest binding all lease contents.
@@ -90,17 +127,14 @@ impl ValidationLease {
         self.context_digest
     }
 
-    pub(crate) fn is_coherent(
-        &self,
-        network: &zakura_chain::parameters::Network,
-        trust_anchor_digest: [u8; 32],
-    ) -> bool {
+    pub(crate) fn is_coherent(&self, policy: &EnginePolicy) -> bool {
         let required = usize::try_from(self.parent.height.0)
             .ok()
             .and_then(|height| height.checked_add(1))
             .map(|height| height.min(crate::POW_ADJUSTMENT_BLOCK_SPAN));
-        if self.network != *network
-            || self.trust_anchor_digest != trust_anchor_digest
+        if self.network != *policy.network()
+            || self.consensus_policy_id != policy.consensus_policy_id()
+            || self.trust_set_id != policy.trust_set_id()
             || required != Some(self.predecessors.len())
             || self.predecessors.first().map(|fact| fact.frontier) != Some(self.parent)
         {
@@ -121,13 +155,7 @@ impl ValidationLease {
                 }
             }
         }
-        Self::new(
-            self.parent,
-            self.predecessors.clone(),
-            self.network.clone(),
-            self.trust_anchor_digest,
-        )
-        .context_digest
+        Self::new(self.parent, self.predecessors.clone(), policy).context_digest
             == self.context_digest
     }
 }
@@ -151,8 +179,8 @@ pub struct PreparedHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextFreePreparationReceipt {
     parent: Frontier,
-    network: zakura_chain::parameters::Network,
-    trust_anchor_digest: [u8; 32],
+    consensus_policy_id: ConsensusPolicyId,
+    trust_set_id: TrustSetId,
 }
 
 impl ContextFreePreparationReceipt {
@@ -161,14 +189,14 @@ impl ContextFreePreparationReceipt {
         self.parent
     }
 
-    /// Return the exact network policy used for graph-independent validation.
-    pub fn network(&self) -> &zakura_chain::parameters::Network {
-        &self.network
+    /// Return the complete consensus-policy identity used during preparation.
+    pub const fn consensus_policy_id(&self) -> ConsensusPolicyId {
+        self.consensus_policy_id
     }
 
-    /// Return the authenticated immutable rule-set identity.
-    pub const fn trust_anchor_digest(&self) -> [u8; 32] {
-        self.trust_anchor_digest
+    /// Return the complete trust-set identity used during preparation.
+    pub const fn trust_set_id(&self) -> TrustSetId {
+        self.trust_set_id
     }
 }
 
@@ -185,8 +213,8 @@ impl PreparedHeaderBatch {
     pub(crate) fn new(
         headers: Vec<PreparedHeader>,
         parent: Frontier,
-        network: zakura_chain::parameters::Network,
-        trust_anchor_digest: [u8; 32],
+        consensus_policy_id: ConsensusPolicyId,
+        trust_set_id: TrustSetId,
         evidence: EvidenceId,
     ) -> Result<Self, TransitionTypeError> {
         if headers.is_empty() {
@@ -202,8 +230,8 @@ impl PreparedHeaderBatch {
             headers,
             receipt: ContextFreePreparationReceipt {
                 parent,
-                network,
-                trust_anchor_digest,
+                consensus_policy_id,
+                trust_set_id,
             },
             evidence,
         })
@@ -228,17 +256,20 @@ impl PreparedHeaderBatch {
     ///
     /// Preparation and finality rebasing must share this exact encoding so a
     /// rebased suffix keeps the same evidence ID that fresh preparation would
-    /// produce for the same parent, trust anchor, and header path.
+    /// produce for the same parent, engine policy, and header path.
     pub(crate) fn context_free_evidence(
         parent: Frontier,
-        trust_anchor_digest: [u8; 32],
+        consensus_policy_id: ConsensusPolicyId,
+        trust_set_id: TrustSetId,
         headers: &[PreparedHeader],
     ) -> EvidenceId {
         let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-chain-context-free-batch-v1");
+        hasher.update(b"zakura-header-chain-context-free-batch");
+        hasher.update([2]);
         hasher.update(parent.height.0.to_le_bytes());
         hasher.update(parent.hash.0);
-        hasher.update(trust_anchor_digest);
+        hasher.update(consensus_policy_id.digest());
+        hasher.update(trust_set_id.digest());
         for header in headers {
             hasher.update(header.height.0.to_le_bytes());
             hasher.update(header.hash.0);
@@ -265,53 +296,17 @@ impl PreparedHeaderBatch {
         let removed = index.saturating_add(1);
         self.headers.drain(..removed);
         self.receipt.parent = parent;
-        self.evidence =
-            Self::context_free_evidence(parent, self.receipt.trust_anchor_digest, &self.headers);
+        self.evidence = Self::context_free_evidence(
+            parent,
+            self.receipt.consensus_policy_id,
+            self.receipt.trust_set_id,
+            &self.headers,
+        );
         Ok(removed)
     }
 
     pub(crate) fn clear_already_applied(&mut self) {
         self.headers.clear();
-    }
-}
-
-/// Hash the authenticated network policy into a replay or lease digest.
-pub(super) fn hash_network_policy(
-    hasher: &mut Sha256,
-    network: &zakura_chain::parameters::Network,
-) {
-    hasher.update([match network.kind() {
-        NetworkKind::Mainnet => 0,
-        NetworkKind::Testnet => 1,
-        NetworkKind::Regtest => 2,
-    }]);
-    hasher.update(network.genesis_hash().0);
-    let target: zakura_chain::work::difficulty::U256 = network.target_difficulty_limit().into();
-    hasher.update(target.to_big_endian());
-    hasher.update([u8::from(network.disable_pow())]);
-    let max_time_height = match network {
-        zakura_chain::parameters::Network::Mainnet => block::Height::MIN,
-        zakura_chain::parameters::Network::Testnet(parameters) => {
-            parameters.max_block_time_start_height()
-        }
-    };
-    hasher.update(max_time_height.0.to_le_bytes());
-    for (height, upgrade) in network.activation_list() {
-        hasher.update(height.0.to_le_bytes());
-        let (branch_tag, upgrade_code) = match upgrade.branch_id() {
-            Some(branch) => (1_u8, u32::from(branch)),
-            None => (
-                0,
-                match upgrade {
-                    zakura_chain::parameters::NetworkUpgrade::Genesis => 0,
-                    zakura_chain::parameters::NetworkUpgrade::BeforeOverwinter => 1,
-                    zakura_chain::parameters::NetworkUpgrade::Nu7 => 2,
-                    _ => u32::MAX,
-                },
-            ),
-        };
-        hasher.update([branch_tag]);
-        hasher.update(upgrade_code.to_le_bytes());
     }
 }
 
@@ -324,7 +319,19 @@ mod tests {
 
     use super::*;
 
-    const TRUST_ANCHOR_DIGEST: [u8; 32] = [0x5a; 32];
+    fn config(local_checkpoints: crate::CheckpointSet) -> crate::EngineConfig {
+        let genesis = regtest_genesis_block();
+        crate::EngineConfig::new(
+            crate::EngineMode::Integrated,
+            Network::new_regtest(RegtestParameters::default()),
+            crate::TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), genesis.hash()),
+                header: genesis.header.clone(),
+            },
+            local_checkpoints,
+        )
+        .expect("the fixture policy is valid")
+    }
 
     fn context_chain(max_height: u32) -> Vec<HeaderContextFact> {
         let genesis = regtest_genesis_block();
@@ -352,6 +359,7 @@ mod tests {
     }
 
     fn lease_at(height: u32) -> ValidationLease {
+        let base_config = config(crate::CheckpointSet::default());
         let facts = context_chain(height);
         let parent = facts
             .last()
@@ -364,21 +372,17 @@ mod tests {
         ValidationLease::new(
             parent,
             facts.into_iter().rev().take(required).collect(),
-            Network::new_regtest(RegtestParameters::default()),
-            TRUST_ANCHOR_DIGEST,
+            base_config.policy(),
         )
     }
 
     #[test]
     fn validation_lease_coherence_enforces_context_boundaries() {
-        let network = Network::new_regtest(RegtestParameters::default());
+        let base_config = config(crate::CheckpointSet::default());
         for (height, expected_len) in [(0, 1), (27, 28), (28, 28), (40, 28)] {
             let lease = lease_at(height);
             assert_eq!(lease.predecessors.len(), expected_len, "height {height}");
-            assert!(
-                lease.is_coherent(&network, TRUST_ANCHOR_DIGEST),
-                "height {height}"
-            );
+            assert!(lease.is_coherent(base_config.policy()), "height {height}");
         }
 
         let baseline = lease_at(2);
@@ -387,28 +391,18 @@ mod tests {
 
         let mut wrong_first = baseline.predecessors.clone();
         wrong_first.swap(0, 1);
-        let wrong_first = ValidationLease::new(
-            baseline.parent,
-            wrong_first,
-            network.clone(),
-            TRUST_ANCHOR_DIGEST,
-        );
+        let wrong_first = ValidationLease::reissue_from(baseline.parent, wrong_first, &baseline);
 
-        let short = ValidationLease::new(
+        let short = ValidationLease::reissue_from(
             baseline.parent,
             baseline.predecessors[..2].to_vec(),
-            network.clone(),
-            TRUST_ANCHOR_DIGEST,
+            &baseline,
         );
 
         let mut hash_mismatch = baseline.predecessors.clone();
         hash_mismatch[1].frontier.hash.0[0] ^= 0xff;
-        let hash_mismatch = ValidationLease::new(
-            baseline.parent,
-            hash_mismatch,
-            network.clone(),
-            TRUST_ANCHOR_DIGEST,
-        );
+        let hash_mismatch =
+            ValidationLease::reissue_from(baseline.parent, hash_mismatch, &baseline);
 
         let mut broken_link = baseline.predecessors.clone();
         let mut alternate = *regtest_genesis_block().header;
@@ -419,53 +413,23 @@ mod tests {
             frontier: Frontier::new(block::Height(1), alternate.hash()),
             header: alternate,
         };
-        let broken_link = ValidationLease::new(
-            baseline.parent,
-            broken_link,
-            network.clone(),
-            TRUST_ANCHOR_DIGEST,
-        );
+        let broken_link = ValidationLease::reissue_from(baseline.parent, broken_link, &baseline);
 
-        let cases = [
-            ("digest", wrong_digest, network.clone(), TRUST_ANCHOR_DIGEST),
-            (
-                "first predecessor",
-                wrong_first,
-                network.clone(),
-                TRUST_ANCHOR_DIGEST,
-            ),
-            (
-                "context length",
-                short,
-                network.clone(),
-                TRUST_ANCHOR_DIGEST,
-            ),
-            (
-                "header hash",
-                hash_mismatch,
-                network.clone(),
-                TRUST_ANCHOR_DIGEST,
-            ),
-            (
-                "parent link",
-                broken_link,
-                network.clone(),
-                TRUST_ANCHOR_DIGEST,
-            ),
-            (
-                "network",
-                baseline.clone(),
-                Network::Mainnet,
-                TRUST_ANCHOR_DIGEST,
-            ),
-            ("trust anchor", baseline, network, [0xa5; 32]),
-        ];
-        for (name, lease, expected_network, expected_trust_anchor) in cases {
-            assert!(
-                !lease.is_coherent(&expected_network, expected_trust_anchor),
-                "{name}"
-            );
+        for (name, lease) in [
+            ("digest", wrong_digest),
+            ("first predecessor", wrong_first),
+            ("context length", short),
+            ("header hash", hash_mismatch),
+            ("parent link", broken_link),
+        ] {
+            assert!(!lease.is_coherent(base_config.policy()), "{name}");
         }
+
+        let changed_trust = config(
+            crate::CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([0xa5; 32]))])
+                .expect("the checkpoint fixture is valid"),
+        );
+        assert!(!baseline.is_coherent(changed_trust.policy()), "trust set");
     }
 
     fn prepared_headers(count: usize) -> (Frontier, Vec<PreparedHeader>) {
@@ -498,14 +462,19 @@ mod tests {
     }
 
     fn prepared_batch(count: usize) -> Result<PreparedHeaderBatch, TransitionTypeError> {
+        let config = config(crate::CheckpointSet::default());
         let (parent, headers) = prepared_headers(count);
-        let evidence =
-            PreparedHeaderBatch::context_free_evidence(parent, TRUST_ANCHOR_DIGEST, &headers);
+        let evidence = PreparedHeaderBatch::context_free_evidence(
+            parent,
+            config.consensus_policy_id(),
+            config.trust_set_id(),
+            &headers,
+        );
         PreparedHeaderBatch::new(
             headers,
             parent,
-            Network::new_regtest(RegtestParameters::default()),
-            TRUST_ANCHOR_DIGEST,
+            config.consensus_policy_id(),
+            config.trust_set_id(),
             evidence,
         )
     }
@@ -547,7 +516,12 @@ mod tests {
         assert_eq!(suffix.headers, original.headers[1..]);
         assert_eq!(
             suffix.evidence,
-            PreparedHeaderBatch::context_free_evidence(first, TRUST_ANCHOR_DIGEST, &suffix.headers)
+            PreparedHeaderBatch::context_free_evidence(
+                first,
+                suffix.receipt.consensus_policy_id,
+                suffix.receipt.trust_set_id,
+                &suffix.headers,
+            )
         );
 
         let mut invalid = original.clone();
@@ -563,7 +537,12 @@ mod tests {
         assert_eq!(consumed.receipt.parent, final_header);
         assert_eq!(
             consumed.evidence,
-            PreparedHeaderBatch::context_free_evidence(final_header, TRUST_ANCHOR_DIGEST, &[])
+            PreparedHeaderBatch::context_free_evidence(
+                final_header,
+                consumed.receipt.consensus_policy_id,
+                consumed.receipt.trust_set_id,
+                &[],
+            )
         );
 
         let mut already_applied = original.clone();

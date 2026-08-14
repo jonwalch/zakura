@@ -8,8 +8,8 @@ use super::super::{
 };
 use super::{failure::invalid, HeaderBatchInput, HeaderFailure, HeaderRule};
 use crate::{
-    Clock, EngineConfig, HeaderValidationState, PreparedHeader, PreparedHeaderBatch,
-    ValidationLease,
+    Clock, ConsensusPolicyId, EngineConfig, HeaderValidationState, PreparedHeader,
+    PreparedHeaderBatch, TrustSetId, ValidationLease,
 };
 
 /// Immutable authenticated rules used by the pure preparation pipeline.
@@ -17,16 +17,18 @@ use crate::{
 pub struct HeaderRules {
     network: Network,
     pow_policy: PowPolicy,
-    trust_anchor_digest: [u8; 32],
+    consensus_policy_id: ConsensusPolicyId,
+    trust_set_id: TrustSetId,
 }
 
 impl HeaderRules {
     /// Derive rules only from the validated engine configuration.
     pub fn from_engine_config(config: &EngineConfig) -> Result<Self, PowPolicyError> {
         Ok(Self {
-            network: config.network.clone(),
-            pow_policy: PowPolicy::for_network(&config.network)?,
-            trust_anchor_digest: config.trust_anchor_digest(),
+            network: config.network().clone(),
+            pow_policy: PowPolicy::for_network(config.network())?,
+            consensus_policy_id: config.consensus_policy_id(),
+            trust_set_id: config.trust_set_id(),
         })
     }
 
@@ -37,7 +39,8 @@ impl HeaderRules {
         Ok(Self {
             pow_policy: PowPolicy::for_network(&network)?,
             network,
-            trust_anchor_digest: lease.trust_anchor_digest,
+            consensus_policy_id: lease.consensus_policy_id,
+            trust_set_id: lease.trust_set_id,
         })
     }
 
@@ -46,9 +49,14 @@ impl HeaderRules {
         &self.network
     }
 
-    /// Return the authenticated trust-anchor identity sealed into preparation receipts.
-    pub const fn trust_anchor_digest(&self) -> [u8; 32] {
-        self.trust_anchor_digest
+    /// Return the complete consensus-policy identity sealed into preparation receipts.
+    pub const fn consensus_policy_id(&self) -> ConsensusPolicyId {
+        self.consensus_policy_id
+    }
+
+    /// Return the complete trust-set identity sealed into preparation receipts.
+    pub const fn trust_set_id(&self) -> TrustSetId {
+        self.trust_set_id
     }
 }
 
@@ -75,7 +83,7 @@ impl HeaderRules {
 /// A successful call returns a nonempty [`PreparedHeaderBatch`]. Each entry
 /// contains the canonical header, its computed hash, inferred height, exact work,
 /// and local validation state. The receipt binds the result to the supplied
-/// parent, network policy, and trust-anchor digest.
+/// parent and complete engine-policy identity.
 ///
 /// The transition planner checks the retained parent and batch linkage. The
 /// planner recomputes each hash, height, and work value. The planner checks
@@ -193,14 +201,15 @@ pub fn prepare_headers(
     // Seal the batch to the parent, network policy, and trust-anchor digest.
     let evidence = PreparedHeaderBatch::context_free_evidence(
         parent_frontier,
-        rules.trust_anchor_digest,
+        rules.consensus_policy_id,
+        rules.trust_set_id,
         &prepared,
     );
     PreparedHeaderBatch::new(
         prepared,
         parent_frontier,
-        rules.network.clone(),
-        rules.trust_anchor_digest,
+        rules.consensus_policy_id,
+        rules.trust_set_id,
         evidence,
     )
     .map_err(|error| invalid(0, HeaderRule::ValidationLease, error))

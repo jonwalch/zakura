@@ -2,7 +2,6 @@
 
 use super::super::admission::validate_snapshot;
 use super::*;
-use zakura_chain::parameters::NetworkKind;
 
 #[test]
 fn hydration_rejects_metadata_work_origin_that_disagrees_with_graph() {
@@ -44,14 +43,17 @@ fn validate_snapshot_rejects_configuration_and_metadata_mismatches() {
             metadata.mode = EngineMode::HeadersOnly;
             (snapshot.clone(), metadata)
         }),
-        ("network identity", {
+        ("policy identity", {
             let mut metadata = metadata.clone();
-            metadata.network_id = NetworkKind::Mainnet;
-            (snapshot.clone(), metadata)
-        }),
-        ("trust-anchor digest", {
-            let mut metadata = metadata.clone();
-            metadata.anchor_manifest_digest = [0xab; 32];
+            let policy = &metadata.policy;
+            let mut consensus = policy.consensus_policy_digest();
+            consensus[0] ^= 0xab;
+            metadata.policy = crate::EnginePolicyBinding::from_untrusted_durable(
+                consensus,
+                policy.trust_set_digest(),
+                policy.trust_entries().iter().cloned(),
+            )
+            .expect("the unchanged trust transcript remains valid");
             (snapshot.clone(), metadata)
         }),
         ("state version", {

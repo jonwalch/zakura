@@ -32,8 +32,8 @@ pub(crate) fn is_incremental_aux_authentication(
         && plan.graph_delta().is_empty()
         && metadata.disk_format == source_metadata.disk_format
         && metadata.mode == source_metadata.mode
-        && metadata.network_id == source_metadata.network_id
-        && metadata.anchor_manifest_digest == source_metadata.anchor_manifest_digest
+        && metadata.policy == source_metadata.policy
+        && metadata.trust_set_extension == source_metadata.trust_set_extension
         && metadata.work_origin == source_metadata.work_origin
         && metadata.finality_epoch == source_metadata.finality_epoch
         && metadata.frontiers == source_metadata.frontiers

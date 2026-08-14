@@ -11,8 +11,8 @@ use super::super::{
 };
 use super::fixture;
 use crate::{
-    BodyUnavailableSummary, BodyValidationState, CheckpointSet, EngineMode, Frontier,
-    HeaderGeneration, StateVersion, VerifiedGeneration,
+    BodyUnavailableSummary, BodyValidationState, CheckpointSet, DurableTrustEntry, EngineMode,
+    EnginePolicyBinding, Frontier, HeaderGeneration, StateVersion, TrustSource, VerifiedGeneration,
 };
 
 #[test]
@@ -21,6 +21,37 @@ fn coherent_source_and_indexes_need_no_recovery_write() {
     let plan = audit_store(&store, &config).expect("the coherent fixture audits cleanly");
     assert!(plan.is_clean());
     assert_eq!(plan.metadata, store.metadata);
+}
+
+#[test]
+fn provenance_only_policy_update_uses_the_checked_atomic_rebind() {
+    let (mut store, config) = fixture();
+    let requested = config.durable_policy_binding();
+    let anchor = store.metadata.frontiers.finalized;
+    store.metadata.policy = EnginePolicyBinding::from_untrusted_durable(
+        requested.consensus_policy_digest(),
+        requested.trust_set_digest(),
+        [
+            DurableTrustEntry::from_untrusted_durable(anchor, [TrustSource::LocalCheckpoint])
+                .expect("the alternate provenance has a valid durable shape"),
+        ],
+    )
+    .expect("the alternate provenance preserves effective trust");
+    store.snapshot = store.metadata.snapshot();
+
+    assert!(matches!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Source { violations })
+            if violations == vec![AuditViolation::Configuration]
+    ));
+    let plan = audit_store_for_trust_anchor_update(&store, &config)
+        .expect("the checked startup path replaces provenance from active configuration");
+    assert_eq!(
+        plan.repairs,
+        BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+    );
+    assert_eq!(plan.metadata.policy, requested);
+    assert!(plan.metadata.trust_set_extension.is_none());
 }
 
 #[test]
@@ -49,9 +80,21 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
             .checked_next()
             .expect("the fixture state version can advance")
     );
+    assert_eq!(plan.metadata.policy, config.durable_policy_binding());
+    let extension = plan
+        .metadata
+        .trust_set_extension
+        .as_ref()
+        .expect("the durable metadata records the checked extension")
+        .clone();
     assert_eq!(
-        plan.metadata.anchor_manifest_digest,
-        config.trust_anchor_digest()
+        extension.requested_trust_set_digest(),
+        config.trust_set_id().digest()
+    );
+    assert_eq!(extension.added().len(), 1);
+    assert_eq!(
+        extension.added()[0].frontier(),
+        Frontier::new(block::Height(10), block::Hash([0x91; 32]))
     );
     assert_eq!(
         plan.metadata.header_generation,
@@ -67,6 +110,10 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
     assert!(audit_store(&store, &config)
         .expect("the rebound store passes the strict audit")
         .is_clean());
+    assert_eq!(
+        store.metadata.trust_set_extension.as_ref(),
+        Some(&extension)
+    );
 
     let mut wrong_mode = config.clone();
     wrong_mode.mode = EngineMode::HeadersOnly;
@@ -87,7 +134,7 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
     assert!(matches!(
         audit_store_for_trust_anchor_update(&store, &conflicting),
         Err(RecoveryFailure::Source { violations })
-            if violations.iter().any(|violation| matches!(violation, AuditViolation::TrustPin(_, _)))
+            if violations == vec![AuditViolation::Configuration]
     ));
 }
 

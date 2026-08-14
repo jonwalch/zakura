@@ -187,7 +187,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     {
         violations.push(AuditViolation::Finality);
     }
-    let settled = config.settled_manifest().pin_for_network(&config.network);
+    let settled = config.settled_manifest().pin_for_network(config.network());
     let pins = config
         .local_checkpoints()
         .iter()

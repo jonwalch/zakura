@@ -46,12 +46,7 @@ fn validation_lease_for(store: &TestStore, parent: Frontier) -> ValidationLease 
             .expect("the validation fixture parent is retained");
         current = Frontier::new(parent_node.height, parent_node.hash);
     }
-    ValidationLease::new(
-        parent,
-        facts,
-        store.lease.network().clone(),
-        store.lease.trust_anchor_digest(),
-    )
+    ValidationLease::reissue_from(parent, facts, &store.lease)
 }
 
 fn apply_with_header_rebase_facts(
@@ -88,7 +83,7 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
         let prepared = batch(
             original_anchor,
             3,
-            store.lease.trust_anchor_digest(),
+            &store.lease,
             EvidenceId::from_digest([0x81; 32]),
         );
         let target = prepared
@@ -268,12 +263,7 @@ fn header_insert_rebase_preserves_a_retained_parent_after_new_finality() {
     let new_finalized = selected[1];
     synchronize_fixture(&mut store, parent);
     let validation = validation_lease_for(&store, parent);
-    let prepared = batch(
-        parent,
-        1,
-        store.lease.trust_anchor_digest(),
-        EvidenceId::from_digest([0xa2; 32]),
-    );
+    let prepared = batch(parent, 1, &store.lease, EvidenceId::from_digest([0xa2; 32]));
     let target = prepared
         .headers()
         .last()

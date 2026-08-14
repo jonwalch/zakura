@@ -21,10 +21,10 @@ pub use event::{
     AuxEvidence, AuxObservationV1, AuxVerificationFactV1, BodyCommitmentKind, BodyEvidence,
     BodyPayloadMismatch, BodySupplierDiscovered, BodyVerificationClass, BodyVerificationOutcome,
     ConsensusBodyInvalid, EventAdmission, FullStateFinalized, InsertHeaders, MigratedPinRefutation,
-    OperatorBodyRetry, OperatorInvalidate, OperatorReconsider, TargetCompletion,
-    TransientBodyFailure, TransientBodyFailureKind, TransitionDomain, TransitionEvent,
-    TransitionFingerprint, TransitionRequest, VerifiedBlockAccepted, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    OperatorBodyRetry, OperatorInvalidate, OperatorReconsider, PolicyBoundFingerprint,
+    TargetCompletion, TransientBodyFailure, TransientBodyFailureKind, TransitionDomain,
+    TransitionEvent, TransitionFingerprint, TransitionRequest, VerifiedBlockAccepted,
+    VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 pub use outcome::{
     ApplyResult, AuxiliaryEffect, CommittedStallReceipt, FinalityEffect, HeaderWorkEffect,

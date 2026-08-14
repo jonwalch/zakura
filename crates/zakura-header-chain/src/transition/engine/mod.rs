@@ -339,15 +339,15 @@ mod tests {
 
     use zakura_chain::{
         block::{self, genesis::regtest_genesis_block},
-        parameters::NetworkKind,
+        parameters::{testnet::RegtestParameters, Network},
     };
 
     use super::*;
     use crate::{
-        AlarmSet, BodySizeHint, BodyValidationState, BranchId, EngineMode, EvidenceId,
-        FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
-        HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId, StateVersion,
-        VerifiedGeneration,
+        AlarmSet, BodySizeHint, BodyValidationState, BranchId, CheckpointSet, EngineConfig,
+        EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion,
+        HeaderGeneration, HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId,
+        StateVersion, TrustedAnchor, VerifiedGeneration,
     };
 
     #[derive(Clone)]
@@ -388,13 +388,23 @@ mod tests {
         let score = graph
             .header_chain_score(child.hash)
             .expect("the child is retained");
+        let config = EngineConfig::new(
+            EngineMode::Integrated,
+            Network::new_regtest(RegtestParameters::default()),
+            TrustedAnchor {
+                frontier: anchor,
+                header: genesis.header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the fixture policy is valid");
         AuditedView {
             graph,
             metadata: EngineMetadata {
                 disk_format: HeaderChainDiskVersion::CURRENT,
                 mode: EngineMode::Integrated,
-                network_id: NetworkKind::Testnet,
-                anchor_manifest_digest: [1; 32],
+                policy: config.durable_policy_binding(),
+                trust_set_extension: None,
                 work_origin: anchor,
                 state_version: StateVersion::new(0),
                 header_generation: HeaderGeneration::new(0),

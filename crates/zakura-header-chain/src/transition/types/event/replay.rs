@@ -9,7 +9,6 @@ use crate::{
 };
 
 use super::super::auxiliary::{AuxDelivery, AuxOutcomeStatus, BodySizeHint};
-use super::super::preparation::hash_network_policy;
 use super::body::{BodyCommitmentKind, BodyEvidence, TransientBodyFailureKind};
 use super::header::TargetCompletion;
 use super::verified::{VerifiedChangeCause, VerifiedHeaderRef};
@@ -146,6 +145,86 @@ impl TransitionFingerprint {
     }
 }
 
+/// Durable replay identity bound to one complete engine policy.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PolicyBoundFingerprint {
+    fingerprint: TransitionFingerprint,
+    consensus_policy_digest: [u8; 32],
+    trust_set_digest: [u8; 32],
+}
+
+impl PolicyBoundFingerprint {
+    pub(crate) fn bind(
+        fingerprint: TransitionFingerprint,
+        policy: &crate::EnginePolicyBinding,
+    ) -> Self {
+        Self {
+            fingerprint,
+            consensus_policy_digest: policy.consensus_policy_digest(),
+            trust_set_digest: policy.trust_set_digest(),
+        }
+    }
+
+    /// Reconstruct and validate one untrusted durable replay record.
+    pub fn from_untrusted_durable(
+        fingerprint: TransitionFingerprint,
+        consensus_policy_digest: [u8; 32],
+        trust_set_digest: [u8; 32],
+        policy: &crate::EnginePolicyBinding,
+    ) -> Option<Self> {
+        (consensus_policy_digest == policy.consensus_policy_digest()
+            && trust_set_digest == policy.trust_set_digest())
+        .then_some(Self {
+            fingerprint,
+            consensus_policy_digest,
+            trust_set_digest,
+        })
+    }
+
+    /// Return the stable event domain.
+    pub const fn domain(self) -> TransitionDomain {
+        self.fingerprint.domain()
+    }
+
+    /// Return the domain-local idempotency evidence.
+    pub const fn evidence(self) -> EvidenceId {
+        self.fingerprint.evidence()
+    }
+
+    /// Return the canonical effect-bearing payload digest.
+    pub const fn payload_digest(self) -> [u8; 32] {
+        self.fingerprint.payload_digest()
+    }
+
+    /// Return the bound consensus-policy digest.
+    pub const fn consensus_policy_digest(self) -> [u8; 32] {
+        self.consensus_policy_digest
+    }
+
+    /// Return the bound trust-set digest.
+    pub const fn trust_set_digest(self) -> [u8; 32] {
+        self.trust_set_digest
+    }
+
+    pub(crate) fn matches(
+        self,
+        fingerprint: TransitionFingerprint,
+        policy: &crate::EnginePolicyBinding,
+    ) -> bool {
+        self == Self::bind(fingerprint, policy)
+    }
+
+    pub(crate) fn conflicts_with(
+        self,
+        fingerprint: TransitionFingerprint,
+        policy: &crate::EnginePolicyBinding,
+    ) -> bool {
+        self.consensus_policy_digest == policy.consensus_policy_digest()
+            && self.trust_set_digest == policy.trust_set_digest()
+            && self.fingerprint.conflicts_with(fingerprint)
+    }
+}
+
 /// Authority/mode gate checked before any transition effect.
 ///
 /// See [`crate::FullStateEvidenceAuthority`] for the capability matrix that
@@ -189,8 +268,8 @@ pub(super) fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEve
             }
             let receipt = event.batch.receipt();
             hash_frontier(hasher, receipt.parent());
-            hasher.update(receipt.trust_anchor_digest());
-            hash_network_policy(hasher, receipt.network());
+            hasher.update(receipt.consensus_policy_id().digest());
+            hasher.update(receipt.trust_set_id().digest());
             for header in event.batch.headers() {
                 hasher.update(header.height.0.to_le_bytes());
                 hasher.update(header.hash.0);

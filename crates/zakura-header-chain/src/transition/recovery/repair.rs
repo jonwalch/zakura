@@ -17,7 +17,8 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
     let AuditedSource {
         snapshot_before_repair,
         mut metadata,
-        trust_anchor_changed,
+        policy_binding_changed,
+        trust_extension,
         ..
     } = audited;
     let ReconstructedDerivedViews {
@@ -35,7 +36,7 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
     } = derived;
 
     let mut repairs = BTreeSet::new();
-    if trust_anchor_changed {
+    if policy_binding_changed {
         repairs.insert(RecoveryRepair::TrustAnchorConfiguration);
     }
     if elapsed_deferrals {
@@ -98,7 +99,10 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
 
     if !repairs.is_empty() {
         metadata.state_version = metadata.state_version.checked_next()?;
-        metadata.anchor_manifest_digest = config.trust_anchor_digest();
+        metadata.policy = config.durable_policy_binding();
+        if let Some(extension) = trust_extension {
+            metadata.trust_set_extension = Some(extension.durable_record());
+        }
         if repairs.contains(&RecoveryRepair::SelectedProjection)
             || repairs.contains(&RecoveryRepair::InheritedEligibility)
             || repairs.contains(&RecoveryRepair::ElapsedDeferrals)

@@ -97,12 +97,11 @@ fn validate_retention_references(
         .header_validation_facts()
         .map(|facts| facts.validation_leases.as_slice())
         .unwrap_or_default();
-    let trust_anchor_digest = context.config.trust_anchor_digest();
     for reference in context.retention_references {
         let authenticated = authority.authorizes_retention_reference(*reference)
             || leases.iter().any(|lease| {
                 lease.parent().hash == *reference
-                    && lease.is_coherent(&context.config.network, trust_anchor_digest)
+                    && lease.is_coherent(context.config.policy())
                     && authority.authorizes_validation_lease(lease)
             });
         if !authenticated {
@@ -120,8 +119,7 @@ pub(super) fn validate_snapshot(
 ) -> Result<(), TransitionFailure> {
     if snapshot.mode != context.config.mode
         || metadata.mode != context.config.mode
-        || metadata.network_id != context.config.network.kind()
-        || metadata.anchor_manifest_digest != context.config.trust_anchor_digest()
+        || metadata.policy != context.config.durable_policy_binding()
         || snapshot.state_version != metadata.state_version
         || snapshot.frontiers != metadata.frontiers
     {

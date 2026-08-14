@@ -204,7 +204,7 @@ fn propagates_every_store_audit_read_error() {
                 config.replace_local_checkpoints(
                     CheckpointSet::new([anchor]).expect("the anchor checkpoint is unique"),
                 );
-                store.metadata.anchor_manifest_digest = config.trust_anchor_digest();
+                store.metadata.policy = config.durable_policy_binding();
                 store.snapshot = store.metadata.snapshot();
             }
             _ => {}
@@ -337,7 +337,7 @@ fn finality_and_historical_pins_require_an_independent_canonical_index() {
     config.replace_local_checkpoints(
         CheckpointSet::new([child]).expect("the one-pin fixture is unique"),
     );
-    store.metadata.anchor_manifest_digest = config.trust_anchor_digest();
+    store.metadata.policy = config.durable_policy_binding();
     store.snapshot = store.metadata.snapshot();
     store
         .canonical
@@ -507,6 +507,29 @@ fn fatal_configuration_mismatch_fails_before_collection_visit() {
 }
 
 #[test]
+fn f225509_consensus_policy_mismatch_fails_before_collection_visit() {
+    let (mut store, config) = fixture();
+    let policy = &store.metadata.policy;
+    let mut consensus = policy.consensus_policy_digest();
+    consensus[0] ^= 0x59;
+    store.metadata.policy = crate::EnginePolicyBinding::from_untrusted_durable(
+        consensus,
+        policy.trust_set_digest(),
+        policy.trust_entries().iter().cloned(),
+    )
+    .expect("the unchanged trust transcript remains valid");
+    store.snapshot = store.metadata.snapshot();
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Source {
+            violations: vec![AuditViolation::Configuration],
+        })
+    );
+}
+
+#[test]
 fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
     let (mut store, config) = fixture();
     let anchor = store.metadata.frontiers.finalized;
@@ -537,7 +560,15 @@ fn audits_each_normative_invariant() {
     let child_hash = base.metadata.frontiers.header_best.hash;
 
     let mut store = base.clone();
-    store.metadata.anchor_manifest_digest[0] ^= 1;
+    let policy = &store.metadata.policy;
+    let mut consensus = policy.consensus_policy_digest();
+    consensus[0] ^= 1;
+    store.metadata.policy = crate::EnginePolicyBinding::from_untrusted_durable(
+        consensus,
+        policy.trust_set_digest(),
+        policy.trust_entries().iter().cloned(),
+    )
+    .expect("the unchanged trust transcript remains valid");
     store.snapshot = store.metadata.snapshot();
     assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
 
@@ -617,7 +648,7 @@ fn audits_each_normative_invariant() {
             .expect("the checkpoint fixture is unique"),
     );
     let mut store = base.clone();
-    store.metadata.anchor_manifest_digest = checkpointed.trust_anchor_digest();
+    store.metadata.policy = checkpointed.durable_policy_binding();
     store.snapshot = store.metadata.snapshot();
     assert!(violations(&store, &checkpointed)
         .contains(&AuditViolation::TrustPin(block::Height(1), child_hash)));

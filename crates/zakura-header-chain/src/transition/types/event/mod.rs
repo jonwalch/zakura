@@ -18,7 +18,7 @@ pub use body::{
 pub use finality::{FullStateFinalized, MigratedPinRefutation};
 pub use header::{InsertHeaders, TargetCompletion};
 pub use operator::{OperatorInvalidate, OperatorReconsider};
-pub use replay::{EventAdmission, TransitionDomain, TransitionFingerprint};
+pub use replay::{EventAdmission, PolicyBoundFingerprint, TransitionDomain, TransitionFingerprint};
 pub use verified::{
     VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };

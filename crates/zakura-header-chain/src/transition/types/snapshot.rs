@@ -1,13 +1,14 @@
 //! Durable metadata root and published engine snapshot.
 
-use zakura_chain::{block, parameters::NetworkKind};
+use zakura_chain::block;
 
 use crate::{
-    BodyUnavailableSummary, BodyWorkAuthority, BranchId, ChainScore, EngineMode, FinalityEpoch,
-    Frontier, FrontierSet, HeaderGeneration, HeaderWorkAuthority, StateVersion, VerifiedGeneration,
+    BodyUnavailableSummary, BodyWorkAuthority, BranchId, ChainScore, DurableTrustSetExtension,
+    EngineMode, EnginePolicyBinding, FinalityEpoch, Frontier, FrontierSet, HeaderGeneration,
+    HeaderWorkAuthority, StateVersion, VerifiedGeneration,
 };
 
-use super::event::TransitionFingerprint;
+use super::event::PolicyBoundFingerprint;
 
 /// Opaque version of the durable header-chain disk schema.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -83,10 +84,10 @@ pub struct EngineMetadata {
     pub disk_format: HeaderChainDiskVersion,
     /// Persisted finality mode.
     pub mode: EngineMode,
-    /// Persisted authenticated network identity.
-    pub network_id: NetworkKind,
-    /// Digest of the release-authenticated settled manifest.
-    pub anchor_manifest_digest: [u8; 32],
+    /// Complete checked consensus and trust identity.
+    pub policy: EnginePolicyBinding,
+    /// Most recent checked monotonic trust-set extension, if one occurred.
+    pub trust_set_extension: Option<DurableTrustSetExtension>,
     /// Immutable work-coordinate origin.
     pub work_origin: Frontier,
     /// Complete durable state version.
@@ -108,7 +109,7 @@ pub struct EngineMetadata {
     /// Durable alarms.
     pub alarms: AlarmSet,
     /// Domain- and payload-bound identity of the most recent committed transition.
-    pub last_transition: Option<TransitionFingerprint>,
+    pub last_transition: Option<PolicyBoundFingerprint>,
 }
 
 impl EngineMetadata {

@@ -324,7 +324,15 @@ mod tests {
     #[test]
     fn incremental_checkpoint_rejects_immutable_metadata_drift() {
         let (fixture, mut plan) = checkpoint_fixture();
-        plan.change_set.metadata.anchor_manifest_digest = [0x64; 32];
+        let policy = &plan.change_set.metadata.policy;
+        let mut consensus = policy.consensus_policy_digest();
+        consensus[0] ^= 0x64;
+        plan.change_set.metadata.policy = crate::EnginePolicyBinding::from_untrusted_durable(
+            consensus,
+            policy.trust_set_digest(),
+            policy.trust_entries().iter().cloned(),
+        )
+        .expect("the unchanged trust transcript remains valid");
         assert_eq!(
             verify_incremental_checkpoint_finality(
                 &fixture.engine,

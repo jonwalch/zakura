@@ -13,7 +13,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{sync::watch, time::Instant};
-use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
+use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 use zakura_header_chain::{
     audit_store, audit_store_for_trust_anchor_update, ApplyResult, AuxDelivery, AuxDelta,
     BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedStallReceipt, CounterExhausted,
@@ -97,6 +97,7 @@ struct StateIssuedAuthority<'a> {
     inner: Option<&'a dyn FullStateEvidenceAuthority>,
     validation_leases: &'a [ValidationLease],
     active_retention_references: &'a [block::Hash],
+    full_state_retention_references: &'a [block::Hash],
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
@@ -121,6 +122,7 @@ impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
 
     fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
         self.active_retention_references.contains(&reference)
+            || self.full_state_retention_references.contains(&reference)
             || self
                 .inner
                 .is_some_and(|inner| inner.authorizes_retention_reference(reference))
@@ -1108,7 +1110,7 @@ impl HeaderChainReader {
             return Ok(None);
         }
         self.store
-            .validation_context(parent_hash, &self.config.network)
+            .validation_context(parent_hash, self.config.policy())
             .map(Some)
             .map_err(HeaderChainStoreError::Store)
     }
@@ -2028,6 +2030,7 @@ impl HeaderChainRuntime {
             inner: first_context.full_state_authority,
             validation_leases: &[],
             active_retention_references: lease_references.as_ref(),
+            full_state_retention_references: &[],
         };
         let first_context = TransitionContext {
             config: first_context.config,
@@ -2061,12 +2064,13 @@ impl HeaderChainRuntime {
         } else {
             vec![self
                 .store
-                .validation_context(checkpoint_parent.hash, &self.config.network)?]
+                .validation_context(checkpoint_parent.hash, self.config.policy())?]
         };
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
             active_retention_references: lease_references.as_ref(),
+            full_state_retention_references: &[],
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
@@ -2207,7 +2211,7 @@ impl HeaderChainRuntime {
         &self,
         request: TransitionRequest,
         before: &EngineSnapshot,
-        network: &Network,
+        policy: &zakura_header_chain::EnginePolicy,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
         let expected_version = request.expected_version;
         Ok(match request.event {
@@ -2217,12 +2221,12 @@ impl HeaderChainRuntime {
                 let mut validation_leases = Vec::new();
                 if self.store.header_node(event.parent_hash)?.is_some() {
                     validation_leases
-                        .push(self.store.validation_context(event.parent_hash, network)?);
+                        .push(self.store.validation_context(event.parent_hash, policy)?);
                 }
                 if anchor_changed && event.parent_hash != before.frontiers.finalized.hash {
                     validation_leases.push(
                         self.store
-                            .validation_context(before.frontiers.finalized.hash, network)?,
+                            .validation_context(before.frontiers.finalized.hash, policy)?,
                     );
                 }
                 validation_leases.dedup_by_key(|lease| lease.parent());
@@ -2255,7 +2259,7 @@ impl HeaderChainRuntime {
                     facts: HeaderValidationFacts {
                         validation_leases: vec![self
                             .store
-                            .validation_context(parent.hash, network)?],
+                            .validation_context(parent.hash, policy)?],
                     },
                 }
             }
@@ -2266,7 +2270,7 @@ impl HeaderChainRuntime {
                     facts: HeaderValidationFacts {
                         validation_leases: vec![self
                             .store
-                            .validation_context(before.frontiers.finalized.hash, network)?],
+                            .validation_context(before.frontiers.finalized.hash, policy)?],
                     },
                 }
             }
@@ -2335,12 +2339,15 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let authoritative_full_state_fork_set = matches!(
-            &request.event,
-            TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
-        ) && context
+        let authenticated_full_state_event = context
             .full_state_authority
             .is_some_and(|authority| authority.authorizes_full_state(&request.event));
+        let authoritative_full_state_fork_set = authenticated_full_state_event
+            && matches!(
+                &request.event,
+                TransitionEvent::VerifiedChainChanged(_)
+                    | TransitionEvent::VerifiedBlockAccepted(_)
+            );
         let lease_references = if authoritative_full_state_fork_set {
             None
         } else {
@@ -2378,7 +2385,7 @@ impl HeaderChainRuntime {
             .map(HeaderSyncWorkOwner::header_authority)
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
-        let input = self.build_transition_input(request, &before, &base_context.config.network)?;
+        let input = self.build_transition_input(request, &before, base_context.config.policy())?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -2387,6 +2394,9 @@ impl HeaderChainRuntime {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
             active_retention_references: lease_references.as_deref().unwrap_or_default(),
+            full_state_retention_references: authenticated_full_state_event
+                .then_some(context.retention_references)
+                .unwrap_or_default(),
         };
         let transition_context = TransitionContext {
             config: base_context.config,
@@ -2866,7 +2876,7 @@ impl HeaderChainStore {
             ));
         }
         let base = snapshot.frontiers.finalized;
-        let network = config.network.kind();
+        let network = config.network().kind();
         let mut progress = match self.reconstruction_progress()? {
             Some(mut progress) => {
                 if progress.network != network
@@ -3087,7 +3097,7 @@ impl HeaderChainStore {
             cause: VerifiedChangeCause::Reset,
         });
         let validation_context =
-            self.validation_context(snapshot.frontiers.finalized.hash, &config.network)?;
+            self.validation_context(snapshot.frontiers.finalized.hash, config.policy())?;
         let authority = Authority {
             event: event
                 .fingerprint()
@@ -3288,7 +3298,7 @@ impl HeaderChainStore {
                 current: metadata.frontiers.finalized,
                 source: match metadata.mode {
                     EngineMode::Integrated => FinalitySource::FullState {
-                        evidence: EvidenceId::from_digest(metadata.anchor_manifest_digest),
+                        evidence: EvidenceId::from_digest(metadata.policy.trust_set_digest()),
                     },
                     EngineMode::HeadersOnly => FinalitySource::MigratedHeadersOnly,
                 },
@@ -3458,6 +3468,13 @@ impl HeaderChainStore {
                 changes,
                 current_metadata.is_some(),
                 finality_advanced,
+            )?;
+        } else if current_metadata.is_none() {
+            self.put_value(
+                &mut batch,
+                HEADER_ENGINE_META,
+                TOMBSTONE_COUNT_KEY,
+                &HeaderRowCountDisk(0),
             )?;
         }
 
@@ -4352,9 +4369,8 @@ impl HeaderChainStore {
     fn validation_context(
         &self,
         parent: block::Hash,
-        network: &Network,
+        policy: &zakura_header_chain::EnginePolicy,
     ) -> Result<ValidationLease, StoreError> {
-        let metadata = self.metadata()?;
         let parent_node = self
             .header_node(parent)?
             .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
@@ -4369,12 +4385,7 @@ impl HeaderChainStore {
                 .rev()
                 .map(|context| context.fact()),
         );
-        Ok(ValidationLease::new(
-            parent_frontier,
-            predecessors,
-            network.clone(),
-            metadata.anchor_manifest_digest,
-        ))
+        Ok(ValidationLease::new(parent_frontier, predecessors, policy))
     }
 
     fn load_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {

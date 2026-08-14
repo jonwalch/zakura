@@ -11,14 +11,14 @@ use crate::{
     AuxDelivery, AuxEvidence, AuxObservationId, AuxObservationV1, AuxOutcome, AuxOutcomeStatus,
     AuxVerificationFactV1, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
     BodySizeHint, BodySupplierDiscovered, BodyUnavailableSummary, BodyVerificationOutcome,
-    BodyWorkAuthority, BodyWorkOwner, BranchId, ConsensusBodyInvalid, EventAdmission, EvidenceId,
-    Frontier, FullStateFinalized, HeaderGeneration, HeaderSyncWorkOwner, HeaderValidationState,
-    HeaderWorkAuthority, InsertHeaders, MigratedPinRefutation, OperatorBodyRetry,
-    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
-    PreparedHeaderBatch, SourceId, TargetCompletion, TransientBodyFailure,
-    TransientBodyFailureKind, TransitionDomain, TransitionEvent, TransitionTypeError,
-    VerifiedBlockAccepted, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef,
+    BodyWorkAuthority, BodyWorkOwner, BranchId, CheckpointSet, ConsensusBodyInvalid, EngineConfig,
+    EngineMode, EventAdmission, EvidenceId, Frontier, FullStateFinalized, HeaderGeneration,
+    HeaderSyncWorkOwner, HeaderValidationState, HeaderWorkAuthority, InsertHeaders,
+    MigratedPinRefutation, OperatorBodyRetry, OperatorInvalidate, OperatorInvalidationId,
+    OperatorReconsider, PreparedHeader, PreparedHeaderBatch, SourceId, TargetCompletion,
+    TransientBodyFailure, TransientBodyFailureKind, TransitionDomain, TransitionEvent,
+    TransitionTypeError, TrustedAnchor, VerifiedBlockAccepted, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
 };
 
 fn header_owner() -> HeaderSyncWorkOwner {
@@ -54,6 +54,16 @@ fn prepared_batch(evidence: EvidenceId) -> PreparedHeaderBatch {
     header.previous_block_hash = parent.hash;
     header.nonce = [8; 32].into();
     let header = Arc::new(header);
+    let config = EngineConfig::new(
+        EngineMode::Integrated,
+        Network::new_regtest(RegtestParameters::default()),
+        TrustedAnchor {
+            frontier: parent,
+            header: genesis.header.clone(),
+        },
+        CheckpointSet::default(),
+    )
+    .expect("the fixture policy is valid");
     PreparedHeaderBatch::new(
         vec![PreparedHeader {
             hash: header.hash(),
@@ -66,8 +76,8 @@ fn prepared_batch(evidence: EvidenceId) -> PreparedHeaderBatch {
             header,
         }],
         parent,
-        Network::new_regtest(RegtestParameters::default()),
-        [9; 32],
+        config.consensus_policy_id(),
+        config.trust_set_id(),
         evidence,
     )
     .expect("the fixture batch is nonempty")

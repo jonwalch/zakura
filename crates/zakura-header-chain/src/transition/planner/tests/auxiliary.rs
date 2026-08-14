@@ -106,8 +106,7 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
                 .header
                 .clone(),
         }],
-        config.network.clone(),
-        config.trust_anchor_digest(),
+        config.policy(),
     );
     config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(1).expect("one is nonzero");
 
@@ -297,8 +296,8 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
             batch: PreparedHeaderBatch::new(
                 vec![repaired],
                 anchor,
-                store.lease.network().clone(),
-                store.lease.trust_anchor_digest,
+                store.lease.consensus_policy_id,
+                store.lease.trust_set_id,
                 EvidenceId::from_digest([0x6b; 32]),
             )
             .expect("the exact repair batch is nonempty"),

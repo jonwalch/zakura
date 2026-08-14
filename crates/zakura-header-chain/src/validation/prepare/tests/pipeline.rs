@@ -43,8 +43,7 @@ fn fixture() -> (HeaderRules, ValidationLease, Arc<block::Header>) {
             frontier: anchor,
             header: anchor_header.clone(),
         }],
-        config.network.clone(),
-        config.trust_anchor_digest(),
+        config.policy(),
     );
     (rules, lease, anchor_header)
 }
@@ -75,10 +74,7 @@ fn complete_batch_is_sealed_to_lease_and_uses_internal_context() {
     .expect("the continuous custom-network batch is valid");
 
     assert_eq!(batch.receipt().parent(), lease.parent());
-    assert_eq!(
-        batch.receipt().trust_anchor_digest(),
-        lease.trust_anchor_digest()
-    );
+    assert_eq!(batch.receipt().trust_set_id(), lease.trust_set_id());
     assert_eq!(batch.headers().len(), 2);
     assert_eq!(batch.headers()[0].height, block::Height(1));
     assert_eq!(batch.headers()[1].height, block::Height(2));
@@ -188,10 +184,7 @@ fn context_free_receipt_excludes_parent_and_branch_context_claims() {
     .expect("graph-independent preparation does not claim parent linkage or MTP");
 
     assert_eq!(batch.receipt().parent(), lease.parent());
-    assert_eq!(
-        batch.receipt().trust_anchor_digest(),
-        rules.trust_anchor_digest()
-    );
+    assert_eq!(batch.receipt().trust_set_id(), rules.trust_set_id());
     assert_eq!(batch.headers()[0].hash, disconnected.hash());
     assert_eq!(batch.headers()[0].height, block::Height(1));
 }

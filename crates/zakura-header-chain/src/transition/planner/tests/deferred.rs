@@ -53,8 +53,8 @@ fn insert_deferred_chain(
     insert.batch = PreparedHeaderBatch::new(
         headers,
         store.lease.parent,
-        config.network.clone(),
-        config.trust_anchor_digest(),
+        config.consensus_policy_id(),
+        config.trust_set_id(),
         evidence,
     )
     .expect("the deferred fixture batch remains coherent");

@@ -16,11 +16,14 @@ mod work;
 mod fuzz;
 
 pub use config::{
-    CheckpointSet, EngineConfig, EngineConfigError, EngineLimits, EngineMode,
-    SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor, MAX_AUX_DELIVERIES_PER_HEADER_V1,
-    MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1, MAX_HEADERS_PER_TRANSITION_V1,
-    MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
+    CheckpointSet, ConsensusPolicyId, DurableTrustEntry, DurableTrustSetExtension, EngineConfig,
+    EngineConfigError, EngineLimits, EngineMode, EnginePolicy, EnginePolicyBinding,
+    SettledUpgradeManifest, SettledUpgradePin, TrustSetId, TrustSource, TrustedAnchor,
+    MAX_AUX_DELIVERIES_PER_HEADER_V1, MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1,
+    MAX_HEADERS_PER_TRANSITION_V1, MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
+    MAX_TRUST_ENTRIES_V1,
 };
+pub(crate) use config::{PolicyBindingMatch, TrustSetExtension};
 pub use discovery::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
 #[cfg(any(test, feature = "fuzz-impl"))]

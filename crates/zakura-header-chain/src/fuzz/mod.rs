@@ -104,8 +104,8 @@ impl FuzzStore {
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode,
-            network_id: config.network.kind(),
-            anchor_manifest_digest: config.trust_anchor_digest(),
+            policy: config.durable_policy_binding(),
+            trust_set_extension: None,
             work_origin: frontier,
             state_version: StateVersion::new(0),
             header_generation: HeaderGeneration::new(0),
@@ -204,12 +204,7 @@ impl FuzzStore {
             });
             hash = header.previous_block_hash;
         }
-        ValidationLease::new(
-            parent,
-            predecessors,
-            self.config.network.clone(),
-            self.config.trust_anchor_digest(),
-        )
+        ValidationLease::new(parent, predecessors, self.config.policy())
     }
 
     fn insertion(
@@ -281,8 +276,8 @@ impl FuzzStore {
         let batch = PreparedHeaderBatch::new(
             headers,
             lease.parent,
-            lease.network.clone(),
-            lease.trust_anchor_digest,
+            lease.consensus_policy_id,
+            lease.trust_set_id,
             evidence,
         )
         .expect("the operation count is nonzero");
@@ -1319,8 +1314,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
             frontier: anchor,
             header: anchor_node.header.clone(),
         }],
-        store.config.network.clone(),
-        store.config.trust_anchor_digest(),
+        store.config.policy(),
     );
     let rules = HeaderRules::from_engine_config(&store.config)
         .expect("the authenticated fuzz network defines header rules");

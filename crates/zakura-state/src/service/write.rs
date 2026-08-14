@@ -25,9 +25,9 @@ use zakura_header_chain::{
     ApplyResult, AuxEvidence, AuxObservationV1, AuxVerificationFactV1, BodyWorkAuthority,
     CheckpointSet, Clock, EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId,
     Frontier, FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate,
-    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, SystemClock,
-    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBlockAccepted,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    OperatorInvalidationId, OperatorReconsider, SettledUpgradeManifest, StateVersion, StoreError,
+    SystemClock, TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor,
+    VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -492,6 +492,18 @@ impl HeaderChainWriter {
         if genesis_hash != network.genesis_hash() {
             return Err(HeaderChainAttachmentError::GenesisMismatch);
         }
+        // The later settled pin commits to every earlier production checkpoint through header
+        // ancestry. Retaining older checkpoint rows would duplicate that authority and exceed the
+        // fixed trust-set bound. Custom networks have no compiled settled pin, so they retain every
+        // configured checkpoint and fail explicitly if their set exceeds the bound.
+        let settled = SettledUpgradeManifest::for_release()?.pin_for_network(&network);
+        let local_checkpoints = CheckpointSet::new(
+            network
+                .checkpoint_list()
+                .iter_cloned()
+                .filter(|(height, _)| settled.is_none_or(|pin| *height >= pin.activation.height))
+                .map(|(height, hash)| Frontier::new(height, hash)),
+        )?;
         let config = EngineConfig::new(
             EngineMode::Integrated,
             network.clone(),
@@ -499,12 +511,7 @@ impl HeaderChainWriter {
                 frontier: Frontier::new(Height(0), genesis_hash),
                 header: genesis_header,
             },
-            CheckpointSet::new(
-                network
-                    .checkpoint_list()
-                    .iter_cloned()
-                    .map(|(height, hash)| Frontier::new(height, hash)),
-            )?,
+            local_checkpoints,
         )?;
         let restored_path = verified_path(non_finalized_state);
         let restored_side_paths = verified_side_paths(non_finalized_state, &restored_path);
@@ -926,7 +933,8 @@ fn restore_verified_side_paths(
         let snapshot = runtime.publisher().snapshot();
         let mut hasher = Sha256::new();
         hasher.update(b"zakura-full-state-startup-side-path-v1");
-        hasher.update(config.trust_anchor_digest());
+        hasher.update(config.consensus_policy_id().digest());
+        hasher.update(config.trust_set_id().digest());
         hasher.update(snapshot.frontiers.finalized.height.0.to_be_bytes());
         hasher.update(snapshot.frontiers.finalized.hash.0);
         for header in &path {

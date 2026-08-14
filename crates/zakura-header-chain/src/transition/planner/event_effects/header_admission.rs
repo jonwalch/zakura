@@ -27,7 +27,8 @@ pub(super) fn admit_prepared_headers(
     let context = event_context.transition;
     let receipt = event.batch.receipt();
     if receipt.parent().hash != event.parent_hash
-        || receipt.trust_anchor_digest() != context.config.trust_anchor_digest()
+        || receipt.consensus_policy_id() != context.config.consensus_policy_id()
+        || receipt.trust_set_id() != context.config.trust_set_id()
     {
         return Err(TransitionFailure::StalePreparation);
     }
@@ -40,8 +41,8 @@ pub(super) fn admit_prepared_headers(
         })?;
     let parent_frontier = Frontier::new(parent_node.height, parent_node.hash);
     if receipt.parent() != parent_frontier
-        || receipt.network() != &context.config.network
-        || receipt.trust_anchor_digest() != context.config.trust_anchor_digest()
+        || receipt.consensus_policy_id() != context.config.consensus_policy_id()
+        || receipt.trust_set_id() != context.config.trust_set_id()
     {
         return Err(TransitionFailure::StalePreparation);
     }
@@ -99,7 +100,7 @@ pub(super) fn admit_prepared_headers(
             prepared.header.time,
             prepared.header.difficulty_threshold,
             parent.height,
-            &context.config.network,
+            context.config.network(),
             contextual.iter().copied(),
             crate::HeaderValidationSource::Prepared,
         )?;

@@ -45,7 +45,11 @@ pub(super) fn bind_replay_and_freshness(
     }
 
     let fingerprint = event.fingerprint();
-    if fingerprint.is_some() && metadata.last_transition == fingerprint {
+    if fingerprint.is_some_and(|fingerprint| {
+        metadata
+            .last_transition
+            .is_some_and(|previous| previous.matches(fingerprint, &metadata.policy))
+    }) {
         return Ok(BoundRequest {
             event,
             domain,
@@ -56,7 +60,7 @@ pub(super) fn bind_replay_and_freshness(
     if metadata
         .last_transition
         .zip(fingerprint)
-        .is_some_and(|(previous, current)| previous.conflicts_with(current))
+        .is_some_and(|(previous, current)| previous.conflicts_with(current, &metadata.policy))
     {
         return Err(TransitionFailure::ConflictingReplay);
     }

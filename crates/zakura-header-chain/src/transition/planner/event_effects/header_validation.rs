@@ -43,12 +43,10 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
                 ));
             };
             let authorized_lease = facts.validation_leases.iter().find_map(|lease| {
-                if !lease.is_coherent(
-                    &transition.config.network,
-                    transition.config.trust_anchor_digest(),
-                ) || !transition
-                    .full_state_authority
-                    .is_some_and(|authority| authority.authorizes_validation_lease(lease))
+                if !lease.is_coherent(transition.config.policy())
+                    || !transition
+                        .full_state_authority
+                        .is_some_and(|authority| authority.authorizes_validation_lease(lease))
                 {
                     return None;
                 }
@@ -184,7 +182,7 @@ pub(super) fn validate_full_state_header<G: HeaderGraphView>(
         header.header.time,
         header.header.difficulty_threshold,
         parent.height,
-        &context.config.network,
+        context.config.network(),
         contextual,
         HeaderValidationSource::FullState,
     )?;
@@ -201,7 +199,7 @@ pub(in crate::transition::planner) fn anchor_reasons(
     if let Some(pin) = context
         .config
         .settled_manifest()
-        .pin_for_network(&context.config.network)
+        .pin_for_network(context.config.network())
     {
         if pin.activation.height == height && pin.activation.hash != hash {
             reasons.push(EligibilityReason::SettledUpgradeConflict {
