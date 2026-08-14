@@ -5,6 +5,9 @@ mod event_effects;
 pub(crate) mod plan;
 mod projected_state;
 mod replay;
+#[cfg(feature = "test-support")]
+pub mod retention;
+#[cfg(not(feature = "test-support"))]
 mod retention;
 mod settlement;
 mod violations;

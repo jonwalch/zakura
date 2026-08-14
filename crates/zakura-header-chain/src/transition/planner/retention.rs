@@ -1,6 +1,6 @@
 //! Deterministic pure retention and resource-eviction planning.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use zakura_chain::block;
 
@@ -16,6 +16,21 @@ pub(super) struct RetentionPlan {
     pub(super) admission_refused: bool,
     /// True when integrated verification/finality must advance before admission can resume.
     pub(super) resource_stalled: bool,
+    /// Structural work performed while enforcing retention.
+    pub(super) work: RetentionWork,
+}
+
+/// Exact structural work performed by one retention attempt.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct RetentionWork {
+    /// Retained nodes visited while building the shared protected-path union.
+    pub(super) protected_path_visits: usize,
+    /// Retained nodes visited by the single candidate-index construction pass.
+    pub(super) candidate_nodes_scanned: usize,
+    /// Retained nodes removed by deterministic eviction.
+    pub(super) evicted_nodes: usize,
+    /// Graph-sized workspaces allocated by retention.
+    pub(super) graph_workspaces: usize,
 }
 
 /// Enforce deterministic retention while protecting selected, verified, and context paths.
@@ -26,55 +41,65 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     validation_context_references: impl IntoIterator<Item = block::Hash>,
     limits: EngineLimits,
 ) -> Result<RetentionPlan, GraphError> {
-    let over_tip_limit = store.view_eligible_header_tips().len() > limits.max_candidate_tips.get();
+    let over_tip_limit = store.view_eligible_header_tip_count() > limits.max_candidate_tips.get();
     let over_node_limit =
         store.view_header_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get();
     if !over_tip_limit && !over_node_limit {
         return Ok(RetentionPlan::default());
     }
 
+    let mut plan = RetentionPlan::default();
     let mut protected = HashSet::new();
-    protect_path(store, header_best.hash, &mut protected)?;
-    protect_path(store, verified_best.hash, &mut protected)?;
+    plan.work.graph_workspaces = 1;
+    plan.work.protected_path_visits += protect_path(store, header_best.hash, &mut protected)?;
+    plan.work.protected_path_visits += protect_path(store, verified_best.hash, &mut protected)?;
     for reference in validation_context_references {
         if !protected.contains(&reference) && store.view_header_node(reference).is_some() {
-            protect_path(store, reference, &mut protected)?;
+            plan.work.protected_path_visits += protect_path(store, reference, &mut protected)?;
         }
     }
 
-    let plan = RetentionPlan::default();
     if protected.len().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
         return Ok(stalled(plan));
     }
-    evict_permanently_ineligible(store, &protected)?;
-    if store.view_eligible_header_tips().len() <= limits.max_candidate_tips.get()
+
+    let mut candidates = RetentionCandidates::build(store)?;
+    plan.work.candidate_nodes_scanned = candidates.scanned;
+    plan.work.graph_workspaces = plan.work.graph_workspaces.saturating_add(1);
+    evict_permanently_ineligible(store, &protected, &mut candidates, &mut plan.work)?;
+    if store.view_eligible_header_tip_count() <= limits.max_candidate_tips.get()
         && store.view_header_node_count().saturating_sub(1) <= limits.max_non_finalized_nodes.get()
     {
         return Ok(plan);
     }
 
-    if store.view_eligible_header_tips().len() > limits.max_candidate_tips.get() {
-        let mut eligible_candidates = unprotected_eligible_header_tips(store, &protected)?;
-        while store.view_eligible_header_tips().len() > limits.max_candidate_tips.get() {
-            let Some(tip) = eligible_candidates.pop() else {
+    if store.view_eligible_header_tip_count() > limits.max_candidate_tips.get() {
+        while store.view_eligible_header_tip_count() > limits.max_candidate_tips.get() {
+            let Some(score) = candidates.eligible_tips.pop_first() else {
                 return Ok(stalled(plan));
             };
-            if store.view_header_node(tip.hash).is_some() {
-                evict_tip_branch(store, tip.hash, &protected)?;
+            if protected.contains(&score.tip_hash) {
+                continue;
+            }
+            if store.view_header_node(score.tip_hash).is_some() {
+                evict_tip_branch(store, score.tip_hash, &protected, &mut plan.work)?;
             }
         }
     }
 
     if store.view_header_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
-        let mut leaf_candidates = unprotected_leaves(store, &protected)?;
         while store.view_header_node_count().saturating_sub(1)
             > limits.max_non_finalized_nodes.get()
         {
-            let Some(hash) = leaf_candidates.pop() else {
+            let Some(score) = candidates.leaves.pop_first() else {
                 return Ok(stalled(plan));
             };
+            let hash = score.tip_hash;
+            if protected.contains(&hash) {
+                continue;
+            }
             if store.view_header_node(hash).is_some() {
-                evict_tip_branch(store, hash, &protected)?;
+                evict_tip_branch(store, hash, &protected, &mut plan.work)?;
             }
         }
     }
@@ -88,6 +113,61 @@ fn stalled(mut plan: RetentionPlan) -> RetentionPlan {
     plan
 }
 
+struct RetentionCandidates {
+    permanent_roots: BTreeSet<(block::Height, [u8; 32])>,
+    eligible_tips: BTreeSet<crate::ChainScore>,
+    leaves: BTreeSet<crate::ChainScore>,
+    scanned: usize,
+}
+
+impl RetentionCandidates {
+    fn build<G: HeaderGraphView>(store: &G) -> Result<Self, GraphError> {
+        let mut permanent_roots = BTreeSet::new();
+        let mut eligible_tips = BTreeSet::new();
+        let mut leaves = BTreeSet::new();
+        let mut scanned = 0usize;
+        let mut error = None;
+        store.visit_header_nodes(&mut |node| {
+            if error.is_some() {
+                return;
+            }
+            scanned = scanned.saturating_add(1);
+            if node.eligibility.has_permanent_reason()
+                || matches!(
+                    node.body_validation_state,
+                    BodyValidationState::ConsensusInvalid { .. }
+                )
+            {
+                permanent_roots.insert((node.height, node.hash.0));
+            }
+            let is_eligible_tip = store.view_is_eligible_header_tip(node.hash);
+            let is_leaf = !store.view_header_has_children(node.hash);
+            if is_eligible_tip || is_leaf {
+                match store.view_header_chain_score(node.hash) {
+                    Ok(score) => {
+                        if is_eligible_tip {
+                            eligible_tips.insert(score);
+                        }
+                        if is_leaf {
+                            leaves.insert(score);
+                        }
+                    }
+                    Err(graph_error) => error = Some(graph_error),
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(Self {
+            permanent_roots,
+            eligible_tips,
+            leaves,
+            scanned,
+        })
+    }
+}
+
 fn protect_path<G: HeaderGraphView>(
     store: &G,
     tip: block::Hash,
@@ -96,10 +176,10 @@ fn protect_path<G: HeaderGraphView>(
     let mut hash = tip;
     let mut visited = 0usize;
     loop {
-        visited = visited.saturating_add(1);
         if protected.contains(&hash) {
             return Ok(visited);
         }
+        visited = visited.saturating_add(1);
         let node = store
             .view_header_node(hash)
             .ok_or(GraphError::UnknownHeaderNode(hash))?;
@@ -114,34 +194,22 @@ fn protect_path<G: HeaderGraphView>(
 fn evict_permanently_ineligible<G: HeaderGraphEdit>(
     store: &mut G,
     protected: &HashSet<block::Hash>,
+    candidates: &mut RetentionCandidates,
+    work: &mut RetentionWork,
 ) -> Result<(), GraphError> {
-    let mut roots: Vec<_> = store
-        .view_retained_header_hashes()
-        .into_iter()
-        .filter(|hash| {
-            !protected.contains(hash)
-                && store.view_header_node(*hash).is_some_and(|node| {
-                    node.eligibility.has_permanent_reason()
-                        || matches!(
-                            node.body_validation_state,
-                            BodyValidationState::ConsensusInvalid { .. }
-                        )
-                })
-        })
-        .collect();
-    roots.sort_unstable_by_key(|hash| {
-        let node = store
-            .view_header_node(*hash)
-            .expect("permanent roots were read from retained nodes");
-        (node.height, hash.0)
-    });
-    for root in roots {
+    while let Some((_, raw_hash)) = candidates.permanent_roots.pop_first() {
+        let root = block::Hash(raw_hash);
+        if protected.contains(&root) {
+            continue;
+        }
         if store.view_header_node(root).is_none() {
             continue;
         }
+        work.graph_workspaces = work.graph_workspaces.saturating_add(1);
         let mut descendants = subtree_postorder(store, root);
         for hash in descendants.drain(..) {
             store.edit_remove_header_leaf(hash)?;
+            work.evicted_nodes = work.evicted_nodes.saturating_add(1);
         }
     }
     Ok(())
@@ -167,38 +235,11 @@ fn subtree_postorder<G: HeaderGraphView>(store: &G, root: block::Hash) -> Vec<bl
     result
 }
 
-fn unprotected_eligible_header_tips<G: HeaderGraphView>(
-    store: &G,
-    protected: &HashSet<block::Hash>,
-) -> Result<Vec<Frontier>, GraphError> {
-    let mut candidates: Vec<_> = store
-        .view_eligible_header_tips()
-        .into_iter()
-        .filter(|tip| !protected.contains(&tip.hash))
-        .map(|tip| Ok((store.view_header_chain_score(tip.hash)?, tip)))
-        .collect::<Result<_, GraphError>>()?;
-    candidates.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
-    Ok(candidates.into_iter().map(|(_, tip)| tip).collect())
-}
-
-fn unprotected_leaves<G: HeaderGraphView>(
-    store: &G,
-    protected: &HashSet<block::Hash>,
-) -> Result<Vec<block::Hash>, GraphError> {
-    let mut candidates: Vec<_> = store
-        .view_retained_header_hashes()
-        .into_iter()
-        .filter(|hash| !protected.contains(hash) && store.view_header_children(*hash).is_empty())
-        .map(|hash| Ok((store.view_header_chain_score(hash)?, hash)))
-        .collect::<Result<_, GraphError>>()?;
-    candidates.sort_unstable_by_key(|(score, _)| std::cmp::Reverse(*score));
-    Ok(candidates.into_iter().map(|(_, hash)| hash).collect())
-}
-
 fn evict_tip_branch<G: HeaderGraphEdit>(
     store: &mut G,
     root: block::Hash,
     protected: &HashSet<block::Hash>,
+    work: &mut RetentionWork,
 ) -> Result<(), GraphError> {
     if protected.contains(&root) || root == store.view_finalized_frontier().hash {
         return Ok(());
@@ -207,8 +248,10 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
         .view_header_node(root)
         .ok_or(GraphError::UnknownHeaderNode(root))?
         .parent_hash;
+    work.graph_workspaces = work.graph_workspaces.saturating_add(1);
     for descendant in subtree_postorder(store, root) {
         store.edit_remove_header_leaf(descendant)?;
+        work.evicted_nodes = work.evicted_nodes.saturating_add(1);
     }
 
     loop {
@@ -223,6 +266,7 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
         }
         let parent = node.parent_hash;
         store.edit_remove_header_leaf(hash)?;
+        work.evicted_nodes = work.evicted_nodes.saturating_add(1);
         if store.view_header_children(parent).is_empty() {
             hash = parent;
         } else {
@@ -230,6 +274,119 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
         }
     }
 }
+
+#[cfg(feature = "test-support")]
+mod benchmark_support {
+    use std::{num::NonZeroUsize, sync::Arc};
+
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    use super::*;
+    use crate::{HeaderValidationState, InsertResult, MemHeaderStore};
+
+    /// Reusable retained-chain fixture for release-mode retention benchmarks.
+    pub struct RetentionBenchmarkFixture {
+        graph: MemHeaderStore,
+        header_best: Frontier,
+        finalized: Frontier,
+        retained_non_finalized_nodes: usize,
+    }
+
+    impl RetentionBenchmarkFixture {
+        /// Build a linear graph at `percent` of the V1 retained-node limit.
+        pub fn at_v1_limit_percent(percent: usize) -> Result<Self, GraphError> {
+            assert!(matches!(percent, 25 | 50 | 90 | 100));
+            let block = regtest_genesis_block();
+            let hash = block.hash();
+            let work = block
+                .header
+                .difficulty_threshold
+                .to_work()
+                .expect("the regtest genesis target has canonical work");
+            let finalized = Frontier::new(block::Height(0), hash);
+            let mut graph =
+                MemHeaderStore::new(finalized, block.header.clone(), work, work.as_u256())?;
+            let retained_non_finalized_nodes =
+                crate::MAX_NON_FINALIZED_NODES_V1.saturating_mul(percent) / 100;
+            let mut header_best = finalized;
+            for index in 0..retained_non_finalized_nodes {
+                let mut header = *regtest_genesis_block().header;
+                header.previous_block_hash = header_best.hash;
+                header.nonce =
+                    [u8::try_from(index % 251).expect("the nonce marker fits"); 32].into();
+                header_best = match graph.insert(
+                    Arc::new(header),
+                    HeaderValidationState::Valid,
+                    [],
+                    BodyValidationState::Unknown,
+                )? {
+                    InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => {
+                        frontier
+                    }
+                };
+            }
+            Ok(Self {
+                graph,
+                header_best,
+                finalized,
+                retained_non_finalized_nodes,
+            })
+        }
+
+        /// Measure the ordinary exact-limit check without graph traversal.
+        pub fn ordinary_check(&mut self) -> Result<RetentionBenchmarkResult, GraphError> {
+            self.enforce_with_limit(self.retained_non_finalized_nodes.max(1))
+        }
+
+        /// Measure refusal when the protected chain exceeds the node limit by one.
+        pub fn protected_refusal(&mut self) -> Result<RetentionBenchmarkResult, GraphError> {
+            self.enforce_with_limit(self.retained_non_finalized_nodes.saturating_sub(1).max(1))
+        }
+
+        fn enforce_with_limit(
+            &mut self,
+            node_limit: usize,
+        ) -> Result<RetentionBenchmarkResult, GraphError> {
+            let limits = EngineLimits {
+                max_non_finalized_nodes: NonZeroUsize::new(node_limit)
+                    .expect("the benchmark node limit is nonzero"),
+                ..EngineLimits::v1()
+            };
+            let plan = enforce_retention(
+                &mut self.graph,
+                self.header_best,
+                self.finalized,
+                [],
+                limits,
+            )?;
+            Ok(RetentionBenchmarkResult {
+                admission_refused: plan.admission_refused,
+                protected_path_visits: plan.work.protected_path_visits,
+                candidate_nodes_scanned: plan.work.candidate_nodes_scanned,
+                evicted_nodes: plan.work.evicted_nodes,
+                graph_workspaces: plan.work.graph_workspaces,
+            })
+        }
+    }
+
+    /// Structural result returned by release-mode retention benchmarks.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub struct RetentionBenchmarkResult {
+        /// Whether the protected chain refused admission.
+        pub admission_refused: bool,
+        /// Unique retained nodes visited while constructing the protected union.
+        pub protected_path_visits: usize,
+        /// Retained nodes scanned while constructing eviction candidates.
+        pub candidate_nodes_scanned: usize,
+        /// Retained nodes removed by eviction.
+        pub evicted_nodes: usize,
+        /// Graph-sized retention workspaces allocated during the attempt.
+        pub graph_workspaces: usize,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub use benchmark_support::{RetentionBenchmarkFixture, RetentionBenchmarkResult};
 
 #[cfg(test)]
 mod tests {
@@ -320,6 +477,10 @@ mod tests {
         assert_eq!(store.eligible_header_tips().len(), 10);
         assert!(store.header_node(header_best.hash).is_some());
         assert!(!plan.admission_refused);
+        assert_eq!(plan.work.protected_path_visits, 2);
+        assert_eq!(plan.work.candidate_nodes_scanned, 13);
+        assert_eq!(plan.work.evicted_nodes, 2);
+        assert_eq!(plan.work.graph_workspaces, 4);
 
         let reacquired_seed = (1..=12)
             .find(|seed| {
@@ -428,6 +589,7 @@ mod tests {
             .expect("a graph below both limits needs no eviction planning");
 
         assert_eq!(plan, RetentionPlan::default());
+        assert_eq!(plan.work, RetentionWork::default());
         assert_eq!(store.header_node_count(), before_header_node_count);
         assert_eq!(store.eligible_header_tips(), before_tips);
         assert_eq!(store.header_node(permanent.hash), before_permanent.as_ref());
@@ -577,12 +739,12 @@ mod tests {
         assert_eq!(
             protect_path(&store, branch.hash, &mut protected)
                 .expect("the branch joins the selected path"),
-            2
+            1
         );
         assert_eq!(
             protect_path(&store, first.hash, &mut protected)
                 .expect("the context reference is already protected"),
-            1
+            0
         );
         assert!(protected.contains(&anchor.hash));
         assert!(protected.contains(&first.hash));

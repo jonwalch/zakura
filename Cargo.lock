@@ -8492,6 +8492,7 @@ name = "zakura-header-chain"
 version = "1.0.0-rc0"
 dependencies = [
  "chrono",
+ "criterion",
  "proptest",
  "rayon",
  "sha2 0.10.9",
