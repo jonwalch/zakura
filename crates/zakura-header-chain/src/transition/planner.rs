@@ -127,6 +127,12 @@ fn derive_plan_candidate(
     // Phase 1: authenticate / admit
     let (snapshot_before_commit, mut metadata, admitted) =
         authenticate_and_admit(engine, &input, context)?;
+    if snapshot_before_commit.alarms.resource_stalled
+        && matches!(&admitted.event, crate::TransitionEvent::InsertHeaders(_))
+    {
+        let domain = admitted.event.domain();
+        return resource_stalled(engine, snapshot_before_commit, domain, context);
+    }
 
     // Phase 2: bind replay and freshness
     let bound_request =

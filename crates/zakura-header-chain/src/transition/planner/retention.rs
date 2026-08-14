@@ -23,7 +23,6 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     store: &mut G,
     header_best: Frontier,
     verified_best: Frontier,
-    protect_all_verified_body_paths: bool,
     validation_context_references: impl IntoIterator<Item = block::Hash>,
     limits: EngineLimits,
 ) -> Result<RetentionPlan, GraphError> {
@@ -37,22 +36,6 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     let mut protected = HashSet::new();
     protect_path(store, header_best.hash, &mut protected)?;
     protect_path(store, verified_best.hash, &mut protected)?;
-    if protect_all_verified_body_paths {
-        let verified_body_hashes = store
-            .view_header_nodes()
-            .into_iter()
-            .filter_map(|node| {
-                matches!(
-                    node.body_validation_state,
-                    BodyValidationState::Verified { .. }
-                )
-                .then_some(node.hash)
-            })
-            .collect::<Vec<_>>();
-        for hash in verified_body_hashes {
-            protect_path(store, hash, &mut protected)?;
-        }
-    }
     for reference in validation_context_references {
         if !protected.contains(&reference) && store.view_header_node(reference).is_some() {
             protect_path(store, reference, &mut protected)?;
@@ -60,6 +43,9 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     }
 
     let plan = RetentionPlan::default();
+    if protected.len().saturating_sub(1) > limits.max_non_finalized_nodes.get() {
+        return Ok(stalled(plan));
+    }
     evict_permanently_ineligible(store, &protected)?;
     if store.view_eligible_header_tips().len() <= limits.max_candidate_tips.get()
         && store.view_header_node_count().saturating_sub(1) <= limits.max_non_finalized_nodes.get()
@@ -327,7 +313,7 @@ mod tests {
                 .0
         });
 
-        let plan = enforce_retention(&mut store, header_best, anchor, true, [], limits(10, 100))
+        let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
             .expect("retention succeeds");
         assert!(store.header_node(expected[0].hash).is_none());
         assert!(store.header_node(expected[1].hash).is_none());
@@ -387,7 +373,7 @@ mod tests {
             .expect("the deferred child is retained")
             .is_eligible());
 
-        let plan = enforce_retention(&mut store, header_best, anchor, true, [], limits(10, 100))
+        let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
             .expect("retention evicts the ineligible descendant subtree");
 
         assert!(store.header_node(deferred.hash).is_none());
@@ -412,7 +398,7 @@ mod tests {
         let selected = insert(&mut store, anchor.hash, 2, []);
         let spare = insert(&mut store, anchor.hash, 3, []);
 
-        enforce_retention(&mut store, selected, anchor, true, [], limits(10, 2))
+        enforce_retention(&mut store, selected, anchor, [], limits(10, 2))
             .expect("permanent subtree frees capacity");
         assert!(store.header_node(permanent.hash).is_none());
         assert!(store.header_node(selected.hash).is_some());
@@ -438,7 +424,7 @@ mod tests {
         let before_permanent = store.header_node(permanent.hash).cloned();
         let before_selected = store.header_node(selected.hash).cloned();
 
-        let plan = enforce_retention(&mut store, selected, anchor, true, [], limits(10, 10))
+        let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 10))
             .expect("a graph below both limits needs no eviction planning");
 
         assert_eq!(plan, RetentionPlan::default());
@@ -454,23 +440,26 @@ mod tests {
         let anchor = store.finalized_frontier();
         let first = insert(&mut store, anchor.hash, 1, []);
         let selected = insert(&mut store, first.hash, 2, []);
-
-        let plan = enforce_retention(
+        let unprotected = insert(
             &mut store,
-            selected,
-            anchor,
-            true,
-            [first.hash],
-            limits(10, 1),
-        )
-        .expect("retention returns a typed refusal");
+            anchor.hash,
+            3,
+            [EligibilityReason::CheckpointConflict {
+                height: block::Height(1),
+                expected: block::Hash([9; 32]),
+            }],
+        );
+
+        let plan = enforce_retention(&mut store, selected, anchor, [first.hash], limits(10, 1))
+            .expect("retention returns a typed refusal");
         assert!(plan.admission_refused);
         assert!(plan.resource_stalled);
         assert!(store.header_node(selected.hash).is_some());
+        assert!(store.header_node(unprotected.hash).is_some());
     }
 
     #[test]
-    fn verified_body_branch_survives_independent_header_retention() {
+    fn verified_side_node_does_not_become_a_protection_root() {
         let mut store = store();
         let anchor = store.finalized_frontier();
         let verified_body = insert(&mut store, anchor.hash, 1, []);
@@ -484,20 +473,19 @@ mod tests {
             .expect("the full-state side branch becomes verified");
         let selected_parent = insert(&mut store, anchor.hash, 2, []);
         let selected = insert(&mut store, selected_parent.hash, 3, []);
-        let header_only = insert(&mut store, anchor.hash, 4, []);
+        let _header_only = insert(&mut store, anchor.hash, 4, []);
 
-        let plan = enforce_retention(&mut store, selected, selected, true, [], limits(2, 100))
-            .expect("retention evicts an unowned header-only branch");
+        let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 100))
+            .expect("retention evicts both unprotected side branches");
 
         assert!(!plan.admission_refused);
         assert!(store.header_node(selected.hash).is_some());
-        assert!(store.header_node(verified_body.hash).is_some());
-        assert!(store.header_node(header_only.hash).is_none());
-        assert_eq!(store.eligible_header_tips().len(), 2);
+        assert!(store.header_node(verified_body.hash).is_none());
+        assert_eq!(store.eligible_header_tips().len(), 1);
     }
 
     #[test]
-    fn verified_body_paths_fail_closed_when_they_fill_retention_capacity() {
+    fn unselected_verified_body_paths_do_not_fill_retention_capacity() {
         let mut store = store();
         let anchor = store.finalized_frontier();
         let first = insert(&mut store, anchor.hash, 1, []);
@@ -512,13 +500,12 @@ mod tests {
             .expect("the full-state branch becomes verified");
         let selected = insert(&mut store, anchor.hash, 3, []);
 
-        let plan = enforce_retention(&mut store, selected, selected, true, [], limits(1, 1))
-            .expect("retention reports pressure without deleting full-state-owned nodes");
+        let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 1))
+            .expect("retention removes the unprotected verified side path");
 
-        assert!(plan.admission_refused);
-        assert!(plan.resource_stalled);
-        assert!(store.header_node(first.hash).is_some());
-        assert!(store.header_node(verified_body.hash).is_some());
+        assert!(!plan.admission_refused);
+        assert!(store.header_node(first.hash).is_none());
+        assert!(store.header_node(verified_body.hash).is_none());
         assert!(store.header_node(selected.hash).is_some());
     }
 
@@ -562,7 +549,6 @@ mod tests {
             &mut store,
             replacement,
             replacement,
-            false,
             staged_tips,
             limits(10, 100),
         )
@@ -613,7 +599,6 @@ mod tests {
             &mut store,
             anchor,
             anchor,
-            true,
             [block::Hash([0x91; 32])],
             limits(10, 100),
         )
@@ -636,7 +621,7 @@ mod tests {
             crate::MAX_NON_FINALIZED_NODES_V1 + 1
         );
 
-        let plan = enforce_retention(&mut store, selected, anchor, true, [], EngineLimits::v1())
+        let plan = enforce_retention(&mut store, selected, anchor, [], EngineLimits::v1())
             .expect("the exact boundary produces a typed refusal");
         assert!(plan.admission_refused);
         assert!(plan.resource_stalled);

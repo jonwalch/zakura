@@ -69,6 +69,6 @@ pub struct TransitionContext<'a> {
     pub clock: &'a dyn Clock,
     /// Integrated full-state authority, available only inside the state writer.
     pub full_state_authority: Option<&'a dyn FullStateEvidenceAuthority>,
-    /// Active retained-path targets that resource eviction must protect.
+    /// Parent hashes from active, coherent, and authorized validation leases.
     pub retention_references: &'a [zakura_chain::block::Hash],
 }

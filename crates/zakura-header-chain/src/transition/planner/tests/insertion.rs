@@ -32,7 +32,7 @@ fn ordinary_header_insertion_rejects_body_repair_authority() {
 }
 
 #[test]
-fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
+fn f_225513_resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
     config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(1).expect("one is nonzero");
     let clock = ManualClock(Utc::now());
@@ -74,6 +74,22 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     assert_eq!(repeated.change_set.metadata, store.metadata);
     assert!(repeated.graph_delta.is_empty());
 
+    let alarm_cleared = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::ReevaluateDeferred,
+        },
+        &context(&config, &clock, None),
+    )
+    .expect("a non-increasing transition clears the resource alarm");
+    assert!(!alarm_cleared.change_set.metadata.alarms.resource_stalled);
+    assert_eq!(
+        alarm_cleared.change_set.metadata.state_version,
+        StateVersion::new(2)
+    );
+    store.commit(&alarm_cleared);
+
     let recovered = apply_transition(
         &store,
         insertion(&store, 1, EvidenceId::from_digest([0x31; 32])),
@@ -85,7 +101,7 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     assert!(!recovered.change_set.metadata.alarms.resource_stalled);
     assert_eq!(
         recovered.change_set.metadata.state_version,
-        StateVersion::new(2)
+        StateVersion::new(3)
     );
     assert_eq!(
         projected_graph(&store.graph, &recovered).header_node_count(),

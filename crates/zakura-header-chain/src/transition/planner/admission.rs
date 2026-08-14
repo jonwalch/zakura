@@ -64,11 +64,12 @@ pub(super) fn authenticate_and_admit(
     let snapshot_before_commit = engine.snapshot();
     let metadata = engine.metadata().clone();
     validate_snapshot(&snapshot_before_commit, &metadata, context)?;
-    if context.retention_references.len() > context.config.limits.max_retention_references.get() {
+    if context.retention_references.len() > crate::POW_PREDECESSOR_CONTEXT_SPAN {
         return Err(
             InvalidTransitionEvidence::Limit(LimitViolation::RetentionReferencesExceeded).into(),
         );
     }
+    validate_retention_references(input, context)?;
     let event = input.event();
     validate_event_resource_bounds(engine, &event, context.config.limits)?;
     validate_authority(&event, context)?;
@@ -80,6 +81,34 @@ pub(super) fn authenticate_and_admit(
             expected_version: input.expected_version(),
         },
     ))
+}
+
+fn validate_retention_references(
+    input: &TransitionInput,
+    context: &TransitionContext<'_>,
+) -> Result<(), TransitionFailure> {
+    if context.retention_references.is_empty() {
+        return Ok(());
+    }
+    let Some(authority) = context.full_state_authority else {
+        return Err(TransitionFailure::Authority);
+    };
+    let leases = input
+        .header_validation_facts()
+        .map(|facts| facts.validation_leases.as_slice())
+        .unwrap_or_default();
+    let trust_anchor_digest = context.config.trust_anchor_digest();
+    for reference in context.retention_references {
+        let authenticated = leases.iter().any(|lease| {
+            lease.parent().hash == *reference
+                && lease.is_coherent(&context.config.network, trust_anchor_digest)
+                && authority.authorizes_validation_lease(lease)
+        });
+        if !authenticated {
+            return Err(TransitionFailure::Authority);
+        }
+    }
+    Ok(())
 }
 
 /// Validate snapshot and persisted metadata against the active configuration.
