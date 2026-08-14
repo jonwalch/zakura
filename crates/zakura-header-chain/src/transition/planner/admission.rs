@@ -99,11 +99,12 @@ fn validate_retention_references(
         .unwrap_or_default();
     let trust_anchor_digest = context.config.trust_anchor_digest();
     for reference in context.retention_references {
-        let authenticated = leases.iter().any(|lease| {
-            lease.parent().hash == *reference
-                && lease.is_coherent(&context.config.network, trust_anchor_digest)
-                && authority.authorizes_validation_lease(lease)
-        });
+        let authenticated = authority.authorizes_retention_reference(*reference)
+            || leases.iter().any(|lease| {
+                lease.parent().hash == *reference
+                    && lease.is_coherent(&context.config.network, trust_anchor_digest)
+                    && authority.authorizes_validation_lease(lease)
+            });
         if !authenticated {
             return Err(TransitionFailure::Authority);
         }

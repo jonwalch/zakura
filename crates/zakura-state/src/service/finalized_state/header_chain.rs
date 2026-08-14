@@ -91,6 +91,7 @@ impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
 struct StateIssuedAuthority<'a> {
     inner: Option<&'a dyn FullStateEvidenceAuthority>,
     validation_leases: &'a [ValidationLease],
+    active_retention_references: &'a [block::Hash],
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
@@ -111,6 +112,10 @@ impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
 
     fn authorizes_validation_lease(&self, lease: &ValidationLease) -> bool {
         self.validation_leases.contains(lease)
+    }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.active_retention_references.contains(&reference)
     }
 }
 
@@ -2014,6 +2019,7 @@ impl HeaderChainRuntime {
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,
             validation_leases: &[],
+            active_retention_references: lease_references.as_ref(),
         };
         let first_context = TransitionContext {
             config: first_context.config,
@@ -2052,6 +2058,7 @@ impl HeaderChainRuntime {
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
+            active_retention_references: lease_references.as_ref(),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
@@ -2371,6 +2378,7 @@ impl HeaderChainRuntime {
         let state_authority = StateIssuedAuthority {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
+            active_retention_references: lease_references.as_deref().unwrap_or_default(),
         };
         let transition_context = TransitionContext {
             config: base_context.config,

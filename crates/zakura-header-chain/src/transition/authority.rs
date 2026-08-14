@@ -54,6 +54,11 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
     fn authorizes_validation_lease(&self, _lease: &ValidationLease) -> bool {
         false
     }
+
+    /// Return true only when an active retained-path lease protects this exact target.
+    fn authorizes_retention_reference(&self, _reference: zakura_chain::block::Hash) -> bool {
+        false
+    }
 }
 
 /// Trusted dependencies used while deriving a transition plan.
