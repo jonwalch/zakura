@@ -332,16 +332,18 @@ jobs:
 
       - name: Ensure node observability endpoints
         if: ${{ !inputs.no_restart }}
+        working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           # Runs after the deploy so a bad drop-in cannot survive the binary
           # rollback. Idempotent: a node already serving both endpoints is left
           # alone, so this only restarts a node the first time it is enabled.
-          cd deploy/deployer
           args=(--config nodes.ci.toml)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py observability "${args[@]}"
