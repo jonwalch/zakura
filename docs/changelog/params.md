@@ -28,6 +28,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS` | `crates/zakura-network/src/zakura/handler.rs` | 9 previous public nodes → 4 current public nodes | [#678](https://github.com/zakura-core/zakura/pull/678) | Point new Mainnet installs at the current native P2P bootstrap set so they can join without a manual `bootstrap_peers` override. |
 | `TLS_HANDSHAKE_TIMEOUT` | `crates/zakura-rpc/src/indexer/server.rs` | new → `10 s` | [#596](https://github.com/zakura-core/zakura/pull/596) | Drop indexer connections that do not complete the unauthenticated TLS handshake promptly, so stalled handshakes cannot retain a bounded connection slot indefinitely. |
 | `MAX_CONCURRENT_STREAMS_PER_CONNECTION` | `crates/zakura-rpc/src/indexer/server.rs` | new → `64` streams | [#596](https://github.com/zakura-core/zakura/pull/596) | Let trusted indexers multiplex long-lived subscriptions, parallel block-range backfills, and unary queries on one HTTP/2 connection while retaining a finite per-connection task and response-buffer bound. |
 | `MAX_CONNECTIONS` | `crates/zakura-rpc/src/indexer/server.rs` | new → `64` connections | [#596](https://github.com/zakura-core/zakura/pull/596) | Leave ample capacity for trusted indexer clients and operational probes while bounding accepted sockets, TLS handshakes, and HTTP/2 connection tasks server-wide. |
