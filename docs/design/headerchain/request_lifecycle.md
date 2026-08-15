@@ -108,7 +108,7 @@ still counts.
 generation and branch, so one retirement pass retires exactly the work a reset invalidated
 and leaves the rest alive.
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `BranchId` | `zakura-header-chain/src/ids.rs` | naming a branch by height. It is `(anchor_hash, target_tip_hash)` and carries no height field, so a reset to a different chain of equal height cannot pass for the same branch |
 | `Gate` | `zakura-header-chain/src/ownership.rs` | a response acting before anyone asked whether it still owns its branch. It is the sole decision point over `PendingOwners` |
@@ -154,7 +154,7 @@ is held, the planner trusts no conclusion preparation reached: it rechecks the r
 against the live config, and a batch prepared under a config that has since moved fails
 with `StalePreparation` (validation before admission, LC-VAL-11).
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `AdapterKey` | `zakura-node-services/src/header_chain.rs` | a prepared batch substituted between the two calls. The adapter seals the target on the way out and is the only holder that can open it on the way back, so two calls are as safe as one |
 | `PreparedHeaderBatch` and its receipt | `zakura-header-chain/src/transition/types/preparation.rs` | a result that does not say what it was prepared against. The receipt names the parent frontier, the network, and the trust-anchor digest, all three rechecked in the planner |
@@ -196,7 +196,7 @@ Two writes sit outside this path, both before the engine exists. Startup commits
 batch when the audit is not clean. A first run against a store that predates the DAG commits
 the migration batch that builds the initial nodes and the migrated finality pin.
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `HeaderChainRuntime` | `zakura-state/src/service/finalized_state/header_chain.rs` | a second writer or a second publisher. It holds the store, the engine mutex, the publisher, and the lease registry, and nothing outside the crate holds one |
 | `ApplyResult` | `zakura-header-chain` | an ambiguous outcome. `Committed`, `NoChange`, `Stale`, and `ResourceStalled` are distinct, so `FullStateResourceStalled` is a case the writer must handle rather than a success it can assume |
@@ -242,7 +242,7 @@ runtime supplies the history the planner judges that observation against.
 **Enforcing types.** This boundary carries the capability model. The runtime vouches for the
 evidence it hands over, and the engine refuses evidence nobody vouched for.
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `ValidationLease` | `zakura-header-chain/src/transition/types/preparation.rs` | predecessor facts arriving loose. The runtime seals the parent, the predecessor facts, the network policy, and the trust-anchor digest under one `context_digest`, and `is_coherent` re-derives that digest and re-walks the backward hash links (post-anchor validation context, LC-ANCHOR-03) |
 | `StateIssuedAuthority` | `zakura-state/src/service/finalized_state/header_chain.rs` | a lease from anywhere but this call. It wraps the caller's authority over exactly the leases the runtime just issued |
@@ -295,7 +295,7 @@ Planning runs against an overlay rather than the graph itself. One implementatio
 alike, so selection cannot behave one way on staged state and another way on committed
 state.
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `GraphOverlay`, `GraphDelta` | `src/graph/overlay.rs` | planning that touches the live graph, or a hand-assembled difference. Reads see the base plus what the overlay staged, writes land in the overlay's own maps, and the delta's fields are crate-private |
 | `TransitionPlan` | `src/transition/planner.rs` | a batch reaching disk that the planner did not derive. `change_set()`, `before()`, `cause()`, and `is_no_change()` are the whole caller surface; the delta and invariant inputs stay private |
@@ -362,7 +362,7 @@ headers against the projected DAG before the write. Three outcomes then leave ea
 A failure between the write and the install fails closed: the runtime returns the store
 error, publishes nothing, and the next open rehydrates the engine from disk.
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `FaultPoint` | `zakura-state/src/service/finalized_state/header_chain.rs` | an untested crash window. Ordered fault points let the recovery tests interrupt each step and check that reopening finds the complete before state or the complete after state (durable deterministic frontiers, LC-ACCEPT-02; deterministic startup reconstruction, LC-RECOVER-02) |
 | `audit_store`, `RecoveryPlan` | `src/transition/recovery/` | startup trusting a stored answer. It re-derives what the DAG determines, recomputes selection, and repairs only reconstructible categories, and it fails closed with publication still disabled on a store that is not one coherent chain (startup integrity audit, LC-RECOVER-01) |
@@ -391,7 +391,7 @@ a just-scheduled request or leave a dead one alive. The reactor then schedules f
 state alone, because a projected value escaping the read surface would put peers to work on a
 frontier that may never commit.
 
-| Abstraction | Location | Unrepresentable mistake |
+| Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `Publisher` | `zakura-state/src/service/finalized_state/header_chain.rs` | a published frontier that is not on disk. It is a latest-value channel fed only from inside the writer lock, so a published snapshot is by construction one the writer committed |
 | `RetiredWork` | `zakura-header-chain` | a reset that leaves dead work alive, or a retirement that cancels a just-scheduled request. It names the generation flags and the exact owners |
