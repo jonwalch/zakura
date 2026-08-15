@@ -189,7 +189,7 @@ fn root_auth_cutover_deletes_header_ahead_rows_and_initializes_frontier() {
     let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
     DiskFormatUpgrade::run(
         &header_root_auth_frontier::Upgrade,
-        Height(0),
+        Some(Height(0)),
         &state,
         &cancel_receiver,
     )

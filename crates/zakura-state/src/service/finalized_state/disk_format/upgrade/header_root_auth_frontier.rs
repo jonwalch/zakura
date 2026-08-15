@@ -6,7 +6,7 @@ use zakura_chain::block::Height;
 
 use crate::service::finalized_state::{DiskWriteBatch, HeaderRootAuthFrontierError, ZakuraDb};
 
-use super::{CancelFormatChange, DiskFormatUpgrade};
+use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
 
 /// First format where commitment-root rows are authenticated before persistence.
 pub(crate) const UPGRADE_VERSION: Version = Version::new(28, 0, 2);
@@ -38,10 +38,10 @@ impl DiskFormatUpgrade for Upgrade {
 
     fn run(
         &self,
-        _initial_tip_height: Height,
+        _initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
         if let Err(error) = rebase_to_body_tip(db) {
             panic!("header-root authentication cutover failed closed: {error}");
@@ -54,7 +54,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         db: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         match db.validate_header_root_auth_state() {
             Ok(_) => Ok(Ok(())),
             Err(error) => Ok(Err(error.to_string())),
@@ -196,14 +196,15 @@ mod tests {
         .expect("legacy header-ahead roots write");
 
         let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
-        DiskFormatUpgrade::run(&Upgrade, Height::MIN, &db, &cancel_rx)
+        DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("first cutover is not cancelled");
-        DiskFormatUpgrade::run(&Upgrade, Height::MIN, &db, &cancel_rx)
+        DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("re-running cutover is idempotent");
 
         assert_eq!(
-            DiskFormatUpgrade::validate(&Upgrade, &db, &cancel_rx),
-            Ok(Ok(())),
+            DiskFormatUpgrade::validate(&Upgrade, &db, &cancel_rx)
+                .expect("validation is not cancelled"),
+            Ok(()),
             "state remains valid after an idempotent re-run"
         );
         assert!(db.commitment_roots(Height::MIN).is_some());

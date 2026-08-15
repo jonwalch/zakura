@@ -2208,7 +2208,7 @@ mod tests {
             "retain terminal header witnesses in the authenticated frontier",
             Version::new(28, 0, 3),
         );
-        DiskFormatUpgrade::run(&upgrade, Height::MIN, &db, &cancel_receiver)
+        DiskFormatUpgrade::run(&upgrade, Some(Height::MIN), &db, &cancel_receiver)
             .expect("the marker-only upgrade completes");
         db.update_format_version_on_disk(&state_database_format_version_in_code())
             .expect("startup marks the marker-only upgrade complete");
