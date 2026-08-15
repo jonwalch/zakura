@@ -905,7 +905,7 @@ async fn mutual_p2p_v2_without_connector_fails_closed() {
 }
 
 #[tokio::test]
-async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
+async fn mutual_p2p_v2_selected_upgrade_records_peer_metadata() {
     let _init_guard = zakura_test::init();
 
     let (local_stream, remote_stream) = duplex(16 * 1024);
@@ -952,7 +952,31 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
 
     assert_eq!(local_calls.load(Ordering::SeqCst), 1);
     assert_eq!(remote_calls.load(Ordering::SeqCst), 1);
-    assert!(address_book_rx.try_recv().is_err());
+
+    let mut metadata = Vec::new();
+    while let Ok(change) = address_book_rx.try_recv() {
+        if let MetaAddrChange::UpdateConnected {
+            addr,
+            user_agent,
+            negotiated_version,
+            ..
+        } = change
+        {
+            metadata.push((addr, user_agent, negotiated_version));
+        }
+    }
+
+    assert_eq!(metadata.len(), 2);
+    assert!(metadata.iter().any(|(addr, user_agent, version)| {
+        *addr == peer_addr(18233)
+            && user_agent == TEST_HANDSHAKE_USER_AGENT
+            && *version == constants::CURRENT_NETWORK_PROTOCOL_VERSION
+    }));
+    assert!(metadata.iter().any(|(addr, user_agent, version)| {
+        *addr == peer_addr(28233)
+            && user_agent == TEST_HANDSHAKE_USER_AGENT
+            && *version == constants::CURRENT_NETWORK_PROTOCOL_VERSION
+    }));
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
 }

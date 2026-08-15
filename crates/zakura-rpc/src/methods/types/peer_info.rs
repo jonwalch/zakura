@@ -11,9 +11,11 @@ pub struct PeerInfo {
     pub(crate) addr: PeerSocketAddr,
 
     /// The peer's user agent string.
+    #[serde(default)]
     pub(crate) subver: String,
 
     /// The negotiated protocol version.
+    #[serde(default)]
     pub(crate) version: u32,
 
     /// Inbound (true) or Outbound (false)

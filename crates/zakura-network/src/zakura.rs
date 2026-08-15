@@ -354,9 +354,9 @@ impl ZakuraHandshakeConnector {
     /// it deregisters the keeper stops, so a genuinely gone peer becomes a
     /// reconnection candidate again.
     ///
-    /// Only meaningful for outbound connections, where `book_addr` is the
-    /// dialable remote address the crawler would otherwise reconnect to. Does
-    /// nothing without a live endpoint.
+    /// This also keeps inbound native peers visible to `getpeerinfo` while
+    /// their replacement connection is registered. Does nothing without a
+    /// live endpoint.
     pub(crate) fn spawn_legacy_liveness_keeper(
         &self,
         peer_id: ZakuraPeerId,
@@ -461,8 +461,12 @@ async fn run_legacy_liveness_keeper(
         }
 
         if !registered.borrow().iter().any(|id| id == &peer_id) {
+            let _ = address_book_updater
+                .send(MetaAddr::new_shutdown(book_addr))
+                .await;
             // The Zakura connection deregistered: stop refreshing so the entry
-            // ages out and the peer can be reconnected over legacy.
+            // is no longer reported as an active peer and can be reconnected
+            // over legacy.
             break;
         }
     }
@@ -609,6 +613,14 @@ mod tests {
 
         // Deregister the peer: the keeper must observe the change and exit.
         registered_tx.send(Vec::new()).expect("receiver is alive");
+        let shutdown = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
+            .await
+            .expect("keeper reports native peer shutdown")
+            .expect("the keeper holds the sender open");
+        assert!(matches!(
+            shutdown,
+            MetaAddrChange::UpdateFailed { addr, .. } if addr == test_book_addr()
+        ));
         tokio::time::timeout(Duration::from_secs(2), keeper)
             .await
             .expect("keeper exits after the peer deregisters")

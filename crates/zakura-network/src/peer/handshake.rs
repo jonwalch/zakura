@@ -1031,6 +1031,14 @@ where
     // the real prelude exchange over a live Zakura endpoint.
     #[cfg(test)]
     if let Some(outcome) = connector.consume_test_outcome() {
+        record_zakura_upgrade(
+            &outcome,
+            connection_info,
+            connected_addr,
+            &connector,
+            address_book_updater,
+        )
+        .await;
         return Ok(outcome);
     }
 
@@ -1112,26 +1120,59 @@ where
         }
     }
 
-    // Keep the upgraded peer's legacy address-book entry live for as long as the
-    // Zakura connection is registered, so the outbound crawler treats it as
-    // connected and does not re-dial it (which would re-run this upgrade and
-    // churn the QUIC connection). Only the outbound side reconnects, and only
-    // when we have a dialable address book entry for the peer.
-    if let ZakuraUpgradeOutcome::Upgraded { peer_id }
-    | ZakuraUpgradeOutcome::Duplicate { peer_id } = &outcome
-    {
-        if !connected_addr.is_inbound() {
-            if let Some(book_addr) = connected_addr.get_address_book_addr() {
-                connector.spawn_legacy_liveness_keeper(
-                    peer_id.clone(),
-                    book_addr,
-                    address_book_updater.clone(),
-                );
-            }
-        }
-    }
+    record_zakura_upgrade(
+        &outcome,
+        connection_info,
+        connected_addr,
+        &connector,
+        address_book_updater,
+    )
+    .await;
 
     Ok(outcome)
+}
+
+/// Record an upgraded peer in the legacy address book and keep it live while
+/// the replacement Zakura connection is registered.
+async fn record_zakura_upgrade(
+    outcome: &ZakuraUpgradeOutcome,
+    connection_info: &ConnectionInfo,
+    connected_addr: ConnectedAddr,
+    connector: &ZakuraHandshakeConnector,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+) {
+    let (ZakuraUpgradeOutcome::Upgraded { peer_id } | ZakuraUpgradeOutcome::Duplicate { peer_id }) =
+        outcome
+    else {
+        return;
+    };
+
+    let Some(book_addr) = connected_addr.get_address_book_addr() else {
+        return;
+    };
+
+    // The legacy stream is dropped after this function returns, so this is
+    // the only address-book update for an upgraded peer. It also creates an
+    // entry for inbound peers, which have no entry before this point.
+    let _ = address_book_updater
+        .send(MetaAddr::new_connected(
+            book_addr,
+            &connection_info.remote.services,
+            connected_addr.is_inbound(),
+            connection_info.remote.user_agent.clone(),
+            connection_info.negotiated_version,
+        ))
+        .await;
+
+    // Keep the upgraded peer's legacy address-book entry live for as long as
+    // its Zakura connection is registered. This prevents the outbound crawler
+    // from re-running the upgrade and keeps inbound native peers visible to
+    // getpeerinfo.
+    connector.spawn_legacy_liveness_keeper(
+        peer_id.clone(),
+        book_addr,
+        address_book_updater.clone(),
+    );
 }
 
 /// The neutral upgrade fallback outcome: keep the legacy connection.
