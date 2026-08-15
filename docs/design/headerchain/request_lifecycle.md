@@ -6,11 +6,6 @@ header-chain specification](../../specs/fork-aware-header-chain-engine.md) remai
 authoritative; rules appear here as `LC-*` citations and use the casual name of each. The
 companion guide `production_code_header-chain.md` names the files that implement each part.
 
-Two methods share the name `apply`, and they promise opposite things.
-`HeaderChainEngine::apply` takes `&self`, mutates nothing, and returns a plan the caller
-may drop. `HeaderChainRuntime::apply` writes a batch, installs the plan, and publishes.
-This document always writes both names in full.
-
 ## Single-planner fork choice
 
 Four sources can move the tip. Peers deliver headers. Full state verifies bodies. The RPC
@@ -47,14 +42,14 @@ sequenceDiagram
   N->>P: Headers
   P->>P: Gate::check, does this still own its branch?
   P->>W: prepare_header_target, off the writer lock
-  W-->>P: PreparedHeaderBatch, sealed under AdapterKey
+  W-->>P: PreparedHeaderTarget, sealed under AdapterKey
   P->>W: apply_header_target
   W->>R: HeaderChainRuntime::apply(request, context)
   R->>R: seal the context: leases, finality path, retention
-  R->>E: HeaderChainEngine::apply, mutates nothing
-  E-->>R: TransitionPlan
+  R->>E: HeaderChainEngine::plan_transition, mutates nothing
+  E-->>R: EngineTransition
   R->>D: one atomic DiskWriteBatch
-  R->>E: apply_committed
+  R->>E: install_committed_transition
   R-->>W: ApplyResult
   R->>P: publish the committed snapshot
   P->>N: GetHeaders for the next target
@@ -110,9 +105,9 @@ and leaves the rest alive.
 
 | Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
-| `BranchId` | `zakura-header-chain/src/ids.rs` | naming a branch by height. It is `(anchor_hash, target_tip_hash)` and carries no height field, so a reset to a different chain of equal height cannot pass for the same branch |
-| `Gate` | `zakura-header-chain/src/ownership.rs` | a response acting before anyone asked whether it still owns its branch. It is the sole decision point over `PendingOwners` |
-| `PendingOwners` | `zakura-header-chain/src/ownership.rs` | an owner surviving its peer's reconnect. The key is `(SourceId, request_id)` and the owner carries the session id, so a reply on a new session for an old request is `OwnerMismatch` |
+| `BranchId` | `zakura-header-chain/src/identity/keys.rs` | naming a branch by height. It is `(anchor_hash, target_tip_hash)` and carries no height field, so a reset to a different chain of equal height cannot pass for the same branch |
+| `Gate` | `zakura-header-chain/src/work/completion.rs` | a response acting before anyone asked whether it still owns its branch. It is the sole decision point over `PendingOwners` |
+| `PendingOwners` | `zakura-header-chain/src/work/completion.rs` | an owner surviving its peer's reconnect. The key is `(SourceId, request_id)` and the owner carries the session id, so a reply on a new session for an old request is `OwnerMismatch` |
 
 ### Late-response staleness
 
@@ -140,8 +135,8 @@ the state service.
 
 Preparation runs off the writer lock, on a blocking thread. It reads a validation lease for
 the common ancestor through the read service, derives the rules in force at that height
-from that lease, and runs `prepare_context_free_headers`. Those are exactly the rules that
-read no ancestor, such as canonical version and hash, checked height inference, commitment
+from that lease, and runs `prepare_headers`. Those are exactly the rules that read no
+ancestor, such as canonical version and hash, checked height inference, commitment
 structure, compact-target domain, and Equihash.
 
 **Sender constraints.** The reactor cannot forge or substitute a prepared batch between the two
@@ -256,11 +251,16 @@ one root takes a running ZIP-221 history tree over the committed body tip and ev
 selected header above it. That history has no bound, so no lease can seal it, and that
 evidence never travels through a lease.
 
-The state writer owns a durable ascending root-authentication frontier instead, advances it
-against its own history-tree frontier, and reports each verdict back as ordinary auxiliary
-evidence. The delivery is unauthenticated until that frontier clears it, and it drives no
-validity and no fork choice in the meantime (unauthenticated metadata isolation, LC-AUX-02;
-cryptographic metadata authentication, LC-AUX-04).
+The state writer authenticates that evidence outside the lease instead. Its sweep in
+`zakura-state/src/service/write/vct_authentication_sweep.rs` walks the selected path above
+the committed body tip, keeps a running history tree over that prefix, and checks each
+delivery against the commitment the next selected header carries. An attributable failure
+becomes a rejection, an ambiguous one a dispute, and either asks for replacement metadata at
+once. Each verdict returns as ordinary auxiliary evidence, and until one arrives the
+delivery drives no validity and no fork choice (unauthenticated metadata isolation,
+LC-AUX-02; cryptographic metadata authentication, LC-AUX-04). The committer authenticates
+every delivery it folds, so the sweep shortens the window a wrong root survives rather than
+moving the trust boundary.
 `docs/design/header-sync-vct-root-authentication.md` carries that design in full.
 
 ### History requirements by event
@@ -284,11 +284,11 @@ engine can observe nothing it was not handed.
 
 Purity here has its usual meaning: same inputs, same output, no effect the caller did not
 ask for. The engine hides no state, because the caller passes it in.
-`HeaderChainEngine::apply` takes `&self`, mutates nothing, and returns the next state as a
-plan to commit. Planning the same event against the same state twice returns the same plan,
-and dropping a plan leaves no write, no publication, and no change in the engine. A test can
-reproduce fork choice from a graph, a config, a clock, and an ordered event list, without
-running a node.
+`HeaderChainEngine::plan_transition` takes `&self`, mutates nothing, and returns the next
+state as a transition to commit. Planning the same event against the same state twice
+returns the same plan, and dropping a plan leaves no write, no publication, and no change in
+the engine. A test can reproduce fork choice from a graph, a config, a clock, and an ordered
+event list, without running a node.
 
 Planning runs against an overlay rather than the graph itself. One implementation of
 `HeaderGraphView` and `HeaderGraphEdit` runs against the overlay and the committed graph
@@ -298,19 +298,19 @@ state.
 | Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
 | `GraphOverlay`, `GraphDelta` | `src/graph/overlay.rs` | planning that touches the live graph, or a hand-assembled difference. Reads see the base plus what the overlay staged, writes land in the overlay's own maps, and the delta's fields are crate-private |
-| `TransitionPlan` | `src/transition/planner.rs` | a batch reaching disk that the planner did not derive. `change_set()`, `before()`, `cause()`, and `is_no_change()` are the whole caller surface; the delta and invariant inputs stay private |
-| `before()` and `StaleSource` | `src/transition/engine.rs` | installing a plan against state it was not derived from. `HeaderChainEngine::apply` takes `&self`, so two planners can race, and only one can install |
-| `Frontier` | `src/frontier.rs` | naming a position on a chain by height alone. It is a height and a hash together, and it is the only way this design names a position |
-| `WorkCoordinate` | `src/frontier.rs` | comparing accumulated work across origins. It carries the origin hash, so a mismatched pair raises an error instead of yielding a smaller number that decides fork choice with nothing logged |
-| `RetentionPlan` | `src/retention.rs` | a resource limit passing for a verdict about a chain. When protected paths alone fill the node bound it sets `admission_refused` and `resource_stalled` rather than evicting protected state or synthesizing finality for room (fork and node limits, LC-RETAIN-01) |
-| eligibility as durable reasons | `src/header_node.rs` | fork choice depending on arrival order. Ineligibility is a set of reasons rather than a flag, and a flag would make eligibility depend on update order |
+| `EngineTransition` | `src/transition/planner/plan.rs` | a batch reaching disk that the planner did not derive, or one that reached disk unverified. `from_verified` is its only constructor and takes a `PlanCandidate` that `verify_candidate` has already passed. `change_set()`, `snapshot_before_commit()`, `domain()`, `effect()`, and `is_no_change()` are the whole caller surface; the delta and invariant inputs stay private |
+| `snapshot_before_commit()` and `StaleSource` | `src/transition/engine/mod.rs` | installing a plan against state it was not derived from. `plan_transition` takes `&self`, so two planners can race, and only one can install |
+| `Frontier` | `src/graph/frontier.rs` | naming a position on a chain by height alone. It is a height and a hash together, and it is the only way this design names a position |
+| `WorkCoordinate` | `src/graph/frontier.rs` | comparing accumulated work across origins. It carries the origin hash, so a mismatched pair raises an error instead of yielding a smaller number that decides fork choice with nothing logged |
+| `RetentionPlan` | `src/transition/planner/retention.rs` | a resource limit passing for a verdict about a chain. When protected paths alone fill the node bound it sets `admission_refused` and `resource_stalled` rather than evicting protected state or synthesizing finality for room (fork and node limits, LC-RETAIN-01) |
+| eligibility as durable reasons | `src/graph/header_node.rs` | fork choice depending on arrival order. Ineligibility is a set of reasons rather than a flag, and a flag would make eligibility depend on update order |
 
 ### Validation passes
 
 Validation runs four times before disk, each pass against more context than the last.
 
-1. **Off the writer lock**, `prepare_context_free_headers` runs the rules that read no
-   ancestor and seals the result under a receipt.
+1. **Off the writer lock**, `prepare_headers` runs the rules that read no ancestor and
+   seals the result under a receipt.
 2. **Under the lock, before planning**, the runtime reads the predecessor facts itself
    rather than accepting any the caller supplies, and seals them into leases.
 3. **In the planner, against the graph**, the receipt's parent, network, and trust-anchor
@@ -318,7 +318,7 @@ Validation runs four times before disk, each pass against more context than the 
    parent link, the hash, the height increment, and the work from the compact target. It
    runs the contextual difficulty and time check against ancestry it reads from the graph
    and the lease.
-4. **After planning and before disk**, `verify_plan` re-derives the projected result:
+4. **After planning and before disk**, `verify_candidate` re-derives the projected result:
    linkage and hashes, index round-trips, work coordinates, inherited eligibility, both
    projections' contiguity, that `header_best` really is the maximum eligible score,
    protected nodes, generation increments, and auxiliary provenance.
@@ -330,9 +330,9 @@ staged. A disagreement between the planner and the verifier is an `InvariantViol
 that batch never reaches disk. Startup adds one more pass that no caller triggers:
 `audit_store` re-derives what the DAG determines before the engine exists.
 
-**Return interface.** `TransitionPlan`: the change set the store will write, the private
-graph delta the engine will install, and `before()`, the snapshot the planner derived it
-from.
+**Return interface.** `EngineTransition`: the change set the store will write, the private
+graph delta the engine will install, and `snapshot_before_commit()`, the snapshot the
+planner derived it from.
 
 ## Engine to disk, memory, and observers: commit order
 
@@ -366,7 +366,7 @@ error, publishes nothing, and the next open rehydrates the engine from disk.
 | --- | --- | --- |
 | `FaultPoint` | `zakura-state/src/service/finalized_state/header_chain.rs` | an untested crash window. Ordered fault points let the recovery tests interrupt each step and check that reopening finds the complete before state or the complete after state (durable deterministic frontiers, LC-ACCEPT-02; deterministic startup reconstruction, LC-RECOVER-02) |
 | `audit_store`, `RecoveryPlan` | `src/transition/recovery/` | startup trusting a stored answer. It re-derives what the DAG determines, recomputes selection, and repairs only reconstructible categories, and it fails closed with publication still disabled on a store that is not one coherent chain (startup integrity audit, LC-RECOVER-01) |
-| `apply_committed` | `src/transition/engine.rs` | memory disagreeing with disk. It is the only mutator, and it refuses a plan whose `before()` no longer matches |
+| `install_committed_transition` | `src/transition/engine/mod.rs` | memory disagreeing with disk. It is the only mutator, and it refuses a transition whose `snapshot_before_commit()` no longer matches |
 
 ## Runtime to peer: publication and retirement
 
@@ -395,5 +395,5 @@ frontier that may never commit.
 | --- | --- | --- |
 | `Publisher` | `zakura-state/src/service/finalized_state/header_chain.rs` | a published frontier that is not on disk. It is a latest-value channel fed only from inside the writer lock, so a published snapshot is by construction one the writer committed |
 | `RetiredWork` | `zakura-header-chain` | a reset that leaves dead work alive, or a retirement that cancels a just-scheduled request. It names the generation flags and the exact owners |
-| `HeaderLocator` | `src/locator.rs` | a locator built from anything but committed state. It builds from the committed selected projection and fails with `StoreError::Incoherent` on a gap |
+| `HeaderLocator` | `src/discovery/mod.rs` | a locator built from anything but committed state. It builds from the committed selected projection and fails with `StoreError::Incoherent` on a gap |
 | cancelled-id window | `zakura-network/src/zakura/header_sync/pipe.rs` | an honest answer to a cancelled request scored as misbehavior. The pipe drops recently cancelled ids for a short grace window instead |
