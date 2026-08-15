@@ -10,7 +10,9 @@ use tokio::{
     time::timeout,
 };
 use zakura_chain::{chain_sync_status::mock::MockSyncStatus, parameters::Network};
-use zakura_network::{address_book_peers::MockAddressBookPeers, PeerSocketAddr};
+use zakura_network::{
+    address_book_peers::MockAddressBookPeers, zakura::ZakuraPeerId, PeerSocketAddr,
+};
 
 // Build a config tailored for tests: enable the listener and disable the
 // built-in rate limiter so assertions don't race the cooldown unless a test
@@ -85,6 +87,7 @@ async fn healthy_and_ready_ok() {
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
+        None,
     )
     .await;
     let addr = addr_opt.expect("server bound addr");
@@ -112,6 +115,7 @@ async fn not_ready_when_syncing_or_lagging() {
         chain_tip_metrics_receiver.clone(),
         sync_status,
         peers_with_count(1),
+        None,
     )
     .await;
     let addr_syncing = addr_syncing.expect("addr");
@@ -130,6 +134,7 @@ async fn not_ready_when_syncing_or_lagging() {
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
+        None,
     )
     .await;
     let addr_lagging = addr_lagging.expect("addr");
@@ -163,6 +168,7 @@ async fn not_ready_when_tip_is_too_old() {
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
+        None,
     )
     .await;
     let addr = addr_opt.expect("addr");
@@ -193,6 +199,7 @@ async fn rate_limiting_drops_bursts() {
         chain_tip_metrics_receiver,
         sync_status,
         peers_with_count(1),
+        None,
     )
     .await;
     let addr = addr_opt.expect("addr");
@@ -218,6 +225,74 @@ async fn rate_limiting_drops_bursts() {
 
     let (third_status, third_body) = http_get(addr, "/healthy").await.unwrap();
     assert_eq!(third_status, 200, "last response: {}", third_body);
+
+    task.abort();
+}
+
+fn zakura_peer_id(byte: u8) -> ZakuraPeerId {
+    ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node ids are valid")
+}
+
+#[tokio::test]
+async fn healthy_when_only_zakura_peers_are_live() {
+    // A zakura-only node never populates the legacy address book. Authenticated
+    // native connections must still satisfy min_connected_peers.
+    let cfg = config_for(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let mut sync_status = MockSyncStatus::default();
+    sync_status.set_is_close_to_tip(true);
+
+    let (chain_tip_metrics_sender, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
+    let _ = chain_tip_metrics_sender.send(ChainTipMetrics::new(Instant::now(), Some(0)));
+    let (_zakura_peers_tx, zakura_peers_rx) = watch::channel(vec![zakura_peer_id(1)]);
+
+    let (task, addr_opt) = init(
+        cfg,
+        Network::Mainnet,
+        chain_tip_metrics_receiver,
+        sync_status,
+        peers_with_count(0),
+        Some(zakura_peers_rx),
+    )
+    .await;
+    let addr = addr_opt.expect("server bound addr");
+
+    let (status_h, body_h) = http_get(addr, "/healthy").await.unwrap();
+    assert_eq!(status_h, 200, "healthy response: {}", body_h);
+
+    let (status_r, body_r) = http_get(addr, "/ready").await.unwrap();
+    assert_eq!(status_r, 200, "ready response: {}", body_r);
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn insufficient_peers_without_legacy_or_zakura_connections() {
+    let cfg = config_for(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let mut sync_status = MockSyncStatus::default();
+    sync_status.set_is_close_to_tip(true);
+
+    let (chain_tip_metrics_sender, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
+    let _ = chain_tip_metrics_sender.send(ChainTipMetrics::new(Instant::now(), Some(0)));
+    let (_zakura_peers_tx, zakura_peers_rx) = watch::channel(Vec::new());
+
+    let (task, addr_opt) = init(
+        cfg,
+        Network::Mainnet,
+        chain_tip_metrics_receiver,
+        sync_status,
+        peers_with_count(0),
+        Some(zakura_peers_rx),
+    )
+    .await;
+    let addr = addr_opt.expect("server bound addr");
+
+    let (status_h, body_h) = http_get(addr, "/healthy").await.unwrap();
+    assert_eq!(status_h, 503, "healthy response: {}", body_h);
+    assert!(body_h.contains("insufficient peers"));
+
+    let (status_r, body_r) = http_get(addr, "/ready").await.unwrap();
+    assert_eq!(status_r, 503, "ready response: {}", body_r);
+    assert!(body_r.contains("insufficient peers"));
 
     task.abort();
 }

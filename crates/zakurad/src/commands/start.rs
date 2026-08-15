@@ -725,12 +725,16 @@ impl StartCmd {
 
         // Start health server if configured
         info!("initializing health endpoints");
+        let zakura_registered_peers = zakura_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.supervisor().subscribe());
         let (health_task_handle, _) = health::init(
             config.health.clone(),
             config.network.network.clone(),
             chain_tip_metrics_receiver,
             sync_status.clone(),
             address_book.clone(),
+            zakura_registered_peers,
         )
         .await;
 

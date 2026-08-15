@@ -11,7 +11,8 @@
 //! Endpoints
 //!
 //! - `GET /healthy` — returns `200 OK` if the process is up and the node has at least
-//!   `min_connected_peers` recently live peers (default: 1). Otherwise `503 Service Unavailable`.
+//!   `min_connected_peers` live peers (default: 1) across the legacy address book and
+//!   authenticated Zakura connections. Otherwise `503 Service Unavailable`.
 //! - `GET /ready` — returns `200 OK` if the node is near the chain tip, the estimated block lag is
 //!   within `ready_max_blocks_behind`, and the latest committed block is recent. On regtest/testnet,
 //!   readiness returns `200` unless `enforce_on_test_networks` is set.
@@ -55,6 +56,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use zakura_chain::{chain_sync_status::ChainSyncStatus, parameters::Network};
+use zakura_network::zakura::ZakuraPeerId;
 use zakura_network::AddressBookPeers;
 
 // Refresh peers on a short cadence so the cached snapshot tracks live network
@@ -111,6 +113,10 @@ impl ChainTipMetrics {
 /// The server accepts HTTP/1.1 requests on a dedicated TCP listener and serves
 /// two endpoints: `/healthy` and `/ready`.
 ///
+/// `zakura_registered_peers` is the authenticated native Zakura peer set. A
+/// `p2p_stack = "zakura"` node has no legacy address-book peers, so readiness
+/// must count these connections or it stays `insufficient peers` forever.
+///
 /// # Panics
 ///
 /// - If the configured `listen_addr` cannot be bound.
@@ -120,6 +126,7 @@ pub async fn init<AddressBook, SyncStatus>(
     chain_tip_metrics_receiver: watch::Receiver<ChainTipMetrics>,
     sync_status: SyncStatus,
     address_book: AddressBook,
+    zakura_registered_peers: Option<watch::Receiver<Vec<ZakuraPeerId>>>,
 ) -> (JoinHandle<()>, Option<SocketAddr>)
 where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
@@ -146,7 +153,7 @@ where
 
     // Seed the watch channel with the first snapshot so early requests see
     // a consistent view even before the refresher loop has ticked.
-    if let Some(metrics) = num_live_peers(&address_book).await {
+    if let Some(metrics) = num_live_peers(&address_book, zakura_registered_peers.as_ref()).await {
         let _ = num_live_peer_sender.send(metrics);
     }
 
@@ -154,6 +161,7 @@ where
     // handlers can read the latest snapshot without taking locks.
     let metrics_task = tokio::spawn(peer_metrics_refresh_task(
         address_book.clone(),
+        zakura_registered_peers,
         num_live_peer_sender,
     ));
 
@@ -270,21 +278,32 @@ where
 
 // Measure peers on a blocking thread, mirroring the previous synchronous
 // implementation but without holding the mutex on the request path.
-async fn num_live_peers<A>(address_book: &A) -> Option<usize>
+async fn num_live_peers<A>(
+    address_book: &A,
+    zakura_registered_peers: Option<&watch::Receiver<Vec<ZakuraPeerId>>>,
+) -> Option<usize>
 where
     A: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     let address_book = address_book.clone();
-    tokio::task::spawn_blocking(move || address_book.recently_live_peers(Utc::now()).len())
-        .await
-        .inspect_err(|err| warn!(?err, "failed to refresh peer metrics"))
-        .ok()
+    let legacy =
+        tokio::task::spawn_blocking(move || address_book.recently_live_peers(Utc::now()).len())
+            .await
+            .inspect_err(|err| warn!(?err, "failed to refresh peer metrics"))
+            .ok()?;
+    let zakura = zakura_registered_peers
+        .map(|peers| peers.borrow().len())
+        .unwrap_or(0);
+    Some(legacy.saturating_add(zakura))
 }
 
 // Periodically update the cached peer metrics for all handlers that hold a
 // receiver. If receivers disappear we exit quietly so shutdown can proceed.
-async fn peer_metrics_refresh_task<A>(address_book: A, num_live_peer_sender: watch::Sender<usize>)
-where
+async fn peer_metrics_refresh_task<A>(
+    address_book: A,
+    zakura_registered_peers: Option<watch::Receiver<Vec<ZakuraPeerId>>>,
+    num_live_peer_sender: watch::Sender<usize>,
+) where
     A: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     let mut interval = time::interval(PEER_METRICS_REFRESH_INTERVAL);
@@ -293,7 +312,8 @@ where
     loop {
         // Updates are best-effort: if the snapshot fails or all receivers are
         // dropped we exit quietly, letting the caller terminate the health task.
-        if let Some(metrics) = num_live_peers(&address_book).await {
+        if let Some(metrics) = num_live_peers(&address_book, zakura_registered_peers.as_ref()).await
+        {
             if let Err(err) = num_live_peer_sender.send(metrics) {
                 tracing::warn!(?err, "failed to send to peer metrics channel");
                 break;
