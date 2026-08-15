@@ -1407,10 +1407,14 @@ fn test_get_peer_info() -> Result<(), Box<dyn std::error::Error>> {
 [
   {
     "addr": "192.168.0.1:8233",
+    "subver": "",
+    "version": 0,
     "inbound": false
   },
   {
     "addr": "[2000:2000:2000:0000::]:8233",
+    "subver": "",
+    "version": 0,
     "inbound": false
   }
 ]
@@ -1437,12 +1441,16 @@ fn test_get_peer_info_with_ping_values_serialization() -> Result<(), Box<dyn std
 [
   {
     "addr": "192.168.0.1:8233",
+    "subver": "",
+    "version": 0,
     "inbound": false,
     "pingtime": 123,
     "pingwait": 45
   },
   {
     "addr": "[2000:2000:2000:0000::]:8233",
+    "subver": "",
+    "version": 0,
     "inbound": false,
     "pingtime": 67,
     "pingwait": 89

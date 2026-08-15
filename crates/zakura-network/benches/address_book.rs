@@ -104,7 +104,7 @@ fn address_book(c: &mut Criterion) {
         assert!(ban_check.bans().contains(existing_addr.ip()));
 
         let mut batch_check = address_book.clone();
-        batch_check.extend(batch_updates.iter().copied());
+        batch_check.extend(batch_updates.iter().cloned());
         assert_eq!(batch_check.len(), size);
 
         group.bench_with_input(
@@ -183,7 +183,7 @@ fn address_book(c: &mut Criterion) {
             b.iter_batched_ref(
                 || address_book.clone(),
                 |address_book| {
-                    address_book.extend(batch_updates.iter().copied());
+                    address_book.extend(batch_updates.iter().cloned());
                     black_box(address_book);
                 },
                 BatchSize::PerIteration,
