@@ -879,6 +879,7 @@ pub struct ZakuraSupervisorHandle {
     inner: Arc<Mutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    registration_set_tx: watch::Sender<HashMap<ZakuraPeerId, ZakuraConnId>>,
 }
 
 static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -1025,6 +1026,7 @@ impl ZakuraSupervisorHandle {
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
+            registration_set_tx: watch::channel(HashMap::new()).0,
         }
     }
 
@@ -1053,6 +1055,13 @@ impl ZakuraSupervisorHandle {
     /// Subscribe to peer-set changes for event-driven tests and diagnostics.
     pub fn subscribe(&self) -> watch::Receiver<Vec<ZakuraPeerId>> {
         self.peer_set_tx.subscribe()
+    }
+
+    /// Subscribe to connection-generation changes for legacy upgrade handoffs.
+    pub(crate) fn subscribe_registrations(
+        &self,
+    ) -> watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>> {
+        self.registration_set_tx.subscribe()
     }
 
     /// Disconnect one active Zakura peer.
@@ -1138,8 +1147,14 @@ impl ZakuraSupervisorHandle {
                 state.increment_ip(remote_ip);
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
+                let registrations = state
+                    .active_by_peer
+                    .iter()
+                    .map(|(peer_id, entry)| (peer_id.clone(), entry.conn_id))
+                    .collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
+                self.registration_set_tx.send_replace(registrations);
                 let disconnect_token = state
                     .active_by_peer
                     .get(&peer_id)
@@ -1207,8 +1222,14 @@ impl ZakuraSupervisorHandle {
         state.supervisor.deregister_authenticated(peer_id);
         state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
+        let registrations = state
+            .active_by_peer
+            .iter()
+            .map(|(peer_id, entry)| (peer_id.clone(), entry.conn_id))
+            .collect();
         set_active_connection_gauge(registered_ids.len());
         self.peer_set_tx.send_replace(registered_ids);
+        self.registration_set_tx.send_replace(registrations);
     }
 
     fn shutdown(&self) {
@@ -6381,12 +6402,15 @@ mod tests {
 
         let connector =
             crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
-        let upgraded = connector
+        let registration = connector
             .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
             .await;
 
         assert!(
-            !upgraded,
+            matches!(
+                registration,
+                crate::zakura::ZakuraUpgradeRegistration::Unavailable
+            ),
             "an unreachable upgrade peer must not report a completed hand-off",
         );
         assert!(

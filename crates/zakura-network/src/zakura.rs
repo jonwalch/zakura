@@ -3,7 +3,7 @@
 //! This module reserves the iroh dependency, privacy-preserving endpoint posture,
 //! persistent identity storage surface, and bounded Zakura handshake wire types.
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use iroh::{endpoint, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -180,8 +180,8 @@ impl Default for ServicePeerSnapshot {
     }
 }
 
-/// How long the legacy->Zakura liveness keeper waits for the upgraded QUIC
-/// connection to register with the supervisor before giving up.
+/// How long a legacy->Zakura handoff waits for the upgraded QUIC connection to
+/// register with the supervisor before giving up.
 ///
 /// The native dial spawned by the upgrade is asynchronous, so the peer only
 /// appears in the supervisor's registered set a little later. If it never
@@ -195,6 +195,57 @@ const ZAKURA_LIVENESS_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// so the `Responded` liveness never ages into a reconnection candidate while
 /// the Zakura connection is alive.
 const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
+
+/// Result of waiting for a native registration during a legacy upgrade.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ZakuraUpgradeRegistration {
+    /// This upgrade observed a fresh authenticated native connection.
+    Fresh {
+        /// The supervisor generation assigned to the connection.
+        conn_id: ZakuraConnId,
+    },
+    /// The claimed peer identity was already registered before this upgrade.
+    Duplicate,
+    /// No matching native connection registered within the bounded wait.
+    Unavailable,
+}
+
+/// A registration snapshot captured before accepting a legacy upgrade.
+pub(crate) struct ZakuraRegistrationWait {
+    registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>>,
+    peer_id: ZakuraPeerId,
+    previous_conn_id: Option<ZakuraConnId>,
+}
+
+impl ZakuraRegistrationWait {
+    fn new(
+        mut registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>>,
+        peer_id: ZakuraPeerId,
+    ) -> Self {
+        let previous_conn_id = registered.borrow_and_update().get(&peer_id).copied();
+        Self {
+            registered,
+            peer_id,
+            previous_conn_id,
+        }
+    }
+
+    /// Returns whether this peer identity was registered before the upgrade.
+    pub(crate) fn is_duplicate(&self) -> bool {
+        self.previous_conn_id.is_some()
+    }
+
+    /// Wait for a registration generation that did not exist in the snapshot.
+    pub(crate) async fn wait(self) -> Option<ZakuraConnId> {
+        wait_for_fresh_zakura_peer(
+            self.registered,
+            self.peer_id,
+            self.previous_conn_id,
+            ZAKURA_LIVENESS_APPEAR_TIMEOUT,
+        )
+        .await
+    }
+}
 
 /// Returns an iroh endpoint builder with relays and external address lookup disabled.
 ///
@@ -293,19 +344,25 @@ impl ZakuraHandshakeConnector {
         peer_id: &ZakuraPeerId,
         node_id: &[u8],
         direct_addresses: &[Vec<u8>],
-    ) -> bool {
+    ) -> ZakuraUpgradeRegistration {
         let Some(endpoint) = self.endpoint.as_ref() else {
-            return false;
+            return ZakuraUpgradeRegistration::Unavailable;
         };
         let Some(node_addr) = node_addr_from_hints(node_id, direct_addresses) else {
-            return false;
+            return ZakuraUpgradeRegistration::Unavailable;
         };
-        let mut registered = endpoint.supervisor().subscribe();
-        if !endpoint.ensure_upgrade_native_dial(node_addr) {
-            return false;
+        let registration_wait = ZakuraRegistrationWait::new(
+            endpoint.supervisor().subscribe_registrations(),
+            peer_id.clone(),
+        );
+        if registration_wait.is_duplicate() {
+            return ZakuraUpgradeRegistration::Duplicate;
         }
-        if wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await {
-            return true;
+        if !endpoint.ensure_upgrade_native_dial(node_addr) {
+            return ZakuraUpgradeRegistration::Unavailable;
+        }
+        if let Some(conn_id) = registration_wait.wait().await {
+            return ZakuraUpgradeRegistration::Fresh { conn_id };
         }
 
         // The hand-off did not complete within the wait window. The dial spawned
@@ -316,30 +373,35 @@ impl ZakuraHandshakeConnector {
         // drop the entry so a malicious legacy responder cannot leak unbounded
         // maintained dials and outbound QUIC traffic by repeating failed
         // upgrades with distinct node ids.
-        if !registered.borrow().iter().any(|id| id == peer_id) {
+        if !endpoint
+            .supervisor()
+            .subscribe_registrations()
+            .borrow()
+            .contains_key(peer_id)
+        {
             endpoint.cancel_upgrade_native_dial(peer_id);
         }
-        false
+        ZakuraUpgradeRegistration::Unavailable
     }
 
-    /// Wait until the upgraded peer's inbound native QUIC connection registers
-    /// with the local supervisor.
+    /// Capture the current registration generation before accepting an inbound
+    /// legacy upgrade.
     ///
     /// Used by the inbound legacy responder, which does not dial: after sending
     /// `Accept` the remote peer is expected to dial our advertised Zakura
     /// endpoint, and our iroh router registers that connection separately. The
-    /// outer handshake drops the legacy TCP connection once the upgrade is
-    /// reported, so the responder must confirm a usable Zakura replacement
-    /// exists first. Returns `false` (keep legacy) if the peer never registers
-    /// within [`ZAKURA_LIVENESS_APPEAR_TIMEOUT`] or this node has no live
-    /// endpoint, so a peer that sends a valid `Init` and then never completes
-    /// the native dial cannot make us silently drop a working legacy peer.
-    pub(crate) async fn wait_for_zakura_registration(&self, peer_id: &ZakuraPeerId) -> bool {
-        let Some(endpoint) = self.endpoint.as_ref() else {
-            return false;
-        };
-        let mut registered = endpoint.supervisor().subscribe();
-        wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await
+    /// snapshot distinguishes a fresh replacement from an unrelated incumbent
+    /// with the same claimed identity. Returns `None` if this node has no live
+    /// endpoint.
+    pub(crate) fn prepare_zakura_registration_wait(
+        &self,
+        peer_id: &ZakuraPeerId,
+    ) -> Option<ZakuraRegistrationWait> {
+        let endpoint = self.endpoint.as_ref()?;
+        Some(ZakuraRegistrationWait::new(
+            endpoint.supervisor().subscribe_registrations(),
+            peer_id.clone(),
+        ))
     }
 
     /// Keep an upgraded peer's legacy address-book entry live for the lifetime
@@ -493,6 +555,29 @@ async fn wait_for_zakura_peer(
     .unwrap_or(false)
 }
 
+/// Wait until `peer_id` has a registration generation newer than the snapshot.
+async fn wait_for_fresh_zakura_peer(
+    mut registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>>,
+    peer_id: ZakuraPeerId,
+    previous_conn_id: Option<ZakuraConnId>,
+    appear_timeout: Duration,
+) -> Option<ZakuraConnId> {
+    tokio::time::timeout(appear_timeout, async {
+        loop {
+            let conn_id = registered.borrow_and_update().get(&peer_id).copied();
+            if conn_id.is_some() && conn_id != previous_conn_id {
+                return conn_id;
+            }
+            if registered.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -580,6 +665,46 @@ mod tests {
             .parse::<std::net::SocketAddr>()
             .expect("valid socket addr")
             .into()
+    }
+
+    #[test]
+    fn registration_wait_detects_preexisting_peer() {
+        let peer_id = test_peer_id();
+        let registrations = HashMap::from([(peer_id.clone(), 7)]);
+        let (_registered_tx, registered_rx) = watch::channel(registrations);
+
+        let registration_wait = ZakuraRegistrationWait::new(registered_rx, peer_id);
+
+        assert!(registration_wait.is_duplicate());
+    }
+
+    #[tokio::test]
+    async fn registration_wait_requires_fresh_matching_generation() {
+        let peer_id = test_peer_id();
+        let (registered_tx, registered_rx) = watch::channel(HashMap::new());
+        let mut registration_wait =
+            tokio::spawn(ZakuraRegistrationWait::new(registered_rx, peer_id.clone()).wait());
+
+        let unrelated_peer =
+            ZakuraPeerId::new(vec![8u8; 32]).expect("32-byte node id is within bounds");
+        registered_tx
+            .send(HashMap::from([(unrelated_peer, 1)]))
+            .expect("registration waiter is alive");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut registration_wait)
+                .await
+                .is_err(),
+            "an unrelated registration must not complete the upgrade wait",
+        );
+
+        registered_tx
+            .send(HashMap::from([(peer_id, 2)]))
+            .expect("registration waiter is alive");
+        let conn_id = tokio::time::timeout(Duration::from_secs(1), registration_wait)
+            .await
+            .expect("the fresh peer registration completes the wait")
+            .expect("the registration waiter does not panic");
+        assert_eq!(conn_id, Some(2));
     }
 
     /// While the peer stays registered, the keeper repeatedly refreshes its

@@ -54,7 +54,10 @@ use crate::{
         ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId, ZakuraProtocolError,
         P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
-    zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
+    zakura::{
+        ZakuraHandshakeConnector, ZakuraRegistrationWait, ZakuraRejectReason, ZakuraUpgradeOutcome,
+        ZakuraUpgradeRegistration,
+    },
     BoxError, Config, PeerSocketAddr, VersionMessage,
 };
 
@@ -1240,7 +1243,7 @@ where
     // Dial the responder's Zakura endpoint over QUIC and wait for the local
     // supervisor to register a usable outbound handle before dropping the
     // legacy connection.
-    if !connector
+    match connector
         .spawn_zakura_dial_to_hints_and_wait(
             &peer_id,
             &accept.iroh_node_id,
@@ -1248,10 +1251,10 @@ where
         )
         .await
     {
-        return Ok(neutral_upgrade_fallback());
+        ZakuraUpgradeRegistration::Fresh { .. } => Ok(ZakuraUpgradeOutcome::Upgraded { peer_id }),
+        ZakuraUpgradeRegistration::Duplicate => Ok(ZakuraUpgradeOutcome::Duplicate { peer_id }),
+        ZakuraUpgradeRegistration::Unavailable => Ok(neutral_upgrade_fallback()),
     }
-
-    Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
 }
 
 /// Selects the registration wait used by the responder upgrade path.
@@ -1262,15 +1265,13 @@ enum ResponderRegistrationWait {
 }
 
 impl ResponderRegistrationWait {
-    async fn wait(self, connector: &ZakuraHandshakeConnector, peer_id: &ZakuraPeerId) -> bool {
+    async fn wait(self, registration_wait: ZakuraRegistrationWait) -> bool {
         match self {
-            Self::Production => connector.wait_for_zakura_registration(peer_id).await,
+            Self::Production => registration_wait.wait().await.is_some(),
             #[cfg(test)]
-            Self::TestTimeout(timeout) => {
-                tokio::time::timeout(timeout, connector.wait_for_zakura_registration(peer_id))
-                    .await
-                    .unwrap_or(false)
-            }
+            Self::TestTimeout(timeout) => tokio::time::timeout(timeout, registration_wait.wait())
+                .await
+                .is_ok_and(|conn_id| conn_id.is_some()),
         }
     }
 }
@@ -1309,6 +1310,15 @@ where
         }
     };
 
+    let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
+        send_upgrade_reject(peer_conn, config).await?;
+        return Ok(neutral_upgrade_fallback());
+    };
+    let Some(native_registration) = connector.prepare_zakura_registration_wait(&peer_id) else {
+        send_upgrade_reject(peer_conn, config).await?;
+        return Ok(neutral_upgrade_fallback());
+    };
+
     let mut responder_upgrade_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut responder_upgrade_nonce);
 
@@ -1335,9 +1345,9 @@ where
     };
     peer_conn.send(Message::P2pV2Upgrade(accept_bytes)).await?;
 
-    let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
-        return Ok(neutral_upgrade_fallback());
-    };
+    if native_registration.is_duplicate() {
+        return Ok(ZakuraUpgradeOutcome::Duplicate { peer_id });
+    }
 
     // The peer dials our advertised Zakura endpoint over QUIC after receiving
     // `Accept`, and our iroh router registers that inbound connection
@@ -1347,7 +1357,7 @@ where
     // and then never completes the native dial would make us discard a working
     // legacy connection with no Zakura replacement. This mirrors the initiator's
     // `spawn_zakura_dial_to_hints_and_wait` hand-off wait.
-    if !registration_wait.wait(connector, &peer_id).await {
+    if !registration_wait.wait(native_registration).await {
         return Ok(neutral_upgrade_fallback());
     }
 
