@@ -13,9 +13,9 @@ This document always writes both names in full.
 
 ## Single-planner fork choice
 
-Four sources can move the tip. Peers deliver headers. Full state verifies bodies. A node
-administrator excludes or restores a block through `invalidateblock` and
-`reconsiderblock`. Finality advances.
+Four sources can move the tip. Peers deliver headers. Full state verifies bodies. The RPC
+service handles `invalidateblock`, which excludes a block and its descendants from
+selection, and `reconsiderblock`, which removes that exclusion. Finality advances.
 
 If each source computes the move, the node runs one fork-choice implementation per source,
 and those implementations can disagree. Ordering breaks the result even when they agree: a
@@ -167,7 +167,8 @@ outside `zakura-state` holds a runtime, so transitions serialize by construction
 
 Three kinds of caller reach that file. The reactor arrives through `ApplyHeaderChainInsert`
 on the write task's channel. The state writer itself submits block commits, body outcomes,
-auxiliary results, verified-chain changes, finality, and operator actions. The write loop's
+auxiliary results, verified-chain changes, finality, and the exclusion changes from
+`invalidateblock` and `reconsiderblock`. The write loop's
 timer submits `ReevaluateDeferred` when the deadline from `earliest_deferred()` elapses,
 which is the one transition no component observed.
 
