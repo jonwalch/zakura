@@ -425,7 +425,8 @@ impl ZakuraDb {
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
-                if disk_version.cmp_precedence(self.db.format_version_in_code()) != Ordering::Less {
+                if disk_version.cmp_precedence(&self.db.format_version_in_code()) != Ordering::Less
+                {
                     DbFormatChange::check_new_blocks(self)
                         .run_format_change_or_check(
                             self,
