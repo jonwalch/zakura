@@ -5,8 +5,7 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
 
     let mut nodes = Vec::new();
@@ -63,7 +62,7 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
 fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
     let (_, _, metadata) = fixture();
     let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.clone());
+    let publisher = HeaderChainSnapshotPublisher::new(initial.clone());
     let (mirror_sender, mirror_receiver) = watch::channel(None);
 
     assert_eq!(*mirror_receiver.borrow(), None);
@@ -82,8 +81,7 @@ fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -108,8 +106,7 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -136,8 +133,7 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
 
     let genesis = VerifiedHeaderRef {
@@ -172,7 +168,7 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
         .expect("the genesis-finalized scratch path reconciles");
     let selected = runtime
         .reader()
-        .selected_hashes(block::Height(1), 4_000)
+        .selected_frontiers(block::Height(1), 4_000)
         .expect("the full block-sync window is one coherent projection read");
 
     assert_eq!(selected.len(), 4_000);
@@ -194,8 +190,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     let (engine_config, anchor, metadata) = fixture();
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
 
     let genesis = VerifiedHeaderRef {
@@ -409,8 +404,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
     let mut child_header = *anchor.header;
     child_header.previous_block_hash = anchor.hash;
@@ -455,11 +449,11 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         None
     );
     let durable_window = reader
-        .selected_auxiliary_window(child.height, child.hash)
+        .durable_selected_auxiliary_window(child.height, child.hash)
         .expect("the exact selected auxiliary window is coherent")
         .expect("the selected child is retained");
     let window = runtime
-        .selected_auxiliary_window(child.height, child.hash)
+        .committed_selected_auxiliary_window(child.height, child.hash)
         .expect("the in-memory selected auxiliary window is coherent")
         .expect("the selected child is retained in the committed engine");
     assert_eq!(window, durable_window);
@@ -472,7 +466,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .expect("the selected projection contains the child");
     assert_eq!(
         runtime
-            .selected_auxiliary_window_at_projection_index(
+            .committed_selected_auxiliary_window_at_projection_index(
                 child_index,
                 Frontier::new(child.height, child.hash),
             )
@@ -481,7 +475,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     );
     assert_eq!(
         runtime
-            .selected_auxiliary_window_at_projection_index(
+            .committed_selected_auxiliary_window_at_projection_index(
                 child_index + 1,
                 Frontier::new(child.height, child.hash),
             )
@@ -502,7 +496,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     assert!(successor_header.auxiliary_deliveries.is_empty());
     assert_eq!(
         reader
-            .selected_auxiliary_window(child.height, block::Hash([0xfe; 32]))
+            .durable_selected_auxiliary_window(child.height, block::Hash([0xfe; 32]))
             .expect("a stale branch hash is a normal read outcome"),
         None
     );
@@ -920,7 +914,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .write(corrupt)
         .expect("the contradictory auxiliary row commits");
     assert!(matches!(
-        reader.selected_auxiliary_window(anchor.height, anchor.hash),
+        reader.durable_selected_auxiliary_window(anchor.height, anchor.hash),
         Err(HeaderChainStoreError::Store(StoreError::Incoherent(
             "retained node and auxiliary delivery index disagree"
         )))

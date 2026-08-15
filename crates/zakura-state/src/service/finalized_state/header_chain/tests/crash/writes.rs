@@ -20,8 +20,7 @@ pub(super) fn crash_fixture_startup_recovery_reopens_complete_before_or_after_wi
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata.clone(), anchor.clone())
+        initialize_fixture_store(&store, metadata.clone(), anchor.clone())
             .expect("the empty schema initializes");
         let mut corrupt = DiskWriteBatch::new();
         store
@@ -137,8 +136,7 @@ pub(super) fn crash_fixture_every_state_writer_crash_point_reopens_complete_befo
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata.clone(), anchor.clone())
+        initialize_fixture_store(&store, metadata.clone(), anchor.clone())
             .expect("the empty schema initializes");
         let (runtime, _) = store
             .startup(&engine_config)
@@ -180,7 +178,7 @@ pub(super) fn crash_fixture_every_state_writer_crash_point_reopens_complete_befo
             .expect("the combined full-state marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             request,
             &context,
             full_state_batch,
@@ -238,8 +236,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata.clone(), anchor.clone())
+        initialize_fixture_store(&store, metadata.clone(), anchor.clone())
             .expect("the empty schema initializes");
         let (runtime, _) = store
             .startup(&engine_config)
@@ -289,10 +286,11 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
                 aux: Vec::new(),
             })),
         };
+        let authority = header_completion_authority(&request);
         let context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
-            full_state_authority: None,
+            full_state_authority: Some(&authority),
             retention_references: &[],
         };
         let marker_key = [marker; 4];
@@ -308,7 +306,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
             .expect("the paired full-state marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             request,
             &context,
             full_state_batch,

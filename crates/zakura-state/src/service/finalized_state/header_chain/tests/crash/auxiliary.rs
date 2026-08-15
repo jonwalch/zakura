@@ -13,8 +13,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata, anchor.clone())
+        initialize_fixture_store(&store, metadata, anchor.clone())
             .expect("the empty schema initializes");
         let (runtime, _) = store
             .startup(&engine_config)
@@ -50,30 +49,29 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             child_header.hash(),
         );
         let insertion_owner = header_owner(&initial, child.hash, 51, 52);
+        let insertion_request = TransitionRequest {
+            expected_version: initial.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner: insertion_owner,
+                source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                parent_hash: anchor.hash,
+                target_tip_hash: child.hash,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: anchor_frontier,
+                },
+                batch: insertion_batch,
+                aux: Vec::new(),
+            })),
+        };
+        let insertion_authority = header_completion_authority(&insertion_request);
         let insertion_context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
-            full_state_authority: None,
+            full_state_authority: Some(&insertion_authority),
             retention_references: &[],
         };
         runtime
-            .apply(
-                TransitionRequest {
-                    expected_version: initial.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner: insertion_owner,
-                        source: SourceId::from_digest([marker.wrapping_add(1); 32]),
-                        parent_hash: anchor.hash,
-                        target_tip_hash: child.hash,
-                        completion: TargetCompletion::TargetComplete {
-                            common_ancestor: anchor_frontier,
-                        },
-                        batch: insertion_batch,
-                        aux: Vec::new(),
-                    })),
-                },
-                &insertion_context,
-            )
+            .apply(insertion_request, &insertion_context)
             .expect("the selected repair target inserts without auxiliary metadata");
         let before = runtime.publisher().snapshot();
         assert_eq!(before.frontiers.header_best, child);
@@ -120,10 +118,26 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             }),
             authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
         };
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner: repair_owner.into(),
+                source,
+                parent_hash: anchor.hash,
+                target_tip_hash: child.hash,
+                completion: TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: anchor_frontier,
+                    selected_target: child,
+                },
+                batch: repair_batch,
+                aux: vec![delivery],
+            })),
+        };
+        let authority = header_completion_authority(&request);
         let context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
-            full_state_authority: None,
+            full_state_authority: Some(&authority),
             retention_references: &[],
         };
         let marker_key = [marker; 4];
@@ -139,22 +153,8 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             .expect("the paired selected-repair marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
-            TransitionRequest {
-                expected_version: before.state_version,
-                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner: repair_owner.into(),
-                    source,
-                    parent_hash: anchor.hash,
-                    target_tip_hash: child.hash,
-                    completion: TargetCompletion::SelectedAuxiliaryRepair {
-                        common_ancestor: anchor_frontier,
-                        selected_target: child,
-                    },
-                    batch: repair_batch,
-                    aux: vec![delivery],
-                })),
-            },
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
+            request,
             &context,
             full_state_batch,
             move || swap_probe.store(true, Ordering::SeqCst),
@@ -294,8 +294,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata, anchor.clone())
+        initialize_fixture_store(&store, metadata, anchor.clone())
             .expect("the empty schema initializes");
         let (runtime, _) = store
             .startup(&engine_config)
@@ -360,30 +359,29 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             }),
             authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
         };
+        let insertion_request = TransitionRequest {
+            expected_version: initial.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner: insertion_owner,
+                source,
+                parent_hash: anchor.hash,
+                target_tip_hash: boundary.hash,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: anchor_frontier,
+                },
+                batch,
+                aux: vec![delivery],
+            })),
+        };
+        let insertion_authority = header_completion_authority(&insertion_request);
         let insertion_context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
-            full_state_authority: None,
+            full_state_authority: Some(&insertion_authority),
             retention_references: &[],
         };
         runtime
-            .apply(
-                TransitionRequest {
-                    expected_version: initial.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner: insertion_owner,
-                        source,
-                        parent_hash: anchor.hash,
-                        target_tip_hash: boundary.hash,
-                        completion: TargetCompletion::TargetComplete {
-                            common_ancestor: anchor_frontier,
-                        },
-                        batch,
-                        aux: vec![delivery],
-                    })),
-                },
-                &insertion_context,
-            )
+            .apply(insertion_request, &insertion_context)
             .expect("the unauthenticated delivery inserts with its exact headers");
 
         let before = runtime.publisher().snapshot();
@@ -424,7 +422,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .expect("the paired auxiliary marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             request,
             &context,
             full_state_batch,
@@ -549,8 +547,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata.clone(), anchor.clone())
+        initialize_fixture_store(&store, metadata.clone(), anchor.clone())
             .expect("the empty schema initializes");
         let marker = u8::try_from(index + 0x80).expect("the rejection cases fit in u8");
         let delivery_owner =
@@ -624,7 +621,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .expect("the paired rejection marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             TransitionRequest {
                 expected_version: before.state_version,
                 event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {

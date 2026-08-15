@@ -15,8 +15,7 @@ fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
     .expect("the updated engine configuration is coherent");
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor)
+    initialize_fixture_store(&store, metadata, anchor)
         .expect("the old manifest initializes the fixture");
 
     let (runtime, report) = store
@@ -53,8 +52,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the header schema initializes");
 
     let mut child_header = *anchor.header;
@@ -69,7 +67,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
         hash: child_header.hash(),
         header: child_header,
     };
-    let (runtime, report) = store
+    let (runtime, _) = store
         .startup_reconciled(
             &engine_config,
             anchor_frontier,
@@ -78,7 +76,6 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
         )
         .expect("restored full state reconciles before publication");
 
-    assert!(report.publication_allowed);
     assert_eq!(
         runtime.publisher().snapshot().frontiers.verified_best,
         Frontier::new(child.height, child.hash)
@@ -115,6 +112,8 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
 
     drop(reopened);
     let finalized_child = Frontier::new(child.height, child.hash);
+    insert_fixture_canonical_headers(&HeaderChainStore::new(db.clone()), std::iter::once(&child))
+        .expect("the finalized child canonical row commits");
     let advanced = HeaderChainStore::new(db)
         .startup_reconciled(&engine_config, finalized_child, vec![child], Vec::new())
         .expect("a dark checkpoint gap is reconciled and finalized before publication")
@@ -136,8 +135,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the header schema initializes");
 
     let mut path = Vec::new();
@@ -162,11 +160,12 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
         parent_header = header;
     }
 
-    let (runtime, report) = store
+    insert_fixture_canonical_headers(&store, &path)
+        .expect("the authoritative finalized path canonical rows commit");
+    let (runtime, _) = store
         .startup_reconciled(&engine_config, parent, path, Vec::new())
         .expect("an oversized finalized gap reconciles in bounded chunks");
 
-    assert!(report.publication_allowed);
     assert_eq!(runtime.publisher().snapshot().frontiers.finalized, parent);
     assert_eq!(
         runtime
@@ -199,8 +198,7 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the header schema initializes");
 
     let mut path = Vec::new();
@@ -225,6 +223,8 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
         parent_header = header;
     }
 
+    insert_fixture_canonical_headers(&store, &path)
+        .expect("the streaming finalized path canonical rows commit");
     let first_attempt = store.clone().startup_reconciled_streaming(
         &engine_config,
         parent,
@@ -262,7 +262,7 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
     assert_eq!(durable_progress.next_height, block::Height(3));
 
     let requested = std::cell::RefCell::new(Vec::new());
-    let (runtime, report) = store
+    let (runtime, _) = store
         .startup_reconciled_streaming(
             &engine_config,
             parent,
@@ -274,7 +274,6 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
             |_| {},
         )
         .expect("the second attempt resumes from its committed marker");
-    assert!(report.publication_allowed);
     assert_eq!(
         requested.into_inner(),
         [block::Height(3), block::Height(4), block::Height(5)]
@@ -296,9 +295,7 @@ fn malformed_reconstruction_progress_fails_closed() {
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor)
-        .expect("the header schema initializes");
+    initialize_fixture_store(&store, metadata, anchor).expect("the header schema initializes");
     let mut corrupt = DiskWriteBatch::new();
     store
         .put_raw(
@@ -367,8 +364,7 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
     let network = engine_config.network.clone();
     let db = open(&db_config, &network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
     let mut corrupt = DiskWriteBatch::new();
     let bogus_parent = block::Hash([0x11; 32]);
@@ -474,7 +470,6 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
         VerifiedGeneration::new(2)
     );
     assert_eq!(report.current.oldest_retained_height, anchor.height);
-    assert!(report.publication_allowed);
     assert_eq!(runtime.publisher().snapshot(), report.current);
     assert_eq!(
         runtime.store.selected_hash(anchor.height),
@@ -518,8 +513,7 @@ fn authoritative_corruption_fails_before_publisher_construction() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the empty schema initializes");
     let mut corrupt = DiskWriteBatch::new();
     store
@@ -545,8 +539,7 @@ fn startup_rejects_verified_projection_without_exact_body_authority() {
     let evidence = EvidenceId::from_digest([0xa5; 32]);
     anchor.body_validation_state = BodyValidationState::Verified { evidence };
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the verified fixture initializes with body authority");
 
     let mut corrupt = DiskWriteBatch::new();

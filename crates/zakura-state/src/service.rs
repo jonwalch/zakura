@@ -2292,7 +2292,7 @@ impl Service<ReadRequest> for ReadStateService {
                 let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
                 let tip = match header_chain_reader {
                     Some(reader) => reader
-                        .selected_tip()
+                        .selected_header_tip()
                         .map(|tip| Some((tip.height, tip.hash)))?,
                     None => read::tip(state.latest_best_chain(), &state.db),
                 };
@@ -2307,7 +2307,7 @@ impl Service<ReadRequest> for ReadStateService {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
                 let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
                 let best_header_tip = match header_chain_reader {
-                    Some(reader) => Some(reader.selected_tip()?.height),
+                    Some(reader) => Some(reader.selected_header_tip()?.height),
                     None => verified_block_tip,
                 };
 

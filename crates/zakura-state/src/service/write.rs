@@ -217,7 +217,7 @@ impl PreparedFullStateTransition {
             full_state_authority: Some(&authority),
             retention_references: &retention_references,
         };
-        match runtime.apply_combined_expected(
+        match runtime.commit_expected_full_state_transition(
             header_request,
             &guarded_context,
             finalized_batch.unwrap_or_else(DiskWriteBatch::new),
@@ -356,7 +356,9 @@ impl HeaderChainWriter {
         height: block::Height,
         hash: block::Hash,
     ) -> Result<VctAuxiliaryWindowRead, HeaderChainStoreError> {
-        let selected_window = self.runtime.selected_auxiliary_window(height, hash)?;
+        let selected_window = self
+            .runtime
+            .committed_selected_auxiliary_window(height, hash)?;
         Self::prepare_vct_auxiliary_window(height, selected_window)
     }
 
@@ -368,7 +370,10 @@ impl HeaderChainWriter {
     ) -> Result<VctAuxiliaryWindowRead, HeaderChainStoreError> {
         let selected_window = self
             .runtime
-            .selected_auxiliary_window_at_projection_index(projection_index, expected_frontier)?;
+            .committed_selected_auxiliary_window_at_projection_index(
+                projection_index,
+                expected_frontier,
+            )?;
         Self::prepare_vct_auxiliary_window(expected_frontier.height, selected_window)
     }
 
@@ -588,7 +593,7 @@ impl HeaderChainWriter {
                 full_state_authority: Some(&authentication_authority),
                 retention_references: &[],
             };
-            self.runtime.apply_aux_then_checkpoint_combined(
+            self.runtime.commit_auxiliary_then_checkpoint(
                 authentication,
                 &authentication_context,
                 checkpoint_request,
@@ -597,7 +602,7 @@ impl HeaderChainWriter {
                 || {},
             )?
         } else {
-            self.runtime.apply_combined(
+            self.runtime.commit_with_full_state_batch(
                 checkpoint_request,
                 &checkpoint_context,
                 full_state_batch,

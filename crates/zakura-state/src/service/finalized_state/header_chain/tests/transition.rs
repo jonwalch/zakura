@@ -30,8 +30,7 @@ fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata.clone(), anchor)
+    initialize_fixture_store(&store, metadata.clone(), anchor)
         .expect("the finality suffix fixture initializes");
 
     let second = Frontier::new(block::Height(10), block::Hash([0x21; 32]));
@@ -122,8 +121,7 @@ fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
     let db = open(&db_config, &integrated_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the headers-only schema initializes");
     let record = FinalityRecord {
         previous: anchor_frontier,
@@ -242,8 +240,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
     let network = engine_config.network.clone();
     let db = open(&db_config, &network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("an empty header schema initializes atomically");
     assert_eq!(store.header_node(anchor.hash), Ok(Some(anchor.clone())));
     assert_eq!(store.selected_hash(anchor.height), Ok(Some(anchor.hash)));
@@ -388,8 +385,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
     };
     let (engine_config, mut anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
 
     let evidence = EvidenceId::from_digest([9; 32]);
@@ -436,8 +432,7 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -532,8 +527,7 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
     };
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the header schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -600,24 +594,29 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
     assert_ne!(after_body.state_version, initial.state_version);
     assert_eq!(after_body.header_generation, initial.header_generation);
 
-    let result = runtime
-        .apply(
-            TransitionRequest {
-                expected_version: initial.state_version,
-                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner: header_owner(&initial, child.hash, 1, 1),
-                    source: SourceId::from_digest([0x69; 32]),
-                    parent_hash: anchor_frontier.hash,
-                    target_tip_hash: child.hash,
-                    completion: TargetCompletion::TargetComplete {
-                        common_ancestor: anchor_frontier,
-                    },
-                    batch,
-                    aux: Vec::new(),
-                })),
+    let request = TransitionRequest {
+        expected_version: initial.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: header_owner(&initial, child.hash, 1, 1),
+            source: SourceId::from_digest([0x69; 32]),
+            parent_hash: anchor_frontier.hash,
+            target_tip_hash: child.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: anchor_frontier,
             },
-            &context,
-        )
+            batch,
+            aux: Vec::new(),
+        })),
+    };
+    let completion_authority = header_completion_authority(&request);
+    let completion_context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: Some(&completion_authority),
+        retention_references: &[],
+    };
+    let result = runtime
+        .apply(request, &completion_context)
         .expect("generation-current header work reaches the transition planner");
 
     assert_eq!(result, ApplyResult::Committed);
@@ -649,8 +648,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
     .expect("the near-overflow anchor retains its canonical identity");
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the near-overflow coordinate fixture initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -675,32 +673,31 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
     )
     .expect("the overflow-triggering child prepares through production validation");
     let child = Frontier::new(block::Height(1), child_header.hash());
+    let request = TransitionRequest {
+        expected_version: initial.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: header_owner(&initial, child.hash, 1, 1),
+            source: SourceId::from_digest([0x6a; 32]),
+            parent_hash: anchor.hash,
+            target_tip_hash: child.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: initial.frontiers.finalized,
+            },
+            batch,
+            aux: Vec::new(),
+        })),
+    };
+    let authority = header_completion_authority(&request);
     let context = TransitionContext {
         config: &engine_config,
         clock: &SystemClock,
-        full_state_authority: None,
+        full_state_authority: Some(&authority),
         retention_references: &[],
     };
 
     assert_eq!(
         runtime
-            .apply(
-                TransitionRequest {
-                    expected_version: initial.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner: header_owner(&initial, child.hash, 1, 1),
-                        source: SourceId::from_digest([0x6a; 32]),
-                        parent_hash: anchor.hash,
-                        target_tip_hash: child.hash,
-                        completion: TargetCompletion::TargetComplete {
-                            common_ancestor: initial.frontiers.finalized,
-                        },
-                        batch,
-                        aux: Vec::new(),
-                    })),
-                },
-                &context,
-            )
+            .apply(request, &context)
             .expect("the valid insertion lazily rebases before it commits"),
         ApplyResult::Committed
     );
@@ -756,8 +753,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor.clone())
+    initialize_fixture_store(&store, metadata, anchor.clone())
         .expect("the header schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -803,10 +799,11 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
             aux: Vec::new(),
         })),
     };
+    let authority = header_completion_authority(&request);
     let context = TransitionContext {
         config: &engine_config,
         clock: &SystemClock,
-        full_state_authority: None,
+        full_state_authority: Some(&authority),
         retention_references: &[],
     };
     let marker_key = b"resource-stall-caller-batch";
@@ -821,9 +818,10 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
         RawBytes::new_raw_bytes(vec![1]),
     );
     let swapped = AtomicBool::new(false);
-    let result = runtime.apply_combined(request.clone(), &context, caller_batch, || {
-        swapped.store(true, Ordering::SeqCst)
-    });
+    let result =
+        runtime.commit_with_full_state_batch(request.clone(), &context, caller_batch, || {
+            swapped.store(true, Ordering::SeqCst)
+        });
     assert!(matches!(
         result,
         Ok(ApplyResult::ResourceStalled(CommittedStallReceipt {
@@ -886,8 +884,7 @@ fn stale_prepared_full_state_transition_is_a_hard_error() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -966,8 +963,7 @@ fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -1038,8 +1034,7 @@ fn mismatched_staged_frontier_writes_and_swaps_nothing() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
-    store
-        .initialize(metadata.clone(), anchor.clone())
+    initialize_fixture_store(&store, metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
     let (runtime, _) = store
         .startup(&engine_config)
@@ -1059,7 +1054,7 @@ fn mismatched_staged_frontier_writes_and_swaps_nothing() {
     let expected = Frontier::new(block::Height(1), anchor.hash);
     let authority = Authority(EvidenceId::from_digest([0x74; 32]));
     let error = runtime
-        .apply_combined_expected(
+        .commit_expected_full_state_transition(
             TransitionRequest {
                 expected_version: metadata.state_version,
                 event: TransitionEvent::OperatorReconsider(
@@ -1107,32 +1102,340 @@ fn mismatched_staged_frontier_writes_and_swaps_nothing() {
     );
 }
 
-#[test]
-fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
-    let source = include_str!("../../header_chain.rs");
-    let start = source
-        .find("pub(in crate::service) fn apply_aux_then_checkpoint_combined")
-        .expect("the combined checkpoint implementation exists");
-    let end = source[start..]
-        .find("fn apply_combined_with_fault")
-        .map(|offset| start.saturating_add(offset))
-        .expect("the next runtime method bounds the combined checkpoint implementation");
-    let implementation = &source[start..end];
+fn combined_aux_checkpoint_fixture(
+    marker: u8,
+) -> (
+    HeaderChainRuntime,
+    EngineConfig,
+    EngineSnapshot,
+    TransitionRequest,
+    TransitionRequest,
+    Frontier,
+    block::Hash,
+) {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    initialize_fixture_store(&store, metadata, anchor.clone())
+        .expect("the combined checkpoint fixture initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the combined checkpoint fixture audits");
+    let initial = runtime.publisher().snapshot();
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the initialized anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated regtest policy is valid");
 
-    assert!(
-        !implementation.contains("transition_engine.clone()"),
-        "per-block VCT staging must not clone the retained header engine"
+    let mut checkpoint_header = *anchor.header;
+    checkpoint_header.previous_block_hash = anchor.hash;
+    checkpoint_header.time += chrono::Duration::seconds(1);
+    checkpoint_header.nonce.0[0] = marker;
+    let checkpoint_header = Arc::new(checkpoint_header);
+    let mut boundary_header = *checkpoint_header;
+    boundary_header.previous_block_hash = checkpoint_header.hash();
+    boundary_header.time += chrono::Duration::seconds(1);
+    boundary_header.nonce.0[0] = marker.wrapping_add(1);
+    let boundary_header = Arc::new(boundary_header);
+    let headers = [checkpoint_header.clone(), boundary_header.clone()];
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the combined checkpoint headers pass production validation");
+    let checkpoint = Frontier::new(block::Height(1), checkpoint_header.hash());
+    let boundary = Frontier::new(block::Height(2), boundary_header.hash());
+    let insertion_owner = header_owner(&initial, boundary.hash, 71, 72);
+    let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
+    let delivery = AuxDelivery {
+        delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+        header_hash: checkpoint.hash,
+        source,
+        owner: insertion_owner,
+        body_size: zakura_header_chain::BodySizeHint::Unknown,
+        tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+            height: checkpoint.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 2,
+            ironwood_tx_count: 3,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                [marker.wrapping_add(4); 32],
+            ),
+        }),
+        authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+    };
+    let insertion = TransitionRequest {
+        expected_version: initial.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: insertion_owner,
+            source,
+            parent_hash: anchor.hash,
+            target_tip_hash: boundary.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: initial.frontiers.finalized,
+            },
+            batch,
+            aux: vec![delivery],
+        })),
+    };
+    let insertion_authority = header_completion_authority(&insertion);
+    runtime
+        .apply(
+            insertion,
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&insertion_authority),
+                retention_references: &[],
+            },
+        )
+        .expect("the retained checkpoint headers and auxiliary delivery insert");
+
+    let before = runtime.publisher().snapshot();
+    let authentication_evidence = EvidenceId::from_digest([marker.wrapping_add(5); 32]);
+    let first_request = TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {
+            owner: body_owner(
+                &before,
+                insertion_owner.session_id(),
+                insertion_owner.request_id().get(),
+            ),
+            deliveries: vec![delivery],
+            authentication: zakura_header_chain::AuxAuthentication::Authenticated {
+                evidence: authentication_evidence,
+                boundary_hash: boundary.hash,
+            },
+        })),
+    };
+    let checkpoint_evidence = EvidenceId::from_digest([marker.wrapping_add(6); 32]);
+    let checkpoint_request = TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: checkpoint_evidence,
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![VerifiedHeaderRef {
+                height: checkpoint.height,
+                hash: checkpoint.hash,
+                header: checkpoint_header,
+            }],
+            cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+
+    (
+        runtime,
+        engine_config,
+        before,
+        first_request,
+        checkpoint_request,
+        checkpoint,
+        anchor.hash,
+    )
+}
+
+#[test]
+fn combined_aux_checkpoint_commits_atomically_on_the_retained_header_fast_path() {
+    let (
+        runtime,
+        engine_config,
+        before,
+        first_request,
+        checkpoint_request,
+        checkpoint,
+        anchor_hash,
+    ) = combined_aux_checkpoint_fixture(0xa1);
+    let first_authority = exact_event_authority(&first_request);
+    let checkpoint_authority = exact_event_authority(&checkpoint_request);
+    let first_context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: Some(&first_authority),
+        retention_references: &[],
+    };
+    let checkpoint_context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: Some(&checkpoint_authority),
+        retention_references: &[],
+    };
+    let mut remove_context = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(
+            &mut remove_context,
+            HEADER_VALIDATION_CONTEXT,
+            anchor_hash.0,
+        )
+        .expect("the fixture can remove the predecessor lease row");
+    runtime
+        .store
+        .db
+        .write(remove_context)
+        .expect("the predecessor lease row is absent before the retained fast path");
+
+    let marker_key = b"combined-aux-checkpoint";
+    let marker_cf = runtime
+        .store
+        .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+        .expect("the marker column exists");
+    let mut full_state_batch = DiskWriteBatch::new();
+    full_state_batch.zs_insert(
+        &marker_cf,
+        RawBytes::new_raw_bytes(marker_key.to_vec()),
+        RawBytes::new_raw_bytes(vec![0xa2]),
     );
-    assert!(
-        implementation.contains("restore_transition_engine_after_staging_error"),
-        "pre-commit staging errors must restore the unchanged durable engine"
+    let swapped = AtomicBool::new(false);
+    let result = runtime
+        .commit_auxiliary_then_checkpoint(
+            first_request,
+            &first_context,
+            checkpoint_request,
+            &checkpoint_context,
+            full_state_batch,
+            || {
+                assert_eq!(
+                    runtime
+                        .store
+                        .db
+                        .raw_get_cf(&marker_cf, marker_key)
+                        .expect("the committed full-state marker reads"),
+                    Some(vec![0xa2]),
+                    "the atomic database commit precedes the memory swap"
+                );
+                let durable = runtime
+                    .store
+                    .metadata()
+                    .expect("the committed metadata reads")
+                    .snapshot();
+                assert_eq!(durable.frontiers.finalized, checkpoint);
+                assert_eq!(durable.frontiers.verified_best, checkpoint);
+                assert_eq!(
+                    runtime.publisher().snapshot(),
+                    before,
+                    "publication must wait until after the memory swap"
+                );
+                swapped.store(true, Ordering::SeqCst);
+            },
+        )
+        .expect("the auxiliary authentication and checkpoint commit atomically");
+
+    assert_eq!(result, ApplyResult::Committed);
+    assert!(swapped.load(Ordering::SeqCst));
+    let published = runtime.publisher().snapshot();
+    assert_eq!(published.frontiers.finalized, checkpoint);
+    assert_eq!(published.frontiers.verified_best, checkpoint);
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the committed metadata remains readable")
+            .snapshot(),
+        published
     );
-    assert!(
-        implementation.contains("checkpoint_headers_are_retained"),
-        "already admitted checkpoint headers must not rebuild predecessor leases per block"
+    assert!(matches!(
+        runtime
+            .store
+            .aux_deliveries(checkpoint.hash)
+            .expect("the committed auxiliary delivery reads")
+            .as_slice(),
+        [AuxDelivery {
+            authentication: zakura_header_chain::AuxAuthentication::Authenticated { .. },
+            ..
+        }]
+    ));
+    assert_transition_engine_matches_store(&runtime);
+}
+
+#[test]
+fn combined_aux_checkpoint_restores_staging_after_second_stage_failure() {
+    let (runtime, engine_config, before, first_request, mut checkpoint_request, checkpoint, _) =
+        combined_aux_checkpoint_fixture(0xb1);
+    let TransitionEvent::VerifiedChainChanged(event) = &mut checkpoint_request.event else {
+        unreachable!("the fixture checkpoint request has the expected event kind");
+    };
+    event.old_tip = Frontier::new(
+        before.frontiers.verified_best.height,
+        block::Hash([0xff; 32]),
     );
-    assert!(
-        implementation.contains("transition_engine.graph().header_node(header.hash).is_some()"),
-        "the predecessor-lease fast path must be justified by the coherent retained graph"
+    let first_authority = exact_event_authority(&first_request);
+    let checkpoint_authority = exact_event_authority(&checkpoint_request);
+    let first_context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: Some(&first_authority),
+        retention_references: &[],
+    };
+    let checkpoint_context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: Some(&checkpoint_authority),
+        retention_references: &[],
+    };
+    let marker_key = b"failed-combined-aux-checkpoint";
+    let marker_cf = runtime
+        .store
+        .cf(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+        .expect("the marker column exists");
+    let mut full_state_batch = DiskWriteBatch::new();
+    full_state_batch.zs_insert(
+        &marker_cf,
+        RawBytes::new_raw_bytes(marker_key.to_vec()),
+        RawBytes::new_raw_bytes(vec![0xb2]),
     );
+    let swapped = AtomicBool::new(false);
+
+    let error = runtime
+        .commit_auxiliary_then_checkpoint(
+            first_request,
+            &first_context,
+            checkpoint_request,
+            &checkpoint_context,
+            full_state_batch,
+            || swapped.store(true, Ordering::SeqCst),
+        )
+        .expect_err("the incoherent second stage fails before commit");
+
+    assert!(matches!(
+        error,
+        HeaderChainStoreError::Transition(TransitionFailure::StalePreparation)
+    ));
+    assert!(!swapped.load(Ordering::SeqCst));
+    assert_eq!(runtime.publisher().snapshot(), before);
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the unchanged metadata reads")
+            .snapshot(),
+        before
+    );
+    assert_eq!(
+        runtime
+            .store
+            .db
+            .raw_get_cf(&marker_cf, marker_key)
+            .expect("the absent full-state marker reads"),
+        None
+    );
+    assert!(matches!(
+        runtime
+            .store
+            .aux_deliveries(checkpoint.hash)
+            .expect("the unchanged auxiliary delivery reads")
+            .as_slice(),
+        [AuxDelivery {
+            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+            ..
+        }]
+    ));
+    assert_transition_engine_matches_store(&runtime);
 }

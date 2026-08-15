@@ -74,6 +74,42 @@ impl FullStateEvidenceAuthority for Authority {
     }
 }
 
+struct HeaderCompletionAuthority(Box<InsertHeaders>);
+
+impl FullStateEvidenceAuthority for HeaderCompletionAuthority {
+    fn authorizes_full_state(&self, _event: &TransitionEvent) -> bool {
+        false
+    }
+
+    fn authorizes_header_completion(&self, insert: &InsertHeaders) -> bool {
+        insert == self.0.as_ref()
+    }
+}
+
+fn header_completion_authority(request: &TransitionRequest) -> HeaderCompletionAuthority {
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        panic!("header completion authority requires an insert request");
+    };
+    HeaderCompletionAuthority(insert.clone())
+}
+
+struct ExactEventAuthority(zakura_header_chain::TransitionFingerprint);
+
+impl FullStateEvidenceAuthority for ExactEventAuthority {
+    fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
+        event.fingerprint() == Some(self.0)
+    }
+}
+
+fn exact_event_authority(request: &TransitionRequest) -> ExactEventAuthority {
+    ExactEventAuthority(
+        request
+            .event
+            .fingerprint()
+            .expect("the fixture event has a stable identity"),
+    )
+}
+
 fn open(config: &Config, network: &Network) -> DiskDb {
     DiskDb::new(
         config,
@@ -86,6 +122,32 @@ fn open(config: &Config, network: &Network) -> DiskDb {
         false,
     )
     .expect("the header-chain fixture database opens")
+}
+
+fn initialize_fixture_store(
+    store: &HeaderChainStore,
+    metadata: EngineMetadata,
+    anchor: HeaderNode,
+) -> Result<(), HeaderChainStoreError> {
+    store.initialize(metadata, anchor.clone())?;
+    let hash_by_height = store.cf("hash_by_height")?;
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(&hash_by_height, anchor.height, anchor.hash);
+    store.db.write(batch)?;
+    Ok(())
+}
+
+fn insert_fixture_canonical_headers<'a>(
+    store: &HeaderChainStore,
+    headers: impl IntoIterator<Item = &'a VerifiedHeaderRef>,
+) -> Result<(), HeaderChainStoreError> {
+    let hash_by_height = store.cf("hash_by_height")?;
+    let mut batch = DiskWriteBatch::new();
+    for header in headers {
+        batch.zs_insert(&hash_by_height, header.height, header.hash);
+    }
+    store.db.write(batch)?;
+    Ok(())
 }
 
 fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {

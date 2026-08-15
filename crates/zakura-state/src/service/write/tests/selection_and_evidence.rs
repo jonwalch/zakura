@@ -176,27 +176,32 @@ fn header_valid_body_invalidity_reselects_after_authenticated_evidence() {
         child_header.hash(),
     );
     let owner = header_owner(&initial, child.hash, 1, 2);
+    let request = TransitionRequest {
+        expected_version: initial.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner,
+            source: SourceId::from_digest([3; 32]),
+            parent_hash: anchor.hash(),
+            target_tip_hash: child.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: anchor_frontier,
+            },
+            batch,
+            aux: Vec::new(),
+        })),
+    };
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        unreachable!("the fixture constructs a header insertion");
+    };
+    let authority = PreparedHeaderCompletionAuthority(insert.clone());
     writer
         .runtime
         .apply(
-            TransitionRequest {
-                expected_version: initial.state_version,
-                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner,
-                    source: SourceId::from_digest([3; 32]),
-                    parent_hash: anchor.hash(),
-                    target_tip_hash: child.hash,
-                    completion: TargetCompletion::TargetComplete {
-                        common_ancestor: anchor_frontier,
-                    },
-                    batch,
-                    aux: Vec::new(),
-                })),
-            },
+            request,
             &TransitionContext {
                 config: &writer.config,
                 clock: &SystemClock,
-                full_state_authority: None,
+                full_state_authority: Some(&authority),
                 retention_references: &[],
             },
         )

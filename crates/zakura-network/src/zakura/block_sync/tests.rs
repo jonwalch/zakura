@@ -534,8 +534,6 @@ fn state_is_only_frontier_publisher() {
     const HEADER_DRIVER: &str =
         include_str!("../../../../zakurad/src/commands/start/zakura/header_sync_driver.rs");
     const NODE_WIRING: &str = include_str!("../../../../zakurad/src/commands/start.rs");
-    const STATE_PUBLISHER: &str =
-        include_str!("../../../../zakura-state/src/service/finalized_state/header_chain.rs");
 
     for (name, source) in [
         ("block-sync driver", BLOCK_DRIVER),
@@ -559,12 +557,6 @@ fn state_is_only_frontier_publisher() {
             );
         }
     }
-
-    assert!(
-        STATE_PUBLISHER.contains("pub struct Publisher")
-            && STATE_PUBLISHER.contains("fn publish(&self, snapshot: EngineSnapshot)"),
-        "state must retain the sole committed-snapshot publisher"
-    );
 }
 
 #[tokio::test]

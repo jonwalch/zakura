@@ -91,7 +91,7 @@ impl DeferredHeaderMaintenance for TestDeferredMaintenance {
         Ok(self
             .deadlines
             .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .map_err(|_| HeaderChainStoreError::SynchronizationPoisoned)?
             .front()
             .copied())
     }
@@ -105,12 +105,12 @@ impl DeferredHeaderMaintenance for TestDeferredMaintenance {
         let mut deadlines = self
             .deadlines
             .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            .map_err(|_| HeaderChainStoreError::SynchronizationPoisoned)?;
         deadlines.pop_front();
         if deadlines.is_empty() {
             self.sender
                 .lock()
-                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+                .map_err(|_| HeaderChainStoreError::SynchronizationPoisoned)?
                 .take();
         }
         Ok(())

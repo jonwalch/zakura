@@ -14,8 +14,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
             let network = engine_config.network.clone();
             let db = open(&db_config, &network);
             let store = HeaderChainStore::new(db.clone());
-            store
-                .initialize(metadata, anchor.clone())
+            initialize_fixture_store(&store, metadata, anchor.clone())
                 .expect("the empty schema initializes");
             let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
             let child_height = anchor
@@ -102,7 +101,7 @@ pub(super) fn crash_fixture_verified_grow_and_reset_reopen_complete_before_or_af
                 .expect("the paired verified-path marker can be staged");
             let memory_swapped = Arc::new(AtomicBool::new(false));
             let swap_probe = memory_swapped.clone();
-            let result = runtime.apply_combined_with_fault(
+            let result = runtime.commit_durable_fact_bound_transition_with_fault(
                 request,
                 &context,
                 full_state_batch,
@@ -242,8 +241,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
             let network = engine_config.network.clone();
             let db = open(&db_config, &network);
             let store = HeaderChainStore::new(db.clone());
-            store
-                .initialize(metadata, anchor.clone())
+            initialize_fixture_store(&store, metadata, anchor.clone())
                 .expect("the empty schema initializes");
             let (runtime, _) = store
                 .startup(&engine_config)
@@ -352,7 +350,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 .expect("the paired retry marker can be staged");
             let memory_swapped = Arc::new(AtomicBool::new(false));
             let swap_probe = memory_swapped.clone();
-            let result = runtime.apply_combined_with_fault(
+            let result = runtime.commit_durable_fact_bound_transition_with_fault(
                 TransitionRequest {
                     expected_version: before.state_version,
                     event,
@@ -490,8 +488,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
             let network = engine_config.network.clone();
             let db = open(&db_config, &network);
             let store = HeaderChainStore::new(db.clone());
-            store
-                .initialize(metadata, anchor.clone())
+            initialize_fixture_store(&store, metadata, anchor.clone())
                 .expect("the empty schema initializes");
             let (runtime, _) = store
                 .startup(&engine_config)
@@ -528,30 +525,29 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 child_header.hash(),
             );
             let owner = header_owner(&initial, child.hash, 41, 42);
+            let insertion_request = TransitionRequest {
+                expected_version: initial.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner,
+                    source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: child.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: anchor_frontier,
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            };
+            let insertion_authority = header_completion_authority(&insertion_request);
             let insertion_context = TransitionContext {
                 config: &engine_config,
                 clock: &SystemClock,
-                full_state_authority: None,
+                full_state_authority: Some(&insertion_authority),
                 retention_references: &[],
             };
             runtime
-                .apply(
-                    TransitionRequest {
-                        expected_version: initial.state_version,
-                        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                            owner,
-                            source: SourceId::from_digest([marker.wrapping_add(1); 32]),
-                            parent_hash: anchor.hash,
-                            target_tip_hash: child.hash,
-                            completion: TargetCompletion::TargetComplete {
-                                common_ancestor: anchor_frontier,
-                            },
-                            batch,
-                            aux: Vec::new(),
-                        })),
-                    },
-                    &insertion_context,
-                )
+                .apply(insertion_request, &insertion_context)
                 .expect("the selected body-conclusion fixture commits");
             let before = runtime.publisher().snapshot();
             assert_eq!(before.frontiers.header_best, child);
@@ -603,7 +599,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 .expect("the paired body-conclusion marker can be staged");
             let memory_swapped = Arc::new(AtomicBool::new(false));
             let swap_probe = memory_swapped.clone();
-            let result = runtime.apply_combined_with_fault(
+            let result = runtime.commit_durable_fact_bound_transition_with_fault(
                 TransitionRequest {
                     expected_version: before.state_version,
                     event,

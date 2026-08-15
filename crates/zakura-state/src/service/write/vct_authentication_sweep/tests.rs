@@ -36,7 +36,7 @@ use crate::{
             verify_commitment_roots, CommitmentRootVerification,
         },
         non_finalized_state::NonFinalizedState,
-        write::{HeaderChainWriter, VctAuxiliaryWindowRead},
+        write::{HeaderChainWriter, PreparedHeaderCompletionAuthority, VctAuxiliaryWindowRead},
     },
     CheckpointVerifiedBlock, Config,
 };
@@ -420,28 +420,33 @@ impl Fixture {
             })
             .collect();
 
+        let request = TransitionRequest {
+            expected_version: snapshot.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner,
+                source,
+                parent_hash: parent.hash(),
+                target_tip_hash,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: snapshot.frontiers.finalized,
+                },
+                batch,
+                aux,
+            })),
+        };
+        let TransitionEvent::InsertHeaders(insert) = &request.event else {
+            unreachable!("the fixture constructs a header insertion");
+        };
+        let authority = PreparedHeaderCompletionAuthority(insert.clone());
         let result = self
             .writer
             .runtime
             .apply(
-                TransitionRequest {
-                    expected_version: snapshot.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner,
-                        source,
-                        parent_hash: parent.hash(),
-                        target_tip_hash,
-                        completion: TargetCompletion::TargetComplete {
-                            common_ancestor: snapshot.frontiers.finalized,
-                        },
-                        batch,
-                        aux,
-                    })),
-                },
+                request,
                 &TransitionContext {
                     config: &self.writer.config,
                     clock: &SystemClock,
-                    full_state_authority: None,
+                    full_state_authority: Some(&authority),
                     retention_references: &[],
                 },
             )
@@ -509,32 +514,37 @@ impl Fixture {
             tree_aux: Some(record),
             authentication: AuxAuthentication::Unauthenticated,
         };
+        let request = TransitionRequest {
+            expected_version: snapshot.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner,
+                source,
+                parent_hash: parent.hash(),
+                target_tip_hash: target.hash(),
+                completion: TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: Frontier::new(
+                        Height(height.0.saturating_sub(1)),
+                        parent.hash(),
+                    ),
+                    selected_target: Frontier::new(height, target.hash()),
+                },
+                batch,
+                aux: vec![delivery],
+            })),
+        };
+        let TransitionEvent::InsertHeaders(insert) = &request.event else {
+            unreachable!("the fixture constructs a header insertion");
+        };
+        let authority = PreparedHeaderCompletionAuthority(insert.clone());
         let result = self
             .writer
             .runtime
             .apply(
-                TransitionRequest {
-                    expected_version: snapshot.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner,
-                        source,
-                        parent_hash: parent.hash(),
-                        target_tip_hash: target.hash(),
-                        completion: TargetCompletion::SelectedAuxiliaryRepair {
-                            common_ancestor: Frontier::new(
-                                Height(height.0.saturating_sub(1)),
-                                parent.hash(),
-                            ),
-                            selected_target: Frontier::new(height, target.hash()),
-                        },
-                        batch,
-                        aux: vec![delivery],
-                    })),
-                },
+                request,
                 &TransitionContext {
                     config: &self.writer.config,
                     clock: &SystemClock,
-                    full_state_authority: None,
+                    full_state_authority: Some(&authority),
                     retention_references: &[],
                 },
             )
@@ -547,7 +557,7 @@ impl Fixture {
         let window = self
             .writer
             .runtime
-            .selected_auxiliary_window(height, hash)
+            .committed_selected_auxiliary_window(height, hash)
             .expect("the selected auxiliary window is coherent")
             .expect("the selected auxiliary header exists");
         window

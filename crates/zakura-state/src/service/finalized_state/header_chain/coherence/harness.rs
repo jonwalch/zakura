@@ -28,7 +28,7 @@ use super::{
                 Config,
             },
             disk_format::{header_chain::HeaderHeightKey, IntoDisk},
-            DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
+            DiskDb, DiskWriteBatch, WriteDisk, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY,
         HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
@@ -102,6 +102,18 @@ struct Authority(EvidenceId);
 impl FullStateEvidenceAuthority for Authority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         event.idempotency_key() == Some(self.0)
+    }
+}
+
+struct HeaderCompletionAuthority(Box<InsertHeaders>);
+
+impl FullStateEvidenceAuthority for HeaderCompletionAuthority {
+    fn authorizes_full_state(&self, _event: &TransitionEvent) -> bool {
+        false
+    }
+
+    fn authorizes_header_completion(&self, insert: &InsertHeaders) -> bool {
+        insert == self.0.as_ref()
     }
 }
 
@@ -184,6 +196,15 @@ impl Harness {
         store
             .initialize(metadata, anchor)
             .expect("the fresh coherence schema initializes");
+        let hash_by_height = store
+            .cf("hash_by_height")
+            .expect("the finalized canonical index exists");
+        let mut canonical = DiskWriteBatch::new();
+        canonical.zs_insert(&hash_by_height, frontier.height, frontier.hash);
+        store
+            .db
+            .write(canonical)
+            .expect("the coherence anchor canonical row commits");
         let (runtime, report) = store
             .startup(&config)
             .expect("the initialized coherence store audits");
@@ -410,33 +431,38 @@ impl Harness {
             .next_request_id
             .checked_add(1)
             .expect("the bounded coherence sequence cannot exhaust request IDs");
+        let request = TransitionRequest {
+            expected_version: snapshot.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner: zakura_header_chain::HeaderWorkOwner {
+                    authority: zakura_header_chain::HeaderWorkAuthority::for_target(
+                        &snapshot,
+                        target.hash,
+                    ),
+                    session_id: 1,
+                    request_id,
+                }
+                .into(),
+                source: SourceId::from_digest([0x51; 32]),
+                parent_hash: anchor_hash,
+                target_tip_hash: target.hash,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: lease.parent(),
+                },
+                batch,
+                aux: Vec::new(),
+            })),
+        };
+        let TransitionEvent::InsertHeaders(insert) = &request.event else {
+            unreachable!("the coherence request is an insert");
+        };
+        let authority = HeaderCompletionAuthority(insert.clone());
         let result = self.runtime().apply(
-            TransitionRequest {
-                expected_version: snapshot.state_version,
-                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner: zakura_header_chain::HeaderWorkOwner {
-                        authority: zakura_header_chain::HeaderWorkAuthority::for_target(
-                            &snapshot,
-                            target.hash,
-                        ),
-                        session_id: 1,
-                        request_id,
-                    }
-                    .into(),
-                    source: SourceId::from_digest([0x51; 32]),
-                    parent_hash: anchor_hash,
-                    target_tip_hash: target.hash,
-                    completion: TargetCompletion::TargetComplete {
-                        common_ancestor: lease.parent(),
-                    },
-                    batch,
-                    aux: Vec::new(),
-                })),
-            },
+            request,
             &TransitionContext {
                 config: &self.config,
                 clock: &SystemClock,
-                full_state_authority: None,
+                full_state_authority: Some(&authority),
                 retention_references: &[],
             },
         );
@@ -549,9 +575,18 @@ impl Harness {
         let snapshot = self.runtime().publisher().snapshot();
         let evidence = self.next_evidence(0x70);
         let authority = Authority(evidence);
+        let hash_by_height = self
+            .runtime()
+            .store
+            .cf("hash_by_height")
+            .expect("the finalized canonical index exists");
+        let mut full_state_batch = DiskWriteBatch::new();
+        for frontier in &self.verified_path[1..=advance] {
+            full_state_batch.zs_insert(&hash_by_height, frontier.height, frontier.hash);
+        }
         let result = self
             .runtime()
-            .apply(
+            .commit_with_full_state_batch(
                 TransitionRequest {
                     expected_version: snapshot.state_version,
                     event: TransitionEvent::FullStateFinalized(FullStateFinalized {
@@ -566,6 +601,8 @@ impl Harness {
                     full_state_authority: Some(&authority),
                     retention_references: &[],
                 },
+                full_state_batch,
+                || {},
             )
             .expect("authenticated full-state finality reaches the writer");
         assert!(matches!(result, ApplyResult::Committed));

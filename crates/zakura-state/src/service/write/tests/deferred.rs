@@ -139,31 +139,33 @@ fn idle_writer_promotes_a_due_persisted_deferred_header() {
         future_header.hash(),
     );
     let owner = header_owner(&initial, future.hash, 41, 42);
+    let request = TransitionRequest {
+        expected_version: initial.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner,
+            source: SourceId::from_digest([0xd1; 32]),
+            parent_hash: anchor.hash(),
+            target_tip_hash: future.hash,
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: Frontier::new(anchor_height, anchor.hash()),
+            },
+            batch,
+            aux: Vec::new(),
+        })),
+    };
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        unreachable!("the fixture constructs a header insertion");
+    };
+    let authority = PreparedHeaderCompletionAuthority(insert.clone());
     let insertion_context = TransitionContext {
         config: &writer.config,
         clock: &preparation_clock,
-        full_state_authority: None,
+        full_state_authority: Some(&authority),
         retention_references: &[],
     };
     writer
         .runtime
-        .apply(
-            TransitionRequest {
-                expected_version: initial.state_version,
-                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                    owner,
-                    source: SourceId::from_digest([0xd1; 32]),
-                    parent_hash: anchor.hash(),
-                    target_tip_hash: future.hash,
-                    completion: TargetCompletion::TargetComplete {
-                        common_ancestor: Frontier::new(anchor_height, anchor.hash()),
-                    },
-                    batch,
-                    aux: Vec::new(),
-                })),
-            },
-            &insertion_context,
-        )
+        .apply(request, &insertion_context)
         .expect("the deferred header insertion commits");
     assert_eq!(
         writer

@@ -19,7 +19,7 @@ use super::{
     super::{
         super::super::constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
         disk_format::{header_chain::HeaderFinalityKey, IntoDisk},
-        DiskDb, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
+        DiskDb, DiskWriteBatch, WriteDisk, STATE_COLUMN_FAMILIES_IN_CODE,
     },
     HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
     HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED,
@@ -71,11 +71,13 @@ struct LogicalRow {
 /// Replay bounded raw row mutations through the production startup audit and repair path.
 pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
     let (config, anchor, metadata) = fixture();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
     let db = open(&config.network);
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata.clone(), anchor)
         .expect("the fixed authenticated recovery fixture initializes");
+    install_canonical_anchor(&store, anchor_frontier);
 
     let mut rows = logical_dump(&store);
     let mut mutations = 0;
@@ -106,7 +108,6 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
         replay_mode_operations(&mode_operations);
     match store.startup(&config) {
         Ok((runtime, report)) => {
-            assert!(report.publication_allowed);
             assert_eq!(
                 report.current.frontiers, metadata.frontiers,
                 "recovery never publishes a frontier absent from authenticated source rows"
@@ -205,6 +206,7 @@ fn replay_mode_operations(operations: &[[u8; 4]]) -> (usize, usize, usize) {
         store
             .initialize(metadata, anchor)
             .expect("the bounded headers-only migration fixture initializes");
+        install_canonical_anchor(&store, anchor_frontier);
         let record = FinalityRecord {
             previous: anchor_frontier,
             current: anchor_frontier,
@@ -250,7 +252,6 @@ fn replay_mode_operations(operations: &[[u8; 4]]) -> (usize, usize, usize) {
 
         let (runtime, report) = result.expect("the exact authenticated pin permits migration");
         assert_eq!(report.current.mode, EngineMode::Integrated);
-        assert!(report.publication_allowed);
         assert!(matches!(
             runtime.store.finality_history().as_deref(),
             Ok([FinalityRecord {
@@ -308,6 +309,18 @@ fn replay_mode_operations(operations: &[[u8; 4]]) -> (usize, usize, usize) {
         refutations += 1;
     }
     (migrations, rejections, refutations)
+}
+
+fn install_canonical_anchor(store: &HeaderChainStore, anchor: Frontier) {
+    let hash_by_height = store
+        .cf("hash_by_height")
+        .expect("the finalized canonical index exists");
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(&hash_by_height, anchor.height, anchor.hash);
+    store
+        .db
+        .write(batch)
+        .expect("the canonical anchor row commits");
 }
 
 struct FuzzAuthority(EvidenceId);

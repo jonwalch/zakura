@@ -13,8 +13,7 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata, anchor.clone())
+        initialize_fixture_store(&store, metadata, anchor.clone())
             .expect("the empty schema initializes");
         let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
         let mut child_header = *anchor.header;
@@ -74,6 +73,11 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
         };
         let marker_key = [marker; 4];
         let mut full_state_batch = DiskWriteBatch::new();
+        let hash_by_height = runtime
+            .store
+            .cf("hash_by_height")
+            .expect("the finalized canonical index exists");
+        full_state_batch.zs_insert(&hash_by_height, child.height, child.hash);
         runtime
             .store
             .put_raw(
@@ -85,7 +89,7 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
             .expect("the paired finality marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             request,
             &context,
             full_state_batch,
@@ -245,8 +249,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
             let network = engine_config.network.clone();
             let db = open(&db_config, &network);
             let store = HeaderChainStore::new(db.clone());
-            store
-                .initialize(metadata, anchor.clone())
+            initialize_fixture_store(&store, metadata, anchor.clone())
                 .expect("the empty schema initializes");
             let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
             let child_height = anchor
@@ -297,30 +300,29 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
             .expect("the equal-work competitor prepares through production validation");
             let before_insert = runtime.publisher().snapshot();
             let owner = header_owner(&before_insert, higher.hash, 1, 1);
+            let request = TransitionRequest {
+                expected_version: before_insert.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner,
+                    source: SourceId::from_digest([0xc1; 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: higher.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: anchor_frontier,
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            };
+            let authority = header_completion_authority(&request);
             let context = TransitionContext {
                 config: &engine_config,
                 clock: &SystemClock,
-                full_state_authority: None,
+                full_state_authority: Some(&authority),
                 retention_references: &[],
             };
             runtime
-                .apply(
-                    TransitionRequest {
-                        expected_version: before_insert.state_version,
-                        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                            owner,
-                            source: SourceId::from_digest([0xc1; 32]),
-                            parent_hash: anchor.hash,
-                            target_tip_hash: higher.hash,
-                            completion: TargetCompletion::TargetComplete {
-                                common_ancestor: anchor_frontier,
-                            },
-                            batch,
-                            aux: Vec::new(),
-                        })),
-                    },
-                    &context,
-                )
+                .apply(request, &context)
                 .expect("the higher raw-hash competitor commits");
             assert_eq!(runtime.publisher().snapshot().frontiers.header_best, higher);
             assert_eq!(
@@ -400,7 +402,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
                 .expect("the paired operator marker can be staged");
             let memory_swapped = Arc::new(AtomicBool::new(false));
             let swap_probe = memory_swapped.clone();
-            let result = runtime.apply_combined_with_fault(
+            let result = runtime.commit_durable_fact_bound_transition_with_fault(
                 TransitionRequest {
                     expected_version: before.state_version,
                     event,

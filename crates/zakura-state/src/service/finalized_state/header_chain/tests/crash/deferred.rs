@@ -24,8 +24,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata, anchor.clone())
+        initialize_fixture_store(&store, metadata, anchor.clone())
             .expect("the empty schema initializes");
         let (runtime, _) = store
             .startup(&engine_config)
@@ -71,30 +70,29 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
             future_header.hash(),
         );
         let owner = header_owner(&initial, future.hash, 31, 32);
+        let insertion_request = TransitionRequest {
+            expected_version: initial.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                owner,
+                source: SourceId::from_digest([marker.wrapping_add(1); 32]),
+                parent_hash: anchor.hash,
+                target_tip_hash: future.hash,
+                completion: TargetCompletion::TargetComplete {
+                    common_ancestor: anchor_frontier,
+                },
+                batch,
+                aux: Vec::new(),
+            })),
+        };
+        let insertion_authority = header_completion_authority(&insertion_request);
         let insertion_context = TransitionContext {
             config: &engine_config,
             clock: &preparation_clock,
-            full_state_authority: None,
+            full_state_authority: Some(&insertion_authority),
             retention_references: &[],
         };
         runtime
-            .apply(
-                TransitionRequest {
-                    expected_version: initial.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner,
-                        source: SourceId::from_digest([marker.wrapping_add(1); 32]),
-                        parent_hash: anchor.hash,
-                        target_tip_hash: future.hash,
-                        completion: TargetCompletion::TargetComplete {
-                            common_ancestor: anchor_frontier,
-                        },
-                        batch,
-                        aux: Vec::new(),
-                    })),
-                },
-                &insertion_context,
-            )
+            .apply(insertion_request, &insertion_context)
             .expect("the deferred header insertion commits");
         let before = runtime.publisher().snapshot();
         assert_eq!(before.frontiers.header_best, anchor_frontier);
@@ -141,7 +139,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
             .expect("the paired reevaluation marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             TransitionRequest {
                 expected_version: before.state_version,
                 event: TransitionEvent::ReevaluateDeferred,
@@ -281,8 +279,7 @@ pub(super) fn crash_fixture_migrated_pin_refutation_fails_closed_at_every_reacha
         let network = integrated_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata, anchor)
+        initialize_fixture_store(&store, metadata, anchor)
             .expect("the headers-only schema initializes");
         let migrated_record = FinalityRecord {
             previous: anchor_frontier,
@@ -332,7 +329,7 @@ pub(super) fn crash_fixture_migrated_pin_refutation_fails_closed_at_every_reacha
             .expect("the paired refutation marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             TransitionRequest {
                 expected_version: before.state_version,
                 event: TransitionEvent::MigratedPinRefutation(
@@ -453,8 +450,7 @@ pub(super) fn crash_fixture_no_change_crash_points_preserve_the_paired_full_stat
         let network = engine_config.network.clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
-        store
-            .initialize(metadata.clone(), anchor.clone())
+        initialize_fixture_store(&store, metadata.clone(), anchor.clone())
             .expect("the empty schema initializes");
         let (runtime, _) = store
             .startup(&engine_config)
@@ -494,7 +490,7 @@ pub(super) fn crash_fixture_no_change_crash_points_preserve_the_paired_full_stat
             .expect("the paired full-state marker can be staged");
         let memory_swapped = Arc::new(AtomicBool::new(false));
         let swap_probe = memory_swapped.clone();
-        let result = runtime.apply_combined_with_fault(
+        let result = runtime.commit_durable_fact_bound_transition_with_fault(
             request,
             &context,
             full_state_batch,
