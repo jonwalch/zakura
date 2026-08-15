@@ -1141,9 +1141,7 @@ async fn record_zakura_upgrade(
     connector: &ZakuraHandshakeConnector,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) {
-    let (ZakuraUpgradeOutcome::Upgraded { peer_id } | ZakuraUpgradeOutcome::Duplicate { peer_id }) =
-        outcome
-    else {
+    let ZakuraUpgradeOutcome::Upgraded { peer_id } = outcome else {
         return;
     };
 

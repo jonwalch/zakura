@@ -94,6 +94,12 @@ fn upgraded_outcome() -> ZakuraUpgradeOutcome {
     }
 }
 
+fn duplicate_outcome() -> ZakuraUpgradeOutcome {
+    ZakuraUpgradeOutcome::Duplicate {
+        peer_id: ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds"),
+    }
+}
+
 async fn negotiate_test_pair(
     local_config: Config,
     remote_config: Config,
@@ -977,6 +983,59 @@ async fn mutual_p2p_v2_selected_upgrade_records_peer_metadata() {
             && user_agent == TEST_HANDSHAKE_USER_AGENT
             && *version == constants::CURRENT_NETWORK_PROTOCOL_VERSION
     }));
+    assert_eq!(local_counter.update_count(), 0);
+    assert_eq!(remote_counter.update_count(), 0);
+}
+
+#[tokio::test]
+async fn mutual_p2p_v2_duplicate_upgrade_does_not_record_peer_metadata() {
+    let _init_guard = zakura_test::init();
+
+    let (local_stream, remote_stream) = duplex(16 * 1024);
+    let (address_book_tx, mut address_book_rx) = tokio::sync::mpsc::channel(8);
+    let local_calls = Arc::new(AtomicUsize::new(0));
+    let remote_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut local_counter = ActiveConnectionCounter::new_counter();
+    let mut remote_counter = ActiveConnectionCounter::new_counter();
+
+    let local_handshake = test_handshake(
+        test_config(P2pStack::Dual),
+        address_book_tx.clone(),
+        local_calls.clone(),
+        duplicate_outcome(),
+    );
+    let remote_handshake = test_handshake(
+        test_config(P2pStack::Dual),
+        address_book_tx,
+        remote_calls.clone(),
+        duplicate_outcome(),
+    );
+
+    let local_task = tokio::spawn(local_handshake.oneshot(HandshakeRequest {
+        data_stream: local_stream,
+        connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(18233)),
+        connection_tracker: local_counter.track_connection(),
+    }));
+    let remote_task = tokio::spawn(remote_handshake.oneshot(HandshakeRequest {
+        data_stream: remote_stream,
+        connected_addr: ConnectedAddr::new_inbound_direct(peer_addr(28233)),
+        connection_tracker: remote_counter.track_connection(),
+    }));
+
+    let local_error = local_task.await.unwrap().unwrap_err();
+    let remote_error = remote_task.await.unwrap().unwrap_err();
+
+    assert!(local_error
+        .downcast_ref::<HandshakeError>()
+        .is_some_and(|error| matches!(error, HandshakeError::ZakuraUpgradeSelected)));
+    assert!(remote_error
+        .downcast_ref::<HandshakeError>()
+        .is_some_and(|error| matches!(error, HandshakeError::ZakuraUpgradeSelected)));
+
+    assert_eq!(local_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(remote_calls.load(Ordering::SeqCst), 1);
+    assert!(address_book_rx.try_recv().is_err());
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
 }
