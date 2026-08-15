@@ -124,11 +124,14 @@ impl Oracle {
     fn suffix_work_from(&self, from: Height) -> PartialCumulativeWork {
         let mut work = PartialCumulativeWork::zero();
         for (_height, hash) in self.committed.range(from..) {
-            work += self
+            let row_work = self
                 .index
                 .get(hash)
                 .expect("committed hashes come from the universe")
                 .work;
+            work = work
+                .checked_add(row_work)
+                .expect("fabricated runs stay far below the 256-bit work boundary");
         }
         work
     }
@@ -161,7 +164,9 @@ impl Oracle {
             let mut new_work = PartialCumulativeWork::zero();
             for row in &range.rows {
                 if row.height >= first_conflict {
-                    new_work += row.work;
+                    new_work = new_work
+                        .checked_add(row.work)
+                        .expect("fabricated runs stay far below the 256-bit work boundary");
                 }
             }
             if new_work <= existing_work {

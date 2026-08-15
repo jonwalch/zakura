@@ -485,6 +485,12 @@ pub enum CommitHeaderRangeError {
     #[error("header height overflow")]
     HeightOverflow,
 
+    /// Summing a conflicting suffix's work overflowed, so the most-work
+    /// comparison cannot be made. Reject the range rather than compare a
+    /// truncated sum.
+    #[error("header range cumulative work overflow")]
+    WorkOverflow,
+
     /// A header in the range does not link to the anchor or to its predecessor,
     /// so committing it would break the header store's linkage invariant.
     #[error(
@@ -755,6 +761,13 @@ pub enum ValidateContextError {
         expected_difficulty: CompactDifficulty,
     },
 
+    #[error("cumulative chain work overflows at block {block_hash} ({height:?})")]
+    #[non_exhaustive]
+    CumulativeWorkOverflow {
+        height: block::Height,
+        block_hash: block::Hash,
+    },
+
     #[error("transparent double-spend: {outpoint:?} is spent twice in {location:?}")]
     #[non_exhaustive]
     DuplicateTransparentSpend {
@@ -1004,6 +1017,7 @@ impl ValidateContextError {
             | ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. }
             | ValidateContextError::VctBlockAuthDataRootMismatch { .. }
             | ValidateContextError::VctSproutHandoffRootMismatch { .. }
+            | ValidateContextError::CumulativeWorkOverflow { .. }
             | ValidateContextError::OrphanedBlock { .. }
             | ValidateContextError::NoteCommitmentTreeError(_)
             | ValidateContextError::HistoryTreeError(_) => 0,

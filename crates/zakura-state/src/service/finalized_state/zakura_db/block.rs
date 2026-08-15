@@ -2254,7 +2254,11 @@ impl DiskWriteBatch {
                     // A stored header passed difficulty validation when committed, so
                     // its threshold always converts to work; skip defensively if not.
                     if let Some(work) = existing_header.difficulty_threshold.to_work() {
-                        existing_work += work;
+                        // Fail closed on overflow. Dropping a term would understate the
+                        // side it lands on, which is the exact comparison this gate makes.
+                        existing_work = existing_work
+                            .checked_add(work)
+                            .ok_or(CommitHeaderRangeError::WorkOverflow)?;
                     }
                 }
             }
@@ -2263,7 +2267,9 @@ impl DiskWriteBatch {
             for (height, _hash, header, _body_size) in &validated_headers {
                 if *height >= first_conflicting_height {
                     if let Some(work) = header.difficulty_threshold.to_work() {
-                        new_work += work;
+                        new_work = new_work
+                            .checked_add(work)
+                            .ok_or(CommitHeaderRangeError::WorkOverflow)?;
                     }
                 }
             }

@@ -2892,12 +2892,16 @@ where
 
         let solution_rate = match response {
             // zcashd returns a 0 rate when the calculation is invalid
-            ReadResponse::SolutionRate(solution_rate) => solution_rate.unwrap_or(0),
+            ReadResponse::SolutionRate(solution_rate) => solution_rate.unwrap_or_default(),
 
             _ => unreachable!("unmatched response to a solution rate request"),
         };
 
-        Ok(u64::try_from(solution_rate).unwrap_or(u64::MAX))
+        // The RPC response stays u64 for zcashd compatibility, but cumulative work is exact
+        // 256-bit. A custom network that relaxes the difficulty-adjustment check (see
+        // `disable_pow` in `zakura-state`'s contextual validation) can declare a target low
+        // enough to push the rate past u64, so saturate rather than panic.
+        Ok(solution_rate.min(U256::from(u64::MAX)).as_u64())
     }
 
     async fn get_network_info(&self) -> Result<GetNetworkInfoResponse> {

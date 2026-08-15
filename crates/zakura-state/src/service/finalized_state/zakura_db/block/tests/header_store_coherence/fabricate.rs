@@ -176,7 +176,9 @@ pub(crate) fn fabricate_body(fab: &FabHeader) -> Arc<Block> {
 pub(crate) fn total_work(headers: &[FabHeader]) -> PartialCumulativeWork {
     let mut total = PartialCumulativeWork::zero();
     for fab in headers {
-        total += fab.work;
+        total = total
+            .checked_add(fab.work)
+            .expect("fabricated runs stay far below the 256-bit work boundary");
     }
     total
 }
