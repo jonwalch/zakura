@@ -9,7 +9,9 @@ use zakura_chain::{
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
     serialization::{DateTime32, Duration32},
-    work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
+    work::difficulty::{
+        CompactDifficulty, ParameterDifficulty as _, PartialCumulativeWork, Work, U256,
+    },
 };
 
 use crate::{
@@ -248,14 +250,12 @@ fn difficulty_time_and_history_tree(
     let cur_time = cur_time.clamp(min_time, max_time);
 
     // Now that we have a valid time, get the difficulty for that time.
-    let difficulty_adjustment = AdjustedDifficulty::new_from_header_time(
+    let expected_difficulty = mining_template_expected_difficulty(
+        network,
         cur_time.into(),
         tip_height,
-        network,
         relevant_data.iter().cloned(),
-    )
-    .expect("the mining template requires a complete committed difficulty context");
-    let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
+    );
 
     let mut result = GetBlockTemplateChainInfo {
         tip_hash,
@@ -272,6 +272,31 @@ fn difficulty_time_and_history_tree(
     result
 }
 
+/// Expected compact target for a mining template candidate block.
+///
+/// When PoW is disabled, contextual validation does not enforce `ThresholdBits`, so a
+/// committed averaging window can contain tiny targets that truncate that formula to zero.
+/// Return the network target limit instead of computing an unenforced threshold.
+fn mining_template_expected_difficulty(
+    network: &Network,
+    candidate_time: DateTime<Utc>,
+    previous_block_height: Height,
+    relevant_data: impl IntoIterator<Item = (CompactDifficulty, DateTime<Utc>)>,
+) -> CompactDifficulty {
+    if network.disable_pow() {
+        return network.target_difficulty_limit().to_compact();
+    }
+
+    AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_block_height,
+        network,
+        relevant_data,
+    )
+    .expect("the mining template requires a complete committed difficulty context")
+    .expected_difficulty_threshold()
+}
+
 /// Adjust the difficulty and time for the testnet minimum difficulty rule.
 ///
 /// The `relevant_data` has recent block difficulties and times in reverse order from the tip.
@@ -281,7 +306,9 @@ fn adjust_difficulty_and_time_for_testnet(
     previous_block_height: Height,
     relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)>,
 ) {
-    if network == &Network::Mainnet {
+    // Mainnet has no minimum-difficulty rule. No-PoW networks do not enforce ThresholdBits,
+    // so the PoW-specific time/difficulty split below must not recompute an expected target.
+    if network == &Network::Mainnet || network.disable_pow() {
         return;
     }
 
@@ -366,13 +393,112 @@ fn adjust_difficulty_and_time_for_testnet(
         result.cur_time = result.cur_time.clamp(result.min_time, result.max_time);
 
         // And then the difficulty needs to be updated for cur_time.
-        result.expected_difficulty = AdjustedDifficulty::new_from_header_time(
+        result.expected_difficulty = mining_template_expected_difficulty(
+            network,
             result.cur_time.into(),
             previous_block_height,
-            network,
             relevant_data.iter().cloned(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use zakura_chain::{
+        parameters::testnet::RegtestParameters,
+        work::difficulty::{ExpandedDifficulty, ParameterDifficulty as _, U256},
+    };
+
+    use super::*;
+
+    /// Tip height whose next candidate needs a full early-chain averaging context.
+    const LOW_TARGET_TIP_HEIGHT: Height = Height(17);
+
+    fn low_target_averaging_window(base: DateTime<Utc>) -> Vec<(CompactDifficulty, DateTime<Utc>)> {
+        let low_target = ExpandedDifficulty::from(U256::one()).to_compact();
+        // Reverse height order from the tip: 18 predecessors for candidate height 18.
+        (1..=18)
+            .rev()
+            .map(|offset| (low_target, base + Duration::seconds(offset)))
+            .collect()
+    }
+
+    #[test]
+    fn disabled_pow_mining_template_uses_target_limit_for_low_target_window() {
+        let network = Network::new_regtest(RegtestParameters::default());
+        assert!(network.disable_pow());
+
+        let base = DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp is in range");
+        let relevant_data = low_target_averaging_window(base);
+        let limit = network.target_difficulty_limit().to_compact();
+
+        let expected = mining_template_expected_difficulty(
+            &network,
+            base + Duration::seconds(19),
+            LOW_TARGET_TIP_HEIGHT,
+            relevant_data.iter().cloned(),
+        );
+
+        assert_eq!(expected, limit);
+        assert!(expected.to_work().is_some());
+    }
+
+    #[test]
+    fn disabled_pow_chain_info_survives_low_target_window() {
+        let network = Network::new_regtest(RegtestParameters::default());
+        let base = DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp is in range");
+        let low_target = ExpandedDifficulty::from(U256::one()).to_compact();
+        let relevant_chain: Vec<Arc<Block>> = (1..=18)
+            .rev()
+            .map(|offset| {
+                let header = block::Header {
+                    version: 4,
+                    previous_block_hash: Hash([0; 32]),
+                    merkle_root: Default::default(),
+                    commitment_bytes: [0; 32].into(),
+                    time: base + Duration::seconds(offset),
+                    difficulty_threshold: low_target,
+                    nonce: [0; 32].into(),
+                    solution: Default::default(),
+                };
+                Arc::new(Block {
+                    header: Arc::new(header),
+                    transactions: Vec::new(),
+                })
+            })
+            .collect();
+
+        let info = difficulty_time_and_history_tree(
+            relevant_chain,
+            LOW_TARGET_TIP_HEIGHT,
+            Hash([0; 32]),
+            &network,
+            Arc::new(HistoryTree::default()),
+        );
+
+        assert_eq!(
+            info.expected_difficulty,
+            network.target_difficulty_limit().to_compact()
+        );
+    }
+
+    /// Locks in the hazard that the mining-template guard avoids: ThresholdBits over a
+    /// tiny-target window truncates to zero and panics in `to_compact`.
+    #[test]
+    #[should_panic(expected = "Zero difficulty values are invalid")]
+    fn low_target_window_threshold_bits_panics_without_disable_pow_guard() {
+        let network = Network::new_regtest(RegtestParameters::default());
+        let base = DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp is in range");
+        let relevant_data = low_target_averaging_window(base);
+
+        let _ = AdjustedDifficulty::new_from_header_time(
+            base + Duration::seconds(19),
+            LOW_TARGET_TIP_HEIGHT,
+            &network,
+            relevant_data,
         )
-        .expect("the testnet mining template retains the same complete difficulty context")
+        .expect("height 18 has complete predecessor context")
         .expected_difficulty_threshold();
     }
 }
