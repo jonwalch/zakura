@@ -70,7 +70,7 @@ impl MetaAddrChange {
         any::<MetaAddr>()
             .prop_flat_map(move |addr| {
                 (
-                    Just(addr),
+                    Just(addr.clone()),
                     vec(MetaAddrChange::addr_strategy(addr.addr), 1..max_addr_change),
                 )
             })

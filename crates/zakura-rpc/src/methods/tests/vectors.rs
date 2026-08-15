@@ -2752,6 +2752,8 @@ async fn rpc_getpeerinfo() {
         .into(),
         &PeerServices::NODE_NETWORK,
         false,
+        String::new(),
+        zakura_network::Version(0),
     )
     .into_new_meta_addr(
         std::time::Instant::now(),
@@ -2767,6 +2769,8 @@ async fn rpc_getpeerinfo() {
         .into(),
         &PeerServices::NODE_NETWORK,
         true,
+        String::new(),
+        zakura_network::Version(0),
     )
     .into_new_meta_addr(
         std::time::Instant::now(),
@@ -2787,8 +2791,8 @@ async fn rpc_getpeerinfo() {
     );
 
     let mock_address_book = MockAddressBookPeers::new(vec![
-        outbound_mock_peer_address,
-        inbound_mock_peer_address,
+        outbound_mock_peer_address.clone(),
+        inbound_mock_peer_address.clone(),
         not_connected_mock_peer_adderess,
     ]);
 
@@ -4109,6 +4113,8 @@ async fn rpc_addnode() {
             // TODO: Fix this when mock address book provides other values
             pingtime: Some(0.1f64),
             pingwait: None,
+            subver: String::new(),
+            version: 0,
         }]
     );
 

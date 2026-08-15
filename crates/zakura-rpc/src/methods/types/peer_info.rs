@@ -11,6 +11,12 @@ pub struct PeerInfo {
     #[getter(copy)]
     pub(crate) addr: PeerSocketAddr,
 
+    /// The peer's user agent string.
+    pub(crate) subver: String,
+
+    /// The negotiated protocol version.
+    pub(crate) version: u32,
+
     /// Inbound (true) or Outbound (false)
     pub(crate) inbound: bool,
 
@@ -28,8 +34,15 @@ pub type GetPeerInfoResponse = Vec<PeerInfo>;
 
 impl From<MetaAddr> for PeerInfo {
     fn from(meta_addr: MetaAddr) -> Self {
+        let subver = meta_addr.user_agent().unwrap_or_default().to_string();
+        let version = meta_addr
+            .negotiated_version()
+            .map_or(0, |version| version.0);
+
         Self {
             addr: meta_addr.addr(),
+            subver,
+            version,
             inbound: meta_addr.is_inbound(),
             pingtime: meta_addr.rtt().map(|d| d.as_secs_f64()),
             pingwait: meta_addr.ping_sent_at().map(|t| t.elapsed().as_secs_f64()),
@@ -41,6 +54,8 @@ impl Default for PeerInfo {
     fn default() -> Self {
         Self {
             addr: PeerSocketAddr::unspecified(),
+            subver: String::new(),
+            version: 0,
             inbound: false,
             pingtime: None,
             pingwait: None,

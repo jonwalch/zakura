@@ -15,7 +15,10 @@ use zakura_chain::{
 use crate::{
     constants::{CONCURRENT_ADDRESS_CHANGE_PERIOD, MAX_PEER_ACTIVE_FOR_GOSSIP},
     meta_addr::MetaAddrChange,
-    protocol::{external::canonical_peer_addr, types::PeerServices},
+    protocol::{
+        external::{canonical_peer_addr, types::Version},
+        types::PeerServices,
+    },
     PeerSocketAddr,
 };
 
@@ -63,6 +66,8 @@ fn sanitize_extremes() {
         last_connection_state: Default::default(),
         misbehavior_score: Default::default(),
         is_inbound: false,
+        user_agent: None,
+        negotiated_version: None,
     };
 
     let max_time_entry = MetaAddr {
@@ -77,6 +82,8 @@ fn sanitize_extremes() {
         last_connection_state: Default::default(),
         misbehavior_score: Default::default(),
         is_inbound: false,
+        user_agent: None,
+        negotiated_version: None,
     };
 
     if let Some(min_sanitized) = min_time_entry.sanitize(&Mainnet) {
@@ -504,11 +511,17 @@ fn ipv4_mapped_misbehavior_panics_without_fix() {
     );
 
     // Handshake succeeds → address book stores the canonical (IPv4) address.
-    let previous = MetaAddr::new_connected(raw_addr, &PeerServices::NODE_NETWORK, true)
-        .into_new_meta_addr(
-            instant_now,
-            chrono_now.try_into().expect("will succeed until 2038"),
-        );
+    let previous = MetaAddr::new_connected(
+        raw_addr,
+        &PeerServices::NODE_NETWORK,
+        true,
+        String::new(),
+        Version(0),
+    )
+    .into_new_meta_addr(
+        instant_now,
+        chrono_now.try_into().expect("will succeed until 2038"),
+    );
 
     assert_eq!(
         previous.addr(),
@@ -549,11 +562,17 @@ fn new_misbehavior_canonicalizes_ipv4_mapped_addr() {
     assert_ne!(raw_addr, canonical_addr);
 
     // Handshake stores canonical IPv4 address.
-    let previous = MetaAddr::new_connected(raw_addr, &PeerServices::NODE_NETWORK, true)
-        .into_new_meta_addr(
-            instant_now,
-            chrono_now.try_into().expect("will succeed until 2038"),
-        );
+    let previous = MetaAddr::new_connected(
+        raw_addr,
+        &PeerServices::NODE_NETWORK,
+        true,
+        String::new(),
+        Version(0),
+    )
+    .into_new_meta_addr(
+        instant_now,
+        chrono_now.try_into().expect("will succeed until 2038"),
+    );
 
     assert_eq!(previous.addr(), canonical_addr);
 

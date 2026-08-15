@@ -1049,6 +1049,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .into(),
         &PeerServices::NODE_NETWORK,
         false,
+        String::new(),
+        zakura_network::Version(0),
     )
     .into_new_meta_addr(Instant::now(), DateTime32::now())]);
 

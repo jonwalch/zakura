@@ -2613,7 +2613,7 @@ where
             PeerServices::NODE_NETWORK,
             DateTime32::now(),
         );
-        fake_peer = Some(addr);
+        fake_peer = Some(addr.clone());
         let addr = addr
             .new_gossiped_change()
             .expect("created MetaAddr contains enough information to represent a gossiped address");
@@ -2631,12 +2631,13 @@ where
     let (crawl_observed_tx, mut crawl_observed_rx) = tokio::sync::mpsc::unbounded_channel();
     let nil_peer_set = service_fn(move |req| {
         let crawl_observed_tx = crawl_observed_tx.clone();
+        let fake_peer = fake_peer.clone();
 
         async move {
             let rsp = match req {
                 // Return the correct response variant for Peers requests,
                 // reusing one of the peers we already provided.
-                Request::Peers => Response::Peers(vec![fake_peer.unwrap()]),
+                Request::Peers => Response::Peers(vec![fake_peer.clone().unwrap()]),
                 _ => unreachable!("unexpected request: {:?}", req),
             };
 
