@@ -285,7 +285,7 @@ fn long_delayed_change_is_not_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_errored(address, PeerServices::NODE_NETWORK);
-    let outcome = change.apply_to_meta_addr(peer, instant_early, chrono_early);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_early, chrono_early);
 
     assert_eq!(
         outcome, None,
@@ -328,7 +328,7 @@ fn later_revert_change_is_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_reconnect(address);
-    let outcome = change.apply_to_meta_addr(peer, instant_late, chrono_late);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_late, chrono_late);
 
     assert!(
         outcome.is_some(),
@@ -369,7 +369,7 @@ fn concurrent_state_revert_change_is_not_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_reconnect(address);
-    let outcome = change.apply_to_meta_addr(peer, instant_early, chrono_early);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_early, chrono_early);
 
     assert_eq!(
         outcome, None,
@@ -387,7 +387,7 @@ fn concurrent_state_revert_change_is_not_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_reconnect(address);
-    let outcome = change.apply_to_meta_addr(peer, instant_late, chrono_late);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_late, chrono_late);
 
     assert_eq!(
         outcome, None,
@@ -428,7 +428,7 @@ fn concurrent_state_progress_change_is_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_errored(address, None);
-    let outcome = change.apply_to_meta_addr(peer, instant_early, chrono_early);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_early, chrono_early);
 
     assert!(
         outcome.is_some(),
@@ -446,7 +446,7 @@ fn concurrent_state_progress_change_is_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_errored(address, None);
-    let outcome = change.apply_to_meta_addr(peer, instant_late, chrono_late);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_late, chrono_late);
 
     assert!(
         outcome.is_some(),

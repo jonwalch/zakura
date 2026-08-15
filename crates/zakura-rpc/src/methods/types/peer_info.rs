@@ -1,11 +1,10 @@
 //! An array of [`PeerInfo`] is the output of the `getpeerinfo` RPC method.
 
 use derive_getters::Getters;
-use derive_new::new;
 use zakura_network::{types::MetaAddr, PeerSocketAddr};
 
 /// Item of the `getpeerinfo` response
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
 pub struct PeerInfo {
     /// The IP address and port of the peer
     #[getter(copy)]
@@ -31,6 +30,25 @@ pub struct PeerInfo {
 
 /// Response type for the `getpeerinfo` RPC method.
 pub type GetPeerInfoResponse = Vec<PeerInfo>;
+
+impl PeerInfo {
+    /// Creates peer information without optional handshake metadata.
+    pub fn new(
+        addr: PeerSocketAddr,
+        inbound: bool,
+        pingtime: Option<f64>,
+        pingwait: Option<f64>,
+    ) -> Self {
+        Self {
+            addr,
+            subver: String::new(),
+            version: 0,
+            inbound,
+            pingtime,
+            pingwait,
+        }
+    }
+}
 
 impl From<MetaAddr> for PeerInfo {
     fn from(meta_addr: MetaAddr) -> Self {

@@ -121,7 +121,7 @@ proptest! {
 
         for (_addr, changes) in addr_changes_lists.iter() {
             for change in changes {
-                address_book.update(*change);
+                address_book.update(change.clone());
                 address_book.peers.assert_consistent();
 
                 prop_assert!(
@@ -146,7 +146,7 @@ proptest! {
         for index in 0..MAX_ADDR_CHANGE {
             for (_addr, changes) in addr_changes_lists.iter() {
                 if let Some(change) = changes.get(index) {
-                    address_book.update(*change);
+                    address_book.update(change.clone());
                     address_book.peers.assert_consistent();
 
                     prop_assert!(

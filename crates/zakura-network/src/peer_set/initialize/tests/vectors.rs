@@ -1927,6 +1927,7 @@ async fn self_connections_should_fail() {
 
         let updated_addr = unlocked_address_book.update(
             real_self_listener
+                .clone()
                 .new_gossiped_change()
                 .expect("change is valid"),
         );
@@ -1942,17 +1943,17 @@ async fn self_connections_should_fail() {
         "inserting our own address into the address book failed: {real_self_listener:?}"
     );
     assert_eq!(
-        updated_addr.unwrap().addr(),
+        updated_addr.as_ref().unwrap().addr(),
         real_self_listener.addr(),
         "wrong address inserted into address book"
     );
     assert_ne!(
-        updated_addr.unwrap().addr().ip(),
+        updated_addr.as_ref().unwrap().addr().ip(),
         Ipv4Addr::UNSPECIFIED,
         "invalid address inserted into address book: ip must be valid for inbound connections"
     );
     assert_ne!(
-        updated_addr.unwrap().addr().port(),
+        updated_addr.as_ref().unwrap().addr().port(),
         0,
         "invalid address inserted into address book: port must be valid for inbound connections"
     );

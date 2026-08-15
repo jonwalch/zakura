@@ -63,7 +63,7 @@ fn address_metrics_are_updated_once_per_batch() {
     ]
     .map(MetaAddr::new_initial_peer);
 
-    address_book.extend(peers);
+    address_book.extend(peers.clone());
 
     assert_eq!(
         address_book.address_metrics_update_count,
