@@ -2,6 +2,7 @@
 
 use std::{
     cmp::{max, Ordering},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -228,7 +229,7 @@ pub struct MetaAddr {
     is_inbound: bool,
 
     /// The user agent string reported by the peer during handshake, if available.
-    user_agent: Option<String>,
+    user_agent: Option<Arc<str>>,
 
     /// The protocol version negotiated with the peer during handshake, if available.
     negotiated_version: Option<Version>,
@@ -1013,9 +1014,9 @@ impl MetaAddrChange {
     }
 
     /// Returns the user agent from this change, if available.
-    fn user_agent(&self) -> Option<String> {
+    fn user_agent(&self) -> Option<Arc<str>> {
         if let MetaAddrChange::UpdateConnected { user_agent, .. } = self {
-            Some(user_agent.clone())
+            Some(Arc::from(user_agent.as_str()))
         } else {
             None
         }
