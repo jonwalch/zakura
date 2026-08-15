@@ -120,6 +120,9 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
     node = node_info(config, hostname)
     metrics_url = str(defaults.get("metrics_url", "http://127.0.0.1:9999/metrics"))
     service = str(defaults.get("service_name", "zakura.service"))
+    controller_service = str(
+        defaults.get("controller_service_name", "zakura-continuous-sync.service")
+    )
     controller_state_path = Path(
         str(
             defaults.get(
@@ -145,6 +148,7 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
         "mode": node.get("mode_label", "unknown"),
         "service": service,
         "service_active": service_active(service),
+        "controller_service_active": service_active(controller_service),
         "metrics_status": metrics_status,
         "height": height,
         "controller_state": controller_state(controller_state_path),

@@ -581,6 +581,22 @@ class ContinuousSyncTests(unittest.TestCase):
 
             post_alert.assert_not_called()
 
+    def test_dead_controller_with_stale_syncing_phase_does_not_page_node_down(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = alert_status_fixture(hostname, service_active=False, phase="syncing")
+        status["controller_service_active"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [hostname])
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                alert.run_once(config)
+
+            post_alert.assert_not_called()
+
     def test_local_query_failure_is_logged_without_changing_alert_state(self):
         hostname = "temp-zakura-sync-test-1"
         status = alert_status_fixture(hostname, service_active=None, phase="unknown")
@@ -960,6 +976,33 @@ class ContinuousSyncTests(unittest.TestCase):
             posted_state = post_slack.call_args.args[1]
             self.assertIn("time to failure: 5m 5s", posted_state)
 
+    def test_halt_persists_failed_state_when_run_json_cannot_be_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            state_path = config.paths.state_dir / "state.json"
+            run_dir = config.paths.runs_dir / "current"
+            run_dir.mkdir(parents=True)
+            run_state = {
+                "run_dir": str(run_dir),
+                "sha": "abc123",
+                "run_id": "run-1",
+                "sync_started_at_epoch": 1000,
+            }
+
+            with (
+                patch.object(sync, "now", return_value=1305),
+                patch.object(sync, "write_run_json", side_effect=OSError(28, "No space left on device")),
+                patch.object(sync, "post_slack"),
+            ):
+                sync.halt(config, state_path, {}, run_state, "disk full")
+
+            saved = sync.load_state(state_path)
+            self.assertTrue(saved["failed"])
+            self.assertEqual(saved["phase"], "failed")
+            self.assertEqual(saved["failure"], "disk full")
+            self.assertEqual(saved["last_failed_sha"], "abc123")
+
     def test_resume_posts_recovery_only_after_successful_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp))
@@ -1027,6 +1070,7 @@ def alert_status_fixture(
         "mode": "dual-stack",
         "service": "zakura.service",
         "service_active": service_active,
+        "controller_service_active": True,
         "metrics_status": "ok" if service_active else "unavailable",
         "height": height,
         "connection": "root@138.68.43.212",

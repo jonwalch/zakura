@@ -162,7 +162,11 @@ def controller_phase(status: dict[str, Any]) -> str:
 
 def controller_failed(status: dict[str, Any]) -> bool:
     controller_state = status.get("controller_state")
-    return isinstance(controller_state, dict) and bool(controller_state.get("failed"))
+    if isinstance(controller_state, dict) and bool(controller_state.get("failed")):
+        return True
+    # An unclean controller exit can leave phase=syncing with zakurad stopped.
+    # That is a controller halt, not a node-down during an active sync.
+    return status.get("controller_service_active") is False
 
 
 def expects_node_service(status: dict[str, Any]) -> bool:

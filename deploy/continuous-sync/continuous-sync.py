@@ -736,9 +736,6 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
             "failure": reason,
         }
     )
-    run_dir = Path(str(run_state.get("run_dir") or config.paths.runs_dir / "unknown"))
-    if run_dir.exists():
-        write_run_json(run_dir, run_state)
     state.update(
         {
             "failed": True,
@@ -749,7 +746,17 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
             "last_failed_run": run_state.get("run_id"),
         }
     )
+    # Persist the halt marker on the controller volume first. run.json lives
+    # with traces and can be unwritable when the extra disk is full; failing
+    # that write used to skip this save and leave phase=syncing, which the
+    # minute monitor pages as a node-down.
     save_state(state_path, state)
+    run_dir = Path(str(run_state.get("run_dir") or config.paths.runs_dir / "unknown"))
+    if run_dir.exists():
+        try:
+            write_run_json(run_dir, run_state)
+        except OSError as error:
+            log(config, f"halt-run-json-failed error={error}")
     post_slack(config, failure_text(config, run_state, reason))
     log(config, f"halted reason={reason}")
 
