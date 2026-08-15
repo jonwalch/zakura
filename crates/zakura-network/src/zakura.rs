@@ -210,29 +210,39 @@ pub(crate) enum ZakuraUpgradeRegistration {
     Unavailable,
 }
 
+/// Supervisor facts used to bind a legacy handoff to one native connection.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ZakuraRegistrationSnapshot {
+    conn_id: ZakuraConnId,
+    transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
+}
+
 /// A registration snapshot captured before accepting a legacy upgrade.
 pub(crate) struct ZakuraRegistrationWait {
-    registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>>,
+    registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraRegistrationSnapshot>>,
     peer_id: ZakuraPeerId,
-    previous_conn_id: Option<ZakuraConnId>,
+    previous: Option<ZakuraRegistrationSnapshot>,
+    expected_transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
 }
 
 impl ZakuraRegistrationWait {
     fn new(
-        mut registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>>,
+        mut registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraRegistrationSnapshot>>,
         peer_id: ZakuraPeerId,
+        expected_transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
     ) -> Self {
-        let previous_conn_id = registered.borrow_and_update().get(&peer_id).copied();
+        let previous = registered.borrow_and_update().get(&peer_id).copied();
         Self {
             registered,
             peer_id,
-            previous_conn_id,
+            previous,
+            expected_transcript_hash,
         }
     }
 
     /// Returns whether this peer identity was registered before the upgrade.
     pub(crate) fn is_duplicate(&self) -> bool {
-        self.previous_conn_id.is_some()
+        self.previous.is_some()
     }
 
     /// Wait for a registration generation that did not exist in the snapshot.
@@ -240,7 +250,8 @@ impl ZakuraRegistrationWait {
         wait_for_fresh_zakura_peer(
             self.registered,
             self.peer_id,
-            self.previous_conn_id,
+            self.previous,
+            self.expected_transcript_hash,
             ZAKURA_LIVENESS_APPEAR_TIMEOUT,
         )
         .await
@@ -344,6 +355,7 @@ impl ZakuraHandshakeConnector {
         peer_id: &ZakuraPeerId,
         node_id: &[u8],
         direct_addresses: &[Vec<u8>],
+        pending: PendingUpgrade,
     ) -> ZakuraUpgradeRegistration {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return ZakuraUpgradeRegistration::Unavailable;
@@ -354,11 +366,13 @@ impl ZakuraHandshakeConnector {
         let registration_wait = ZakuraRegistrationWait::new(
             endpoint.supervisor().subscribe_registrations(),
             peer_id.clone(),
+            pending.legacy_upgrade_transcript,
         );
         if registration_wait.is_duplicate() {
             return ZakuraUpgradeRegistration::Duplicate;
         }
-        if !endpoint.ensure_upgrade_native_dial(node_addr) {
+        let expected_transcript_hash = pending.legacy_upgrade_transcript;
+        if !endpoint.ensure_transcript_bound_upgrade_dial(node_addr, pending) {
             return ZakuraUpgradeRegistration::Unavailable;
         }
         if let Some(conn_id) = registration_wait.wait().await {
@@ -366,18 +380,19 @@ impl ZakuraHandshakeConnector {
         }
 
         // The hand-off did not complete within the wait window. The dial spawned
-        // by `ensure_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
+        // by `ensure_transcript_bound_upgrade_dial` uses `RedialPolicy::maintain`, so it
         // would keep redialing this peer-supplied address forever and retain its
-        // `upgrade_dials` entry. Unless the peer registered in the meantime
-        // (keep its maintained dial as the recovery path), cancel the dial and
-        // drop the entry so a malicious legacy responder cannot leak unbounded
-        // maintained dials and outbound QUIC traffic by repeating failed
-        // upgrades with distinct node ids.
-        if !endpoint
+        // `upgrade_dials` entry. Unless the transcript-bound peer registered in
+        // the meantime (keep its maintained dial as the recovery path), cancel
+        // the dial and drop the entry so a malicious legacy responder cannot
+        // leak unbounded maintained dials and outbound QUIC traffic by repeating
+        // failed upgrades with distinct node ids.
+        if endpoint
             .supervisor()
             .subscribe_registrations()
             .borrow()
-            .contains_key(peer_id)
+            .get(peer_id)
+            .is_none_or(|registration| registration.transcript_hash != expected_transcript_hash)
         {
             endpoint.cancel_upgrade_native_dial(peer_id);
         }
@@ -393,15 +408,33 @@ impl ZakuraHandshakeConnector {
     /// snapshot distinguishes a fresh replacement from an unrelated incumbent
     /// with the same claimed identity. Returns `None` if this node has no live
     /// endpoint.
-    pub(crate) fn prepare_zakura_registration_wait(
+    pub(crate) async fn prepare_zakura_registration_wait(
         &self,
         peer_id: &ZakuraPeerId,
+        pending: PendingUpgrade,
     ) -> Option<ZakuraRegistrationWait> {
         let endpoint = self.endpoint.as_ref()?;
-        Some(ZakuraRegistrationWait::new(
+        let registration_wait = ZakuraRegistrationWait::new(
             endpoint.supervisor().subscribe_registrations(),
             peer_id.clone(),
-        ))
+            pending.legacy_upgrade_transcript,
+        );
+        if !registration_wait.is_duplicate()
+            && endpoint
+                .insert_pending_inbound_upgrade(pending)
+                .await
+                .is_err()
+        {
+            return None;
+        }
+        Some(registration_wait)
+    }
+
+    /// Cancel a pending inbound transcript after its legacy handoff fails.
+    pub(crate) async fn cancel_pending_inbound_upgrade(&self, peer_id: &ZakuraPeerId) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.cancel_pending_inbound_upgrade(peer_id).await;
+        }
     }
 
     /// Keep an upgraded peer's legacy address-book entry live for the lifetime
@@ -557,16 +590,20 @@ async fn wait_for_zakura_peer(
 
 /// Wait until `peer_id` has a registration generation newer than the snapshot.
 async fn wait_for_fresh_zakura_peer(
-    mut registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraConnId>>,
+    mut registered: watch::Receiver<HashMap<ZakuraPeerId, ZakuraRegistrationSnapshot>>,
     peer_id: ZakuraPeerId,
-    previous_conn_id: Option<ZakuraConnId>,
+    previous: Option<ZakuraRegistrationSnapshot>,
+    expected_transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
     appear_timeout: Duration,
 ) -> Option<ZakuraConnId> {
     tokio::time::timeout(appear_timeout, async {
         loop {
-            let conn_id = registered.borrow_and_update().get(&peer_id).copied();
-            if conn_id.is_some() && conn_id != previous_conn_id {
-                return conn_id;
+            let registration = registered.borrow_and_update().get(&peer_id).copied();
+            if let Some(registration) = registration.filter(|registration| {
+                Some(*registration) != previous
+                    && registration.transcript_hash == expected_transcript_hash
+            }) {
+                return Some(registration.conn_id);
             }
             if registered.changed().await.is_err() {
                 return None;
@@ -667,13 +704,21 @@ mod tests {
             .into()
     }
 
+    fn registration(conn_id: ZakuraConnId, transcript_byte: u8) -> ZakuraRegistrationSnapshot {
+        ZakuraRegistrationSnapshot {
+            conn_id,
+            transcript_hash: [transcript_byte; TRANSCRIPT_HASH_BYTES],
+        }
+    }
+
     #[test]
     fn registration_wait_detects_preexisting_peer() {
         let peer_id = test_peer_id();
-        let registrations = HashMap::from([(peer_id.clone(), 7)]);
+        let registrations = HashMap::from([(peer_id.clone(), registration(7, 1))]);
         let (_registered_tx, registered_rx) = watch::channel(registrations);
 
-        let registration_wait = ZakuraRegistrationWait::new(registered_rx, peer_id);
+        let registration_wait =
+            ZakuraRegistrationWait::new(registered_rx, peer_id, [1; TRANSCRIPT_HASH_BYTES]);
 
         assert!(registration_wait.is_duplicate());
     }
@@ -682,13 +727,15 @@ mod tests {
     async fn registration_wait_requires_fresh_matching_generation() {
         let peer_id = test_peer_id();
         let (registered_tx, registered_rx) = watch::channel(HashMap::new());
-        let mut registration_wait =
-            tokio::spawn(ZakuraRegistrationWait::new(registered_rx, peer_id.clone()).wait());
+        let expected_transcript = [2; TRANSCRIPT_HASH_BYTES];
+        let mut registration_wait = tokio::spawn(
+            ZakuraRegistrationWait::new(registered_rx, peer_id.clone(), expected_transcript).wait(),
+        );
 
         let unrelated_peer =
             ZakuraPeerId::new(vec![8u8; 32]).expect("32-byte node id is within bounds");
         registered_tx
-            .send(HashMap::from([(unrelated_peer, 1)]))
+            .send(HashMap::from([(unrelated_peer, registration(1, 2))]))
             .expect("registration waiter is alive");
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut registration_wait)
@@ -698,13 +745,23 @@ mod tests {
         );
 
         registered_tx
-            .send(HashMap::from([(peer_id, 2)]))
+            .send(HashMap::from([(peer_id.clone(), registration(2, 3))]))
+            .expect("registration waiter is alive");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut registration_wait)
+                .await
+                .is_err(),
+            "a native registration with another transcript must not complete the wait",
+        );
+
+        registered_tx
+            .send(HashMap::from([(peer_id, registration(3, 2))]))
             .expect("registration waiter is alive");
         let conn_id = tokio::time::timeout(Duration::from_secs(1), registration_wait)
             .await
             .expect("the fresh peer registration completes the wait")
             .expect("the registration waiter does not panic");
-        assert_eq!(conn_id, Some(2));
+        assert_eq!(conn_id, Some(3));
     }
 
     /// While the peer stays registered, the keeper repeatedly refreshes its
