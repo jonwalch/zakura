@@ -213,9 +213,9 @@ fn finalized_anchor(
     if bootstrap.height > finalized.height {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
-    let (stored_bootstrap_hash, stored_bootstrap) = source
-        .header_by_height(bootstrap.height)
-        .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
+    let (stored_bootstrap_hash, stored_bootstrap) =
+        finalized_header_by_height(source, bootstrap.height)
+            .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
     if stored_bootstrap_hash != bootstrap.hash
         || stored_bootstrap.as_ref() != config.bootstrap_anchor().header.as_ref()
     {
@@ -232,8 +232,7 @@ fn finalized_anchor(
         height = height
             .next()
             .map_err(|_| HeaderChainInitializationError::Work)?;
-        let (hash, next) = source
-            .header_by_height(height)
+        let (hash, next) = finalized_header_by_height(source, height)
             .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
         if next.hash() != hash || next.previous_block_hash != header.hash() {
             return Err(HeaderChainInitializationError::AnchorMismatch);
@@ -259,8 +258,17 @@ fn validation_context(
     expected_hash: block::Hash,
 ) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
     linked_validation_context(anchor, expected_hash, |height| {
-        source.header_by_height(height)
+        finalized_header_by_height(source, height)
     })
+}
+
+fn finalized_header_by_height(
+    source: &ZakuraDb,
+    height: block::Height,
+) -> Option<(block::Hash, Arc<block::Header>)> {
+    let hash = source.hash(height)?;
+    let header = source.block_header(height.into())?;
+    Some((hash, header))
 }
 
 fn linked_validation_context(
