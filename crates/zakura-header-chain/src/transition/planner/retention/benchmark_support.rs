@@ -34,7 +34,8 @@ impl RetentionBenchmarkFixture {
         for index in 0..retained_non_finalized_nodes {
             let mut header = *regtest_genesis_block().header;
             header.previous_block_hash = header_best.hash;
-            header.nonce = [u8::try_from(index % 251).expect("the nonce marker fits"); 32].into();
+            let nonce_marker = (index % 251) as u8;
+            header.nonce = [nonce_marker; 32].into();
             header_best = match graph.insert(
                 Arc::new(header),
                 HeaderValidationState::Valid,
