@@ -290,10 +290,11 @@ returns the same plan, and dropping a plan leaves no write, no publication, and 
 the engine. A test can reproduce fork choice from a graph, a config, a clock, and an ordered
 event list, without running a node.
 
-Planning runs against an overlay rather than the graph itself. One implementation of
-`HeaderGraphView` and `HeaderGraphEdit` runs against the overlay and the committed graph
-alike, so selection cannot behave one way on staged state and another way on committed
-state.
+Planning runs against an overlay rather than the graph itself. Selection reads and writes
+the graph through `HeaderGraphView` and `HeaderGraphEdit`, which the overlay and the
+committed graph both implement, so one implementation of fork choice serves staged and
+committed state alike. Selection cannot behave one way on staged state and another way on
+committed state.
 
 | Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
@@ -323,8 +324,11 @@ Validation runs four times before disk, each pass against more context than the 
    projections' contiguity, that `header_best` really is the maximum eligible score,
    protected nodes, generation increments, and auxiliary provenance.
 
-No pass trusts the one before it. The fourth checks the plan against a graph rebuilt from
-the delta with `GraphOverlay::from_delta`, not against the overlay the planner mutated. The
+No pass trusts the one before it. The fourth checks the plan against the graph
+`GraphOverlay::from_delta` projects from the delta, not against the overlay the planner
+mutated. That projection binds to the graph revision the delta was derived from, so a delta
+built against a graph that has since moved fails as `StaleDelta` instead of validating
+against the wrong base. The
 verifier therefore approves the transition the engine will install rather than the one it
 staged. A disagreement between the planner and the verifier is an `InvariantViolation`, and
 that batch never reaches disk. Startup adds one more pass that no caller triggers:
