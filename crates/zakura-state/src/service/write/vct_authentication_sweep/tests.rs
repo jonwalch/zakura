@@ -869,12 +869,8 @@ fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() 
         Some(TestAuxStatus::Authenticated)
     ));
     let successor_states = fixture.authentications(bad);
-    assert!(successor_states
-        .iter()
-        .any(|state| *state == TestAuxStatus::Disputed));
-    assert!(successor_states
-        .iter()
-        .any(|state| *state == TestAuxStatus::Authenticated));
+    assert!(successor_states.contains(&TestAuxStatus::Disputed));
+    assert!(successor_states.contains(&TestAuxStatus::Authenticated));
     assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
 }
 
@@ -892,12 +888,8 @@ fn a_replacement_predecessor_preserves_the_honest_successor() {
     fixture.sweep(&mut sweeper);
 
     let predecessor_states = fixture.authentications(bad);
-    assert!(predecessor_states
-        .iter()
-        .any(|state| *state == TestAuxStatus::Disputed));
-    assert!(predecessor_states
-        .iter()
-        .any(|state| *state == TestAuxStatus::Authenticated));
+    assert!(predecessor_states.contains(&TestAuxStatus::Disputed));
+    assert!(predecessor_states.contains(&TestAuxStatus::Authenticated));
     assert!(matches!(
         fixture.authentication(successor),
         Some(TestAuxStatus::Authenticated)
