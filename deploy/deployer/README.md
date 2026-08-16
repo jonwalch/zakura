@@ -101,10 +101,14 @@ The workflow is manual (`workflow_dispatch`). Inputs:
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
+- `block_propagation_trace` — write hash-correlated block propagation traces
+  under `/mnt/data/traces/block-propagation` on every selected node; defaults
+  to `false`. See [`docs/block-propagation-tracing.md`](../../docs/block-propagation-tracing.md).
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
 Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
 explicit `node`, preventing canary settings from being applied fleet-wide.
+`block_propagation_trace` may be enabled for the whole selected fleet.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available

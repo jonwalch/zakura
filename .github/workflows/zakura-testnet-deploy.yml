@@ -36,6 +36,11 @@ on:
         type: boolean
         required: false
         default: false
+      block_propagation_trace:
+        description: "Write block propagation traces on every selected node"
+        type: boolean
+        required: false
+        default: false
       node:
         description: "Optional single deployer node name; blank deploys the whole fleet"
         required: false
@@ -135,6 +140,7 @@ jobs:
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
         env:
+          BLOCK_PROPAGATION_TRACE: ${{ inputs.block_propagation_trace }}
           HEADER_SYNC_TRACE: ${{ inputs.header_sync_trace }}
           NODE: ${{ inputs.node }}
           P2P_STACK: ${{ inputs.p2p_stack }}
@@ -160,7 +166,9 @@ jobs:
           fi
 
           zakura_trace_line=""
-          if [ "${HEADER_SYNC_TRACE}" = "true" ]; then
+          if [ "${BLOCK_PROPAGATION_TRACE}" = "true" ]; then
+            zakura_trace_line='trace_dir = "/mnt/data/traces/block-propagation"'
+          elif [ "${HEADER_SYNC_TRACE}" = "true" ]; then
             zakura_trace_line='trace_dir = "/mnt/data/traces/header-chain-canary"'
           fi
 

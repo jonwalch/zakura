@@ -6,6 +6,7 @@
 //! don't fit the async context well.
 
 pub(crate) mod auth_download_height;
+pub(crate) mod block_propagation_trace;
 pub mod health;
 pub mod inbound;
 #[allow(missing_docs)]

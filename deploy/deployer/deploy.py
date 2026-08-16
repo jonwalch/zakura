@@ -506,6 +506,7 @@ def render_service(node: Node) -> str:
             f"AssertPathIsMountPoint={DATA_MOUNT}\n"
         )
     return render_template("zakurad.service", {
+        "NODE_NAME": node.name,
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,

@@ -466,6 +466,11 @@ impl StartCmd {
         //
         // See `zakura_network::Connection::drive_peer_request()` for details.
         let (setup_tx, setup_rx) = oneshot::channel();
+        let block_propagation_trace =
+            crate::components::block_propagation_trace::BlockPropagationTrace::new(
+                config.network.zakura.trace_dir.clone(),
+                config.network.expose_peer_addresses,
+            );
         let zcashd_compat_pruning_retention = config
             .zcashd_compat
             .enabled
@@ -476,13 +481,16 @@ impl StartCmd {
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(Inbound::new(
-                config.sync.full_verify_concurrency_limit,
-                config.network.expose_peer_addresses,
-                zcashd_compat_pruning_retention,
-                zcashd_compat_block_gossip_peer_ips.clone(),
-                setup_rx,
-            ));
+            .service(
+                Inbound::new(
+                    config.sync.full_verify_concurrency_limit,
+                    config.network.expose_peer_addresses,
+                    zcashd_compat_pruning_retention,
+                    zcashd_compat_block_gossip_peer_ips.clone(),
+                    setup_rx,
+                )
+                .with_block_propagation_trace(block_propagation_trace.clone()),
+            );
 
         let advertised_services = Self::advertised_services(&config);
 
@@ -682,11 +690,12 @@ impl StartCmd {
         // Start concurrent tasks which don't add load to other tasks
         info!("spawning block gossip task");
         let block_gossip_task_handle = tokio::spawn(
-            sync::gossip_best_tip_block_hashes(
+            sync::gossip_best_tip_block_hashes_with_trace(
                 sync_status.clone(),
                 chain_tip_change.clone(),
                 peer_set.clone(),
                 Some(submit_block_channel.receiver()),
+                block_propagation_trace,
             )
             .in_current_span(),
         );

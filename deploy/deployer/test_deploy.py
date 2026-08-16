@@ -172,6 +172,11 @@ class MountRenderingTests(NodeBuilder, unittest.TestCase):
         self.assertNotIn("RequiresMountsFor=/mnt/data", service)
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
 
+    def test_render_service_sets_stable_trace_node_id(self):
+        service = deploy.render_service(self.node(name="testnet-observer-eu"))
+
+        self.assertIn("Environment=ZAKURA_NODE_ID=testnet-observer-eu", service)
+
 
 class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
     """The [metrics] and [health] sections are opt-in and must round-trip as TOML."""
