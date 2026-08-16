@@ -164,10 +164,15 @@ jobs:
             echo "header_sync_trace requires one explicit node" >&2
             exit 1
           fi
+          if [ "${BLOCK_PROPAGATION_TRACE}" = "true" ] \
+            && [ "${HEADER_SYNC_TRACE}" = "true" ]; then
+            echo "block_propagation_trace and header_sync_trace are mutually exclusive" >&2
+            exit 1
+          fi
 
           zakura_trace_line=""
           if [ "${BLOCK_PROPAGATION_TRACE}" = "true" ]; then
-            zakura_trace_line='trace_dir = "/mnt/data/traces/block-propagation"'
+            zakura_trace_line='block_propagation_trace_dir = "/mnt/data/traces/block-propagation"'
           elif [ "${HEADER_SYNC_TRACE}" = "true" ]; then
             zakura_trace_line='trace_dir = "/mnt/data/traces/header-chain-canary"'
           fi

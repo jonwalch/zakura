@@ -22,7 +22,7 @@ use futures::{
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
 
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network::{self as zn, zakura::BlockPropagationTrace, PeerSocketAddr};
 use zakura_state::{self as zs};
 
 use zakura_chain::{
@@ -34,7 +34,7 @@ use zakura_consensus::{router::RouterError, VerifyBlockError};
 use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
 
-use crate::{components::block_propagation_trace::BlockPropagationTrace, BoxError};
+use crate::BoxError;
 
 // Re-use the syncer timeouts for consistency.
 use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};

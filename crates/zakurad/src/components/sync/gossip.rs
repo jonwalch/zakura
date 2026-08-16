@@ -14,14 +14,11 @@ use tower::{timeout::Timeout, Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::block;
-use zakura_network as zn;
+use zakura_network::{self as zn, zakura::BlockPropagationTrace};
 use zakura_state::ChainTipChange;
 
 use crate::{
-    components::{
-        block_propagation_trace::BlockPropagationTrace,
-        sync::{SyncStatus, PEER_GOSSIP_DELAY, TIPS_RESPONSE_TIMEOUT},
-    },
+    components::sync::{SyncStatus, PEER_GOSSIP_DELAY, TIPS_RESPONSE_TIMEOUT},
     BoxError,
 };
 

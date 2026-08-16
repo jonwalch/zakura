@@ -89,8 +89,9 @@ docker compose up -d --force-recreate s-nomp
 
 ## Block Propagation Tracing
 
-The optional Compose override enables hash-correlated JSONL traces on the mining
-node without exposing another host port:
+The optional Compose override enables the narrow, hash-correlated
+`block_propagation.jsonl` trace on the mining node without enabling the general
+Zakura trace tables or exposing another host port:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.trace.yml up -d

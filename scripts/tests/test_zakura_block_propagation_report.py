@@ -286,6 +286,41 @@ class PropagationReportTests(unittest.TestCase):
             )
             self.assertEqual(report["nodes"]["body-node"]["discovery_to_body_us"], 0)
 
+    def test_dedicated_native_rows_replace_broad_trace_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            node = Path(temp) / "observer"
+            canonical = {
+                "wall_ts_unix_us": 3_000_000,
+                "event": "block_body_received",
+                "hash": BLOCK_HASH,
+                "height": 42,
+                "peer": "peer:source",
+            }
+            write_rows(node, "block_propagation.jsonl", [canonical])
+            write_rows(
+                node,
+                "block_sync.jsonl",
+                [{**canonical, "wall_ts_unix_us": 3_000_001}],
+            )
+
+            report = reporter.build_report(
+                {"observer": node},
+                BLOCK_HASH,
+                origin="first-discovery",
+            )
+
+            body_events = [
+                event
+                for event in report["events"]
+                if event["raw_event"] == "block_body_received"
+            ]
+            self.assertEqual(len(body_events), 1)
+            self.assertEqual(
+                body_events[0]["trace_file"],
+                "block_propagation.jsonl",
+            )
+            self.assertEqual(report["duplicates"], [])
+
     def test_reports_missing_origin_timestamp_restarts_and_duplicate_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             node = Path(temp) / "observer"

@@ -157,6 +157,11 @@ impl PeerRoutine {
     }
 
     pub(super) fn trace_body_received(&self, received: ReceivedBodyTrace) {
+        self.trace.block_propagation().native_block_body_received(
+            &self.peer,
+            received.hash,
+            received.height,
+        );
         self.emit(bs_trace::BLOCK_BODY_RECEIVED, |row| {
             row.peer = Some(trace_peer(&self.peer));
             row.height = Some(trace_height(received.height));

@@ -248,6 +248,20 @@ def build_report(
                         f"{event['disposition']}"
                     )
 
+    native_events = {"header_status_received", "block_body_received", "commit_finish"}
+    canonical_native_events = {
+        (event["node"], event["raw_event"])
+        for event in events
+        if event["trace_file"] == "block_propagation.jsonl"
+        and event["raw_event"] in native_events
+    }
+    events = [
+        event
+        for event in events
+        if event["trace_file"] == "block_propagation.jsonl"
+        or (event["node"], event["raw_event"]) not in canonical_native_events
+    ]
+
     events.sort(
         key=lambda event: (
             event["wall_ts_unix_us"],

@@ -26,13 +26,10 @@ use zakura_chain::{
     block::{self, HeightDiff},
     chain_tip::ChainTip,
 };
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network::{self as zn, zakura::BlockPropagationTrace, PeerSocketAddr};
 use zakura_state as zs;
 
-use crate::components::{
-    auth_download_height::tip_child_mismatch, block_propagation_trace::BlockPropagationTrace,
-    sync::MIN_CONCURRENCY_LIMIT,
-};
+use crate::components::{auth_download_height::tip_child_mismatch, sync::MIN_CONCURRENCY_LIMIT};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

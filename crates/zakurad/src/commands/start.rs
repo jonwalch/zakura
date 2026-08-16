@@ -467,10 +467,7 @@ impl StartCmd {
         // See `zakura_network::Connection::drive_peer_request()` for details.
         let (setup_tx, setup_rx) = oneshot::channel();
         let block_propagation_trace =
-            crate::components::block_propagation_trace::BlockPropagationTrace::new(
-                config.network.zakura.trace_dir.clone(),
-                config.network.expose_peer_addresses,
-            );
+            zakura_network::zakura::BlockPropagationTrace::from_config(&config.network);
         let zcashd_compat_pruning_retention = config
             .zcashd_compat
             .enabled
@@ -495,14 +492,17 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura_header_sync(
+            zakura_network::init_with_zakura_header_sync_and_block_propagation(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),
                 user_agent(),
                 advertised_services,
                 zcashd_compat_block_gossip_peer_ips,
-                zakura_header_sync_driver_startup,
+                (
+                    zakura_header_sync_driver_startup,
+                    block_propagation_trace.clone(),
+                ),
             )
             .await;
 

@@ -40,9 +40,17 @@ is enabled for that run. Native peer labels stay pseudonymous (`peer:<hex>`).
 
 ## Enable tracing
 
-Tracing is off until `network.zakura.trace_dir` is set. The same directory
-receives `block_propagation.jsonl` plus the existing `block_sync.jsonl` and
-`commit_state.jsonl` tables used for the native path.
+Tracing is off by default. There are two mutually exclusive settings:
+
+```toml
+[network.zakura]
+block_propagation_trace_dir = "/mnt/data/traces/block-propagation"
+```
+
+The dedicated setting writes only `block_propagation.jsonl`. The existing
+general `trace_dir` remains available for full Zakura diagnostics and also
+contains propagation data for backward compatibility. Zakura rejects startup
+if both settings are configured.
 
 ### Testnet observers
 
@@ -67,35 +75,29 @@ older `header_sync_trace` input remains restricted to one explicit node.
 
 ### Mainnet observers
 
-The Mainnet deploy is binary-only and deliberately leaves each node's
-hand-managed configuration and systemd unit unchanged. Enable tracing manually
-on each observer for a short measurement window.
+The Mainnet deploy is binary-only, so the workflow enables narrow tracing with
+an owned systemd drop-in rather than rewriting the hand-managed node config or
+base unit:
 
-Add a trace directory to the existing node configuration:
-
-```toml
-[network.zakura]
-trace_dir = "/mnt/data/traces/block-propagation"
+```bash
+gh workflow run zakura-mainnet-deploy.yml \
+  --ref REF \
+  -f ref=REF \
+  -f block_propagation_trace=true
 ```
 
-Set a stable node label in the `zakurad` systemd service or a service drop-in,
-then restart the service:
+Leave `node` blank to select the whole fleet, or pass `-f node=NAME` for one
+observer. The drop-in sets the dedicated trace directory and a stable
+`ZAKURA_NODE_ID`, and writes traces under:
 
-```ini
-[Service]
-Environment=ZAKURA_NODE_ID=us-east-0
+```text
+/mnt/data/traces/block-propagation
 ```
 
-The label must match the `NAME` supplied in `--trace-dir NAME=PATH`. If
-`ZAKURA_NODE_ID` is unset, use the resolved hostname as `NAME`; the report
-rejects rows whose embedded node label belongs to a different observer.
-
-Repeat this on the desired managed observers: `asia-0`, `us-0`, `us-east-0`,
-`us-west-0`, `canada-0`, `europe-west-0`, `europe-central-0`, `asia-south-0`,
-and `asia-pacific-0`. Their current host addresses are listed in the
+The managed observers are `asia-0`, `us-0`, `us-east-0`, `us-west-0`,
+`canada-0`, `europe-west-0`, `europe-central-0`, `asia-south-0`, and
+`asia-pacific-0`. Their current host addresses are listed in the
 [deployer documentation](../deploy/deployer/README.md#github-actions-mainnet-fleet-deploy).
-Keep the window short because native `block_sync.jsonl` can grow quickly at
-Mainnet head.
 
 Confirm the observers are synchronized and their clocks are synchronized
 before the measurement. After a new block is committed, obtain its hash from
@@ -257,9 +259,9 @@ docker compose -f docker-compose.yml -f docker-compose.trace.yml down
 docker compose up -d
 ```
 
-On Mainnet, remove `trace_dir` from each hand-managed configuration and restart
-the service. Remove the temporary `ZAKURA_NODE_ID` drop-in too if it was added
-only for this measurement.
+On Mainnet, rerun the deploy workflow with
+`block_propagation_trace=false`. This removes only the workflow-owned drop-in
+and leaves the hand-managed configuration and base unit untouched.
 
 Keep the exported run directory with the report, exact ref, node
 configuration, and clock preflight results. Remove remote or Docker-volume
