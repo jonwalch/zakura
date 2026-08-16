@@ -86,6 +86,11 @@ impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
         self.0
             .is_some_and(|inner| inner.authorizes_validation_lease(lease))
     }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.0
+            .is_some_and(|inner| inner.authorizes_retention_reference(reference))
+    }
 }
 
 struct StateIssuedAuthority<'a> {
@@ -116,6 +121,9 @@ impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
 
     fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
         self.active_retention_references.contains(&reference)
+            || self
+                .inner
+                .is_some_and(|inner| inner.authorizes_retention_reference(reference))
     }
 }
 

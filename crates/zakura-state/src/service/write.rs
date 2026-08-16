@@ -106,22 +106,41 @@ pub struct PreparedFullStateTransition {
     header_request: TransitionRequest,
 }
 
-struct PreparedAuthority(zakura_header_chain::TransitionFingerprint);
+struct PreparedAuthority {
+    transition: zakura_header_chain::TransitionFingerprint,
+    retention_references: Vec<block::Hash>,
+}
 
 impl PreparedAuthority {
     fn for_event(event: &TransitionEvent) -> Result<Self, HeaderChainStoreError> {
         event
             .fingerprint()
-            .map(Self)
+            .map(|transition| Self {
+                transition,
+                retention_references: Vec::new(),
+            })
             .ok_or(HeaderChainStoreError::Incoherent(
                 "prepared full-state event has no stable identity",
             ))
+    }
+
+    fn for_event_with_retention(
+        event: &TransitionEvent,
+        retention_references: Vec<block::Hash>,
+    ) -> Result<Self, HeaderChainStoreError> {
+        let mut authority = Self::for_event(event)?;
+        authority.retention_references = retention_references;
+        Ok(authority)
     }
 }
 
 impl FullStateEvidenceAuthority for PreparedAuthority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
-        event.fingerprint() == Some(self.0)
+        event.fingerprint() == Some(self.transition)
+    }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.retention_references.contains(&reference)
     }
 }
 
@@ -225,7 +244,10 @@ impl PreparedFullStateTransition {
             header_request,
             ..
         } = self;
-        let authority = PreparedAuthority::for_event(&header_request.event)?;
+        let authority = PreparedAuthority::for_event_with_retention(
+            &header_request.event,
+            staged_tips.clone(),
+        )?;
         let mut retention_references = context.retention_references.to_vec();
         retention_references.extend(staged_tips);
         retention_references.sort_unstable_by_key(|hash| hash.0);
