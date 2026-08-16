@@ -12,7 +12,7 @@ use zakura_header_chain::{
 };
 
 use super::{
-    super::ZAKURA_HEADER_BY_HEIGHT,
+    super::{ZAKURA_HEADER_BY_HEIGHT, ZAKURA_HEADER_HASH_BY_HEIGHT, ZAKURA_HEADER_HEIGHT_BY_HASH},
     common::{mainnet_block, state_with_genesis_config, write_full_block_header_and_transactions},
 };
 use crate::{
@@ -86,12 +86,88 @@ fn clean_store_initializes_only_from_finalized_full_state() {
 }
 
 #[test]
-fn predecessor_overlay_fails_closed_without_mutation_or_publication() {
+fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let genesis = mainnet_block(0);
     let block1 = mainnet_block(1);
+    let block2 = mainnet_block(2);
     let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    write_full_block_header_and_transactions(&state, block1.clone());
+    let header_cf = state
+        .db
+        .cf_handle(ZAKURA_HEADER_BY_HEIGHT)
+        .expect("the obsolete column remains physically present");
+    let hash_cf = state
+        .db
+        .cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT)
+        .expect("the obsolete column remains physically present");
+    let height_cf = state
+        .db
+        .cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH)
+        .expect("the obsolete column remains physically present");
+    let mut legacy = DiskWriteBatch::new();
+    legacy.zs_insert(&header_cf, Height(2), &block2.header);
+    legacy.zs_insert(&hash_cf, Height(2), block2.hash());
+    legacy.zs_insert(&height_cf, block2.hash(), Height(2));
+    state
+        .db
+        .write(legacy)
+        .expect("the legacy fixture row writes");
+    let config = engine_config(network, &genesis);
+
+    let (runtime, report) = initialize_header_chain_reconciled(&state, &config, Vec::new())
+        .expect("obsolete overlay rows are replaced from authenticated full state");
+    let anchor = Frontier::new(Height(1), block1.hash());
+    assert_eq!(report.anchor, anchor);
+    assert_eq!(report.startup.current.frontiers.header_best, anchor);
+    assert_eq!(runtime.publisher().snapshot(), report.startup.current);
+    assert_eq!(
+        StoreAuditRead::selected_projection(&HeaderChainStore::new(state.header_chain_disk_db()))
+            .expect("the initialized selection decodes"),
+        vec![anchor]
+    );
+    for family in [
+        ZAKURA_HEADER_BY_HEIGHT,
+        ZAKURA_HEADER_HASH_BY_HEIGHT,
+        ZAKURA_HEADER_HEIGHT_BY_HASH,
+    ] {
+        let cf = state
+            .db
+            .cf_handle(family)
+            .expect("the obsolete column remains physically present");
+        assert!(
+            state
+                .db
+                .raw_range_cf(&cf, &[], None)
+                .expect("the obsolete column remains readable")
+                .is_empty(),
+            "{family} is empty after migration"
+        );
+    }
+    assert!(matches!(
+        initialize_header_chain_reconciled(&state, &config, Vec::new()),
+        Err(HeaderChainInitializationError::AlreadyInitialized)
+    ));
+    assert_eq!(
+        runtime
+            .reader()
+            .validation_context(anchor.hash)
+            .expect("the authenticated context read succeeds")
+            .expect("the finalized anchor is retained")
+            .predecessors()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn predecessor_overlay_is_preserved_when_full_state_authentication_fails() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = mainnet_block(0);
+    let block1 = mainnet_block(1);
+    let state = state_with_genesis_config(&network, genesis, Config::ephemeral());
     let header_cf = state
         .db
         .cf_handle(ZAKURA_HEADER_BY_HEIGHT)
@@ -106,11 +182,20 @@ fn predecessor_overlay_fails_closed_without_mutation_or_publication() {
         .db
         .raw_range_cf(&header_cf, &[], None)
         .expect("the predecessor row can be observed without decoding it");
-    let config = engine_config(network, &genesis);
+    let config = EngineConfig::new(
+        EngineMode::Integrated,
+        network,
+        TrustedAnchor {
+            frontier: Frontier::new(Height(1), block1.hash()),
+            header: block1.header.clone(),
+        },
+        CheckpointSet::default(),
+    )
+    .expect("the fixture has an authenticated but unavailable anchor");
 
     assert!(matches!(
         initialize_header_chain_reconciled(&state, &config, Vec::new()),
-        Err(HeaderChainInitializationError::IncompatibleLegacyOverlay)
+        Err(HeaderChainInitializationError::AnchorMismatch)
     ));
     assert!(
         StoreAuditRead::metadata(&HeaderChainStore::new(state.header_chain_disk_db())).is_err()
