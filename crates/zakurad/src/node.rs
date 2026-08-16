@@ -1,22 +1,34 @@
 //! In-process Zakura node lifecycle.
 
 use abscissa_core::config::Override;
-use color_eyre::Report;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use color_eyre::{eyre::eyre, Report};
 use tokio_util::sync::CancellationToken;
 
 use crate::{commands::StartCmd, components::tokio::run_until_shutdown, config::ZakuradConfig};
 
 pub use zakura_network::zakura::CustomService;
 
+static EMBEDDED_NODE_STARTED: AtomicBool = AtomicBool::new(false);
+
 /// Runs a Zakura node on the current Tokio runtime until shutdown or failure.
 ///
-/// tracing, metrics, Rayon setup, and panic hooks are the embedding
+/// Tracing, metrics, Rayon setup, and panic hooks are the embedding
 /// application's responsibility.
+///
+/// Zakura supports one embedded node startup per process. The function rejects
+/// `zcashd-compat` because dropping its managed child process requires separate
+/// lifecycle coordination.
 pub async fn run(config: ZakuradConfig, shutdown: CancellationToken) -> Result<(), Report> {
     run_with_services(config, Vec::new(), shutdown).await
 }
 
-/// Runs a Zakura node with custom p2p services
+/// Runs a Zakura node with custom P2P services.
+///
+/// Zakura supports one embedded node startup per process. The function rejects
+/// `zcashd-compat` because dropping its managed child process requires separate
+/// lifecycle coordination.
 pub async fn run_with_services(
     config: ZakuradConfig,
     custom_services: Vec<CustomService>,
@@ -28,6 +40,16 @@ pub async fn run_with_services(
 
     let command = StartCmd::default();
     let config = command.override_config(config)?;
+    if config.zcashd_compat.enabled {
+        return Err(eyre!(
+            "embedded nodes do not support zcashd-compat lifecycle management"
+        ));
+    }
+    if EMBEDDED_NODE_STARTED.swap(true, Ordering::AcqRel) {
+        return Err(eyre!(
+            "Zakura supports one embedded node startup per process"
+        ));
+    }
     let node_shutdown = CancellationToken::new();
     // One-way latch: cancelled means shutdown must await the root future's cleanup.
     let shutdown_cleanup_required = CancellationToken::new();
@@ -138,5 +160,26 @@ mod tests {
         .await
         .expect("dropping the node future releases its Zakura endpoint");
         drop(socket);
+
+        let error = run(ZakuradConfig::default(), CancellationToken::new())
+            .await
+            .expect_err("a second embedded startup must fail explicitly");
+        assert!(error
+            .to_string()
+            .contains("one embedded node startup per process"));
+    }
+
+    #[tokio::test]
+    async fn embedded_node_rejects_zcashd_compat() {
+        let mut config = ZakuradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+
+        let error = run(config, CancellationToken::new())
+            .await
+            .expect_err("embedded startup must reject zcashd-compat");
+        assert!(error
+            .to_string()
+            .contains("do not support zcashd-compat lifecycle management"));
     }
 }
