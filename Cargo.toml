@@ -32,14 +32,14 @@ edition = "2021"
 
 [workspace.dependencies]
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = "0.15.4"
-sapling-crypto = "0.7"
+orchard = { version = "0.15.5", package = "zakura-orchard", path = "../libraries/orchard" }
+sapling-crypto = { version = "0.7", package = "zakura-sapling-crypto", path = "../libraries/sapling-crypto" }
 zcash_address = "0.13.0"
 zcash_encoding = "0.4"
 zcash_history = "0.5.0"
-zcash_keys = "0.16.0"
-zcash_primitives = "0.30.0"
-zcash_proofs = "0.30.0"
+zcash_keys = { version = "0.16.1", package = "zakura-keys", path = "../libraries/zcash_keys" }
+zcash_primitives = { version = "0.30.0", package = "zakura-primitives", path = "../libraries/zcash_primitives" }
+zcash_proofs = { version = "0.30.0", package = "zakura-proofs", path = "../libraries/zcash_proofs" }
 zcash_transparent = "0.10.0"
 zcash_protocol = "0.10.1"
 zip32 = "0.2"
@@ -117,8 +117,8 @@ rand = "0.8.5"
 rand_chacha = "0.3"
 rand_core = "0.6"
 rayon = "1.10"
-reddsa = "0.5"
-redjubjub = "0.8"
+reddsa = { version = "0.5", package = "zakura-reddsa", path = "../libraries/reddsa" }
+redjubjub = { version = "0.8", package = "zakura-redjubjub", path = "../libraries/redjubjub" }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false }
 ripemd = "0.1"
