@@ -1404,7 +1404,7 @@ impl FallibleDiskValue for EngineMetadata {
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
         let mut decoder = Decoder::new(bytes);
         let disk_format = decoder.u32()?;
-        if disk_format != 1 {
+        if disk_format != HeaderChainDiskVersion::CURRENT.0 {
             return Err(HeaderChainValueError::UnsupportedDiskFormat(disk_format));
         }
         let disk_format = HeaderChainDiskVersion(disk_format);
@@ -1728,7 +1728,7 @@ mod tests {
         );
 
         let metadata = EngineMetadata {
-            disk_format: HeaderChainDiskVersion(1),
+            disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::HeadersOnly,
             network_id: NetworkKind::Regtest,
             anchor_manifest_digest: [13; 32],
@@ -1773,8 +1773,14 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 1, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 2, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
+        let mut version_one_bytes = bytes.clone();
+        version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            EngineMetadata::decode(&version_one_bytes),
+            Err(HeaderChainValueError::UnsupportedDiskFormat(1))
+        );
         let mut legacy_bytes = bytes.clone();
         legacy_bytes.truncate(
             legacy_bytes
@@ -1788,7 +1794,7 @@ mod tests {
         );
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
-        // The metadata digest last moved when `headers_only_migration_epoch` was appended.
+        // The metadata digest last moved when the header-chain disk version advanced to 2.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -1798,7 +1804,7 @@ mod tests {
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "538aaccaf8a97966ec5d3b678c608067e950402ac95995ef7e0eecfecba36066",
+                "3f4965a634583e651b4904de0601c44e934719dbcb4e22a783bf052b7c21e9eb",
             ]
         );
     }
@@ -1875,13 +1881,13 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 2];
+        let mut metadata = vec![0, 0, 0, 3];
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(2))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(3))
         );
-        metadata[3] = 1;
+        metadata[3] = 2;
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

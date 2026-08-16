@@ -623,7 +623,8 @@ mod tests {
         let mut cases = Vec::new();
 
         let mut disk_format = no_change_candidate(&fixture.engine);
-        disk_format.change_set.metadata.disk_format = crate::HeaderChainDiskVersion(2);
+        disk_format.change_set.metadata.disk_format =
+            crate::HeaderChainDiskVersion(crate::HeaderChainDiskVersion::CURRENT.0 + 1);
         cases.push(disk_format);
 
         let mut network = no_change_candidate(&fixture.engine);

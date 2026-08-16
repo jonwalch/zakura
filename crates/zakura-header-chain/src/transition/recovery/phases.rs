@@ -63,7 +63,7 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
     let metadata = store.metadata()?;
     let trust_anchor_changed = metadata.anchor_manifest_digest != config.trust_anchor_digest();
     if snapshot_before_repair != metadata.snapshot()
-        || metadata.disk_format.0 != 1
+        || metadata.disk_format != crate::HeaderChainDiskVersion::CURRENT
         || metadata.mode != config.mode
         || metadata.network_id != config.network.kind()
         || trust_anchor_changed && !allow_trust_anchor_update

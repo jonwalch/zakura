@@ -127,7 +127,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         None
     );
 
-    let window = VctAuxiliaryWindow {
+    let mut window = VctAuxiliaryWindow {
         engine_snapshot: EngineSnapshot {
             mode: EngineMode::Integrated,
             state_version: StateVersion::new(1),
@@ -147,6 +147,23 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         successor_height: None,
         successor: None,
     };
+    assert_eq!(
+        missing_vct_successor_retry(&window, block::Height(1)),
+        (block::Height(2), VctWriteRetryCause::MissingSuccessor),
+        "an absent successor header waits for header admission"
+    );
+    window.successor_height = Some(block::Height(2));
+    assert_eq!(
+        missing_vct_successor_retry(&window, block::Height(1)),
+        (
+            block::Height(2),
+            VctWriteRetryCause::MissingRoot {
+                replacement_required: true
+            }
+        ),
+        "a retained successor without usable auxiliary data requests replacement"
+    );
+    window.successor_height = None;
     let expected_roots = authenticated
         .tree_aux
         .map(|aux| (aux.sapling_root, aux.orchard_root, aux.ironwood_root))

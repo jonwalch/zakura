@@ -391,7 +391,7 @@ mod tests {
         AuditedView {
             graph,
             metadata: EngineMetadata {
-                disk_format: HeaderChainDiskVersion(1),
+                disk_format: HeaderChainDiskVersion::CURRENT,
                 mode: EngineMode::Integrated,
                 network_id: NetworkKind::Testnet,
                 anchor_manifest_digest: [1; 32],

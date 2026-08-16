@@ -3280,14 +3280,7 @@ impl HeaderChainStore {
             }),
             metadata: metadata.clone(),
         };
-        let mut batch = self.batch_for(&change_set)?;
-        self.put_value(
-            &mut batch,
-            HEADER_ENGINE_META,
-            TOMBSTONE_COUNT_KEY,
-            &HeaderRowCountDisk(0),
-        )?;
-        self.db.write(batch)?;
+        self.db.write(self.batch_for(&change_set)?)?;
         Ok(())
     }
 
@@ -3440,7 +3433,10 @@ impl HeaderChainStore {
         let finality_advanced = current_metadata.as_ref().is_some_and(|metadata| {
             metadata.frontiers.finalized != changes.metadata.frontiers.finalized
         });
-        if finality_advanced || !changes.put_consensus_invalid_body_tombstones.is_empty() {
+        if current_metadata.is_none()
+            || finality_advanced
+            || !changes.put_consensus_invalid_body_tombstones.is_empty()
+        {
             self.apply_consensus_invalid_tombstones(
                 &mut batch,
                 changes,

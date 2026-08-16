@@ -70,7 +70,7 @@ impl TestStore {
             .header_chain_score(frontier.hash)
             .expect("the anchor is retained");
         let metadata = EngineMetadata {
-            disk_format: HeaderChainDiskVersion(1),
+            disk_format: HeaderChainDiskVersion::CURRENT,
             mode,
             network_id: config.network.kind(),
             anchor_manifest_digest: config.trust_anchor_digest(),

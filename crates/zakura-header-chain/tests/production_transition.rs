@@ -63,7 +63,7 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
     )
     .expect("the fixture configuration is coherent");
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),

@@ -393,7 +393,7 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
     .expect("the canonical child fields agree");
     let score = ChainScore::new(SuffixWork::new(child_work.as_u256()), child.hash);
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),

@@ -1536,6 +1536,7 @@ mod tests {
             .new_consensus_invalid_body_tombstones
             .push(ConsensusInvalidBodyTombstone {
                 hash: child.hash,
+                height: child.height,
                 evidence: EvidenceId::from_digest([9; 32]),
                 rule: crate::BodyRuleId::new("test.sparse-tombstone"),
             });

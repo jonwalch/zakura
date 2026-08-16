@@ -122,7 +122,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         epoch: FinalityEpoch::new(0),
     };
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: config.mode,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),

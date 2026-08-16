@@ -66,6 +66,25 @@ use vct_authentication_sweep::VctAuthenticationSweeper;
 use vct_write_retry::{VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
+fn missing_vct_successor_retry(
+    auxiliary_window: &VctAuxiliaryWindow,
+    current_height: Height,
+) -> (Height, VctWriteRetryCause) {
+    if let Some(successor_height) = auxiliary_window.successor_height {
+        return (
+            successor_height,
+            VctWriteRetryCause::MissingRoot {
+                replacement_required: true,
+            },
+        );
+    }
+
+    (
+        current_height.next().unwrap_or(current_height),
+        VctWriteRetryCause::MissingSuccessor,
+    )
+}
+
 /// A full-state mutation staged until its matching header transition commits durably.
 #[allow(dead_code)] // Constructed when the dark header engine is attached to the writer task.
 pub struct PreparedFullStateTransition {
@@ -2034,16 +2053,13 @@ impl WriteBlockWorkerTask {
                     .and_then(|auxiliary_window| auxiliary_window.successor.as_ref())
                     .is_none()
             {
-                let height = vct_auxiliary_window
+                let auxiliary_window = vct_auxiliary_window
                     .as_ref()
-                    .and_then(|auxiliary_window| auxiliary_window.successor_height)
-                    .or_else(|| ordered_block.0.height.next().ok())
-                    .unwrap_or(ordered_block.0.height);
-                let wait = vct_write_retry_manager.on_retryable_error(
-                    height,
-                    VctWriteRetryCause::MissingSuccessor,
-                    ordered_block,
-                );
+                    .expect("exact VCT roots require an auxiliary window");
+                let (height, retry_cause) =
+                    missing_vct_successor_retry(auxiliary_window, ordered_block.0.height);
+                let wait =
+                    vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
                 std::thread::park_timeout(wait);
                 continue;
             }
