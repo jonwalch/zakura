@@ -241,8 +241,11 @@ enum HeadersOnlyWitnessRelation {
 /// Relate `witness` to `current` using only retained header rows.
 ///
 /// The walk stops at `current` even when that pin is no longer retained, by matching the
-/// child that names it as parent. A missing parent is unauthenticated, not a contradiction:
-/// retention drops headers below the live finalized frontier and may drop an abandoned fork.
+/// child that names it as parent. A retained child at `current.height + 1` that names a
+/// different parent contradicts the pin without looking that parent up: its ancestor at
+/// `current.height` is some other hash. A missing parent deeper than that is
+/// unauthenticated, not a contradiction: retention drops headers below the live finalized
+/// frontier and may drop an abandoned fork.
 fn headers_only_witness_relation(
     by_hash: &HashMap<block::Hash, &HeaderNode>,
     witness: crate::Frontier,
@@ -255,8 +258,12 @@ fn headers_only_witness_relation(
         return HeadersOnlyWitnessRelation::ContradictsCurrent;
     }
     while node.height > current.height {
-        if current.height.next().ok() == Some(node.height) && node.parent_hash == current.hash {
-            return HeadersOnlyWitnessRelation::DescendsToCurrent;
+        if current.height.next().ok() == Some(node.height) {
+            return if node.parent_hash == current.hash {
+                HeadersOnlyWitnessRelation::DescendsToCurrent
+            } else {
+                HeadersOnlyWitnessRelation::ContradictsCurrent
+            };
         }
         let Some(parent) = by_hash.get(&node.parent_hash).copied() else {
             return HeadersOnlyWitnessRelation::Unauthenticated;

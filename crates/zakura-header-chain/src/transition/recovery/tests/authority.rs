@@ -1092,6 +1092,17 @@ fn recovery_rejects_a_historical_current_frontier_on_an_unrelated_chain() {
 }
 
 #[test]
+fn recovery_rejects_a_retained_child_that_names_a_different_parent_at_current_height() {
+    let (mut store, config, _) = historical_headers_only_depth_history_fixture();
+    let forged = Frontier::new(store.finality[0].current.height, block::Hash([0x5b; 32]));
+    store.canonical.insert(forged.height, forged.hash);
+    store.finality[0].current = forged;
+    store.finality[1].previous = forged;
+
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
 fn recovery_rejects_a_retained_witness_at_the_wrong_height() {
     let (mut store, config, tip) = headers_only_depth_history_fixture();
     let finalized = store.metadata.frontiers.finalized;
