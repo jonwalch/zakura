@@ -366,7 +366,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
         .copied()
         .expect("the depth transition appended a finality record");
     forged.source = FinalitySource::HeadersOnlyDepth {
-        selected_tip: Frontier::new(selected_tip.height, block::Hash([0x63; 32])),
+        selected_tip: Frontier::new(selected_tip.height, finalized.hash),
     };
     let mut corruption = DiskWriteBatch::new();
     runtime

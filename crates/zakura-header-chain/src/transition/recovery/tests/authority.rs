@@ -868,58 +868,217 @@ fn settled_headers_only_depth_history_fixture() -> (AuditStore, EngineConfig, Fr
     (store, config, second)
 }
 
+/// Build a depth-two store after a legal reorg that abandons historical witnesses.
+///
+/// Branch A witnessed epochs 0–1 at h3/h4. Branch B forks at h3, wins, and finality
+/// advances onto it. Retention keeps only B; the append-only history still names A's tips.
+fn headers_only_reorg_abandons_depth_two_witnesses() -> (AuditStore, EngineConfig) {
+    let (mut store, config, third_a) = historical_headers_only_depth_history_fixture();
+    let second_node = store.nodes[0].clone();
+    let second = Frontier::new(second_node.height, second_node.hash);
+    let fourth_a = store.finality[1]
+        .headers_only_depth_witness(config.limits.local_finality_depth.get())
+        .expect("epoch 1 carries a depth-two witness");
+    let first = store.finality[0].current;
+    let anchor = store.finality[0].previous;
+    let anchor_header = store.contexts[0].header.clone();
+    let first_header = store.contexts[1].header.clone();
+
+    let third_b = extend(&second_node, 0x58);
+    let fourth_b = extend(&third_b, 0x59);
+    let fifth_b = extend(&fourth_b, 0x5a);
+    let third_b_frontier = Frontier::new(third_b.height, third_b.hash);
+    let fourth_b_frontier = Frontier::new(fourth_b.height, fourth_b.hash);
+    let fifth_b_frontier = Frontier::new(fifth_b.height, fifth_b.hash);
+
+    store.metadata.finality_epoch = FinalityEpoch::new(2);
+    store.metadata.frontiers.finalized = third_b_frontier;
+    store.metadata.frontiers.header_best = fifth_b_frontier;
+    store.metadata.frontiers.verified_best = third_b_frontier;
+    store.metadata.header_best_score = ChainScore::new(
+        fifth_b
+            .work_coordinate()
+            .suffix_after(third_b.work_coordinate())
+            .expect("the winning suffix work is in range"),
+        fifth_b.hash,
+    );
+    store.metadata.oldest_retained_height = third_b.height;
+    store.nodes = vec![third_b.clone(), fourth_b.clone(), fifth_b.clone()];
+    store.children = vec![(third_b.hash, fourth_b.hash), (fourth_b.hash, fifth_b.hash)];
+    store.selected = vec![third_b_frontier, fourth_b_frontier, fifth_b_frontier];
+    store.verified = vec![third_b_frontier];
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: anchor_header,
+            height: anchor.height,
+        },
+        ValidationContextRecord {
+            header: first_header,
+            height: first.height,
+        },
+        ValidationContextRecord {
+            header: second_node.header,
+            height: second.height,
+        },
+    ];
+    store.finality = vec![
+        FinalityRecord {
+            previous: anchor,
+            current: first,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: third_a,
+            },
+            epoch: FinalityEpoch::new(0),
+        },
+        FinalityRecord {
+            previous: first,
+            current: second,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: fourth_a,
+            },
+            epoch: FinalityEpoch::new(1),
+        },
+        FinalityRecord {
+            previous: second,
+            current: third_b_frontier,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: fifth_b_frontier,
+            },
+            epoch: FinalityEpoch::new(2),
+        },
+    ];
+    store.canonical.insert(first.height, first.hash);
+    store.canonical.insert(second.height, second.hash);
+    store.canonical.insert(third_b.height, third_b.hash);
+    store.snapshot = store.metadata.snapshot();
+    (store, config)
+}
+
+/// Build a depth-one store after a legal reorg that changes the hash at current.height + 1.
+fn headers_only_reorg_abandons_depth_one_witness() -> (AuditStore, EngineConfig) {
+    let (mut store, config, tip_a) = headers_only_depth_history_fixture();
+    let child_node = store.nodes[0].clone();
+    let child = Frontier::new(child_node.height, child_node.hash);
+    let anchor = store.finality[0].previous;
+    let anchor_header = store.contexts[0].header.clone();
+
+    let tip_b = extend(&child_node, 0x53);
+    let next_b = extend(&tip_b, 0x54);
+    let tip_b_frontier = Frontier::new(tip_b.height, tip_b.hash);
+    let next_b_frontier = Frontier::new(next_b.height, next_b.hash);
+
+    store.metadata.finality_epoch = FinalityEpoch::new(1);
+    store.metadata.frontiers.finalized = tip_b_frontier;
+    store.metadata.frontiers.header_best = next_b_frontier;
+    store.metadata.frontiers.verified_best = tip_b_frontier;
+    store.metadata.header_best_score =
+        ChainScore::new(SuffixWork::new(next_b.block_work.as_u256()), next_b.hash);
+    store.metadata.oldest_retained_height = tip_b.height;
+    store.nodes = vec![tip_b.clone(), next_b.clone()];
+    store.children = vec![(tip_b.hash, next_b.hash)];
+    store.selected = vec![tip_b_frontier, next_b_frontier];
+    store.verified = vec![tip_b_frontier];
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: anchor_header,
+            height: anchor.height,
+        },
+        ValidationContextRecord {
+            header: child_node.header,
+            height: child.height,
+        },
+    ];
+    store.finality = vec![
+        FinalityRecord {
+            previous: anchor,
+            current: child,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: tip_a,
+            },
+            epoch: FinalityEpoch::new(0),
+        },
+        FinalityRecord {
+            previous: child,
+            current: tip_b_frontier,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: next_b_frontier,
+            },
+            epoch: FinalityEpoch::new(1),
+        },
+    ];
+    store.canonical.insert(child.height, child.hash);
+    store.canonical.insert(tip_b.height, tip_b.hash);
+    store.snapshot = store.metadata.snapshot();
+    (store, config)
+}
+
 #[test]
 fn recovery_authenticates_headers_only_selected_tip_witness() {
     use std::sync::atomic::Ordering;
 
     let (store, config, _) = headers_only_depth_history_fixture();
     audit_store(&store, &config).expect("the retained selected-tip witness recovers");
-    // The witness sits above the finalized frontier, so only the frontier itself is read from
-    // the canonical index, which does not cover unsettled heights.
+    // Witnesses are not authenticated through the canonical index. The finalized pin is.
     assert_eq!(store.canonical_reads.load(Ordering::Relaxed), 1);
 
     let (settled, settled_config, _) = settled_headers_only_depth_history_fixture();
     audit_store(&settled, &settled_config).expect("the settled selected-tip witness recovers");
-    assert_eq!(settled.canonical_reads.load(Ordering::Relaxed), 2);
+    assert_eq!(settled.canonical_reads.load(Ordering::Relaxed), 1);
 }
 
 #[test]
-fn recovery_authenticates_historical_witnesses_against_the_current_frontier() {
+fn recovery_accepts_retained_historical_witnesses_that_descend_to_their_record_current() {
     let (store, config, _) = historical_headers_only_depth_history_fixture();
 
     audit_store(&store, &config)
-        .expect("retained historical witnesses descend to the current finalized frontier");
+        .expect("retained historical witnesses that still reach their record pin recover");
 }
 
 #[test]
-fn recovery_rejects_missing_or_forged_settled_selected_tip_witness() {
+fn recovery_accepts_abandoned_headers_only_witnesses_after_a_legal_reorg() {
+    let (depth_two, depth_two_config) = headers_only_reorg_abandons_depth_two_witnesses();
+    audit_store(&depth_two, &depth_two_config)
+        .expect("abandoned depth-two witnesses remain valid after a legal headers-only reorg");
+
+    let (depth_one, depth_one_config) = headers_only_reorg_abandons_depth_one_witness();
+    audit_store(&depth_one, &depth_one_config).expect(
+        "an abandoned depth-one witness remains valid when the reorg changes current.height + 1",
+    );
+}
+
+#[test]
+fn recovery_does_not_treat_unauthenticated_historical_witnesses_as_finality_failures() {
     let (base, config, witness) = settled_headers_only_depth_history_fixture();
 
     let mut missing = base.clone();
     missing.canonical.remove(&witness.height);
-    assert!(violations(&missing, &config).contains(&AuditViolation::Finality));
+    audit_store(&missing, &config)
+        .expect("a settled witness is not authenticated through the canonical index");
 
     let mut forged_index = base.clone();
     forged_index
         .canonical
         .insert(witness.height, block::Hash([0x68; 32]));
-    assert!(violations(&forged_index, &config).contains(&AuditViolation::Finality));
+    audit_store(&forged_index, &config)
+        .expect("a canonical mismatch at a historical witness height is not a finality failure");
 
     let mut forged_record = base;
     forged_record.finality[0].source = FinalitySource::HeadersOnlyDepth {
         selected_tip: Frontier::new(witness.height, block::Hash([0x69; 32])),
     };
-    assert!(violations(&forged_record, &config).contains(&AuditViolation::Finality));
+    audit_store(&forged_record, &config)
+        .expect("an unretained historical witness is unauthenticated, not contradictory");
 }
 
 #[test]
-fn recovery_rejects_an_absent_historical_witness() {
+fn recovery_accepts_an_unretained_historical_witness() {
     let (mut store, config, witness) = historical_headers_only_depth_history_fixture();
     store.finality[0].source = FinalitySource::HeadersOnlyDepth {
         selected_tip: Frontier::new(witness.height, block::Hash([0x6a; 32])),
     };
 
-    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+    audit_store(&store, &config)
+        .expect("an unretained historical witness does not fail the finality audit");
 }
 
 #[test]
@@ -933,21 +1092,25 @@ fn recovery_rejects_a_historical_current_frontier_on_an_unrelated_chain() {
 }
 
 #[test]
-fn recovery_rejects_an_unprovable_above_finalized_witness() {
-    let (base, config, tip) = headers_only_depth_history_fixture();
-
-    let mut unretained = base.clone();
-    unretained.finality[0].source = FinalitySource::HeadersOnlyDepth {
-        selected_tip: Frontier::new(tip.height, block::Hash([0x54; 32])),
-    };
-    assert!(violations(&unretained, &config).contains(&AuditViolation::Finality));
-
-    let mut wrong_height = base;
-    let finalized = wrong_height.metadata.frontiers.finalized;
-    wrong_height.finality[0].source = FinalitySource::HeadersOnlyDepth {
+fn recovery_rejects_a_retained_witness_at_the_wrong_height() {
+    let (mut store, config, tip) = headers_only_depth_history_fixture();
+    let finalized = store.metadata.frontiers.finalized;
+    store.finality[0].source = FinalitySource::HeadersOnlyDepth {
         selected_tip: Frontier::new(tip.height, finalized.hash),
     };
-    assert!(violations(&wrong_height, &config).contains(&AuditViolation::Finality));
+
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
+fn recovery_accepts_an_unretained_latest_witness() {
+    let (mut store, config, tip) = headers_only_depth_history_fixture();
+    store.finality[0].source = FinalitySource::HeadersOnlyDepth {
+        selected_tip: Frontier::new(tip.height, block::Hash([0x54; 32])),
+    };
+
+    audit_store(&store, &config)
+        .expect("an unretained latest witness is unauthenticated, not a finality failure");
 }
 
 #[test]
@@ -1116,4 +1279,95 @@ fn audits_each_normative_invariant() {
     assert!(violations(&store, &config)
         .iter()
         .any(|violation| matches!(violation, AuditViolation::Auxiliary(_))));
+}
+
+/// REVIEW SCRATCH: the exact reproduction from the first review pass, verbatim scenario.
+#[test]
+fn review_scratch_original_repro() {
+    let (mut store, mut config) = fixture();
+    let anchor_node = store.nodes[0].clone();
+    let first_node = store.nodes[1].clone();
+    let second_node = extend(&first_node, 0x55);
+    let third_a = extend(&second_node, 0x56);
+    let fourth_a = extend(&third_a, 0x57);
+    let third_b = extend(&second_node, 0x76);
+    let fourth_b = extend(&third_b, 0x77);
+    let fifth_b = extend(&fourth_b, 0x78);
+
+    let anchor = Frontier::new(anchor_node.height, anchor_node.hash);
+    let first = Frontier::new(first_node.height, first_node.hash);
+    let second = Frontier::new(second_node.height, second_node.hash);
+    let third_a_frontier = Frontier::new(third_a.height, third_a.hash);
+    let fourth_a_frontier = Frontier::new(fourth_a.height, fourth_a.hash);
+    let third_b_frontier = Frontier::new(third_b.height, third_b.hash);
+    let fourth_b_frontier = Frontier::new(fourth_b.height, fourth_b.hash);
+    let fifth_b_frontier = Frontier::new(fifth_b.height, fifth_b.hash);
+
+    config.mode = EngineMode::HeadersOnly;
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(2).expect("two is nonzero");
+    store.metadata.mode = EngineMode::HeadersOnly;
+    store.metadata.finality_epoch = FinalityEpoch::new(2);
+    store.metadata.frontiers.finalized = third_b_frontier;
+    store.metadata.frontiers.header_best = fifth_b_frontier;
+    store.metadata.frontiers.verified_best = third_b_frontier;
+    store.metadata.header_best_score =
+        ChainScore::new(SuffixWork::new(fifth_b.block_work.as_u256()), fifth_b.hash);
+    store.metadata.oldest_retained_height = third_b.height;
+    store.nodes = vec![third_b.clone(), fourth_b.clone(), fifth_b.clone()];
+    store.children = vec![
+        (third_b_frontier.hash, fourth_b_frontier.hash),
+        (fourth_b_frontier.hash, fifth_b_frontier.hash),
+    ];
+    store.selected = vec![third_b_frontier, fourth_b_frontier, fifth_b_frontier];
+    store.verified = vec![third_b_frontier];
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: anchor_node.header,
+            height: anchor.height,
+        },
+        ValidationContextRecord {
+            header: first_node.header,
+            height: first.height,
+        },
+        ValidationContextRecord {
+            header: second_node.header,
+            height: second.height,
+        },
+    ];
+    store.finality = vec![
+        FinalityRecord {
+            previous: anchor,
+            current: first,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: third_a_frontier,
+            },
+            epoch: FinalityEpoch::new(0),
+        },
+        FinalityRecord {
+            previous: first,
+            current: second,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: fourth_a_frontier,
+            },
+            epoch: FinalityEpoch::new(1),
+        },
+        FinalityRecord {
+            previous: second,
+            current: third_b_frontier,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: fifth_b_frontier,
+            },
+            epoch: FinalityEpoch::new(2),
+        },
+    ];
+    store.canonical.insert(first.height, first.hash);
+    store.canonical.insert(second.height, second.hash);
+    store
+        .canonical
+        .insert(third_b_frontier.height, third_b_frontier.hash);
+    store.snapshot = store.metadata.snapshot();
+
+    let result = audit_store(&store, &config);
+    println!("REVIEW SCRATCH: ok={}", result.is_ok());
+    assert!(result.is_ok(), "original repro must now recover");
 }

@@ -163,17 +163,14 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
             if let Some(selected_tip) =
                 record.headers_only_depth_witness(config.limits.local_finality_depth.get())
             {
-                // The canonical index authenticates settled witnesses. Retained rows authenticate
-                // an above-finalized witness against the current finalized frontier. Recovery
-                // authenticates the record's historical current frontier independently above.
-                let witness_is_authentic =
-                    if selected_tip.height <= metadata.frontiers.finalized.height {
-                        store.authenticated_canonical_hash(selected_tip.height)?
-                            == Some(selected_tip.hash)
-                    } else {
-                        witness_descends_to(&by_hash, selected_tip, metadata.frontiers.finalized)
-                    };
-                if !witness_is_authentic {
+                // The witness is commit-time depth evidence, not a second pin. A later legal
+                // reorg can abandon it, and retention can drop it. Fail closed only when
+                // retained rows contradict this record's current frontier. The current
+                // frontier is authenticated independently above.
+                if matches!(
+                    headers_only_witness_relation(&by_hash, selected_tip, record.current),
+                    HeadersOnlyWitnessRelation::ContradictsCurrent
+                ) {
                     invalid_history = true;
                 }
             }
@@ -231,33 +228,51 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     Ok(())
 }
 
-/// Return true when the audited header rows prove `witness` descends to `frontier`.
+/// How retained header rows relate a headers-only depth witness to its record pin.
+enum HeadersOnlyWitnessRelation {
+    /// Retained parents prove the witness descends to this record's current frontier.
+    DescendsToCurrent,
+    /// A retained row claims this witness but disagrees with the record's current frontier.
+    ContradictsCurrent,
+    /// The witness is absent, or the walk hits the retention floor before the pin.
+    Unauthenticated,
+}
+
+/// Relate `witness` to `current` using only retained header rows.
 ///
-/// Retention keeps the current finalized frontier and every descendant. The walk therefore
-/// avoids a historical frontier that retention may have pruned.
-fn witness_descends_to(
+/// The walk stops at `current` even when that pin is no longer retained, by matching the
+/// child that names it as parent. A missing parent is unauthenticated, not a contradiction:
+/// retention drops headers below the live finalized frontier and may drop an abandoned fork.
+fn headers_only_witness_relation(
     by_hash: &HashMap<block::Hash, &HeaderNode>,
     witness: crate::Frontier,
-    frontier: crate::Frontier,
-) -> bool {
+    current: crate::Frontier,
+) -> HeadersOnlyWitnessRelation {
     let Some(mut node) = by_hash.get(&witness.hash).copied() else {
-        return false;
+        return HeadersOnlyWitnessRelation::Unauthenticated;
     };
     if node.height != witness.height {
-        return false;
+        return HeadersOnlyWitnessRelation::ContradictsCurrent;
     }
-    while node.height > frontier.height {
+    while node.height > current.height {
+        if current.height.next().ok() == Some(node.height) && node.parent_hash == current.hash {
+            return HeadersOnlyWitnessRelation::DescendsToCurrent;
+        }
         let Some(parent) = by_hash.get(&node.parent_hash).copied() else {
-            return false;
+            return HeadersOnlyWitnessRelation::Unauthenticated;
         };
         // Reject a parent link that does not descend exactly one height, which also bounds
         // this walk on a store whose height rows contradict its parent rows.
         if parent.height.next().ok() != Some(node.height) {
-            return false;
+            return HeadersOnlyWitnessRelation::ContradictsCurrent;
         }
         node = parent;
     }
-    node.hash == frontier.hash && node.height == frontier.height
+    if node.hash == current.hash && node.height == current.height {
+        HeadersOnlyWitnessRelation::DescendsToCurrent
+    } else {
+        HeadersOnlyWitnessRelation::ContradictsCurrent
+    }
 }
 
 fn finality_history_starts_validly(
