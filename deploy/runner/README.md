@@ -45,8 +45,8 @@ of rendering blanks.
 
 Sparklines come from an in-memory per-node ring buffer sized by
 `--history-window` (default 3h). This history is deliberately not persisted:
-`--state-file` carries the durable orphan-pair and stall timers, and losing
-sparklines across a dashboard restart is acceptable.
+`--state-file` carries the durable orphan-pair history and per-node tip progress,
+and losing sparklines across a dashboard restart is acceptable.
 
 The probe collects a redacted tail of the node's `ERROR`/`WARN` log lines, but
 the page does not serve it unless the dashboard runs with `--expose-logs`. These
@@ -64,15 +64,17 @@ hashes sampled at 1, 2, 5, 10, and 32 blocks back, so an unresolved fork reports
 
 A node whose height drops or whose tip hash changes at the same height records
 an orphan pair: the discarded hash, the new canonical hash, and the depth. Pass
-`--state-file` to persist that history across restarts; the deploy workflows
-point it at `/var/lib/zakura-<network>-dashboard/orphan-pairs.json`. Without the
-flag the history is in-memory only and is lost on every restart.
+`--state-file` to persist that history and the tip baseline across restarts; the
+deploy workflows point it at
+`/var/lib/zakura-<network>-dashboard/orphan-pairs.json`. Without the flag the
+history is in-memory only and is lost on every restart.
 
 ## Fleet Slack Watchdog
 
 `zakura-cluster-watchdog.py` is a small stdlib-only Python service that polls the
 mainnet and testnet cluster status dashboards and posts Slack transition alerts
-when a fleet node remains unhealthy.
+when a fleet node remains unhealthy or the agreeing fleet observes an extended
+block interval.
 
 It is installed by `.github/workflows/zakura-mainnet-deploy.yml` on `us-east-0`:
 
@@ -91,12 +93,68 @@ The default config in `fleet-watchdog.toml` watches:
 Alerts fire only after a sustained condition:
 
 - `health` is `down` or `rpc_error` for at least 10 minutes
-- `seconds_since_advanced` is at least 600 seconds for at least 10 minutes
-- a dashboard endpoint is unreachable for at least 10 minutes
+- no agreed-fleet or individual-node tip change for at least 600 seconds
+- a dashboard fetch fails or its completed poll is stale for at least 10 minutes
+
+When at least two reachable nodes share the freshest majority height and hash,
+the watchdog suppresses duplicate stall alerts for those majority nodes. After
+the threshold it opens one fleet-wide extended-interval incident, including the
+configured target spacing and the client implementations that confirm the tip.
+The incident keeps that height, hash, header time, and start time as an immutable
+anchor. The default fleet config sets the current post-Blossom target of 75
+seconds and the corresponding mainnet or testnet CipherScan block explorer.
+
+The `zcashd-compat` sidecar is pinned to its local Zakura node, so cross-client
+agreement is useful context but not an independent network reference. The first
+fleet alert therefore leaves the interval unclassified. When the agreeing
+majority changes, one resolution message first verifies that the new tip
+descends from the exact alerted hash, then compares that block and its first
+successor's canonical header timestamps. A same-height replacement, rollback,
+or mismatched ancestor resolves as a canonical branch change consistent with an
+orphan/reorg; it is never classified as a Zakura delay. A snapshot whose last
+completed dashboard poll is more than one watchdog interval old is handled as
+one fleet telemetry failure instead of entering chain or per-node
+classification. Per-node sample times can span a full collection cycle without
+invalidating a completed poll.
+
+With the default 600-second alert threshold, 30-second timestamp tolerance, and
+75-second target spacing, same-branch intervals are classified conservatively:
+
+- 600 seconds or more confirms a long canonical interval;
+- 570-599 seconds is consistent with the alert within the timestamp tolerance;
+- 0-150 seconds indicates that the fleet likely observed the successor late;
+- 151-569 seconds, or a negative timestamp delta, remains inconclusive.
+
+Two matching header reports are sufficient when the other reports are missing
+because header data is deterministic for an already agreed block hash. Any
+conflicting report makes the evidence unavailable. Missing or inconsistent
+H+1/H+2 evidence is retried for two watchdog cycles without an intermediate
+Slack message. If the evidence remains missing, or the fleet has already
+advanced beyond the exact header window, the one resolution says progress
+resumed but leaves the cause unclassified.
+
+The classified resolution links the canonical blocks at the alerted height and
+its successor in CipherScan. A long or near-threshold canonical interval means a
+Zakura fleet delay is not needed to explain the alert. Conversely, a canonical
+interval near the 75-second target paired with a long observed interval points
+to a fleet observation delay.
+
+An unchanged height and hash does not confirm or clear the interval. A changed
+hash resets the dashboard's stall timer and resolves an open incident as a
+branch change. Any node behind the freshest majority still gets its own stall
+alert, and if a reference node is already ahead, the older majority is not
+classified as a long block.
+
+The alert and follow-up also count real orphan/reorg observations recorded
+during the interval. They report both the dashboard's observed no-progress
+duration and, when available, the canonical header interval. Header timestamps
+are miner-reported, so this classifies the interval recorded by the canonical
+chain rather than claiming the exact wall-clock instant that mining completed.
 
 Down alerts take precedence over stalled alerts, so each node has at most one
-active alert. The watchdog posts only on transitions: first failure after the
-threshold, then recovery. Persistent failures do not post every poll.
+active alert. Node and dashboard failures post once after the threshold and
+again on recovery. A consolidated interval posts one initial alert and one
+classified resolution; neither repeats on every poll.
 
 Slack delivery is **webhook-only**. Set:
 

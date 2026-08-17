@@ -133,18 +133,47 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode())
                 method = payload.get("method")
+                params = payload.get("params") or []
+                best_hash = "b" * 64
+                previous_hash = "a" * 64
                 if method in outer.rpc_results:
+                    result = outer.rpc_results[method]
+                elif method == "getblockchaininfo":
+                    result = {
+                        "blocks": 101,
+                        "headers": 101,
+                        "bestblockhash": best_hash,
+                        "chain": "test",
+                        "valuePools": [],
+                    }
+                elif method == "getblockhash":
+                    result = "c" * 64
+                elif method == "getblockheader" and params[0] == best_hash:
+                    result = {
+                        "previousblockhash": previous_hash,
+                        "time": 10_831,
+                    }
+                elif method == "getblockheader" and params[0] == previous_hash:
+                    result = {
+                        "previousblockhash": "9" * 64,
+                        "time": 10_000,
+                    }
+                elif method == "getinfo":
+                    result = {"testnet": True, "build": "stub"}
+                elif method == "getpeerinfo":
+                    result = []
+                elif method == "getmempoolinfo":
+                    result = {"size": 0, "bytes": 0}
+                else:
                     body = json.dumps({
                         "jsonrpc": "2.0",
                         "id": payload.get("id"),
-                        "result": outer.rpc_results[method],
+                        "error": {"code": -32601, "message": method},
                     }).encode()
                     return self.reply(200, body)
-                body = json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": payload.get("id"),
-                    "error": {"code": -32601, "message": method},
-                }).encode()
+                body = json.dumps(
+                    {"result": result, "error": None, "id": payload.get("id")}
+                ).encode()
                 return self.reply(200, body)
 
         self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
@@ -344,6 +373,16 @@ zcash_net_in_bytes_total 12345
         self.assertIn("metrics_error", probe)
         self.assertNotIn("metrics", probe)
         self.assertIn("host", probe)
+
+    def test_rpc_probe_reports_the_canonical_header_interval(self):
+        probe = self.run_probe(rpc_url=f"http://{self.endpoint}/")
+
+        self.assertNotIn("rpc_error", probe)
+        self.assertEqual(probe["block_time"], 10_831)
+        self.assertEqual(probe["previous_block_time"], 10_000)
+        self.assertEqual(probe["grandparent_hash"], "9" * 64)
+        self.assertEqual(probe["ancestor_hashes"]["1"], "a" * 64)
+        self.assertEqual(probe["ancestor_hashes"]["2"], "9" * 64)
 
 
 class IronwoodStatusTests(unittest.TestCase):
@@ -565,6 +604,8 @@ class TipAgreementTests(unittest.TestCase):
                 "height": 98,
                 "headers": 101,
                 "block_hash": "b" * 64,
+                "block_time": 10_831,
+                "previous_block_time": 10_000,
                 "active_state": "active",
                 "process_running": True,
                 "client_name": "zakurad",
@@ -576,6 +617,10 @@ class TipAgreementTests(unittest.TestCase):
         self.assertEqual(row["tip_event"], "reorg_height_drop")
         self.assertEqual(row["headers"], 101)
         self.assertEqual(row["header_lag"], 3)
+        self.assertEqual(row["block_time"], 10_831)
+        self.assertEqual(row["previous_block_time"], 10_000)
+        self.assertEqual(row["seconds_since_advanced"], 0.0)
+        self.assertEqual(row["health"], "healthy")
         self.assertEqual(len(subject.recent_reorgs), 1)
         self.assertEqual(subject.recent_reorgs[0]["kind"], "reorg_height_drop")
 
@@ -635,6 +680,28 @@ class TipAgreementTests(unittest.TestCase):
             self.assertEqual(event["discarded_hash"], "a" * 64)
             self.assertEqual(event["canonical_hash"], "b" * 64)
 
+    def test_same_height_tip_switch_resets_the_stall_timer(self):
+        subject = collector()
+        subject.last_height["node-a"] = 100
+        subject.last_block_hash["node-a"] = "a" * 64
+        subject.last_advanced_at["node-a"] = 100.0
+
+        row = subject.row_for(
+            node(),
+            {
+                "height": 100,
+                "block_hash": "b" * 64,
+                "active_state": "active",
+                "process_running": True,
+            },
+            now=1_000.0,
+        )
+
+        self.assertEqual(row["tip_event"], "tip_switch")
+        self.assertEqual(row["seconds_since_advanced"], 0.0)
+        self.assertEqual(row["health"], "healthy")
+        self.assertEqual(subject.last_advanced_at["node-a"], 1_000.0)
+
     def test_stall_timer_survives_a_collector_restart(self):
         # A restart used to reseed last_advanced_at to "now", reporting every
         # node as freshly advanced and clearing in-flight stall alerts.
@@ -674,6 +741,48 @@ class TipAgreementTests(unittest.TestCase):
             )
             self.assertEqual(row["seconds_since_advanced"], 3_000.0)
             self.assertEqual(row["health"], "stale")
+
+    def test_tip_switch_is_detected_across_a_collector_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            first = status.ClusterCollector(
+                [node()],
+                interval=10,
+                stale_after=300,
+                network="testnet",
+                state_file=state_file,
+            )
+            first.last_height["node-a"] = 100
+            first.last_block_hash["node-a"] = "a" * 64
+            first.last_ancestors["node-a"] = {"1": "p" * 64}
+            first.last_advanced_at["node-a"] = 1_000.0
+            first.persist_state()
+
+            second = status.ClusterCollector(
+                [node()],
+                interval=10,
+                stale_after=300,
+                network="testnet",
+                state_file=state_file,
+            )
+            self.assertEqual(second.last_block_hash["node-a"], "a" * 64)
+            self.assertEqual(second.last_ancestors["node-a"], {"1": "p" * 64})
+
+            row = second.row_for(
+                node(),
+                {
+                    "height": 100,
+                    "block_hash": "b" * 64,
+                    "ancestor_hashes": {"1": "p" * 64},
+                    "active_state": "active",
+                    "process_running": True,
+                },
+                now=1_100.0,
+            )
+
+            self.assertEqual(row["tip_event"], "tip_switch")
+            self.assertEqual(row["seconds_since_advanced"], 0.0)
+            self.assertEqual(second.recent_reorgs[0]["discarded_hash"], "a" * 64)
 
     def test_progress_state_tolerates_a_missing_or_corrupt_file(self):
         with tempfile.TemporaryDirectory() as tmp:

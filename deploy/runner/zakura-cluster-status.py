@@ -4,7 +4,7 @@
 Reads a deploy/deployer nodes TOML, polls each node over SSH, and serves a small
 HTML dashboard showing the running commit, Zakura node ID, restart time, current
 height, latest block hash, tip agreement across the fleet, per-node reorg
-candidates, and whether the node has advanced recently. It also serves a
+candidates, and whether the node's tip has changed recently. It also serves a
 deliberately small public Ironwood status response for zakura.com.
 
 Only the Python stdlib is used.
@@ -808,10 +808,35 @@ if rpc_url:
 
         best_hash = out.get("block_hash")
         if best_hash:
+            # Depths 1 and 2 are used for alert classification, so only accept
+            # hashes walked directly from the saved tip. Height lookups can race
+            # with a reorg between RPC calls and describe a different branch.
+            ancestor_hashes.pop("1", None)
+            ancestor_hashes.pop("2", None)
             try:
                 header = rpc_call("getblockheader", [best_hash, True])
                 if isinstance(header, dict):
-                    out["previous_hash"] = header.get("previousblockhash") or ""
+                    previous_hash = header.get("previousblockhash") or ""
+                    block_time = header.get("time")
+                    out["previous_hash"] = previous_hash
+                    out["block_time"] = block_time
+                    if previous_hash:
+                        ancestor_hashes["1"] = previous_hash
+                        try:
+                            previous_header = rpc_call(
+                                "getblockheader", [previous_hash, True]
+                            )
+                            if isinstance(previous_header, dict):
+                                grandparent_hash = (
+                                    previous_header.get("previousblockhash") or ""
+                                )
+                                if grandparent_hash:
+                                    ancestor_hashes["2"] = grandparent_hash
+                                    out["grandparent_hash"] = grandparent_hash
+                                previous_block_time = previous_header.get("time")
+                                out["previous_block_time"] = previous_block_time
+                        except Exception as error:
+                            out["previous_block_time_error"] = str(error)
             except Exception as error:
                 out["previous_hash_error"] = str(error)
 
@@ -903,7 +928,12 @@ print(json.dumps(out, separators=(",", ":")))
 
 
 def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
+    return subprocess.run(
+        node.ssh_cmd("bash", "-s"),
+        input=script,
+        text=True,
+        capture_output=True,
+    )
 
 
 def probe_node(node: Node, want_metrics: bool = True) -> dict:
@@ -1007,9 +1037,15 @@ class ClusterCollector:
         self.last_height: dict[str, int | None] = {
             node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
         }
-        self.last_block_hash: dict[str, str | None] = {node.name: None for node in nodes}
+        self.last_block_hash: dict[str, str | None] = {
+            node.name: restored_progress.get(node.name, {}).get("block_hash")
+            for node in nodes
+        }
         self.last_ancestors: dict[str, dict[str, str]] = {
-            node.name: {} for node in nodes
+            node.name: dict(
+                restored_progress.get(node.name, {}).get("ancestor_hashes") or {}
+            )
+            for node in nodes
         }
         self.last_advanced_at: dict[str, float | None] = {
             node.name: restored_progress.get(node.name, {}).get("last_advanced_at")
@@ -1064,7 +1100,7 @@ class ClusterCollector:
             self.last_poll = now
             self.record_node_history(now, rows)
             snapshot = self.progress_snapshot()
-        # Snapshot under the lock, write outside it: the stall timers must
+        # Snapshot under the lock, write outside it: the tip-change timers must
         # survive a restart or every node reports as freshly advanced on the
         # next process start.
         self.persist_state(snapshot)
@@ -1073,6 +1109,8 @@ class ClusterCollector:
         return {
             name: {
                 "height": self.last_height.get(name),
+                "block_hash": self.last_block_hash.get(name),
+                "ancestor_hashes": dict(self.last_ancestors.get(name) or {}),
                 "last_advanced_at": self.last_advanced_at.get(name),
             }
             for name in self.last_advanced_at
@@ -1183,9 +1221,9 @@ class ClusterCollector:
             )
             if previous_height is None and self.last_advanced_at.get(node.name) is None:
                 self.last_advanced_at[node.name] = now
-            elif previous_height is not None and height > previous_height:
+            elif tip_event in ("advanced", "reorg_height_drop", "tip_switch"):
                 self.last_advanced_at[node.name] = now
-                advanced = True
+                advanced = tip_event == "advanced"
             self.last_height[node.name] = height
             if block_hash:
                 self.last_block_hash[node.name] = block_hash
@@ -1245,10 +1283,10 @@ class ClusterCollector:
             detail = str(probe.get("rpc_error") or "RPC height unavailable")
         elif not recent:
             health = "stale"
-            detail = "height has not advanced within stale window"
+            detail = "tip has not changed within stale window"
         else:
             health = "healthy"
-            detail = "advanced this poll" if advanced else "height recently advanced"
+            detail = "advanced this poll" if advanced else "tip recently changed"
 
         if tip_event == "reorg_height_drop":
             detail = (
@@ -1300,6 +1338,7 @@ class ClusterCollector:
             "commit": probe.get("commit") or "",
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
+            "grandparent_hash": str(probe.get("grandparent_hash") or ""),
             "ancestor_hashes": ancestor_hashes,
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
@@ -1307,6 +1346,8 @@ class ClusterCollector:
             "height": height,
             "headers": headers,
             "header_lag": header_lag,
+            "block_time": coerce_int(probe.get("block_time")),
+            "previous_block_time": coerce_int(probe.get("previous_block_time")),
             "tip_event": tip_event,
             "chain_role": "unknown",
             "active_state": active_state,
@@ -1584,10 +1625,10 @@ def save_orphan_pairs(
 
 
 def load_progress(path: Path | None) -> dict[str, dict]:
-    """Restore per-node height/last-advanced timers written by a previous process.
+    """Restore per-node tip and progress timers written by a previous process.
 
     Without this the stall clock restarts from zero on every dashboard restart,
-    which reports every node as freshly advanced regardless of its real height.
+    and a hash replacement across the restart cannot be identified as a reorg.
     """
     if path is None or not path.exists():
         return {}
@@ -1605,9 +1646,14 @@ def load_progress(path: Path | None) -> dict[str, dict]:
         if not isinstance(record, dict):
             continue
         height = record.get("height")
+        block_hash = record.get("block_hash")
         advanced_at = record.get("last_advanced_at")
         restored[str(name)] = {
             "height": int(height) if isinstance(height, (int, float)) else None,
+            "block_hash": str(block_hash) if block_hash else None,
+            "ancestor_hashes": normalize_ancestor_hashes(
+                record.get("ancestor_hashes")
+            ),
             "last_advanced_at": (
                 float(advanced_at) if isinstance(advanced_at, (int, float)) else None
             ),
@@ -2555,7 +2601,7 @@ footer {
             <th class="col-chain sortable" data-sort="chain_role">Chain<span class="arrow"></span></th>
             <th class="col-height col-num sortable" data-sort="height">Height<span class="arrow"></span></th>
             <th class="col-hdr col-num sortable" data-sort="header_lag" title="headers minus blocks">Hdr<span class="arrow"></span></th>
-            <th class="col-adv col-num sortable" data-sort="seconds_since_advanced" title="time since the tip last advanced">Adv<span class="arrow"></span></th>
+            <th class="col-adv col-num sortable" data-sort="seconds_since_advanced" title="time since the tip last changed">Age<span class="arrow"></span></th>
             <th class="col-commit sortable" data-sort="commit">Commit<span class="arrow"></span></th>
             <th class="col-tip">Tip</th>
             <th class="col-restarted sortable" data-sort="last_restarted">Restarted<span class="arrow"></span></th>
@@ -3043,7 +3089,7 @@ function drawerHtml(row) {
     + fieldHtml('Headers / blocks', num(row.headers) + ' / ' + num(row.height))
     + fieldHtml('Commit', row.commit, { mono: true, copy: true })
     + fieldHtml('Tip event', tipEventLabel(row.tip_event) || row.tip_event)
-    + fieldHtml('Tip last advanced', row.last_advanced_at
+    + fieldHtml('Tip last changed', row.last_advanced_at
       ? new Date(row.last_advanced_at * 1000).toLocaleString() : '')
     + fieldHtml('Last probed', row.last_seen_at
       ? new Date(row.last_seen_at * 1000).toLocaleString() : '')
@@ -3333,7 +3379,7 @@ function renderNodeChain(data) {
     kvRow('vs fleet majority', delta == null ? '—' : (delta > 0 ? '+' : '') + num(delta),
       delta ? 'warn' : null),
     kvRow('Advance rate', rate == null ? '—' : decimal(rate, 1) + ' blocks/min'),
-    kvRow('Tip last advanced', age(row.seconds_since_advanced) + ' ago'),
+    kvRow('Tip last changed', age(row.seconds_since_advanced) + ' ago'),
     kvRowHtml('Tip hash', copyCell(row.block_hash, shortHash(row.block_hash), 'Copy tip hash')),
     kvRowHtml('Parent hash', copyCell(row.previous_hash, shortHash(row.previous_hash), 'Copy parent hash')),
     kvRow('RPC chain', String(row.rpc_chain || 'unknown')),
@@ -3800,7 +3846,7 @@ def main() -> None:
         "--stale-after",
         type=float,
         default=300.0,
-        help="mark a node stale if height has not advanced in this many seconds",
+        help="mark a node stale if its tip has not changed in this many seconds",
     )
     parser.add_argument(
         "--state-file",
