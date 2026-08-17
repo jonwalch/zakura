@@ -262,6 +262,9 @@ fn headers_only_witness_contradicts_current(
         }
         node = parent;
     }
+    // Every iteration returns at `current.height + 1`, and a deeper parent still sits above
+    // `current`, so the loop exits only when the witness never sat above its own pin. The
+    // exact-depth witness shape excludes that; this tail keeps a malformed witness contradictory.
     node.hash != current.hash || node.height != current.height
 }
 
