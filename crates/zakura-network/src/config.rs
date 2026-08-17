@@ -1254,6 +1254,14 @@ impl<'de> Deserialize<'de> for Config {
                  network.zakura.block_propagation_trace_dir are mutually exclusive",
             ));
         }
+        if zakura.block_propagation_expose_peer_addresses
+            && zakura.block_propagation_trace_dir.is_none()
+        {
+            return Err(de::Error::custom(
+                "network.zakura.block_propagation_expose_peer_addresses requires \
+                 network.zakura.block_propagation_trace_dir",
+            ));
+        }
         zakura.apply_network_defaults(&network);
         let default_zakura_bootstrap_peers =
             ZakuraConfig::default_bootstrap_peers_for_network(&network);

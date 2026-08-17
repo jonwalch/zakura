@@ -147,6 +147,7 @@ class NodeBuilder:
             "checkpoint_sync": True,
             "vct_fast_sync": True,
             "block_propagation_trace_dir": "",
+            "block_propagation_expose_peer_addresses": False,
             "zakura": None,
             "working_dir": "",
             "start_command": "",
@@ -261,6 +262,7 @@ class ConfigKeyTests(unittest.TestCase):
                 [defaults]
                 manage_config = false
                 block_propagation_trace_dir = "/mnt/data/traces/block-propagation"
+                block_propagation_expose_peer_addresses = true
 
                 [[nodes]]
                 name = "node-a"
@@ -274,6 +276,7 @@ class ConfigKeyTests(unittest.TestCase):
                 nodes[0].block_propagation_trace_dir,
                 "/mnt/data/traces/block-propagation",
             )
+            self.assertTrue(nodes[0].block_propagation_expose_peer_addresses)
 
     def test_block_propagation_trace_dir_rejects_managed_or_external_paths(self):
         for defaults in (
@@ -294,14 +297,36 @@ class ConfigKeyTests(unittest.TestCase):
                 with self.assertRaises(deploy.DeployError):
                     deploy.load_nodes(path, None)
 
+    def test_peer_address_exposure_requires_dedicated_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                manage_config = false
+                block_propagation_expose_peer_addresses = true
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            with self.assertRaisesRegex(
+                deploy.DeployError,
+                "requires block_propagation_trace_dir",
+            ):
+                deploy.load_nodes(path, None)
+
 
 class BinaryOnlyTraceOverrideTests(unittest.TestCase):
-    def render_script(self, trace_dir, no_restart="0"):
+    def render_script(self, trace_dir, no_restart="0", expose_peer_addresses=False):
         return deploy.BINARY_ONLY_INSTALL_SCRIPT.format(
             bin_path="'/usr/local/bin/zakurad'",
             service="'zakurad'",
             no_restart=no_restart,
             block_propagation_trace_dir=f"'{trace_dir}'",
+            block_propagation_expose_peer_addresses=(
+                "true" if expose_peer_addresses else "false"
+            ),
             node_id="'us-east-0'",
         )
 
@@ -310,6 +335,10 @@ class BinaryOnlyTraceOverrideTests(unittest.TestCase):
 
         self.assertIn(
             "ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR=%s",
+            script,
+        )
+        self.assertIn(
+            "ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_EXPOSE_PEER_ADDRESSES=%s",
             script,
         )
         self.assertIn('Environment="ZAKURA_NODE_ID=%s"', script)
@@ -328,6 +357,15 @@ class BinaryOnlyTraceOverrideTests(unittest.TestCase):
         self.assertIn('install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"', script)
         self.assertIn('install -m 644 "$DROP_IN_BACKUP" "$DROP_IN"', script)
         self.assertIn("rolling back binary and trace override", script)
+
+    def test_peer_address_exposure_is_scoped_to_propagation_drop_in(self):
+        script = self.render_script(
+            "/mnt/data/traces/block-propagation",
+            expose_peer_addresses=True,
+        )
+
+        self.assertIn("EXPOSE_PEER_ADDRESSES=true", script)
+        self.assertNotIn("ZAKURA_NETWORK__EXPOSE_PEER_ADDRESSES", script)
 
     def test_no_restart_stages_drop_in_before_exiting(self):
         script = self.render_script(

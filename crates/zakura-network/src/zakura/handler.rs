@@ -304,6 +304,11 @@ pub struct ZakuraConfig {
     /// When set, only `block_propagation.jsonl` is written. This setting is
     /// mutually exclusive with [`Self::trace_dir`].
     pub block_propagation_trace_dir: Option<PathBuf>,
+    /// Expose legacy peer socket addresses only in the dedicated propagation trace.
+    ///
+    /// This setting requires [`Self::block_propagation_trace_dir`]. It does not
+    /// expose addresses in general traces, logs, or metric labels.
+    pub block_propagation_expose_peer_addresses: bool,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -338,6 +343,7 @@ impl Default for ZakuraConfig {
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
             block_propagation_trace_dir: None,
+            block_propagation_expose_peer_addresses: false,
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,

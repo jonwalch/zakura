@@ -75,6 +75,8 @@ DEFAULTS = {
     # Binary-only systemd deploys manage this through an owned drop-in.
     # Empty removes the owned override without touching the hand-managed unit.
     "block_propagation_trace_dir": "",
+    # Exposes legacy socket addresses only in the dedicated propagation trace.
+    "block_propagation_expose_peer_addresses": False,
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Common keys: dev_network, listen_addr, bootstrap_peers, and trace dirs.
     "zakura": None,
@@ -119,6 +121,7 @@ class Node:
     checkpoint_sync: bool
     vct_fast_sync: bool
     block_propagation_trace_dir: str
+    block_propagation_expose_peer_addresses: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
     working_dir: str
     start_command: str
@@ -221,6 +224,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         merged = dict(defaults)
         merged.update(raw)
         block_propagation_trace_dir = merged["block_propagation_trace_dir"]
+        block_propagation_expose_peer_addresses = merged[
+            "block_propagation_expose_peer_addresses"
+        ]
         if not isinstance(block_propagation_trace_dir, str):
             raise DeployError(
                 f"[[nodes]] {name}: block_propagation_trace_dir must be a string"
@@ -246,6 +252,16 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
                     f"[[nodes]] {name}: block_propagation_trace_dir requires "
                     "manage_config=false and deploy_kind=systemd"
                 )
+        if not isinstance(block_propagation_expose_peer_addresses, bool):
+            raise DeployError(
+                f"[[nodes]] {name}: "
+                "block_propagation_expose_peer_addresses must be a boolean"
+            )
+        if block_propagation_expose_peer_addresses and not block_propagation_trace_dir:
+            raise DeployError(
+                f"[[nodes]] {name}: block_propagation_expose_peer_addresses "
+                "requires block_propagation_trace_dir"
+            )
         nodes.append(Node(
             name=name,
             ssh_string=merged["ssh_string"],
@@ -273,6 +289,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             block_propagation_trace_dir=block_propagation_trace_dir,
+            block_propagation_expose_peer_addresses=(
+                block_propagation_expose_peer_addresses
+            ),
             zakura=merged.get("zakura"),
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
@@ -741,6 +760,7 @@ BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
 TRACE_DIR={block_propagation_trace_dir}
+EXPOSE_PEER_ADDRESSES={block_propagation_expose_peer_addresses}
 NODE_ID={node_id}
 DROP_IN_DIR="/etc/systemd/system/${{SERVICE}}.service.d"
 DROP_IN="${{DROP_IN_DIR}}/50-zakura-block-propagation-trace.conf"
@@ -766,6 +786,7 @@ if [ -n "$TRACE_DIR" ]; then
     {{
         printf '%s\n' '[Service]'
         printf 'Environment="ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR=%s"\n' "$TRACE_DIR"
+        printf 'Environment="ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_EXPOSE_PEER_ADDRESSES=%s"\n' "$EXPOSE_PEER_ADDRESSES"
         printf 'Environment="ZAKURA_NODE_ID=%s"\n' "$NODE_ID"
     }} > "${{DROP_IN}}.new"
     install -m 644 "${{DROP_IN}}.new" "$DROP_IN"
@@ -925,6 +946,11 @@ def cmd_deploy(args) -> int:
                         no_restart="1" if args.no_restart else "0",
                         block_propagation_trace_dir=shlex.quote(
                             node.block_propagation_trace_dir
+                        ),
+                        block_propagation_expose_peer_addresses=(
+                            "true"
+                            if node.block_propagation_expose_peer_addresses
+                            else "false"
                         ),
                         node_id=shlex.quote(node.name),
                     )

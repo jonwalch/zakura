@@ -45,6 +45,11 @@ on:
         type: boolean
         required: false
         default: false
+      block_propagation_expose_peer_addresses:
+        description: "Include legacy peer addresses only in block propagation traces"
+        type: boolean
+        required: false
+        default: false
       node:
         description: "Optional single deployer node name; blank deploys the whole fleet"
         required: false
@@ -107,7 +112,8 @@ jobs:
           set -euo pipefail
           if ! grep -q 'manage_config' deploy/deployer/deploy.py ||
              ! grep -q 'container_name' deploy/deployer/deploy.py ||
-             ! grep -q 'block_propagation_trace_dir' deploy/deployer/deploy.py; then
+             ! grep -q 'block_propagation_trace_dir' deploy/deployer/deploy.py ||
+             ! grep -q 'block_propagation_expose_peer_addresses' deploy/deployer/deploy.py; then
             echo "::error::deploy.py at ref '${REF}' lacks required binary-only deploy support." \
                  "Deploy from a ref with managed propagation trace drop-ins."
             exit 1
@@ -174,10 +180,17 @@ jobs:
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
         env:
+          BLOCK_PROPAGATION_EXPOSE_PEER_ADDRESSES: ${{ inputs.block_propagation_expose_peer_addresses }}
           BLOCK_PROPAGATION_TRACE: ${{ inputs.block_propagation_trace }}
           REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+
+          if [ "${BLOCK_PROPAGATION_EXPOSE_PEER_ADDRESSES}" = "true" ] \
+            && [ "${BLOCK_PROPAGATION_TRACE}" != "true" ]; then
+            echo "block_propagation_expose_peer_addresses requires block_propagation_trace" >&2
+            exit 1
+          fi
 
           block_propagation_trace_dir=""
           if [ "${BLOCK_PROPAGATION_TRACE}" = "true" ]; then
@@ -205,6 +218,7 @@ jobs:
           # compat host does not. Used only for the dashboard's disk probe.
           state_cache_dir = "/mnt/data/zakura-cache"
           block_propagation_trace_dir = "${block_propagation_trace_dir}"
+          block_propagation_expose_peer_addresses = ${BLOCK_PROPAGATION_EXPOSE_PEER_ADDRESSES}
 
           # Public mainnet node ids (crates/zakura-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.

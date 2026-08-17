@@ -13,6 +13,8 @@ state_cache_dir = "/var/lib/zakura"
 #                                            # service, leaving config/unit/cache untouched (systemd only)
 # block_propagation_trace_dir = "/mnt/data/traces/block-propagation"
 #                                            # binary-only systemd drop-in; empty removes it
+# block_propagation_expose_peer_addresses = false
+#                                            # raw legacy addresses in propagation trace only
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
 # identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id

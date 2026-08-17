@@ -224,6 +224,9 @@ cd deploy/deployer
 The workflow is manual (`workflow_dispatch`). In addition to `ref`,
 `force_rebuild`, `no_restart`, and `node`, `block_propagation_trace` enables
 the narrow trace across every selected node.
+`block_propagation_expose_peer_addresses` temporarily includes raw legacy
+socket addresses only in that propagation trace and requires
+`block_propagation_trace = true`.
 
 **Binary-only deploy (`manage_config = false`).** The mainnet nodes were
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
@@ -244,9 +247,10 @@ is separate future work.
 When `block_propagation_trace` is enabled, the deployer manages only
 `50-zakura-block-propagation-trace.conf` under the service's systemd drop-in
 directory. It sets the dedicated trace environment variable and stable node
-label without rewriting the base unit or TOML. A deployment with the input
-disabled removes that owned drop-in. Failed restarts restore both the previous
-binary and previous drop-in.
+label without rewriting the base unit or TOML. The same drop-in carries the
+propagation-only address exposure flag. A deployment with tracing disabled
+removes that owned drop-in. Failed restarts restore both the previous binary
+and previous drop-in.
 
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 

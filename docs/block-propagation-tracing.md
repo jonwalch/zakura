@@ -35,8 +35,9 @@ network latency. The report defaults to ±100 ms.
 An observer may receive the same block through both transports. Duplicate
 events are retained so the report can show which path arrived first.
 
-Legacy peer addresses stay redacted unless `network.expose_peer_addresses`
-is enabled for that run. Native peer labels stay pseudonymous (`peer:<hex>`).
+Legacy peer addresses stay redacted unless the dedicated
+`block_propagation_expose_peer_addresses` setting is enabled for that run.
+Native peer labels stay pseudonymous (`peer:<hex>`).
 
 ## Enable tracing
 
@@ -45,12 +46,18 @@ Tracing is off by default. There are two mutually exclusive settings:
 ```toml
 [network.zakura]
 block_propagation_trace_dir = "/mnt/data/traces/block-propagation"
+block_propagation_expose_peer_addresses = false
 ```
 
 The dedicated setting writes only `block_propagation.jsonl`. The existing
 general `trace_dir` remains available for full Zakura diagnostics and also
 contains propagation data for backward compatibility. Zakura rejects startup
 if both settings are configured.
+
+`block_propagation_expose_peer_addresses` affects only the dedicated
+propagation file. It requires `block_propagation_trace_dir` and does not expose
+peer addresses in general traces, logs, or metric labels. Enable it only for a
+bounded route-measurement window and restrict access to the retained traces.
 
 ### Testnet observers
 
@@ -83,7 +90,8 @@ base unit:
 gh workflow run zakura-mainnet-deploy.yml \
   --ref REF \
   -f ref=REF \
-  -f block_propagation_trace=true
+  -f block_propagation_trace=true \
+  -f block_propagation_expose_peer_addresses=false
 ```
 
 Leave `node` blank to select the whole fleet, or pass `-f node=NAME` for one
@@ -120,6 +128,12 @@ Here, `t0` is the first time any supplied observer recorded an announcement,
 body, or commit. The offsets measure spread within the observed fleet, not time
 from the miner. They are a lower bound on true network propagation delay
 because the miner and unobserved peers are outside the measurement.
+
+To infer legacy managed-node edges for a bounded run, set
+`block_propagation_expose_peer_addresses=true`, collect the requested block
+window, then redeploy the same ref with the input set back to `false`. Raw
+legacy socket addresses remain in rows already written, so archive or delete
+those rows according to the run's retention policy.
 
 ### Testnet mining node
 

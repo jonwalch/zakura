@@ -630,6 +630,7 @@ fn block_propagation_trace_dir_is_narrow_and_mutually_exclusive() {
         r#"
         [zakura]
         block_propagation_trace_dir = "target/block-propagation"
+        block_propagation_expose_peer_addresses = true
         "#,
     )
     .expect("dedicated propagation tracing is valid");
@@ -638,6 +639,7 @@ fn block_propagation_trace_dir_is_narrow_and_mutually_exclusive() {
         Some("target/block-propagation".into())
     );
     assert!(narrow.zakura.trace_dir.is_none());
+    assert!(narrow.zakura.block_propagation_expose_peer_addresses);
 
     let error = toml::from_str::<Config>(
         r#"
@@ -650,6 +652,18 @@ fn block_propagation_trace_dir_is_narrow_and_mutually_exclusive() {
     assert!(
         error.to_string().contains("mutually exclusive"),
         "unexpected trace directory conflict error: {error}"
+    );
+
+    let error = toml::from_str::<Config>(
+        r#"
+        [zakura]
+        block_propagation_expose_peer_addresses = true
+        "#,
+    )
+    .expect_err("address exposure without the dedicated trace must fail closed");
+    assert!(
+        error.to_string().contains("requires"),
+        "unexpected propagation address exposure error: {error}"
     );
 }
 

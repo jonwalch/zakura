@@ -40,7 +40,11 @@ impl BlockPropagationTrace {
             .unwrap_or_else(JsonlTracer::noop);
         Self {
             emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
-            expose_peer_addresses: config.expose_peer_addresses,
+            expose_peer_addresses: if emit_native_events {
+                config.zakura.block_propagation_expose_peer_addresses
+            } else {
+                config.expose_peer_addresses
+            },
             emit_native_events,
         }
     }
@@ -366,6 +370,25 @@ mod tests {
         };
 
         assert_eq!(private_trace.legacy_peer_label(peer), "legacy:redacted");
+        assert_eq!(
+            public_trace.legacy_peer_label(peer),
+            "legacy:203.0.113.7:18233"
+        );
+    }
+
+    #[test]
+    fn dedicated_trace_uses_its_own_address_privacy_policy() {
+        let peer = PeerSocketAddr::from(([203, 0, 113, 7], 18233));
+        let mut config = Config::default();
+        config.expose_peer_addresses = true;
+        config.zakura.block_propagation_trace_dir = Some("target/propagation-test".into());
+
+        let private_trace = BlockPropagationTrace::from_config(&config);
+        assert_eq!(private_trace.legacy_peer_label(peer), "legacy:redacted");
+
+        config.expose_peer_addresses = false;
+        config.zakura.block_propagation_expose_peer_addresses = true;
+        let public_trace = BlockPropagationTrace::from_config(&config);
         assert_eq!(
             public_trace.legacy_peer_label(peer),
             "legacy:203.0.113.7:18233"
