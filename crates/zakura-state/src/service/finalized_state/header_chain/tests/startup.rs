@@ -269,8 +269,8 @@ fn startup_rejects_an_ineligible_verified_projection_before_publication() {
     ));
 }
 
-#[test]
-fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
+/// Open a headers-only RocksDB store whose latest depth witness sits above the finalized frontier.
+fn headers_only_depth_witness_runtime() -> (DiskDb, EngineConfig, HeaderChainRuntime, Frontier) {
     let db_config = Config::ephemeral();
     let (mut engine_config, anchor, mut metadata) = fixture();
     engine_config.mode = EngineMode::HeadersOnly;
@@ -357,7 +357,14 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
         .expect("the independent canonical finalized row commits");
     audit_store(&runtime.store, &engine_config)
         .expect("the exact headers-only selected-tip witness recovers");
+    (db, engine_config, runtime, selected_tip)
+}
 
+fn overwrite_latest_headers_only_witness(
+    runtime: &HeaderChainRuntime,
+    db: &DiskDb,
+    witness: Frontier,
+) {
     let mut forged = runtime
         .store
         .finality_history()
@@ -366,7 +373,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
         .copied()
         .expect("the depth transition appended a finality record");
     forged.source = FinalitySource::HeadersOnlyDepth {
-        selected_tip: Frontier::new(selected_tip.height, finalized.hash),
+        selected_tip: witness,
     };
     let mut corruption = DiskWriteBatch::new();
     runtime
@@ -380,6 +387,17 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
         .expect("the forged finality row encodes");
     db.write(corruption)
         .expect("the forged finality row reaches RocksDB");
+}
+
+#[test]
+fn rocksdb_recovery_rejects_a_retained_headers_only_witness_at_the_wrong_height() {
+    let (db, engine_config, runtime, selected_tip) = headers_only_depth_witness_runtime();
+    let finalized = runtime.publisher().snapshot().frontiers.finalized;
+    overwrite_latest_headers_only_witness(
+        &runtime,
+        &db,
+        Frontier::new(selected_tip.height, finalized.hash),
+    );
     drop(runtime);
 
     assert!(matches!(
@@ -387,6 +405,30 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
         Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source { violations }))
             if violations.contains(&zakura_header_chain::AuditViolation::Finality)
     ));
+}
+
+#[test]
+fn rocksdb_recovery_accepts_an_unretained_headers_only_witness() {
+    let (db, engine_config, runtime, selected_tip) = headers_only_depth_witness_runtime();
+    let unretained = block::Hash([0x63; 32]);
+    assert!(
+        runtime
+            .store
+            .header_node(unretained)
+            .expect("header lookup is readable")
+            .is_none(),
+        "the forged witness must not name a retained header row"
+    );
+    overwrite_latest_headers_only_witness(
+        &runtime,
+        &db,
+        Frontier::new(selected_tip.height, unretained),
+    );
+    drop(runtime);
+
+    HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("an unretained headers-only witness is unauthenticated, not a finality failure");
 }
 
 fn legacy_rejected_aux_bytes(delivery: AuxDelivery, evidence: [u8; 32]) -> Vec<u8> {
