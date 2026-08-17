@@ -326,7 +326,7 @@ One trade-off to weigh: the node's sizes currently act as a loose cross-check on
 client's tree position. It is a weak check, since those sizes are unauthenticated on every
 backend, but dropping it should be a deliberate decision rather than a silent side effect.
 
-**Prototyped (2026-08-05).** zecd derives sizes locally *only* inside the band — that is, only
+**Prototyped (2026-08-05).** zecd derives sizes locally _only_ inside the band — that is, only
 when the node cannot serve the tree state just below a scan range, which is exactly when its
 per-block `trees` query would fail anyway. Everywhere else the node's sizes are still used, so the
 cross-check is kept where it costs nothing and dropped only where it does not exist.
@@ -353,7 +353,7 @@ only if all three roots match. **This is the same check as §3.1, run on the oth
 so it carries the same weight: a frontier that reproduces an authenticated root is the frontier,
 and a wrong or stale anchor cannot survive it. The trust boundary therefore does not move. The
 node's roots are authenticated against its own header chain and the client already relies on that
-node for its view of the chain; what it does *not* have to do is believe an unverified frontier.
+node for its view of the chain; what it does _not_ have to do is believe an unverified frontier.
 
 Three properties follow, and they are why this is worth having alongside §3.3 rather than instead
 of it:
@@ -363,7 +363,7 @@ of it:
    apply, so an operator can serve the band without a replay budget or an RPC-timeout risk.
 2. **The client's cache is self-invalidating.** A wallet memoizes each verified end state and
    anchors the next batch on it. A stale entry — from an abandoned fork, or from before a reorg —
-   cannot corrupt anything, because it would have to replay into the *new* chain's authenticated
+   cannot corrupt anything, because it would have to replay into the _new_ chain's authenticated
    roots. It can only make a request fail, never succeed wrongly. No explicit reorg invalidation is
    needed.
 3. **It composes with the anchor grid.** The client's anchor is whichever is higher: its own
@@ -371,7 +371,7 @@ of it:
    the common case, so grid spacing again only costs the first request of a sweep.
 
 The cost the client pays is the replay itself, and the block bodies it needs for it. A pruned node
-still cannot supply those, so this widens *who can serve* the band but not *which nodes* can.
+still cannot supply those, so this widens _who can serve_ the band but not _which nodes_ can.
 Subtree roots (§3.4) are unaffected: they cannot be checked this way on either side, so they still
 ship as a reviewed artifact.
 
