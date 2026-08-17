@@ -167,10 +167,8 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
                 // reorg can abandon it, and retention can drop it. Fail closed only when
                 // retained rows contradict this record's current frontier. The current
                 // frontier is authenticated independently above.
-                if matches!(
-                    headers_only_witness_relation(&by_hash, selected_tip, record.current),
-                    HeadersOnlyWitnessRelation::ContradictsCurrent
-                ) {
+                if headers_only_witness_contradicts_current(&by_hash, selected_tip, record.current)
+                {
                     invalid_history = true;
                 }
             }
@@ -228,58 +226,43 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     Ok(())
 }
 
-/// How retained header rows relate a headers-only depth witness to its record pin.
-enum HeadersOnlyWitnessRelation {
-    /// Retained parents prove the witness descends to this record's current frontier.
-    DescendsToCurrent,
-    /// A retained row claims this witness but disagrees with the record's current frontier.
-    ContradictsCurrent,
-    /// The witness is absent, or the walk hits the retention floor before the pin.
-    Unauthenticated,
-}
-
-/// Relate `witness` to `current` using only retained header rows.
+/// Whether retained header rows contradict this record's current frontier for `witness`.
+///
+/// The walk has three outcomes; only contradiction fails closed. Descent to `current` and
+/// unauthenticated absence (missing witness, or a walk that hits the retention floor before
+/// the pin) are both accepted: retention drops headers below the live finalized frontier and
+/// may drop an abandoned fork.
 ///
 /// The walk stops at `current` even when that pin is no longer retained, by matching the
 /// child that names it as parent. A retained child at `current.height + 1` that names a
 /// different parent contradicts the pin without looking that parent up: its ancestor at
-/// `current.height` is some other hash. A missing parent deeper than that is
-/// unauthenticated, not a contradiction: retention drops headers below the live finalized
-/// frontier and may drop an abandoned fork.
-fn headers_only_witness_relation(
+/// `current.height` is some other hash.
+fn headers_only_witness_contradicts_current(
     by_hash: &HashMap<block::Hash, &HeaderNode>,
     witness: crate::Frontier,
     current: crate::Frontier,
-) -> HeadersOnlyWitnessRelation {
+) -> bool {
     let Some(mut node) = by_hash.get(&witness.hash).copied() else {
-        return HeadersOnlyWitnessRelation::Unauthenticated;
+        return false;
     };
     if node.height != witness.height {
-        return HeadersOnlyWitnessRelation::ContradictsCurrent;
+        return true;
     }
     while node.height > current.height {
         if current.height.next().ok() == Some(node.height) {
-            return if node.parent_hash == current.hash {
-                HeadersOnlyWitnessRelation::DescendsToCurrent
-            } else {
-                HeadersOnlyWitnessRelation::ContradictsCurrent
-            };
+            return node.parent_hash != current.hash;
         }
         let Some(parent) = by_hash.get(&node.parent_hash).copied() else {
-            return HeadersOnlyWitnessRelation::Unauthenticated;
+            return false;
         };
         // Reject a parent link that does not descend exactly one height, which also bounds
         // this walk on a store whose height rows contradict its parent rows.
         if parent.height.next().ok() != Some(node.height) {
-            return HeadersOnlyWitnessRelation::ContradictsCurrent;
+            return true;
         }
         node = parent;
     }
-    if node.hash == current.hash && node.height == current.height {
-        HeadersOnlyWitnessRelation::DescendsToCurrent
-    } else {
-        HeadersOnlyWitnessRelation::ContradictsCurrent
-    }
+    node.hash != current.hash || node.height != current.height
 }
 
 fn finality_history_starts_validly(
