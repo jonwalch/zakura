@@ -67,7 +67,7 @@ pub fn build_version() -> Version {
         )
     });
 
-    let mut version = vergen_build_version().unwrap_or(fallback_version);
+    let mut version = git_describe_build_version().unwrap_or(fallback_version);
 
     // Docker builds do not include `.git`, so use the explicitly supplied
     // commit when `git describe` could not add build metadata.
@@ -92,9 +92,9 @@ pub fn clap_build_version() -> &'static str {
         .as_str()
 }
 
-/// Returns the `zakurad` version from this build, if available from `vergen`.
-fn vergen_build_version() -> Option<Version> {
-    // VERGEN_GIT_DESCRIBE should be in the format:
+/// Returns the `zakurad` version derived from `git describe`, when available.
+fn git_describe_build_version() -> Option<Version> {
+    // The build-time Git description should be in the format:
     // - v1.0.0-rc.9-6-g319b01bb84
     // - v1.0.0-6-g319b01bb84
     // but sometimes it is just a short commit hash. See #6879 for details.
@@ -111,18 +111,18 @@ fn vergen_build_version() -> Option<Version> {
     // - version: major`.`minor`.`patch
     // - optional pre-release: `-`tag[`.`tag ...]
     // - optional build: `+`tag[`.`tag ...]
-    // change the git describe format to the semver 2.0 format
-    let vergen_git_describe = VERGEN_GIT_DESCRIBE?;
+    // Change the `git describe` format to the SemVer 2.0 format.
+    let git_describe = VERGEN_GIT_DESCRIBE?;
 
     // `git describe` uses "dirty" for uncommitted changes,
     // but users won't understand what that means.
-    let vergen_git_describe = vergen_git_describe.replace("dirty", "modified");
+    let git_describe = git_describe.replace("dirty", "modified");
 
     // Split using "git describe" separators.
-    let mut vergen_git_describe = vergen_git_describe.split('-').peekable();
+    let mut git_describe = git_describe.split('-').peekable();
 
     // Check the "version core" part.
-    let mut version = vergen_git_describe.next()?;
+    let mut version = git_describe.next()?;
 
     // strip the leading "v", if present.
     version = version.strip_prefix('v').unwrap_or(version);
@@ -136,7 +136,7 @@ fn vergen_build_version() -> Option<Version> {
 
     // Check if the next part is a pre-release or build part,
     // but only consume it if it is a pre-release tag.
-    let Some(part) = vergen_git_describe.peek() else {
+    let Some(part) = git_describe.peek() else {
         // No pre-release or build.
         return semver.parse().ok();
     };
@@ -147,11 +147,11 @@ fn vergen_build_version() -> Option<Version> {
         semver.push_str(part);
 
         // Consume the pre-release tag to move on to the build tags, if any.
-        let _ = vergen_git_describe.next();
+        let _ = git_describe.next();
     }
 
     // Check if the next part is a build part.
-    let Some(build) = vergen_git_describe.peek() else {
+    let Some(build) = git_describe.peek() else {
         // No build tags.
         return semver.parse().ok();
     };
@@ -162,7 +162,7 @@ fn vergen_build_version() -> Option<Version> {
     }
 
     // Append the rest of the build parts with the correct `+` and `.` separators.
-    let build_parts: Vec<_> = vergen_git_describe.collect();
+    let build_parts: Vec<_> = git_describe.collect();
     let build_parts = build_parts.join(".");
 
     semver.push('+');

@@ -6,66 +6,61 @@
 //! When compiling the `lightwalletd` gRPC tests, also builds a gRPC client
 //! Rust API for `lightwalletd`.
 
-use vergen_gitcl::{CargoBuilder, Emitter, GitclBuilder, RustcBuilder};
+#[path = "build/metadata.rs"]
+mod metadata;
 
-/// Process entry point for `zakurad`'s build script
+use std::{env, path::PathBuf};
+
+/// Process entry point for `zakurad`'s build script.
 #[allow(clippy::print_stderr)]
 fn main() {
-    let mut emitter = Emitter::default();
-
-    // Configures an [`Emitter`] for everything except for `git` env vars.
-    // This builder fails the build on error.
-    //
-    // The cargo instructions are listed explicitly instead of using
-    // `all_cargo()`: its `dependencies` instruction (whose output nothing
-    // consumes) runs `cargo metadata` at compile time, which resolves the
-    // dependency graph against the registry index — that fails in the
-    // `cargo package`/`cargo publish` verify build of the packaged crate
-    // (before the zakura-* dependencies are published) and in offline builds.
-    let cargo_instructions = CargoBuilder::default()
-        .debug(true)
-        .features(true)
-        .opt_level(true)
-        .target_triple(true)
-        .build()
-        .expect("cargo instruction builder should build successfully");
-
-    emitter
-        .fail_on_error()
-        .add_instructions(&cargo_instructions)
-        .expect("adding cargo instructions should succeed")
-        .add_instructions(
-            &RustcBuilder::all_rustc().expect("all_rustc() should build successfully"),
+    for (name, value) in metadata::cargo_metadata()
+        .expect("Cargo should provide the required build metadata")
+        .into_iter()
+        .chain(
+            metadata::rustc_metadata()
+                .expect("rustc -vV should provide the required compiler metadata"),
         )
-        .expect("adding all_rustc() instructions should succeed");
-
-    // Get git information. This is used by e.g. ZakuradApp::register_components()
-    // to log the commit hash
-    let all_git = GitclBuilder::default()
-        .branch(true)
-        .commit_author_email(true)
-        .commit_author_name(true)
-        .commit_count(true)
-        .commit_date(true)
-        .commit_message(true)
-        .commit_timestamp(true)
-        .describe(false, false, None)
-        .sha(true)
-        .dirty(false)
-        .describe(true, true, Some("v*.*.*"))
-        .build()
-        .expect("all_git + describe + sha should build successfully");
-
-    if let Err(e) = emitter.add_instructions(&all_git) {
-        // The most common failure here is due to a missing `.git` directory,
-        // e.g., when building from `cargo install zakurad`. We simply
-        // proceed with the build.
-        // Note that this won't be printed unless in cargo very verbose mode (-vv).
-        // We could emit a build warning, but that might scare users.
-        eprintln!("git error in vergen build script: skipping git env vars: {e:?}",);
+    {
+        metadata::emit_rustc_env(name, &value)
+            .expect("Cargo and rustc metadata should be safe Cargo directive values");
     }
 
-    emitter.emit().expect("base emit should succeed");
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR")
+            .expect("Cargo should provide the package manifest directory"),
+    );
+    let out_dir = PathBuf::from(
+        env::var_os("OUT_DIR").expect("Cargo should provide the build output directory"),
+    );
+
+    match metadata::git_metadata(&manifest_dir, &out_dir) {
+        Ok(git) => {
+            for (name, value) in [
+                ("VERGEN_GIT_BRANCH", git.branch.as_str()),
+                ("VERGEN_GIT_COMMIT_TIMESTAMP", git.commit_timestamp.as_str()),
+                ("VERGEN_GIT_DESCRIBE", git.describe.as_str()),
+                ("VERGEN_GIT_SHA", git.sha.as_str()),
+            ] {
+                metadata::emit_rustc_env(name, value)
+                    .expect("Git metadata should be safe Cargo directive values");
+            }
+
+            for path in metadata::git_rerun_paths(&git) {
+                metadata::emit_rerun_path(&path)
+                    .expect("Git metadata paths should be safe Cargo directive values");
+            }
+        }
+        Err(error) => {
+            // Packaged sources and some Docker contexts intentionally have no
+            // `.git` directory. Git metadata is optional in those builds.
+            eprintln!("git metadata unavailable: {error}");
+        }
+    }
+
+    // Watch the whole package so dirty-source changes refresh `git describe`.
+    metadata::emit_rerun_path(&manifest_dir)
+        .expect("the package path should be a safe Cargo directive value");
 
     #[cfg(feature = "lightwalletd-grpc-tests")]
     tonic_prost_build::configure()
