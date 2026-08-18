@@ -3660,12 +3660,25 @@ impl HeaderChainStore {
                 }
                 let next_count = if count == limit {
                     let cf = self.cf(HEADER_FINALITY_HISTORY)?;
-                    let (first_key, first_value) =
-                        self.db
-                            .raw_first_cf(&cf)?
-                            .ok_or(HeaderChainStoreError::Incoherent(
-                                "bounded finality history is unexpectedly empty",
-                            ))?;
+                    // The published checkpoint names the last epoch this loop removed, so every
+                    // epoch at or below it is already deleted and the oldest surviving record
+                    // sits above it. Seeking from there keeps eviction O(1). Starting at the
+                    // beginning of the column family instead would step over the tombstone left
+                    // by every previous eviction: the retained window is a few MB, far too small
+                    // to trigger the compaction that collects them, so that cost grows without
+                    // bound and eventually dominates every block commit.
+                    let retained_low = self
+                        .get_value::<FinalityHistoryCheckpoint>(
+                            HEADER_ENGINE_META,
+                            FINALITY_HISTORY_CHECKPOINT_KEY,
+                        )?
+                        .map_or(0, |checkpoint| checkpoint.epoch.get().saturating_add(1));
+                    let (first_key, first_value) = self
+                        .db
+                        .raw_first_cf_from(&cf, &retained_low.to_be_bytes())?
+                        .ok_or(HeaderChainStoreError::Incoherent(
+                            "bounded finality history is unexpectedly empty",
+                        ))?;
                     let first = FinalityRecord::decode(&first_value).map_err(|_| {
                         HeaderChainStoreError::Incoherent("invalid oldest finality record")
                     })?;
