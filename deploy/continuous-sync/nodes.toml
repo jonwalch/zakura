@@ -29,7 +29,13 @@ ready_url = "http://127.0.0.1:8080/ready"
 healthy_url = "http://127.0.0.1:8080/healthy"
 poll_interval_seconds = 30
 startup_timeout_seconds = 600
-stall_seconds = 600
+# Must stay comfortably above the node's own body-sync watchdog
+# (ZAKURA_BODY_SYNC_STALL_TIMEOUT, 600s, in crates/zakurad/src/components/sync.rs). On a
+# dual-stack node that watchdog hands body sync to the legacy syncer after 600s of frozen
+# height, and the handover needs to download and verify before the height moves again. A
+# 600s controller deadline killed the node 7 seconds after the handover started, so the
+# recovery could never complete and every stall became a halted run.
+stall_seconds = 1800
 max_run_seconds = 172800
 ready_samples = 6
 ready_sample_interval_seconds = 30
@@ -77,4 +83,3 @@ alias = "temp-zakura-sync-test-5"
 public_ip = "142.93.27.189"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
-stall_seconds = 1800
