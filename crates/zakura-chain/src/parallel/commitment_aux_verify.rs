@@ -309,7 +309,7 @@ pub fn verify_supplied_sapling_root_below_heartwood_from_header(
 }
 
 /// Verifies that a supplied Sapling transaction count is zero before Sapling.
-pub fn verify_supplied_sapling_tx_below_sapling(
+fn verify_supplied_sapling_tx_below_sapling(
     network: &Network,
     height: Height,
     sapling_tx: u64,
@@ -339,7 +339,7 @@ pub fn verify_supplied_sapling_tx_below_sapling(
 ///
 /// Heartwood+ `sapling_tx` and NU5+ `auth_data_root` are left intact: those values were checked
 /// against the applicable header commitment / history leaf before confirmation.
-pub fn normalize_unauthenticated_commitment_fields(
+fn normalize_unauthenticated_commitment_fields(
     network: &Network,
     mut roots: BlockCommitmentRoots,
 ) -> BlockCommitmentRoots {
@@ -385,7 +385,7 @@ pub fn verify_supplied_orchard_root_below_nu5(
 }
 
 /// Verifies that a supplied Orchard transaction count is zero before NU5.
-pub fn verify_supplied_orchard_tx_below_nu5(
+fn verify_supplied_orchard_tx_below_nu5(
     network: &Network,
     height: Height,
     orchard_tx: u64,
@@ -432,7 +432,7 @@ pub fn verify_supplied_ironwood_root_below_nu6_3(
 }
 
 /// Verifies that a supplied Ironwood transaction count is zero before Nu6_3.
-pub fn verify_supplied_ironwood_tx_below_nu6_3(
+fn verify_supplied_ironwood_tx_below_nu6_3(
     network: &Network,
     height: Height,
     ironwood_tx: u64,

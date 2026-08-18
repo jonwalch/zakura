@@ -6,8 +6,6 @@
 //! Sapling/Orchard/Ironwood roots (from a fixture today, an untrusted peer later), confirm
 //! they reconstruct a history tree consistent with the header commitments.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::sync::Arc;
 
 use zakura_chain::{
@@ -15,13 +13,13 @@ use zakura_chain::{
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::commitment_aux_verify::{
-        header_commitment_is_valid_for_chain_history, SuppliedRootsError,
+        header_commitment_is_valid_for_chain_history, verify_supplied_ironwood_root_below_nu6_3,
+        verify_supplied_orchard_root_below_nu5,
+        verify_supplied_sapling_root_below_heartwood_from_header, SuppliedRootsError,
     },
-    parameters::{Network, NetworkUpgrade},
+    parameters::Network,
     sapling,
 };
-
-use zakura_chain::block::{Commitment, CommitmentError};
 
 use crate::{service::check, ValidateContextError};
 
@@ -89,16 +87,19 @@ impl CommitmentRootVerification {
 pub(crate) enum CommitmentRootVerificationError {
     /// The current block body does not match its parent-history commitment.
     CurrentBlock {
+        #[cfg_attr(not(test), allow(dead_code))]
         height: Height,
         error: ValidateContextError,
     },
     /// The current block's supplied roots failed a direct check or history-tree fold.
     CurrentRoots {
+        #[cfg_attr(not(test), allow(dead_code))]
         height: Height,
         error: ValidateContextError,
     },
     /// The successor header rejected the candidate tree containing the current roots.
     SuccessorBoundary {
+        #[cfg_attr(not(test), allow(dead_code))]
         height: Height,
         error: ValidateContextError,
     },
@@ -135,98 +136,21 @@ impl CommitmentRootVerificationError {
     }
 }
 
-/// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the
-/// block header.
-///
-/// The ZIP-221 history MMR does not exist below Heartwood, so `block_commitment_is_valid_for_chain_history`
-/// is a no-op there and cannot authenticate the supplied roots. This fills that gap:
-/// - Sapling..Heartwood: the header's `FinalSaplingRoot` commits the Sapling root
-///   directly, so the supplied root must equal it.
-/// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the empty-tree root.
-pub(crate) fn verify_supplied_sapling_root_below_heartwood(
-    network: &Network,
-    block: &Block,
-    sapling_root: &sapling::tree::Root,
-) -> Result<(), ValidateContextError> {
-    let expected = match block.commitment(network)? {
-        Commitment::FinalSaplingRoot(header_root) => header_root,
-        Commitment::PreSaplingReserved(_) => sapling::tree::NoteCommitmentTree::default().root(),
-        // Heartwood activation and later are authenticated by the MMR path.
-        _ => return Ok(()),
-    };
-
-    if sapling_root != &expected {
-        return Err(ValidateContextError::InvalidBlockCommitment(
-            CommitmentError::InvalidFinalSaplingRoot {
-                expected: <[u8; 32]>::from(expected),
-                actual: <[u8; 32]>::from(*sapling_root),
-            },
-        ));
-    }
-
-    Ok(())
-}
-
-/// Verifies a supplied Orchard root for a pre-NU5 block.
-///
-/// Blocks before NU5 do not commit to Orchard roots, so the MMR cannot
-/// authenticate them. The supplied root must therefore be the empty-tree root.
-pub(crate) fn verify_supplied_orchard_root_below_nu5(
-    network: &Network,
-    height: Height,
-    orchard_root: &orchard::tree::Root,
-) -> Result<(), ValidateContextError> {
-    // At/above NU5 the ZIP-221 V2 MMR commits to the Orchard root, so it is
-    // authenticated there, not here.
-    if let Some(nu5_height) = NetworkUpgrade::Nu5.activation_height(network) {
-        if height >= nu5_height {
-            return Ok(());
+/// Converts supplied-root verification failures into state validation failures.
+fn supplied_roots_error_to_validate_context(error: SuppliedRootsError) -> ValidateContextError {
+    match error {
+        SuppliedRootsError::InvalidHeaderCommitment(error) => {
+            ValidateContextError::InvalidBlockCommitment(error)
         }
-    }
-
-    let expected = orchard::tree::NoteCommitmentTree::default().root();
-    if orchard_root != &expected {
-        return Err(ValidateContextError::InvalidBlockCommitment(
-            CommitmentError::InvalidPreNu5OrchardRoot {
-                expected: <[u8; 32]>::from(expected),
-                actual: <[u8; 32]>::from(*orchard_root),
-            },
-        ));
-    }
-
-    Ok(())
-}
-
-/// Verifies a supplied Ironwood root for a pre-Ironwood (pre-`Nu6_3`) block.
-///
-/// `Nu6_3` is the first network upgrade whose `HistoryTree` leaf commits to an
-/// Ironwood root (the `IronwoodOnward`/V3 leaf); below it, no header commits to an
-/// Ironwood root and the Ironwood tree is provably empty (no Ironwood actions are
-/// allowed), so the supplied root must be the empty-tree root.
-pub(crate) fn verify_supplied_ironwood_root_below_nu6_3(
-    network: &Network,
-    height: Height,
-    ironwood_root: &ironwood::tree::Root,
-) -> Result<(), ValidateContextError> {
-    // At/above Nu6_3 the ZIP-221 V3 MMR commits to the Ironwood root, so it is
-    // authenticated there, not here.
-    if let Some(nu6_3_height) = NetworkUpgrade::Nu6_3.activation_height(network) {
-        if height >= nu6_3_height {
-            return Ok(());
+        SuppliedRootsError::MissingHistoryTreeRoot => {
+            ValidateContextError::HistoryTreeError(Arc::new(
+                zakura_chain::history_tree::HistoryTreeError::InvalidCachedTree {
+                    reason: "a header commitment requires a non-empty parent history tree",
+                },
+            ))
         }
+        SuppliedRootsError::HistoryTree(error) => ValidateContextError::HistoryTreeError(error),
     }
-
-    let expected = ironwood::tree::NoteCommitmentTree::default().root();
-    if ironwood_root != &expected {
-        return Err(ValidateContextError::InvalidBlockCommitment(
-            CommitmentError::InvalidPreNu6_3IronwoodRoot {
-                expected: <[u8; 32]>::from(expected),
-                actual: <[u8; 32]>::from(*ironwood_root),
-            },
-        ));
-    }
-
-    Ok(())
 }
 
 /// Verifies that `items` (blocks in ascending height order, with supplied
@@ -294,22 +218,7 @@ where
                     &history_tree,
                     auth_data_root,
                 )
-                .map_err(|error| match error {
-                    SuppliedRootsError::InvalidHeaderCommitment(error) => {
-                        ValidateContextError::InvalidBlockCommitment(error)
-                    }
-                    SuppliedRootsError::MissingHistoryTreeRoot => {
-                        ValidateContextError::HistoryTreeError(Arc::new(
-                            zakura_chain::history_tree::HistoryTreeError::InvalidCachedTree {
-                                reason:
-                                    "a header commitment requires a non-empty parent history tree",
-                            },
-                        ))
-                    }
-                    SuppliedRootsError::HistoryTree(error) => {
-                        ValidateContextError::HistoryTreeError(error)
-                    }
-                })
+                .map_err(supplied_roots_error_to_validate_context)
                 .map_err(|error| {
                     CommitmentRootVerificationError::SuccessorBoundary { height, error }
                 })?;
@@ -321,11 +230,19 @@ where
         };
 
         let block = block.expect("verification items with supplied roots have a block body");
-        verify_supplied_sapling_root_below_heartwood(network, &block, &sapling_root)
-            .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
+        verify_supplied_sapling_root_below_heartwood_from_header(
+            network,
+            &block.header,
+            height,
+            &sapling_root,
+        )
+        .map_err(supplied_roots_error_to_validate_context)
+        .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
         verify_supplied_orchard_root_below_nu5(network, height, &orchard_root)
+            .map_err(supplied_roots_error_to_validate_context)
             .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
         verify_supplied_ironwood_root_below_nu6_3(network, height, &ironwood_root)
+            .map_err(supplied_roots_error_to_validate_context)
             .map_err(|error| CommitmentRootVerificationError::CurrentRoots { height, error })?;
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
@@ -346,11 +263,7 @@ mod tests {
 
     use zakura_chain::{
         block::Block,
-        parameters::{
-            testnet::{ConfiguredActivationHeights, RegtestParameters},
-            Network::Mainnet,
-            NetworkUpgrade,
-        },
+        parameters::{Network::Mainnet, NetworkUpgrade},
         serialization::ZcashDeserializeInto,
     };
 
@@ -369,20 +282,6 @@ mod tests {
             &Default::default(),
         )
         .expect("empty history tree for a pre-Heartwood block")
-    }
-
-    /// A distinct, valid Orchard root that is *not* the empty-tree root, for the
-    /// negative cases. Zero is a valid Pallas base field element, and the empty
-    /// Orchard tree root is an uncommitted-leaf hash, so the two differ.
-    fn non_empty_orchard_root() -> orchard::tree::Root {
-        let empty = orchard::tree::NoteCommitmentTree::default().root();
-        let wrong = orchard::tree::Root::try_from([0u8; 32])
-            .expect("zero is a valid pallas base field element");
-        assert_ne!(
-            wrong, empty,
-            "the negative cases need a root distinct from the empty-tree root"
-        );
-        wrong
     }
 
     fn mainnet_block_at(height: u32) -> Arc<Block> {
@@ -464,217 +363,6 @@ mod tests {
             Some(block.auth_data_root())
         );
         assert!(!header_only.skip_parent_check);
-    }
-
-    /// Below Heartwood the supplied Sapling root is authenticated directly by the
-    /// header commitment (or pinned to empty before Sapling). At/above Heartwood,
-    /// the MMR path authenticates it instead, so this direct check accepts.
-    #[test]
-    fn pins_sapling_root_below_heartwood_to_header_or_empty() {
-        let empty = sapling::tree::NoteCommitmentTree::default().root();
-        let sapling_root = mainnet_sapling_root_at(419_200);
-        let different_sapling_root = mainnet_sapling_root_at(419_201);
-        assert_ne!(
-            empty, different_sapling_root,
-            "the pre-Sapling negative case needs a non-empty root"
-        );
-        assert_ne!(
-            sapling_root, different_sapling_root,
-            "the negative cases need two distinct roots"
-        );
-
-        let pre_sapling_block = mainnet_block_at(1);
-        verify_supplied_sapling_root_below_heartwood(&Mainnet, &pre_sapling_block, &empty)
-            .expect("the empty-tree root is accepted before Sapling");
-        let error = verify_supplied_sapling_root_below_heartwood(
-            &Mainnet,
-            &pre_sapling_block,
-            &different_sapling_root,
-        )
-        .expect_err("a non-empty Sapling root must be rejected before Sapling");
-        assert!(
-            matches!(
-                error,
-                ValidateContextError::InvalidBlockCommitment(
-                    CommitmentError::InvalidFinalSaplingRoot { .. }
-                )
-            ),
-            "rejection uses the final Sapling root error, got: {error:?}"
-        );
-
-        let sapling_block = mainnet_block_at(419_200);
-        verify_supplied_sapling_root_below_heartwood(&Mainnet, &sapling_block, &sapling_root)
-            .expect("the header's final Sapling root is accepted before Heartwood");
-        let error = verify_supplied_sapling_root_below_heartwood(
-            &Mainnet,
-            &sapling_block,
-            &different_sapling_root,
-        )
-        .expect_err("a Sapling root different from the header root must be rejected");
-        assert!(
-            matches!(
-                error,
-                ValidateContextError::InvalidBlockCommitment(
-                    CommitmentError::InvalidFinalSaplingRoot { .. }
-                )
-            ),
-            "rejection uses the final Sapling root error, got: {error:?}"
-        );
-
-        let heartwood_block = mainnet_block_at(903_000);
-        verify_supplied_sapling_root_below_heartwood(
-            &Mainnet,
-            &heartwood_block,
-            &different_sapling_root,
-        )
-        .expect("at Heartwood the root is authenticated by the MMR, not pinned here");
-    }
-
-    /// Below NU5 the supplied Orchard root must equal the empty-tree root (no header
-    /// commits to it there), and any other root is rejected. At/above NU5 the MMR
-    /// authenticates it, so this check accepts unconditionally.
-    #[test]
-    fn pins_orchard_root_to_empty_below_nu5_and_defers_above() {
-        let nu5 = NetworkUpgrade::Nu5
-            .activation_height(&Mainnet)
-            .expect("mainnet has NU5");
-        let empty = orchard::tree::NoteCommitmentTree::default().root();
-        let wrong = non_empty_orchard_root();
-
-        // Below NU5: the empty root is accepted, a non-empty root is rejected.
-        let pre_nu5 = Height(nu5.0 - 1);
-        verify_supplied_orchard_root_below_nu5(&Mainnet, pre_nu5, &empty)
-            .expect("the empty-tree root is accepted below NU5");
-        let error = verify_supplied_orchard_root_below_nu5(&Mainnet, pre_nu5, &wrong)
-            .expect_err("a non-empty orchard root must be rejected below NU5");
-        assert!(
-            matches!(
-                error,
-                ValidateContextError::InvalidBlockCommitment(
-                    CommitmentError::InvalidPreNu5OrchardRoot { .. }
-                )
-            ),
-            "rejection uses the dedicated pre-NU5 orchard error, got: {error:?}"
-        );
-
-        // Pre-Sapling/Heartwood (well below NU5) is also pinned to empty.
-        verify_supplied_orchard_root_below_nu5(&Mainnet, Height(1), &empty)
-            .expect("the empty-tree root is accepted at low heights");
-        verify_supplied_orchard_root_below_nu5(&Mainnet, Height(1), &wrong)
-            .expect_err("a non-empty orchard root must be rejected at low heights");
-
-        // At and above NU5 the MMR path authenticates the root, so even a non-empty
-        // root is accepted here (it is checked elsewhere).
-        verify_supplied_orchard_root_below_nu5(&Mainnet, nu5, &wrong)
-            .expect("at NU5 the root is authenticated by the MMR, not pinned here");
-        verify_supplied_orchard_root_below_nu5(&Mainnet, Height(nu5.0 + 1), &wrong)
-            .expect("above NU5 the root is authenticated by the MMR, not pinned here");
-    }
-
-    #[test]
-    fn pins_orchard_root_to_empty_when_nu5_is_unconfigured() {
-        let network = zakura_chain::parameters::Network::new_regtest(RegtestParameters {
-            activation_heights: ConfiguredActivationHeights {
-                nu5: None,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let empty = orchard::tree::NoteCommitmentTree::default().root();
-        let wrong = non_empty_orchard_root();
-
-        verify_supplied_orchard_root_below_nu5(&network, Height(1), &empty)
-            .expect("the empty-tree root is accepted when NU5 is unconfigured");
-        let error = verify_supplied_orchard_root_below_nu5(&network, Height(1), &wrong)
-            .expect_err("a non-empty orchard root must be rejected when NU5 is unconfigured");
-        assert!(
-            matches!(
-                error,
-                ValidateContextError::InvalidBlockCommitment(
-                    CommitmentError::InvalidPreNu5OrchardRoot { .. }
-                )
-            ),
-            "rejection uses the dedicated pre-NU5 orchard error, got: {error:?}"
-        );
-    }
-
-    /// A distinct, valid Ironwood root that is *not* the empty-tree root, for the
-    /// negative cases.
-    fn non_empty_ironwood_root() -> ironwood::tree::Root {
-        let empty = empty_ironwood_root();
-        let wrong = ironwood::tree::Root::try_from([0u8; 32])
-            .expect("zero is a valid pallas base field element");
-        assert_ne!(
-            wrong, empty,
-            "the negative cases need a root distinct from the empty-tree root"
-        );
-        wrong
-    }
-
-    /// Below `Nu6_3` the supplied Ironwood root must equal the empty-tree root (no
-    /// header commits to it there), and any other root is rejected. At/above
-    /// `Nu6_3` the MMR authenticates it, so this check accepts unconditionally.
-    #[test]
-    fn pins_ironwood_root_to_empty_below_nu6_3_and_defers_above() {
-        let network = zakura_chain::parameters::Network::new_regtest(RegtestParameters {
-            activation_heights: ConfiguredActivationHeights {
-                nu6_3: Some(1_000),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let nu6_3 = Height(1_000);
-        let empty = empty_ironwood_root();
-        let wrong = non_empty_ironwood_root();
-
-        // Below Nu6_3: the empty root is accepted, a non-empty root is rejected.
-        let pre_nu6_3 = Height(nu6_3.0 - 1);
-        verify_supplied_ironwood_root_below_nu6_3(&network, pre_nu6_3, &empty)
-            .expect("the empty-tree root is accepted below Nu6_3");
-        let error = verify_supplied_ironwood_root_below_nu6_3(&network, pre_nu6_3, &wrong)
-            .expect_err("a non-empty ironwood root must be rejected below Nu6_3");
-        assert!(
-            matches!(
-                error,
-                ValidateContextError::InvalidBlockCommitment(
-                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. }
-                )
-            ),
-            "rejection uses the dedicated pre-Nu6_3 ironwood error, got: {error:?}"
-        );
-
-        // Pre-Sapling/Heartwood (well below Nu6_3) is also pinned to empty.
-        verify_supplied_ironwood_root_below_nu6_3(&network, Height(1), &empty)
-            .expect("the empty-tree root is accepted at low heights");
-        verify_supplied_ironwood_root_below_nu6_3(&network, Height(1), &wrong)
-            .expect_err("a non-empty ironwood root must be rejected at low heights");
-
-        // At and above Nu6_3 the MMR path authenticates the root, so even a
-        // non-empty root is accepted here (it is checked elsewhere).
-        verify_supplied_ironwood_root_below_nu6_3(&network, nu6_3, &wrong)
-            .expect("at Nu6_3 the root is authenticated by the MMR, not pinned here");
-        verify_supplied_ironwood_root_below_nu6_3(&network, Height(nu6_3.0 + 1), &wrong)
-            .expect("above Nu6_3 the root is authenticated by the MMR, not pinned here");
-    }
-
-    #[test]
-    fn pins_ironwood_root_to_empty_when_nu6_3_is_unconfigured() {
-        let empty = empty_ironwood_root();
-        let wrong = non_empty_ironwood_root();
-
-        verify_supplied_ironwood_root_below_nu6_3(&Mainnet, Height(1), &empty)
-            .expect("the empty-tree root is accepted when Nu6_3 is unconfigured");
-        let error = verify_supplied_ironwood_root_below_nu6_3(&Mainnet, Height(1), &wrong)
-            .expect_err("a non-empty ironwood root must be rejected when Nu6_3 is unconfigured");
-        assert!(
-            matches!(
-                error,
-                ValidateContextError::InvalidBlockCommitment(
-                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. }
-                )
-            ),
-            "rejection uses the dedicated pre-Nu6_3 ironwood error, got: {error:?}"
-        );
     }
 
     /// The verifier confirms real Sapling roots over the Heartwood activation and its
