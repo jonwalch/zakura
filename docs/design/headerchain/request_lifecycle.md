@@ -39,9 +39,7 @@ of a range commit (single frontier publisher, LC-GEN-05).
 The node runs one fork-choice implementation.
 [`HeaderChainEngine::plan_transition`](../../../crates/zakura-header-chain/src/transition/engine/mod.rs)
 is the only code that decides which chain is best, and this guide calls that code the
-planner. Every source reports what it observed, and the planner derives every consequence
-from that evidence: which headers the node admits, which chain is best, how far finality
-moves, what the node retains, and which rows the store writes.
+planner.
 
 ```rust
 // crates/zakura-header-chain/src/transition/engine/mod.rs
@@ -52,11 +50,16 @@ pub fn plan_transition(
 ) -> Result<EngineTransition, TransitionFailure>
 ```
 
-The signature carries the rule. `input` is authenticated evidence of what happened, never a
-consequence the caller wants. `TransitionRequest`, the value a caller submits to the state
-writer, documents that contract in one line: callers never submit desired consequences.
-`&self` means the call mutates nothing, so a plan is a value the caller can inspect, commit,
-or drop. The planner runs six phases in order: it authenticates and admits the evidence, binds
+`input` is authenticated evidence of what happened, never a consequence the caller wants. That
+is the mechanism the design rests on. The peer path reports the headers it received. Full state
+reports the bodies it verified. The RPC path reports the exclusion an operator asked for. None
+of them names a tip, and the planner derives every consequence from what they report: which
+headers the node admits, which chain is best, how far finality moves, what the node retains,
+and which rows the store writes. The documentation on `TransitionRequest` states the rule in
+one line: callers never submit desired consequences.
+
+`&self` means the call mutates nothing, so a plan is a value the caller can inspect, commit, or
+drop. The planner runs six phases in order: it authenticates and admits the evidence, binds
 replay and freshness, projects the evidence onto staged state, derives finality and retention,
 assembles the write set, and verifies the result against the invariants. The same evidence
 against the same state produces the same plan.
@@ -78,12 +81,10 @@ The design therefore gives each layer one decision and denies it the rest.
 | Runtime | `zakura-state`, under the writer lock | which history the planner judges the evidence against | invent a fact the store does not hold |
 | Engine | `zakura-header-chain` | which chain is best | perform any effect, including committing its own answer |
 
-The build enforces two of those prohibitions, so no reviewer has to. The `Port` trait in
+The reactor's prohibition is not a convention. The `Port` trait in
 [`zakura-node-services`](../../../crates/zakura-node-services/src/header_chain.rs) lists every
-operation the reactor may call, and no operation names the database. The
-`architecture_dependencies_stay_sync_only_and_layered` test fails the build when the engine
-manifest names `tokio`, `tower`, `zakura-state`, `zakura-network`, or `zakura-consensus`
-(block-sync concerns excluded, LC-SCOPE-06).
+operation the reactor may call, and none of them names the database, so the reactor has no
+method that reaches it.
 
 A type carries each of the remaining boundaries. The value that crosses a boundary cannot
 express the mistake the boundary prevents, so a reader checks the rule by reading the type
@@ -131,17 +132,16 @@ returned. Every frontier it schedules against is therefore already on disk.
 
 The delivery arrives as
 [`HeaderSyncMessage::Headers`](../../../crates/zakura-network/src/zakura/header_sync/wire.rs) on
-the header-sync stream. A peer is an anonymous party, and every field in that message is a claim
-rather than a fact. If the reactor derived any chain fact from that claim, the peer would take
+the header-sync stream. Peers are not trusted. Authenticating a peer's key establishes who sent
+the message, and it says nothing about whether the contents are true, so every field in the
+message is a claim. If the reactor derived a chain fact from that claim, the peer would take
 part in fork choice.
 
 So the reactor derives none. It decides when to ask, whom to ask, and how much to ask for.
 Those are timing questions, and the reactor holds the only timer. Lower layers decide whether
 a header is valid, which chain is best, and whether a late response still counts. The height
 a peer attaches to a header never becomes evidence, because height comes from a checked
-parent increment further down. The codec bounds every collection before it allocates, and a
-zero request id decodes as a failure rather than matching every outstanding request (bounded
-decoding, LC-WIRE-01).
+parent increment further down.
 
 Message framing, schema evolution, and the per-message limits that stop a peer from exhausting
 the node belong to the wire protocol rather than to this path. A separate specification for
@@ -194,12 +194,17 @@ Validation also costs CPU, because Equihash and the hash and target checks run p
 The writer lock serializes every write in the node, so running that work under the lock
 stalls every other writer.
 
-The port splits the work in two. Preparation runs off the lock, on a blocking thread, and
-covers exactly the rules that read no ancestor: canonical version and hash, checked height
-inference, commitment structure, compact-target domain, and Equihash. It reads a validation
-lease for the common ancestor through the read service and derives the rules in force at that
-height from that lease. The result comes back sealed, and only the adapter that issued it can
-open it.
+The port splits the work in two. Preparation runs off the lock, on a blocking thread, and runs
+exactly the rules that read no ancestor.
+
+- The header's own encoding: canonical version, hash, and commitment structure.
+- Its height, inferred from the parent and checked.
+- Its proof of work: the compact-target domain and Equihash.
+
+Preparation takes the rules in force at that height from a validation lease that the port
+obtains through the read service, so the reactor still touches no database. Every remaining
+rule needs history, and every one of them waits for the lock. The prepared result comes back
+sealed, and only the adapter that issued it can open it.
 
 ```rust
 // crates/zakura-node-services/src/header_chain.rs
@@ -299,9 +304,8 @@ The engine cannot open the batch, because the batch spans full-state column fami
 the engine must not link. It cannot close the batch either, because the runtime may still add a
 second transition.
 
-Two writes sit outside this path, both before the engine exists. Startup commits one repair
-batch when the audit is not clean. A first run against a store that predates the DAG commits
-the migration batch that builds the initial nodes and the migrated finality pin.
+Two writes sit outside this path, both before the engine exists: the startup repair batch and
+the migration batch that builds the initial nodes.
 
 | Type | Location | Unrepresentable mistake |
 | --- | --- | --- |
