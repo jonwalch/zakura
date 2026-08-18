@@ -32,17 +32,24 @@ edition = "2021"
 
 [workspace.dependencies]
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = "0.15.4"
-sapling-crypto = "0.7"
+# Cryptography forks from zakura-core/libraries, pinned to main at
+# 3042ed06 (Add reproducible Orchard benchmark harnesses, #77).
+# Package names are the zakura-branded crates.io reservations; directory
+# and lib names stay upstream, so `use orchard::` / `use halo2::` paths
+# are unchanged. Consume them as git dependencies — not [patch] — so
+# crates.io originals never enter the graph.
+orchard = { package = "zakura-orchard", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
+sapling-crypto = { package = "zakura-sapling-crypto", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
 zcash_address = "0.13.0"
 zcash_encoding = "0.4"
 zcash_history = "0.5.0"
-zcash_keys = "0.16.0"
-zcash_primitives = "0.30.0"
-zcash_proofs = "0.30.0"
+zcash_keys = { package = "zakura-keys", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
+zcash_primitives = { package = "zakura-primitives", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
+zcash_proofs = { package = "zakura-proofs", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
 zcash_transparent = "0.10.0"
-zcash_protocol = "0.10.1"
+zcash_protocol = "0.10.2"
 zip32 = "0.2"
+sinsemilla = { package = "zakura-sinsemilla", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
 abscissa_core = "0.7"
 base64 = "0.22.1"
 bech32 = "0.11.0"
@@ -73,7 +80,7 @@ futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 group = "0.13"
-halo2 = "0.3"
+halo2 = { package = "zakura-halo2-proofs", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
 hex = "0.4.3"
 hex-literal = "0.4"
 howudoin = "0.1"
@@ -117,8 +124,8 @@ rand = "0.8.5"
 rand_chacha = "0.3"
 rand_core = "0.6"
 rayon = "1.10"
-reddsa = "0.5"
-redjubjub = "0.8"
+reddsa = { package = "zakura-reddsa", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
+redjubjub = { package = "zakura-redjubjub", git = "https://github.com/zakura-core/libraries", rev = "3042ed06d758147360c2d38bb3e258491fcf379b" }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false }
 ripemd = "0.1"
@@ -247,21 +254,21 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.pasta_curves]
+[profile.dev.package.zakura-pasta-curves]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.halo2_proofs]
+[profile.dev.package.zakura-halo2-proofs]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.halo2_gadgets]
+[profile.dev.package.zakura-halo2-gadgets]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
@@ -289,7 +296,7 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.zcash_proofs]
+[profile.dev.package.zakura-proofs]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
