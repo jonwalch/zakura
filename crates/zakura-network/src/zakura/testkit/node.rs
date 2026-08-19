@@ -109,6 +109,7 @@ impl ZakuraTestNode {
             self.endpoint.clone(),
             self.discovery.clone(),
             self.limits.clone(),
+            Vec::new(),
         ))
     }
 
@@ -556,12 +557,12 @@ impl ZakuraTestNodeBuilder {
             Arc::new(DiscoveryService::new(discovery.clone()))
         };
         let registry = service_registry(
-            &supervisor,
             header_sync,
             block_sync_handle.clone(),
             self.block_sync_config.clone(),
             base_service,
             discovery_service,
+            Vec::new(),
             None,
         )?;
         let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
