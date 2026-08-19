@@ -568,6 +568,11 @@ pub struct ZakuraEndpoint {
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
     upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, UpgradeDialOwnership>>>,
+    /// Native services this node constructed but did not register, because
+    /// [`ZakuraConfig::provide_services`] turned them off. Never read: the field
+    /// exists so their resources outlive startup. See [`service_registry`].
+    #[allow(dead_code)]
+    retained_services: Arc<Vec<Arc<dyn Service>>>,
 }
 
 #[derive(Debug)]
@@ -881,6 +886,7 @@ impl ZakuraEndpoint {
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            retained_services: Arc::new(Vec::new()),
         }
     }
 
@@ -908,6 +914,7 @@ impl ZakuraEndpoint {
             header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            retained_services: Arc::new(Vec::new()),
         }
     }
 
@@ -939,6 +946,7 @@ impl ZakuraEndpoint {
             block_sync_actions: block_sync_actions
                 .map(|actions| Arc::new(Mutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            retained_services: Arc::new(Vec::new()),
         }
     }
 }
@@ -1895,10 +1903,17 @@ pub(crate) fn service_registry(
         watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
     >,
     gate: NativeServiceGate,
-) -> Result<Arc<ServiceRegistry>, BoxError> {
+) -> Result<(Arc<ServiceRegistry>, Vec<Arc<dyn Service>>), BoxError> {
     let mut services = Vec::new();
+    // A native service the gate turned off is still constructed, and dropping it
+    // would take its resources down with it: the legacy gossip sink owns the only
+    // remaining handle to the inbound service on a Zakura-only node, so dropping
+    // it closes the inbound service the node needs to start. Retain them instead.
+    let mut retained: Vec<Arc<dyn Service>> = Vec::new();
     if gate.legacy {
         services.push(legacy_service.clone());
+    } else {
+        retained.push(legacy_service.clone());
     }
     let header_sync_service = if let Some(header_sync) = &header_sync {
         Arc::new(
@@ -1909,6 +1924,8 @@ pub(crate) fn service_registry(
     };
     if gate.header_sync {
         services.push(header_sync_service.clone());
+    } else {
+        retained.push(header_sync_service.clone());
     }
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
@@ -1942,12 +1959,15 @@ pub(crate) fn service_registry(
     services.push(discovery_service as Arc<dyn Service>);
     if gate.block_sync {
         services.push(block_sync);
+    } else {
+        retained.push(block_sync);
     }
     services.extend(custom_services);
 
-    Ok(Arc::new(
+    let registry = Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,
-    ))
+    );
+    Ok((registry, retained))
 }
 
 /// Iroh protocol handler for the Zakura `p2p-v2/1` ALPN.
@@ -3779,7 +3799,7 @@ async fn spawn_zakura_endpoint_inner(
         service_demand.clone(),
         gate,
     );
-    let registry = match registry {
+    let (registry, retained_services) = match registry {
         Ok(registry) => registry,
         Err(error) => {
             header_sync_shutdown.cancel();
@@ -3841,6 +3861,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+        retained_services: Arc::new(retained_services),
     };
     let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
@@ -5882,7 +5903,7 @@ mod tests {
         assert!(self_record.body.services.contains(&service_id));
         assert!(!self_record.body.services.contains(&custom.seeks[0]));
 
-        let registry = service_registry(
+        let (registry, _retained_services) = service_registry(
             None,
             None,
             ZakuraBlockSyncConfig::default(),
@@ -5943,6 +5964,54 @@ mod tests {
         let error = NativeServiceGate::from_config(&config)
             .expect_err("an unknown id must fail startup instead of silently disabling a service");
         assert!(error.to_string().contains("unknown native service"));
+    }
+
+    #[tokio::test]
+    async fn gated_off_native_services_are_retained_not_dropped() {
+        // A gated-off native service must stay alive. The legacy gossip sink owns
+        // the last handle to the node's inbound service on a Zakura-only node, so
+        // dropping it here closed the inbound service and startup failed with
+        // "could not send setup data to inbound service".
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let discovery = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[9u8; 32]),
+                direct_addrs: Vec::new(),
+                services: Vec::new(),
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            ZakuraSupervisorHandle::new(1).subscribe(),
+        )
+        .expect("test discovery handle builds");
+        let legacy_service = Arc::new(NoopService) as Arc<dyn Service>;
+        let (_registry, retained) = service_registry(
+            None,
+            None,
+            ZakuraBlockSyncConfig::default(),
+            legacy_service.clone(),
+            Arc::new(crate::zakura::DiscoveryService::new(discovery)),
+            Vec::new(),
+            None,
+            NativeServiceGate {
+                legacy: false,
+                header_sync: false,
+                block_sync: false,
+            },
+        )
+        .expect("registry builds with every native service gated off");
+        assert!(
+            retained
+                .iter()
+                .any(|service| Arc::ptr_eq(service, &legacy_service)),
+            "the gated-off legacy service must be retained, not dropped",
+        );
+        // Header sync and block sync are constructed too, so all three are held.
+        assert_eq!(retained.len(), 3);
     }
 
     #[test]

@@ -556,7 +556,7 @@ impl ZakuraTestNodeBuilder {
         } else {
             Arc::new(DiscoveryService::new(discovery.clone()))
         };
-        let registry = service_registry(
+        let (registry, _retained_services) = service_registry(
             header_sync,
             block_sync_handle.clone(),
             self.block_sync_config.clone(),
