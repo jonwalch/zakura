@@ -44,6 +44,8 @@ use zakura_chain::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{
     self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy, ZakuraServiceId,
+    SERVICE_ID_BLOCK_SYNC, SERVICE_ID_DISCOVERY, SERVICE_ID_HEADER_SYNC, SERVICE_ID_LEGACY_GOSSIP,
+    SERVICE_ID_LEGACY_REQUESTS, SERVICE_ID_SERVICE_DISCOVERY,
 };
 use super::trace::{reject_reason_label, ZakuraTrace};
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -318,6 +320,23 @@ pub struct ZakuraConfig {
     /// isolation while still validating the same chain. Has no effect unless
     /// [`v2_p2p`](crate::config::Config::v2_p2p) is enabled.
     pub dev_network: Option<String>,
+    /// Native services this node registers and advertises.
+    ///
+    /// `None` runs every native service, which is the production default. A list
+    /// restricts the node to the named services, so an operator can run, for
+    /// example, a header-sync-only node. Unregistered services drop their stream
+    /// capabilities from the control handshake and their ids from the signed
+    /// discovery record, so peers neither request nor select this node for them.
+    ///
+    /// [`SERVICE_ID_DISCOVERY`](crate::zakura::SERVICE_ID_DISCOVERY) is always
+    /// registered: it is the substrate every other service is discovered through.
+    pub provide_services: Option<Vec<String>>,
+    /// Extra service ids this node prefers when it picks discovery dial targets.
+    ///
+    /// The discovery dialer tries candidates advertising any of these ids before
+    /// falling back to general candidates, so a node that needs one service finds
+    /// a peer offering it instead of a random peer.
+    pub seek_services: Vec<String>,
 }
 
 impl Default for ZakuraConfig {
@@ -337,6 +356,8 @@ impl Default for ZakuraConfig {
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,
+            provide_services: None,
+            seek_services: Vec::new(),
         }
     }
 }
@@ -1862,6 +1883,7 @@ pub(crate) struct NativeHandshakeNegotiated {
     pub(crate) accepted_capabilities: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn service_registry(
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
@@ -1872,8 +1894,12 @@ pub(crate) fn service_registry(
     service_demand: Option<
         watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
     >,
+    gate: NativeServiceGate,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
-    let mut services = vec![legacy_service.clone()];
+    let mut services = Vec::new();
+    if gate.legacy {
+        services.push(legacy_service.clone());
+    }
     let header_sync_service = if let Some(header_sync) = &header_sync {
         Arc::new(
             HeaderSyncService::new(header_sync.clone()).with_service_demand(service_demand.clone()),
@@ -1881,7 +1907,9 @@ pub(crate) fn service_registry(
     } else {
         Arc::new(HeaderSyncPassthroughService::new(legacy_service.clone())) as Arc<dyn Service>
     };
-    services.push(header_sync_service.clone());
+    if gate.header_sync {
+        services.push(header_sync_service.clone());
+    }
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
         None => match header_sync.as_ref() {
@@ -1897,11 +1925,24 @@ pub(crate) fn service_registry(
         .into_iter()
         .map(|custom| custom.service)
         .collect::<Vec<_>>();
-    let mut connection_owners = vec![legacy_service, header_sync_service, block_sync.clone()];
+    // Only registered services own connections: a service the node does not run
+    // must not keep a connection alive on its behalf.
+    let mut connection_owners = Vec::new();
+    if gate.legacy {
+        connection_owners.push(legacy_service);
+    }
+    if gate.header_sync {
+        connection_owners.push(header_sync_service);
+    }
+    if gate.block_sync {
+        connection_owners.push(block_sync.clone());
+    }
     connection_owners.extend(custom_services.iter().cloned());
     discovery_service.set_connection_owners(connection_owners);
     services.push(discovery_service as Arc<dyn Service>);
-    services.push(block_sync);
+    if gate.block_sync {
+        services.push(block_sync);
+    }
     services.extend(custom_services);
 
     Ok(Arc::new(
@@ -3381,8 +3422,88 @@ fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId
         .len()
 }
 
-fn provided_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
-    let mut provided_services = discovery::default_advertised_services();
+/// The native services a node runs, resolved from
+/// [`ZakuraConfig::provide_services`].
+///
+/// Discovery is not represented: it is always registered, because it is the
+/// substrate every other service is found through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeServiceGate {
+    legacy: bool,
+    header_sync: bool,
+    block_sync: bool,
+}
+
+impl NativeServiceGate {
+    /// Every native service, the production default.
+    pub(crate) fn all() -> Self {
+        Self {
+            legacy: true,
+            header_sync: true,
+            block_sync: true,
+        }
+    }
+
+    /// Resolve the gate from config, rejecting ids that are not native services.
+    ///
+    /// An unknown id is an operator typo that would otherwise silently disable a
+    /// service, so it fails startup instead.
+    pub(crate) fn from_config(config: &ZakuraConfig) -> Result<Self, BoxError> {
+        let Some(provided) = config.provide_services.as_ref() else {
+            return Ok(Self::all());
+        };
+        let native = [
+            SERVICE_ID_DISCOVERY,
+            SERVICE_ID_SERVICE_DISCOVERY,
+            SERVICE_ID_HEADER_SYNC,
+            SERVICE_ID_BLOCK_SYNC,
+            SERVICE_ID_LEGACY_GOSSIP,
+            SERVICE_ID_LEGACY_REQUESTS,
+        ];
+        for id in provided {
+            if !native.contains(&id.as_str()) {
+                return Err(std::io::Error::other(format!(
+                    "network.zakura.provide_services lists unknown native service {id:?};                      expected any of {native:?}"
+                ))
+                .into());
+            }
+        }
+        let provides = |id: &str| provided.iter().any(|entry| entry == id);
+        Ok(Self {
+            legacy: provides(SERVICE_ID_LEGACY_GOSSIP) || provides(SERVICE_ID_LEGACY_REQUESTS),
+            header_sync: provides(SERVICE_ID_HEADER_SYNC),
+            block_sync: provides(SERVICE_ID_BLOCK_SYNC),
+        })
+    }
+
+    /// The native service ids this node advertises in its discovery record.
+    fn advertised_service_ids(&self) -> Vec<ZakuraServiceId> {
+        if *self == Self::all() {
+            return discovery::default_advertised_services();
+        }
+        let mut ids = vec![
+            ZakuraServiceId::discovery(),
+            ZakuraServiceId::service_discovery(),
+        ];
+        if self.header_sync {
+            ids.push(ZakuraServiceId::header_sync());
+        }
+        if self.block_sync {
+            ids.push(ZakuraServiceId::block_sync());
+        }
+        if self.legacy {
+            ids.push(ZakuraServiceId::legacy_gossip());
+            ids.push(ZakuraServiceId::legacy_requests());
+        }
+        ids
+    }
+}
+
+fn provided_services_with_custom(
+    custom_services: &[CustomService],
+    gate: NativeServiceGate,
+) -> Vec<ZakuraServiceId> {
+    let mut provided_services = gate.advertised_service_ids();
     provided_services.extend(
         custom_services
             .iter()
@@ -3393,14 +3514,24 @@ fn provided_services_with_custom(custom_services: &[CustomService]) -> Vec<Zakur
     provided_services
 }
 
-fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
+fn sought_services_with_custom(
+    custom_services: &[CustomService],
+    configured_seeks: &[String],
+) -> Result<Vec<ZakuraServiceId>, BoxError> {
     let mut sought_services: Vec<_> = custom_services
         .iter()
         .flat_map(|custom| custom.seeks.iter().cloned())
         .collect();
+    for id in configured_seeks {
+        sought_services.push(ZakuraServiceId::new(id.clone()).map_err(|error| -> BoxError {
+            Box::new(std::io::Error::other(format!(
+                "network.zakura.seek_services entry {id:?} is not a valid service id: {error}"
+            )))
+        })?);
+    }
     sought_services.sort_unstable();
     sought_services.dedup();
-    sought_services
+    Ok(sought_services)
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -3562,11 +3693,13 @@ async fn spawn_zakura_endpoint_inner(
         &config.network,
         config.zakura.dev_network.as_deref(),
     );
-    let sought_services = sought_services_with_custom(&custom_services);
+    let gate = NativeServiceGate::from_config(&config.zakura)?;
+    let sought_services =
+        sought_services_with_custom(&custom_services, &config.zakura.seek_services)?;
     let discovery = super::discovery::build_discovery_handle(
         discovery_secret_key,
         discovery_direct_addrs(config, local_node_id),
-        provided_services_with_custom(&custom_services),
+        provided_services_with_custom(&custom_services, gate),
         &handshake_config,
         config.zakura.max_connections,
         remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
@@ -3644,6 +3777,7 @@ async fn spawn_zakura_endpoint_inner(
         discovery_service,
         custom_services,
         service_demand.clone(),
+        gate,
     );
     let registry = match registry {
         Ok(registry) => registry,
@@ -5714,7 +5848,8 @@ mod tests {
             provides: vec![service_id.clone(), service_id.clone()],
             seeks: vec![ZakuraServiceId::new("zakura.test.remote.v1")?],
         };
-        let provided_services = provided_services_with_custom(std::slice::from_ref(&custom));
+        let provided_services =
+            provided_services_with_custom(std::slice::from_ref(&custom), NativeServiceGate::all());
         assert_eq!(
             provided_services
                 .iter()
@@ -5723,7 +5858,7 @@ mod tests {
             1
         );
         assert_eq!(
-            sought_services_with_custom(&[custom.clone(), custom.clone()]),
+            sought_services_with_custom(&[custom.clone(), custom.clone()], &[])?,
             custom.seeks
         );
 
@@ -5755,6 +5890,7 @@ mod tests {
             Arc::new(crate::zakura::DiscoveryService::new(discovery)),
             vec![custom],
             None,
+            NativeServiceGate::all(),
         )?;
 
         assert_eq!(
@@ -5763,6 +5899,61 @@ mod tests {
         );
         assert_ne!(registry.supported_capabilities() & CUSTOM_CAPABILITY, 0);
         Ok(())
+    }
+
+    #[test]
+    fn provide_services_gates_native_services_and_advertisements() {
+        let mut config = ZakuraConfig::default();
+        assert_eq!(
+            NativeServiceGate::from_config(&config).expect("the default config runs every service"),
+            NativeServiceGate::all(),
+        );
+        assert_eq!(
+            provided_services_with_custom(&[], NativeServiceGate::all()),
+            {
+                let mut expected = discovery::default_advertised_services();
+                expected.sort_unstable();
+                expected
+            },
+        );
+
+        config.provide_services = Some(vec![
+            SERVICE_ID_DISCOVERY.to_owned(),
+            SERVICE_ID_HEADER_SYNC.to_owned(),
+        ]);
+        let gate = NativeServiceGate::from_config(&config).expect("native service ids are valid");
+        assert_eq!(
+            gate,
+            NativeServiceGate {
+                legacy: false,
+                header_sync: true,
+                block_sync: false,
+            },
+        );
+        let advertised = provided_services_with_custom(&[], gate);
+        assert!(advertised.contains(&ZakuraServiceId::header_sync()));
+        assert!(advertised.contains(&ZakuraServiceId::discovery()));
+        // A header-sync-only node must not advertise the services it does not run,
+        // or peers select it for block sync and legacy gossip it cannot serve.
+        assert!(!advertised.contains(&ZakuraServiceId::block_sync()));
+        assert!(!advertised.contains(&ZakuraServiceId::legacy_gossip()));
+        assert!(!advertised.contains(&ZakuraServiceId::legacy_requests()));
+
+        config.provide_services = Some(vec!["zakura.not_a_native_service.v1".to_owned()]);
+        let error = NativeServiceGate::from_config(&config)
+            .expect_err("an unknown id must fail startup instead of silently disabling a service");
+        assert!(error.to_string().contains("unknown native service"));
+    }
+
+    #[test]
+    fn seek_services_config_extends_the_sought_service_ids() {
+        let sought = sought_services_with_custom(&[], &[SERVICE_ID_HEADER_SYNC.to_owned()])
+            .expect("a native service id is a valid seek");
+        assert_eq!(sought, vec![ZakuraServiceId::header_sync()]);
+
+        let error = sought_services_with_custom(&[], &[String::new()])
+            .expect_err("an empty seek entry is not a valid service id");
+        assert!(error.to_string().contains("is not a valid service id"));
     }
 
     #[tokio::test]

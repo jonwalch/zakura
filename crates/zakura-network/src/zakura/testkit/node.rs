@@ -564,6 +564,7 @@ impl ZakuraTestNodeBuilder {
             discovery_service,
             Vec::new(),
             None,
+            super::super::handler::NativeServiceGate::all(),
         )?;
         let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),
