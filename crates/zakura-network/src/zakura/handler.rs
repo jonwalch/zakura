@@ -530,6 +530,140 @@ pub struct CustomService {
     pub seeks: Vec<ZakuraServiceId>,
 }
 
+/// A peer a custom service has been handed and has not yet had removed.
+#[derive(Copy, Clone, Debug)]
+struct AdmittedCustomPeer {
+    conn_id: ZakuraConnId,
+    negotiated: u64,
+    direction: ServicePeerDirection,
+}
+
+/// Wraps a [`CustomService`] so a connection it has been handed is not closed
+/// as discovery-only.
+///
+/// [`Service::owns_connection_for_peer`] defaults to `false` and every native
+/// service overrides it. A custom service that keeps the default therefore
+/// claims nothing, so discovery closes the connection as soon as its own
+/// exchange completes — roughly a millisecond after the custom stream opened —
+/// and the peer is re-dialed only to be dropped again. The failure is invisible
+/// to a test that asserts a single round trip, because the round trip lands
+/// before the teardown.
+///
+/// Tracking admission here keeps that off the embedder: the service owns the
+/// connection it was handed for as long as the peer is admitted and it still
+/// wants that peer. A service that does its own connection accounting still
+/// overrides [`Service::owns_connection_for_peer`], and its answer wins.
+#[derive(Debug)]
+struct CustomServiceConnectionOwner {
+    inner: Arc<dyn Service>,
+    admitted: StdMutex<HashMap<ZakuraPeerId, AdmittedCustomPeer>>,
+}
+
+impl CustomServiceConnectionOwner {
+    fn new(inner: Arc<dyn Service>) -> Self {
+        Self {
+            inner,
+            admitted: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn admitted(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, AdmittedCustomPeer>> {
+        self.admitted
+            .lock()
+            .expect("custom service peer map mutex is never poisoned")
+    }
+}
+
+impl Service for CustomServiceConnectionOwner {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn streams(&self) -> &[Stream] {
+        self.inner.streams()
+    }
+
+    fn ordered_stream_policy(&self, kind: u16) -> OrderedStreamPolicy {
+        self.inner.ordered_stream_policy(kind)
+    }
+
+    fn ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        self.inner
+            .ordered_session_demand(conn_id, peer, negotiated, direction)
+    }
+
+    fn wants_peer(
+        &self,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> bool {
+        self.inner.wants_peer(peer, negotiated, direction)
+    }
+
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        if self.inner.owns_connection_for_peer(peer, conn_id) {
+            return true;
+        }
+        let Some(admitted) = self
+            .admitted()
+            .get(peer)
+            .copied()
+            .filter(|admitted| admitted.conn_id == conn_id)
+        else {
+            return false;
+        };
+        // A service that has stopped wanting the peer releases the connection,
+        // so an idle custom session cannot pin a connection open indefinitely.
+        self.inner
+            .wants_peer(peer, admitted.negotiated, admitted.direction)
+    }
+
+    fn add_peer(&self, peer: Peer) {
+        self.admitted().insert(
+            peer.id.clone(),
+            AdmittedCustomPeer {
+                conn_id: peer.conn_id,
+                negotiated: peer.negotiated,
+                direction: peer.direction,
+            },
+        );
+        self.inner.add_peer(peer);
+    }
+
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        {
+            let mut admitted = self.admitted();
+            if admitted
+                .get(peer)
+                .is_some_and(|admitted| admitted.conn_id == conn_id)
+            {
+                admitted.remove(peer);
+            }
+        }
+        self.inner.remove_peer(peer, conn_id);
+    }
+
+    fn deliver_frame(
+        &self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        frame: Frame,
+    ) -> Result<(), SinkReject> {
+        self.inner.deliver_frame(peer_id, stream_kind, frame)
+    }
+
+    fn as_request_response(&self) -> Option<&dyn crate::zakura::RequestResponseService> {
+        self.inner.as_request_response()
+    }
+}
+
 /// Running Zakura endpoint owned by `zakura-network`/`zakurad` startup.
 #[derive(Debug, Clone)]
 pub struct ZakuraEndpoint {
@@ -1721,7 +1855,9 @@ pub(crate) fn service_registry(
     let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
     let custom_services = custom_services
         .into_iter()
-        .map(|custom| custom.service)
+        .map(|custom| {
+            Arc::new(CustomServiceConnectionOwner::new(custom.service)) as Arc<dyn Service>
+        })
         .collect::<Vec<_>>();
     let mut connection_owners = vec![legacy_service, header_sync_service, block_sync.clone()];
     connection_owners.extend(custom_services.iter().cloned());
@@ -5547,6 +5683,85 @@ mod tests {
             Some(CUSTOM_STREAM)
         );
         assert_ne!(registry.supported_capabilities() & CUSTOM_CAPABILITY, 0);
+        Ok(())
+    }
+
+    /// A custom service that keeps every `Service` default must still own the
+    /// connection it was handed. Otherwise discovery finds no other owner after
+    /// its exchange, closes the connection as discovery-only about a
+    /// millisecond after the custom stream opened, and the peer is re-dialed
+    /// only to be dropped again.
+    #[tokio::test]
+    async fn custom_service_owns_the_connection_it_was_handed() -> Result<(), BoxError> {
+        const CUSTOM_CAPABILITY: u64 = 1 << 16;
+        const CUSTOM_STREAM: Stream = Stream {
+            kind: 64,
+            version: 1,
+            frame_cap: 64 * 1024,
+            capability: CUSTOM_CAPABILITY,
+            mode: StreamMode::Ordered,
+        };
+
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let discovery = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: SecretKey::from_bytes(&[9u8; 32]),
+                direct_addrs: Vec::new(),
+                services: Vec::new(),
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            supervisor.subscribe(),
+        )?;
+
+        let registry = service_registry(
+            None,
+            None,
+            ZakuraBlockSyncConfig::default(),
+            Arc::new(NoopService),
+            Arc::new(crate::zakura::DiscoveryService::new(discovery)),
+            vec![CustomService {
+                // Overrides nothing, so it keeps the `false` default of
+                // `Service::owns_connection_for_peer`.
+                service: Arc::new(DeclaredStreamService {
+                    streams: vec![CUSTOM_STREAM],
+                }),
+                provides: vec![ZakuraServiceId::new("zakura.test.custom.v1")?],
+                seeks: Vec::new(),
+            }],
+            None,
+        )?;
+
+        let service = registry
+            .service_for_kind(CUSTOM_STREAM.kind)
+            .expect("the custom stream is registered");
+        let peer_id = ZakuraPeerId::new(vec![21u8; 32]).expect("test peer id is within bounds");
+
+        assert!(!service.owns_connection_for_peer(&peer_id, 1));
+
+        service.add_peer(Peer::new_with_conn_id_and_direction(
+            1,
+            peer_id.clone(),
+            None,
+            CUSTOM_CAPABILITY,
+            ServicePeerDirection::Outbound,
+            HashMap::new(),
+            CancellationToken::new(),
+        ));
+
+        assert!(service.owns_connection_for_peer(&peer_id, 1));
+        assert!(
+            !service.owns_connection_for_peer(&peer_id, 2),
+            "ownership must be scoped to the connection the service was handed"
+        );
+
+        service.remove_peer(&peer_id, 1);
+        assert!(!service.owns_connection_for_peer(&peer_id, 1));
         Ok(())
     }
 
