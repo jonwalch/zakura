@@ -127,6 +127,23 @@ impl Service for SmokeEchoService {
         std::slice::from_ref(&SMOKE_STREAM)
     }
 
+    /// Hold the connection while this service has a live session on it.
+    ///
+    /// The trait default is `false`. A custom service that keeps the default
+    /// never claims its connection, so discovery closes it as a discovery-only
+    /// connection (`closed.neutral`, `reason: discovery_exchange_complete`) the
+    /// moment the exchange finishes -- about a millisecond after the custom
+    /// stream opens. Every embedding application that wants a durable session
+    /// has to override this.
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.counters
+            .live_peers
+            .lock()
+            .expect("smoke service peer map is never poisoned")
+            .get(&peer_id_hex(peer))
+            .is_some_and(|live_conn_id| *live_conn_id == conn_id)
+    }
+
     fn add_peer(&self, mut peer: Peer) {
         let peer_id = peer_id_hex(&peer.id);
         self.counters.peers_added.fetch_add(1, Ordering::Relaxed);
@@ -165,11 +182,17 @@ impl Service for SmokeEchoService {
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let peer_id = peer_id_hex(peer);
         self.counters.peers_removed.fetch_add(1, Ordering::Relaxed);
-        self.counters
+        // Remove only this connection's entry: a reconnect can register the new
+        // connection before the old one is torn down.
+        let mut live_peers = self
+            .counters
             .live_peers
             .lock()
-            .expect("smoke service peer map is never poisoned")
-            .remove(&peer_id);
+            .expect("smoke service peer map is never poisoned");
+        if live_peers.get(&peer_id) == Some(&conn_id) {
+            live_peers.remove(&peer_id);
+        }
+        drop(live_peers);
         info!(peer = %peer_id, conn_id, "smoke-echo stream closed");
     }
 }
