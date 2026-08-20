@@ -353,7 +353,8 @@ fn configured_pow_spans_size_the_difficulty_context() {
         block::Height(100),
         &network,
         long_context.iter().copied(),
-    );
+    )
+    .expect("the context spans the configured window");
     assert_eq!(
         adjusted.median_time_past(),
         candidate_time - Duration::seconds(5),
@@ -366,7 +367,8 @@ fn configured_pow_spans_size_the_difficulty_context() {
         block::Height(100),
         &Network::Mainnet,
         long_context.iter().copied(),
-    );
+    )
+    .expect("the context spans the Mainnet window");
     assert_eq!(
         mainnet_adjusted.median_time_past(),
         candidate_time - Duration::seconds(6),
@@ -405,6 +407,7 @@ fn default_pow_parameters_compute_the_mainnet_threshold() {
         &mainnet,
         mainnet_context.iter().copied(),
     )
+    .expect("the Mainnet context spans its adjustment window")
     .expected_difficulty_threshold();
 
     let actual = difficulty::AdjustedDifficulty::new_from_header_time(
@@ -413,6 +416,7 @@ fn default_pow_parameters_compute_the_mainnet_threshold() {
         &configured,
         mainnet_context.iter().copied(),
     )
+    .expect("the configured context spans its adjustment window")
     .expected_difficulty_threshold();
 
     assert_eq!(actual, expected);
@@ -480,7 +484,8 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
             candidate,
             network,
             difficulty_context(&generated.blocks, index),
-        );
+        )
+        .expect("the seeded chain supplies a full difficulty context");
 
         difficulty_threshold_and_time_are_valid(candidate.header.difficulty_threshold, adjustment)
             .unwrap_or_else(|error| {
@@ -497,6 +502,7 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
                 network,
                 difficulty_context(&generated.blocks, index),
             )
+            .expect("the seeded chain supplies a full difficulty context")
             .expected_difficulty_threshold();
             generated.blocks[index].header.difficulty_threshold != expected
         })
@@ -550,6 +556,7 @@ fn first_block_at_pow_start_height_expects_the_configured_limit() {
         network,
         difficulty_context(&generated.blocks, generated.blocks.len()),
     )
+    .expect("the seeded chain supplies a full difficulty context")
     .expected_difficulty_threshold();
 
     let expected_target: U256 = expected

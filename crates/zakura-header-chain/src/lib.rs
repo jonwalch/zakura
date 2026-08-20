@@ -37,6 +37,7 @@ pub use identity::{
     HeaderGeneration, HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
 pub use transition::*;
+pub use validation::pow_adjustment_block_span;
 pub use validation::{
     infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,
     validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,
