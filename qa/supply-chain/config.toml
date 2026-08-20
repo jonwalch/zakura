@@ -107,6 +107,11 @@ criteria = "safe-to-deploy"
 version = "0.4.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.cpu-equihash-solver]]
+version = "0.3.0"
+criteria = "safe-to-deploy"
+notes = "Temporary internal-miner fork pinned to a reviewed valargroup/librustzcash commit."
+
 [[exemptions.crypto-common]]
 version = "0.2.0-rc.1"
 criteria = "safe-to-deploy"
