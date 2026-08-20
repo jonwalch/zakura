@@ -62,8 +62,9 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock,
-    ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
+    BlockAdmission, BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config,
+    KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
+    StateInitError,
 };
 
 pub mod block_iter;
@@ -809,7 +810,11 @@ impl StateService {
         queued: QueuedSemanticallyVerified,
         error: impl Into<CommitSemanticallyVerifiedError>,
     ) {
-        let (finalized, rsp_tx) = queued;
+        let (finalized, rsp_tx, admission) = queued;
+
+        if let Some(admission) = admission {
+            admission.reject();
+        }
 
         // The block sender might have already given up on this block,
         // so ignore any channel send errors.
@@ -894,6 +899,7 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
+        admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
@@ -908,6 +914,9 @@ impl StateService {
             .non_finalized_block_write_sent_hashes
             .contains(&semantically_verified.hash)
         {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
                 Some(semantically_verified.hash.into()),
@@ -922,6 +931,9 @@ impl StateService {
             .db
             .contains_height(semantically_verified.height)
         {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
                 Some(semantically_verified.height.into()),
@@ -934,10 +946,13 @@ impl StateService {
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx)) = self
+        let rsp_rx = if let Some((_, old_rsp_tx, _)) = self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
         {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             tracing::debug!("replacing older queued request with new request");
             let (mut rsp_tx, rsp_rx) = oneshot::channel();
             std::mem::swap(old_rsp_tx, &mut rsp_tx);
@@ -949,8 +964,11 @@ impl StateService {
             rsp_rx
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            self.non_finalized_state_queued_blocks
-                .queue((semantically_verified, rsp_tx));
+            self.non_finalized_state_queued_blocks.queue((
+                semantically_verified,
+                rsp_tx,
+                admission,
+            ));
             rsp_rx
         };
 
@@ -1013,10 +1031,12 @@ impl StateService {
                     .dequeue_children(parent_hash);
 
                 for queued_child in queued_children {
-                    let (SemanticallyVerifiedBlock { hash, .. }, _) = queued_child;
+                    let (SemanticallyVerifiedBlock { hash, .. }, _, _) = &queued_child;
+                    let hash = *hash;
 
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
+                    let admission = queued_child.2.clone();
                     let send_result = non_finalized_block_write_sender.send(queued_child.into());
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
@@ -1030,6 +1050,10 @@ impl StateService {
 
                         return;
                     };
+
+                    if let Some(admission) = admission {
+                        admission.admit();
+                    }
 
                     new_parents.push(hash);
                 }
@@ -1458,7 +1482,7 @@ impl Service<Request> for StateService {
 
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(semantically_verified)
+                        self.queue_and_commit_to_non_finalized_state(semantically_verified, None)
                     })
                 });
 
@@ -1472,6 +1496,31 @@ impl Service<Request> for StateService {
                 // Await the channel response, flatten the result, map receive errors to
                 // `CommitSemanticallyVerifiedError::WriteTaskExited`.
                 // Then flatten the nested Result and convert any errors to a BoxError.
+                let span = Span::current();
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
+                        .and_then(|result| result)
+                        .map_err(BoxError::from)
+                        .map(Response::Committed)
+                }
+                .instrument(span)
+                .boxed()
+            }
+
+            Request::CommitSemanticallyVerifiedBlockWithAdmission { block, admission } => {
+                let timer = CodeTimer::start();
+                self.assert_block_can_be_validated(&block);
+                self.pending_utxos.check_against_ordered(&block.new_outputs);
+
+                let rsp_rx = tokio::task::block_in_place(move || {
+                    span.in_scope(|| {
+                        self.queue_and_commit_to_non_finalized_state(block, Some(admission))
+                    })
+                });
+
+                timer.finish_desc("CommitSemanticallyVerifiedBlockWithAdmission");
                 let span = Span::current();
                 async move {
                     rsp_rx
