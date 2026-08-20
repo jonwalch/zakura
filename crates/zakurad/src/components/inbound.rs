@@ -362,6 +362,7 @@ impl Inbound {
         Self::new_with_pending_blocks(
             full_verify_concurrency_limit,
             expose_peer_addresses,
+            block_verify_trace,
             zcashd_compat_pruning_retention,
             zcashd_compat_peer_ips,
             setup,
@@ -370,9 +371,11 @@ impl Inbound {
     }
 
     /// Creates an inbound service with a pending-block registry shared with mining RPCs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_pending_blocks(
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,
+        block_verify_trace: BlockVerifyTrace,
         zcashd_compat_pruning_retention: Option<u32>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
