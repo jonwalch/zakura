@@ -4,15 +4,12 @@ use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 use zakura_chain::{
     block::{self, Block},
-    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
+    parameters::{Network, NetworkUpgrade, MAX_POW_ADJUSTMENT_BLOCK_SPAN},
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
     BoundedVec,
 };
 
-use super::{
-    POW_ADJUSTMENT_BLOCK_SPAN, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
-    POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_BLOCK_SPAN,
-};
+use super::pow_adjustment_block_span;
 
 /// The difficulty context calculates a block's adjusted difficulty.
 pub struct AdjustedDifficulty {
@@ -27,14 +24,14 @@ pub struct AdjustedDifficulty {
     /// The `header.difficulty_threshold`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
-    relevant_difficulty_thresholds: BoundedVec<CompactDifficulty, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
+    relevant_difficulty_thresholds: BoundedVec<CompactDifficulty, 1, MAX_POW_ADJUSTMENT_BLOCK_SPAN>,
     /// The `header.time`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
     ///
     /// The calculation uses only the first and last `PoWMedianBlockSpan` times.
     /// The calculation ignores times `11..=16`.
-    relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
+    relevant_times: BoundedVec<DateTime<Utc>, 1, MAX_POW_ADJUSTMENT_BLOCK_SPAN>,
 }
 
 /// Invalid branch context supplied to a difficulty calculation.
@@ -109,12 +106,13 @@ impl AdjustedDifficulty {
         let candidate_height =
             (previous_block_height + 1).ok_or(AdjustedDifficultyError::HeightOverflow)?;
 
+        let adjustment_block_span = pow_adjustment_block_span(network);
         let (thresholds, times) = context
             .into_iter()
-            .take(POW_ADJUSTMENT_BLOCK_SPAN + 1)
+            .take(adjustment_block_span + 1)
             .unzip::<_, _, Vec<_>, Vec<_>>();
 
-        let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+        let span = u32::try_from(adjustment_block_span)
             .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
         let expected = usize::try_from(candidate_height.0.min(span))
             .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
@@ -129,11 +127,11 @@ impl AdjustedDifficulty {
         let relevant_difficulty_thresholds: BoundedVec<
             CompactDifficulty,
             1,
-            POW_ADJUSTMENT_BLOCK_SPAN,
+            MAX_POW_ADJUSTMENT_BLOCK_SPAN,
         > = thresholds
             .try_into()
             .map_err(|_| AdjustedDifficultyError::ContextLength { expected, actual })?;
-        let relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN> = times
+        let relevant_times: BoundedVec<DateTime<Utc>, 1, MAX_POW_ADJUSTMENT_BLOCK_SPAN> = times
             .try_into()
             .map_err(|_| AdjustedDifficultyError::ContextLength { expected, actual })?;
 
@@ -192,7 +190,7 @@ impl AdjustedDifficulty {
     /// The difficulty calculation implements `ThresholdBits` from the Zcash specification.
     /// `ThresholdBits` excludes the Testnet minimum difficulty adjustment.
     fn threshold_bits(&self) -> CompactDifficulty {
-        let averaging_window_height = u32::try_from(POW_AVERAGING_WINDOW)
+        let averaging_window_height = u32::try_from(self.network.pow_averaging_window())
             .expect("averaging window is much smaller than u32::MAX");
 
         if self.candidate_height.0 <= averaging_window_height {
@@ -230,10 +228,11 @@ impl AdjustedDifficulty {
         // `threshold_bits` returns `PoWLimit` before it calls this function at early-chain heights.
         // A valid relevant chain contains at least 17 blocks at later heights.
 
+        let averaging_window = self.network.pow_averaging_window();
         let averaging_window_thresholds =
-            &self.relevant_difficulty_thresholds.as_slice()[0..POW_AVERAGING_WINDOW];
+            &self.relevant_difficulty_thresholds.as_slice()[0..averaging_window];
 
-        let divisor: U256 = POW_AVERAGING_WINDOW.into();
+        let divisor: U256 = averaging_window.into();
         let mut quotient_total = U256::zero();
         let mut remainder_total = U256::zero();
         for compact in averaging_window_thresholds {
@@ -276,8 +275,8 @@ impl AdjustedDifficulty {
             self.candidate_height,
         );
         // The duration value is exact. The calculation must truncate its nanoseconds component.
-        let damped_variance =
-            (self.median_timespan() - averaging_window_timespan) / POW_DAMPING_FACTOR;
+        let damped_variance = (self.median_timespan() - averaging_window_timespan)
+            / self.network.pow_damping_factor();
         // `num_seconds` truncates negative values toward zero as the Zcash specification requires.
         let damped_variance = Duration::seconds(damped_variance.num_seconds());
 
@@ -286,9 +285,9 @@ impl AdjustedDifficulty {
 
         // `MinActualTimespan` and `MaxActualTimespan` in the Zcash spec
         let min_median_timespan =
-            averaging_window_timespan * (100 - POW_MAX_ADJUST_UP_PERCENT) / 100;
+            averaging_window_timespan * (100 - self.network.pow_max_adjust_up_percent()) / 100;
         let max_median_timespan =
-            averaging_window_timespan * (100 + POW_MAX_ADJUST_DOWN_PERCENT) / 100;
+            averaging_window_timespan * (100 + self.network.pow_max_adjust_down_percent()) / 100;
 
         // `ActualTimespanBounded` in the Zcash specification
         max(
@@ -308,13 +307,14 @@ impl AdjustedDifficulty {
         let newer_median = self.median_time_past();
 
         // MedianTime(height : N) := median([ nTime(𝑖) for 𝑖 from max(0, height − PoWMedianBlockSpan) up to max(0, height − 1) ])
-        let older_median = if self.relevant_times.len() > POW_AVERAGING_WINDOW {
+        let averaging_window = self.network.pow_averaging_window();
+        let older_median = if self.relevant_times.len() > averaging_window {
             let older_times: Vec<_> = self
                 .relevant_times
                 .iter()
-                .skip(POW_AVERAGING_WINDOW)
+                .skip(averaging_window)
                 .cloned()
-                .take(POW_MEDIAN_BLOCK_SPAN)
+                .take(self.network.pow_median_block_span())
                 .collect();
 
             AdjustedDifficulty::median_time(older_times)
@@ -335,7 +335,7 @@ impl AdjustedDifficulty {
         let median_times: Vec<DateTime<Utc>> = self
             .relevant_times
             .iter()
-            .take(POW_MEDIAN_BLOCK_SPAN)
+            .take(self.network.pow_median_block_span())
             .cloned()
             .collect();
 

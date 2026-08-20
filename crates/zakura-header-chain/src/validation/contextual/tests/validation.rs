@@ -9,7 +9,8 @@ use zakura_chain::{
     block,
     parameters::{
         testnet::{Parameters, RegtestParameters},
-        Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
+        Network, NetworkUpgrade, POW_AVERAGING_WINDOW, POW_DAMPING_FACTOR,
+        POW_MAX_ADJUST_DOWN_PERCENT, POW_MAX_ADJUST_UP_PERCENT,
     },
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
 };

@@ -1,4 +1,4 @@
-use zakura_chain::parameters::POW_AVERAGING_WINDOW;
+use zakura_chain::parameters::{Network, MAX_POW_ADJUSTMENT_BLOCK_SPAN, POW_AVERAGING_WINDOW};
 
 /// The median block span for time median calculations.
 ///
@@ -14,20 +14,27 @@ pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_B
 /// Durable predecessors needed below a separately retained parent frontier.
 pub const POW_PREDECESSOR_CONTEXT_SPAN: usize = POW_ADJUSTMENT_BLOCK_SPAN - 1;
 
-/// The damping factor for median timespan variance.
+/// Returns the overall block span used for adjusting block difficulty on `network`.
 ///
-/// `PoWDampingFactor` in the Zcash specification.
-pub const POW_DAMPING_FACTOR: i32 = 4;
+/// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification, based on
+/// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
+///
+/// This is [`POW_ADJUSTMENT_BLOCK_SPAN`] on Mainnet and the default Testnet. A
+/// configured Testnet may raise either term, but the network builder rejects a
+/// sum above [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`], which is what keeps the
+/// difficulty context vectors bounded.
+pub fn pow_adjustment_block_span(network: &Network) -> usize {
+    let span = network
+        .pow_averaging_window()
+        .saturating_add(network.pow_median_block_span());
 
-/// The maximum upward adjustment percentage for median timespan variance.
-///
-/// `PoWMaxAdjustUp * 100` in the Zcash specification.
-pub const POW_MAX_ADJUST_UP_PERCENT: i32 = 16;
+    debug_assert!(
+        span <= MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+        "configured networks with an oversized adjustment span are rejected when they are built"
+    );
 
-/// The maximum downward adjustment percentage for median timespan variance.
-///
-/// `PoWMaxAdjustDown * 100` in the Zcash specification.
-pub const POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
+    span.min(MAX_POW_ADJUSTMENT_BLOCK_SPAN)
+}
 
 /// The maximum number of seconds between the `median-time-past` of a block,
 /// and the block's `time` field.
