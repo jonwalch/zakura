@@ -47,6 +47,47 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
 }
 
 #[test]
+fn syncing_nodes_require_outbound_peers_to_serve_blocks() {
+    let outbound_direct = ConnectedAddr::new_outbound_direct(peer_addr(8233));
+    let outbound_proxy = ConnectedAddr::new_outbound_proxy(
+        "127.0.0.1:9050".parse().expect("valid proxy address"),
+        "127.0.0.1:32000".parse().expect("valid local address"),
+    );
+    let inbound = ConnectedAddr::new_inbound_direct(peer_addr(32000));
+
+    assert!(is_non_serving_outbound_peer(
+        &outbound_direct,
+        PeerServices::empty(),
+        true,
+    ));
+    assert!(is_non_serving_outbound_peer(
+        &outbound_proxy,
+        PeerServices::empty(),
+        true,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &outbound_direct,
+        PeerServices::NODE_NETWORK,
+        true,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &outbound_direct,
+        PeerServices::empty(),
+        false,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &inbound,
+        PeerServices::empty(),
+        true,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &ConnectedAddr::new_isolated(),
+        PeerServices::empty(),
+        true,
+    ));
+}
+
+#[test]
 fn connected_addr_labels_require_explicit_opt_in() {
     let peer = ConnectedAddr::new_outbound_direct(
         "192.0.2.1:8233".parse().expect("valid test peer address"),
