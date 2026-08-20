@@ -314,8 +314,9 @@ fn daa_context(
 /// A configured network's difficulty adjustment reads its own spans, not the
 /// Mainnet constants.
 ///
-/// The context is deliberately longer than either network needs, so the assertion
-/// is about how much of it each network consumes.
+/// Each network is given exactly the context its own span requires, and the
+/// assertion is that the two spans place the median-time-past at different
+/// times for the same one-second block spacing.
 #[test]
 fn configured_pow_spans_size_the_difficulty_context() {
     let _init_guard = zakura_test::init();
@@ -335,24 +336,28 @@ fn configured_pow_spans_size_the_difficulty_context() {
 
     let candidate_time =
         DateTime::from_timestamp(1_000_000, 0).expect("test timestamp is in-range");
-    let long_context: Vec<_> = (0..100)
-        .map(|offset| {
-            (
-                network.target_difficulty_limit().to_compact(),
-                candidate_time - Duration::seconds(i64::from(offset) + 1),
-            )
-        })
-        .collect();
+    let context_for = |span: usize, difficulty: CompactDifficulty| -> Vec<_> {
+        (0..span)
+            .map(|offset| {
+                (
+                    difficulty,
+                    candidate_time - Duration::seconds(i64::from(offset as u32) + 1),
+                )
+            })
+            .collect()
+    };
 
-    // `AdjustedDifficulty` truncates the context to the network's own span, and
-    // `median_time_past` then takes the median of the first `PoWMedianBlockSpan`
+    // `median_time_past` takes the median of the first `PoWMedianBlockSpan`
     // times. With 9 times at one-second spacing ending one second before the
     // candidate, the median is the fifth: five seconds back.
     let adjusted = difficulty::AdjustedDifficulty::new_from_header_time(
         candidate_time,
         block::Height(100),
         &network,
-        long_context.iter().copied(),
+        context_for(
+            difficulty::pow_adjustment_block_span(&network),
+            network.target_difficulty_limit().to_compact(),
+        ),
     )
     .expect("the context spans the configured window");
     assert_eq!(
@@ -360,13 +365,15 @@ fn configured_pow_spans_size_the_difficulty_context() {
         candidate_time - Duration::seconds(5),
     );
 
-    // The same context on Mainnet uses the 11-block span, so the median is the
-    // sixth time instead.
+    // Mainnet's 11-block span puts the median at the sixth time instead.
     let mainnet_adjusted = difficulty::AdjustedDifficulty::new_from_header_time(
         candidate_time,
         block::Height(100),
         &Network::Mainnet,
-        long_context.iter().copied(),
+        context_for(
+            difficulty::pow_adjustment_block_span(&Network::Mainnet),
+            Network::Mainnet.target_difficulty_limit().to_compact(),
+        ),
     )
     .expect("the context spans the Mainnet window");
     assert_eq!(
@@ -450,14 +457,16 @@ fn seeded_chain_with_pow_start(
 }
 
 /// The relevant chain for `blocks[index]`: its ancestors, newest first.
-fn difficulty_context(
-    blocks: &[Block],
+fn difficulty_context<'a>(
+    blocks: &'a [Block],
     index: usize,
-) -> impl Iterator<Item = (CompactDifficulty, DateTime<chrono::Utc>)> + '_ {
+    network: &Network,
+) -> impl Iterator<Item = (CompactDifficulty, DateTime<chrono::Utc>)> + 'a {
     blocks[..index]
         .iter()
         .rev()
         .map(|block| (block.header.difficulty_threshold, block.header.time))
+        .take(difficulty::pow_adjustment_block_span(network))
 }
 
 /// Seed blocks below `pow_start_height` are exempt from the contextual
@@ -483,7 +492,7 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
         let adjustment = difficulty::AdjustedDifficulty::new_from_block(
             candidate,
             network,
-            difficulty_context(&generated.blocks, index),
+            difficulty_context(&generated.blocks, index, network),
         )
         .expect("the seeded chain supplies a full difficulty context");
 
@@ -500,7 +509,7 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
             let expected = difficulty::AdjustedDifficulty::new_from_block(
                 &generated.blocks[index],
                 network,
-                difficulty_context(&generated.blocks, index),
+                difficulty_context(&generated.blocks, index, network),
             )
             .expect("the seeded chain supplies a full difficulty context")
             .expected_difficulty_threshold();
@@ -554,7 +563,7 @@ fn first_block_at_pow_start_height_expects_the_configured_limit() {
         candidate_time,
         block::Height(pow_start_height.0 - 1),
         network,
-        difficulty_context(&generated.blocks, generated.blocks.len()),
+        difficulty_context(&generated.blocks, generated.blocks.len(), network),
     )
     .expect("the seeded chain supplies a full difficulty context")
     .expected_difficulty_threshold();
