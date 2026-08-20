@@ -306,7 +306,9 @@ where
                     prepared_candidates.lookup(&block, request.work_id(), &network)
                 {
                     let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
-                    if pow_policy.is_authenticated_custom_waiver() {
+                    if pow_policy.is_authenticated_custom_waiver()
+                        || network.should_skip_pow_at_height(height)
+                    {
                         check::difficulty_threshold_is_valid(
                             &block.header,
                             &network,
