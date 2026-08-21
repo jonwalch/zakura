@@ -35,14 +35,13 @@ incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "1.0.0-rc.2", package = "zakura-orchard" }
 sapling-crypto = { version = "1.0.0-rc.2", package = "zakura-sapling-crypto" }
 zcash_address = "0.13.0"
-zcash_encoding = "0.4"
 zcash_history = "0.5.0"
 zcash_keys = { version = "1.0.0-rc.2", package = "zakura-keys" }
 zcash_primitives = { version = "1.0.0-rc.2", package = "zakura-primitives" }
 zcash_proofs = { version = "1.0.0-rc.2", package = "zakura-proofs" }
 zcash_transparent = "0.10.0"
 zcash_protocol = "0.10.1"
-abscissa_core = "0.7"
+abscissa_core = { version = "0.7", default-features = false }
 base64 = "0.22.1"
 bech32 = "0.11.0"
 bellman = { version = "1.0.0-rc.2", package = "zakura-bellman" }
@@ -162,9 +161,9 @@ tracing-journald = "0.3"
 tracing-subscriber = "0.3.19"
 tracing-test = "0.2.4"
 tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = "0.32.1"
-opentelemetry-otlp = "0.32"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
 vergen-gitcl = { version = "9", default-features = false }
 x25519-dalek = "2.0.1"
