@@ -65,7 +65,6 @@ group = { workspace = true }
 incrementalmerkletree.workspace = true
 jubjub = { workspace = true }
 dirs = { workspace = true }
-num-integer = { workspace = true }
 primitive-types = { workspace = true }
 rand_core = { workspace = true }
 rand_10 = { workspace = true }
@@ -99,7 +98,6 @@ chrono = { workspace = true, features = ["clock", "std", "serde"] }
 humantime = { workspace = true }
 
 # Error Handling & Formatting
-static_assertions = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

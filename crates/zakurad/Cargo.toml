@@ -211,7 +211,6 @@ thiserror = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
-tracing-futures = { workspace = true }
 tracing = { workspace = true }
 
 metrics = { workspace = true }
@@ -231,7 +230,6 @@ hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 # Configuration management
 config = { workspace = true }
 
-num-integer = { workspace = true }
 rand = { workspace = true }
 nix = { workspace = true, features = ["fs"] }
 

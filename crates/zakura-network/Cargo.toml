@@ -56,7 +56,6 @@ indexmap = { workspace = true, features = ["serde"] }
 iroh = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
-num-integer = { workspace = true }
 pin-project = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -74,7 +73,6 @@ tokio-util = { workspace = true, features = ["codec"] }
 tower = { workspace = true, features = ["retry", "discover", "load", "load-shed", "timeout", "util", "buffer"] }
 
 metrics = { workspace = true }
-tracing-futures = { workspace = true }
 tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
@@ -96,7 +94,6 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 criterion = { workspace = true }
 
-static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
