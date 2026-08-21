@@ -128,11 +128,6 @@ tokio-rustls = "0.26.4"
 # Only used to read the validity dates of the configured RPC TLS certificates.
 der = "0.7.10"
 
-[build-dependencies]
-openrpsee = { workspace = true }
-tonic-prost-build = { workspace = true }
-which = { workspace = true }
-
 [dev-dependencies]
 bytes = { workspace = true }
 http-body = { workspace = true }
