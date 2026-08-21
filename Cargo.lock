@@ -8827,6 +8827,7 @@ dependencies = [
  "zakura-chain",
  "zakura-halo2-proofs",
  "zakura-header-chain",
+ "zakura-jsonl-trace",
  "zakura-jubjub",
  "zakura-node-services",
  "zakura-orchard",
