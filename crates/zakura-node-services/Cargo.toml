@@ -22,7 +22,11 @@ default = []
 
 # Tool and test features
 
+# Retain the published feature name after removing its unused dependency.
+color-eyre = []
+
 rpc-client = [
+    "color-eyre",
     "jsonrpsee-types",
     "reqwest",
     "serde",

@@ -31,13 +31,13 @@ default = []
 # Each binary has a feature that activates the extra dependencies it needs
 
 zakura-checkpoints = [
-    "dep:clap",
+    "clap",
     "dep:color-eyre",
     "dep:hex",
-    "dep:itertools",
+    "itertools",
     "dep:serde_json",
     "dep:thiserror",
-    "dep:tokio",
+    "tokio",
     "dep:zakura-chain",
     "dep:zakura-node-services",
     "zakura-chain/json-conversion",
@@ -52,13 +52,17 @@ zakura-checkpoints-offline = [
 ]
 
 # Preserve published feature names after removing the obsolete developer tools.
+clap = ["dep:clap"]
+itertools = ["dep:itertools"]
 search-issue-refs = [
     "regex",
     "reqwest",
-    "dep:tokio"
+    "tokio"
 ]
 regex = []
 reqwest = []
+tokio = ["dep:tokio"]
+zcash_primitives = ["dep:zcash_primitives"]
 
 [dependencies]
 color-eyre = { workspace = true, optional = true }
@@ -81,6 +85,8 @@ zakura-state = { path = "../zakura-state", version = "7.0.0-rc0", optional = tru
 
 # This crate is needed for the zakura-checkpoints binary
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"], optional = true }
+
+zcash_primitives = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
