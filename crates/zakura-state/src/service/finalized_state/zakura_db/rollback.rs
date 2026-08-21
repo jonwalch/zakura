@@ -1471,6 +1471,28 @@ mod tests {
         );
     }
 
+    /// Before NU6.3, an empty Ironwood column family can occur while the background format
+    /// upgrade is still backfilling it, and reads must return the consensus-correct empty tree.
+    #[test]
+    fn ironwood_tree_by_height_returns_empty_tree_before_nu6_3() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let mut batch = DiskWriteBatch::new();
+        let hash_by_height = db.db().cf_handle("hash_by_height").unwrap();
+        batch.zs_insert(&hash_by_height, Height(10), block::Hash([10; 32]));
+        db.write_batch(batch)
+            .expect("seeding a pre-NU6.3 finalized tip succeeds");
+
+        let tree = db
+            .ironwood_tree_by_height(&Height(10))
+            .expect("pre-NU6.3 reads return an empty Ironwood tree during backfill");
+        assert_eq!(
+            tree.root(),
+            zakura_chain::ironwood::tree::NoteCommitmentTree::default().root()
+        );
+    }
+
     /// `serve_block_roots` reads a request that starts at or above the upgrade height `U` straight
     /// from the serving index, without touching the per-height trees.
     #[test]
