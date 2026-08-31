@@ -89,14 +89,30 @@ mod tests {
     use crate::{
         config::database_format_version_on_disk,
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        request::{FinalizedBlock, Treestate},
         service::finalized_state::{
-            column_family::register_typed_batch_write_error, FinalizedState,
-            STATE_COLUMN_FAMILIES_IN_CODE, TX_LOC_BY_SPENT_OUT_LOC,
+            column_family::register_typed_batch_write_error,
+            disk_format::upgrade::track_tx_locs_by_spends, DiskWriteBatch, FinalizedState,
+            WriteDisk, STATE_COLUMN_FAMILIES_IN_CODE, TX_LOC_BY_SPENT_OUT_LOC,
         },
         CheckpointVerifiedBlock, Config, StateInitError,
     };
-    use zakura_chain::{block, parameters::Network, serialization::ZcashDeserializeInto};
-    use zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES;
+    use zakura_chain::{
+        block, orchard, parameters::Network, serialization::ZcashDeserializeInto, transaction,
+        transparent,
+    };
+    use zakura_test::vectors::{BLOCK_TESTNET_1842468_BYTES, BLOCK_TESTNET_GENESIS_BYTES};
+
+    struct SpendIndexFixture {
+        spent_outpoint: transparent::OutPoint,
+        orchard_nullifier: orchard::Nullifier,
+        spending_transaction: crate::TransactionLocation,
+        spending_transaction_hash: transaction::Hash,
+    }
+
+    fn test_network() -> Network {
+        Network::new_default_testnet()
+    }
 
     fn persistent_config() -> (tempfile::TempDir, Config) {
         let cache = tempfile::tempdir().expect("temporary cache directory is created");
@@ -117,7 +133,7 @@ mod tests {
             config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
-            &Network::Mainnet,
+            &test_network(),
             debug_skip_format_upgrades,
             STATE_COLUMN_FAMILIES_IN_CODE
                 .iter()
@@ -126,21 +142,91 @@ mod tests {
         )
     }
 
-    fn mainnet_state_with_genesis(config: &Config) -> FinalizedState {
-        let mut state = FinalizedState::new(config, &Network::Mainnet)
-            .expect("temporary finalized state opens");
-        let genesis: Arc<block::Block> = BLOCK_MAINNET_GENESIS_BYTES
+    fn testnet_state_with_genesis(config: &Config) -> (FinalizedState, Arc<block::Block>) {
+        let mut state =
+            FinalizedState::new(config, &test_network()).expect("temporary finalized state opens");
+        let genesis: Arc<block::Block> = BLOCK_TESTNET_GENESIS_BYTES
             .zcash_deserialize_into()
-            .expect("mainnet genesis deserializes");
+            .expect("testnet genesis deserializes");
         state
             .commit_finalized_direct(
-                CheckpointVerifiedBlock::from(genesis).into(),
+                CheckpointVerifiedBlock::from(genesis.clone()).into(),
                 None,
                 None,
                 "index removal range-delete failure test",
             )
-            .expect("mainnet genesis commits");
-        state
+            .expect("testnet genesis commits");
+        (state, genesis)
+    }
+
+    fn seed_mixed_spend_indexes(db: &ZakuraDb, genesis: &Arc<block::Block>) -> SpendIndexFixture {
+        let source_block: Arc<block::Block> = BLOCK_TESTNET_1842468_BYTES
+            .zcash_deserialize_into()
+            .expect("mixed-spend testnet block deserializes");
+        let mixed_transaction = source_block
+            .transactions
+            .iter()
+            .find(|transaction| {
+                transaction
+                    .inputs()
+                    .iter()
+                    .any(|input| input.outpoint().is_some())
+                    && transaction.orchard_nullifiers().next().is_some()
+            })
+            .cloned()
+            .expect("testnet block 1,842,468 contains a transparent and Orchard spend");
+        let spent_outpoints: Vec<_> = mixed_transaction
+            .inputs()
+            .iter()
+            .filter_map(|input| input.outpoint())
+            .collect();
+        assert_eq!(
+            spent_outpoints.len(),
+            1,
+            "the mixed-spend test vector has one transparent input"
+        );
+        let spent_outpoint = spent_outpoints[0];
+        let orchard_nullifier = mixed_transaction
+            .orchard_nullifiers()
+            .next()
+            .cloned()
+            .expect("the mixed-spend test vector has an Orchard nullifier");
+        let spending_transaction = crate::TransactionLocation::from_index(Height::MIN, 1);
+        let spending_transaction_hash = mixed_transaction.hash();
+
+        let synthetic_block = Arc::new(block::Block {
+            header: genesis.header.clone(),
+            transactions: vec![genesis.transactions[0].clone(), mixed_transaction],
+        });
+        let finalized = FinalizedBlock::from_checkpoint_verified(
+            CheckpointVerifiedBlock::from(synthetic_block),
+            Treestate::default(),
+        );
+        let mut batch = DiskWriteBatch::new();
+        batch
+            .prepare_block_header_and_transaction_data_batch(db, &finalized, true, None)
+            .expect("the synthetic mixed-spend block is valid test data");
+
+        let source_transaction = crate::TransactionLocation::from_index(Height::MIN, 0);
+        let tx_loc_by_hash = db.db().cf_handle("tx_loc_by_hash").unwrap();
+        batch.zs_insert(&tx_loc_by_hash, spent_outpoint.hash, source_transaction);
+        let spent_output =
+            crate::OutputLocation::from_outpoint(source_transaction, &spent_outpoint);
+        let _ = db
+            .tx_loc_by_spent_output_loc_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&spent_output, &spending_transaction);
+        let orchard_nullifiers = db.db().cf_handle("orchard_nullifiers").unwrap();
+        batch.zs_insert(&orchard_nullifiers, orchard_nullifier, spending_transaction);
+        db.write_batch(batch)
+            .expect("mixed transparent and Orchard spend indexes write");
+
+        SpendIndexFixture {
+            spent_outpoint,
+            orchard_nullifier,
+            spending_transaction,
+            spending_transaction_hash,
+        }
     }
 
     fn injected_rocksdb_error() -> rocksdb::Error {
@@ -151,28 +237,26 @@ mod tests {
     }
 
     #[test]
-    fn range_delete_error_preserves_indexer_marker_and_retries_on_startup() {
+    fn range_delete_error_preserves_and_rebuilds_spend_indexes() {
         let (_cache, config) = persistent_config();
-        let state = mainnet_state_with_genesis(&config);
+        let (state, genesis) = testnet_state_with_genesis(&config);
         let db = &state.db;
+        let fixture = seed_mixed_spend_indexes(db, &genesis);
         let running_version = state_database_format_version_in_code();
         let mut indexed_version = running_version.clone();
         indexed_version.build = BuildMetadata::new("indexer").expect("indexer is valid metadata");
         db.update_format_version_on_disk(&indexed_version)
             .expect("indexed fixture version writes");
 
-        let spent_output = crate::OutputLocation::from_output_index(
-            crate::TransactionLocation::from_index(Height::MIN, 1),
-            0,
-        );
-        let spending_transaction = crate::TransactionLocation::from_index(Height::MIN, 2);
-        db.tx_loc_by_spent_output_loc_cf()
-            .new_batch_for_writing()
-            .zs_insert(&spent_output, &spending_transaction)
-            .write_batch()
-            .expect("transparent index fixture writes");
-
         assert_eq!(db.finalized_tip_height(), Some(Height::MIN));
+        assert_eq!(
+            db.spending_tx_loc(&fixture.spent_outpoint),
+            Some(fixture.spending_transaction)
+        );
+        assert_eq!(
+            db.orchard_revealing_tx_loc(&fixture.orchard_nullifier),
+            Some(fixture.spending_transaction)
+        );
         assert_eq!(
             db.format_version_on_disk()
                 .expect("the indexed fixture version is readable"),
@@ -200,7 +284,7 @@ mod tests {
                 &config,
                 STATE_DATABASE_KIND,
                 running_version.major,
-                &Network::Mainnet,
+                &test_network(),
             )
             .expect("the indexed version remains readable"),
             Some(indexed_version.clone()),
@@ -210,9 +294,14 @@ mod tests {
         let preserved = open_persistent(&config, true)
             .expect("the failed removal database opens when format changes are disabled");
         assert_eq!(
-            preserved.tx_location_by_spent_output_location(&spent_output),
-            Some(spending_transaction),
+            preserved.spending_tx_loc(&fixture.spent_outpoint),
+            Some(fixture.spending_transaction),
             "the injected failure must leave the transparent index entry readable"
+        );
+        assert_eq!(
+            preserved.orchard_revealing_tx_loc(&fixture.orchard_nullifier),
+            Some(fixture.spending_transaction),
+            "a stopped removal must leave the shielded index entry readable"
         );
         drop(preserved);
 
@@ -227,9 +316,48 @@ mod tests {
             "successful retry must remove the +indexer marker"
         );
         assert_eq!(
-            reopened.tx_location_by_spent_output_location(&spent_output),
+            reopened.spending_tx_loc(&fixture.spent_outpoint),
             None,
             "the marker must not be cleared until the transparent rebuild skip-trigger is removed"
+        );
+        assert_eq!(
+            reopened.orchard_revealing_tx_loc(&fixture.orchard_nullifier),
+            None,
+            "successful removal must clear the Orchard spend location"
+        );
+        assert!(
+            reopened.contains_orchard_nullifier(&fixture.orchard_nullifier),
+            "index removal must preserve the consensus nullifier"
+        );
+
+        reopened
+            .update_format_version_on_disk(&indexed_version)
+            .expect("the test indexer marker writes before rebuilding");
+        let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
+        track_tx_locs_by_spends::run(Height::MIN, &reopened, &cancel_receiver)
+            .expect("the real index rebuild loop succeeds");
+
+        assert_eq!(
+            reopened
+                .format_version_on_disk()
+                .expect("the rebuilt version is readable"),
+            Some(indexed_version),
+            "the rebuilt database retains the +indexer marker"
+        );
+        assert_eq!(
+            reopened.spending_tx_loc(&fixture.spent_outpoint),
+            Some(fixture.spending_transaction),
+            "the transparent spend location is rebuilt"
+        );
+        assert_eq!(
+            reopened.orchard_revealing_tx_loc(&fixture.orchard_nullifier),
+            Some(fixture.spending_transaction),
+            "the Orchard spend location is rebuilt"
+        );
+        assert_eq!(
+            reopened.transaction_hash(fixture.spending_transaction),
+            Some(fixture.spending_transaction_hash),
+            "both rebuilt spend locations resolve to the spending transaction"
         );
     }
 }
