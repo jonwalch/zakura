@@ -8,8 +8,6 @@
 //!
 //! Instead, [`crate::init`] installs a `LogCaptureLayer` in the single process-wide
 //! subscriber, and tests read the messages it captures through a [`LogCapture`] handle.
-//! The layer captures warnings and errors independently of the `RUST_LOG` filter used
-//! for formatted test output.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -30,8 +28,8 @@ static ACTIVE_CAPTURES: Mutex<Vec<Weak<Mutex<Vec<String>>>>> = Mutex::new(Vec::n
 /// tests running concurrently in the same test binary. So tests should only assert on
 /// messages that no other test in the binary can produce.
 ///
-/// Only warnings and errors are captured. This fixed capture policy is independent of
-/// the `RUST_LOG` filter used for formatted test output.
+/// Messages are only captured if they pass the subscriber's filter, which is `RUST_LOG`
+/// or the [`crate::init`] defaults. Warnings and errors always pass the default filter.
 pub struct LogCapture {
     messages: Arc<Mutex<Vec<String>>>,
 }
@@ -67,8 +65,7 @@ impl Default for LogCapture {
     }
 }
 
-/// A tracing layer that copies warning and error messages into active [`LogCapture`]
-/// buffers.
+/// A tracing layer that copies log messages into the active [`LogCapture`] buffers.
 ///
 /// Does nothing unless a [`LogCapture`] is alive, so it is always installed by
 /// [`crate::init`].

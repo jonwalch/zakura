@@ -1,6 +1,11 @@
 //! Fixed test vectors for indexer RPCs
 
-use std::{fs, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::StreamExt;
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -170,59 +175,110 @@ async fn indexer_server_requires_a_trusted_client_certificate() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn indexer_server_warns_for_server_certificates_outside_their_validity_window() -> Result<()>
-{
-    let _init_guard = zakura_test::init();
-    let captured_logs = zakura_test::log_capture::LogCapture::new();
-    let certificate_cases = [
-        (
-            "expired",
-            "expired-server.pem",
-            EXPIRED_SERVER_CERT,
-            "RPC TLS certificate has expired",
-        ),
-        (
-            "not yet valid",
-            "not-yet-valid-server.pem",
-            NOT_YET_VALID_SERVER_CERT,
-            "RPC TLS certificate is not valid yet",
-        ),
-    ];
-    let mut missing_certificate_warnings = Vec::new();
+#[derive(Clone, Default)]
+struct CapturedLogWriter {
+    output: Arc<Mutex<Vec<u8>>>,
+}
 
-    for (certificate_state, certificate_file_name, server_certificate, expected_warning) in
-        certificate_cases
-    {
-        let temp_dir = tempfile::tempdir()?;
-        let ca_file = temp_dir.path().join("ca.pem");
-        let server_cert_file = temp_dir.path().join(certificate_file_name);
-        let server_key_file = temp_dir.path().join("server-key.pem");
-        fs::write(&ca_file, CA_CERT)?;
-        fs::write(&server_cert_file, server_certificate)?;
-        fs::write(&server_key_file, SERVER_KEY)?;
+impl CapturedLogWriter {
+    fn contains(&self, needle: &str) -> bool {
+        let output = self
+            .output
+            .lock()
+            .expect("no code panics while holding the captured log output lock");
 
-        let server_tls = IndexerTlsConfig {
-            cert_file: server_cert_file,
-            key_file: server_key_file,
-            client_ca_file: ca_file,
-        };
-        let (server_task, _listen_addr, _read_state, _tip_sender, _mempool_sender) =
-            start_server(Some(server_tls)).await?;
-        server_task.abort();
+        String::from_utf8_lossy(&output).contains(needle)
+    }
+}
 
-        if !captured_logs.contains(expected_warning) {
-            missing_certificate_warnings.push(certificate_state);
-        }
+impl Write for CapturedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output
+            .lock()
+            .map_err(|_| io::Error::other("captured log output lock should not be poisoned"))?
+            .extend_from_slice(buf);
+
+        Ok(buf.len())
     }
 
-    assert!(
-        missing_certificate_warnings.is_empty(),
-        "indexer listeners started, but startup did not warn for these server certificates: {}",
-        missing_certificate_warnings.join(", ")
-    );
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
-    Ok(())
+#[test]
+fn indexer_server_warns_for_server_certificates_outside_their_validity_window() -> Result<()> {
+    let captured_logs = CapturedLogWriter::default();
+    let log_writer = captured_logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(move || log_writer.clone())
+        .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    // The current-thread runtime keeps every poll under this thread-local subscriber.
+    // Its fixed warning filter makes the assertions independent of the caller's RUST_LOG.
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let certificate_cases = [
+                (
+                    "expired",
+                    "expired-server.pem",
+                    EXPIRED_SERVER_CERT,
+                    "RPC TLS certificate has expired",
+                ),
+                (
+                    "not yet valid",
+                    "not-yet-valid-server.pem",
+                    NOT_YET_VALID_SERVER_CERT,
+                    "RPC TLS certificate is not valid yet",
+                ),
+            ];
+            let mut missing_certificate_warnings = Vec::new();
+
+            for (
+                certificate_state,
+                certificate_file_name,
+                server_certificate,
+                expected_warning,
+            ) in certificate_cases
+            {
+                let temp_dir = tempfile::tempdir()?;
+                let ca_file = temp_dir.path().join("ca.pem");
+                let server_cert_file = temp_dir.path().join(certificate_file_name);
+                let server_key_file = temp_dir.path().join("server-key.pem");
+                fs::write(&ca_file, CA_CERT)?;
+                fs::write(&server_cert_file, server_certificate)?;
+                fs::write(&server_key_file, SERVER_KEY)?;
+
+                let server_tls = IndexerTlsConfig {
+                    cert_file: server_cert_file,
+                    key_file: server_key_file,
+                    client_ca_file: ca_file,
+                };
+                let (server_task, _listen_addr, _read_state, _tip_sender, _mempool_sender) =
+                    start_server(Some(server_tls)).await?;
+                server_task.abort();
+
+                if !captured_logs.contains(expected_warning) {
+                    missing_certificate_warnings.push(certificate_state);
+                }
+            }
+
+            assert!(
+                missing_certificate_warnings.is_empty(),
+                "indexer listeners started, but startup did not warn for these server certificates: {}",
+                missing_certificate_warnings.join(", ")
+            );
+
+            Ok(())
+        })
+    })
 }
 
 #[test]

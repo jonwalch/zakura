@@ -11,7 +11,7 @@ use color_eyre::section::PanicMessage;
 use once_cell::sync::Lazy;
 use owo_colors::OwoColorize;
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[allow(missing_docs)]
 pub mod command;
@@ -85,7 +85,7 @@ pub fn init() -> impl Drop {
 
     INIT.call_once_force(|_| {
         let fmt_layer = fmt::layer().with_target(false);
-        // Use the RUST_LOG env var for formatted output and error context, or by default:
+        // Use the RUST_LOG env var, or by default:
         //  - warn for most tests, and
         //  - for some modules, hide expected warn logs
         let filter_layer = EnvFilter::try_from_default_env()
@@ -105,14 +105,11 @@ pub fn init() -> impl Drop {
             // (There are currently no always-on directives.)
             ;
 
-        let output_layers = fmt_layer
-            .and_then(ErrorLayer::default())
-            .with_filter(filter_layer);
-
         tracing_subscriber::registry()
-            .with(output_layers)
-            // Keep captured warnings independent of the caller's RUST_LOG value.
-            .with(log_capture::LogCaptureLayer.with_filter(LevelFilter::WARN))
+            .with(filter_layer)
+            .with(fmt_layer)
+            .with(log_capture::LogCaptureLayer)
+            .with(ErrorLayer::default())
             .try_init()
             .ok();
 
