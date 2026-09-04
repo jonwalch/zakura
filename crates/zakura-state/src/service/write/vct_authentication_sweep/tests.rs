@@ -497,12 +497,19 @@ impl Fixture {
             &SystemClock,
         )
         .expect("the replacement header passes production validation");
-        let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
-            .bind(
-                u64::from(marker),
-                NonZeroU64::new(1).expect("one is nonzero"),
-            )
-            .into();
+        let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+            u64::from(marker),
+            NonZeroU64::new(1).expect("one is nonzero"),
+        );
+        let repair_episode = self
+            .writer
+            .runtime
+            .reader()
+            .vct_repair_context(repair_owner, height)
+            .expect("the replacement repair context is coherent")
+            .expect("the replacement target remains selected")
+            .episode;
+        let owner = repair_owner.into();
         let source = SourceId::from_digest([marker; 32]);
         let mut record = zakura_header_chain::TreeAuxRecordV1 {
             height,
@@ -544,6 +551,7 @@ impl Fixture {
                                 parent.hash(),
                             ),
                             selected_target: Frontier::new(height, target.hash()),
+                            episode: repair_episode,
                         },
                         batch,
                         aux: vec![delivery],
@@ -848,6 +856,14 @@ fn an_ambiguous_boundary_disputes_both_deliveries_without_rejecting_them() {
         },
         "repair restarts at the lower disputed height"
     );
+
+    let generation = fixture.repair_receiver.borrow().generation;
+    fixture.sweep(&mut sweeper);
+    assert_eq!(
+        fixture.repair_receiver.borrow().generation,
+        generation,
+        "re-reading durable dispute evidence must not replace in-flight repair work"
+    );
 }
 
 #[test]
@@ -861,7 +877,6 @@ fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() 
     fixture.sweep(&mut sweeper);
 
     fixture.redeliver(bad, None, 0x71);
-    fixture.redeliver(bad, None, 0x72);
     fixture.sweep(&mut sweeper);
 
     assert!(matches!(
@@ -927,7 +942,9 @@ fn a_transient_anchor_gate_preserves_an_existing_repair() {
     let repair_height = Height(BODY_TIP + 2);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, None);
-    fixture.repair.request_sweep_repair(repair_height);
+    fixture
+        .repair
+        .request_sweep_repair(repair_height, VctRepairTrigger::MissingRootObserved);
     fixture
         .finalized_state
         .enable_vct_exact_root_source_for_test(Height(BODY_TIP));
@@ -982,7 +999,7 @@ fn a_committer_stall_below_the_sweep_takes_priority() {
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: stalled },
-        "the lower need is the one whose replacement unblocks the other"
+        "the committer repair must unblock the checkpoint queue before the sweep can resume"
     );
 
     fixture.repair.on_commit_success();

@@ -114,6 +114,7 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -149,6 +150,101 @@ where
 }
 
 include!("methods/rpc_openrpc.rs");
+
+/// The access class assigned to an RPC method.
+///
+/// Every registered method must have exactly one class. This makes additions
+/// fail closed until their intended exposure is reviewed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RpcAccess {
+    /// Available on restricted unauthenticated Mainnet and Testnet RPC listeners.
+    Unauthenticated,
+
+    /// Available only on authenticated listeners, except on Regtest.
+    Admin,
+
+    /// A Regtest control method retained on the full RPC surface.
+    Test,
+}
+
+/// The method set exposed by one RPC listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RpcSurface {
+    /// The explicitly classified unauthenticated compatibility method set.
+    Restricted,
+
+    /// Every registered method.
+    Full,
+}
+
+impl RpcSurface {
+    /// Returns whether this surface exposes `method_name`.
+    pub(crate) fn exposes(self, method_name: &str) -> bool {
+        match self {
+            Self::Restricted => rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated),
+            Self::Full => true,
+        }
+    }
+}
+
+/// The reviewed access class for every registered JSON-RPC method.
+///
+/// The unauthenticated set intentionally preserves existing access for normal
+/// query, transaction submission, mining, lightwalletd, and fleet health use.
+/// Operators that want credentials on every method can enable cookie
+/// authentication. This classification does not mean that these methods are
+/// hardened for arbitrary Internet traffic.
+///
+/// Keep this list synchronized with the generated [`RpcServer`] trait. Server
+/// startup and unit tests reject methods that are missing from either side.
+pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
+    ("getinfo", RpcAccess::Unauthenticated),
+    ("getdeprecationinfo", RpcAccess::Unauthenticated),
+    ("getblockchaininfo", RpcAccess::Unauthenticated),
+    ("getaddressbalance", RpcAccess::Unauthenticated),
+    ("sendrawtransaction", RpcAccess::Unauthenticated),
+    ("getblock", RpcAccess::Unauthenticated),
+    ("getblockheader", RpcAccess::Unauthenticated),
+    ("getbestblockhash", RpcAccess::Unauthenticated),
+    ("getbestblockheightandhash", RpcAccess::Unauthenticated),
+    ("getchaintips", RpcAccess::Unauthenticated),
+    ("getmempoolinfo", RpcAccess::Unauthenticated),
+    ("getrawmempool", RpcAccess::Unauthenticated),
+    ("z_gettreestate", RpcAccess::Unauthenticated),
+    ("z_getsubtreesbyindex", RpcAccess::Unauthenticated),
+    ("getrawtransaction", RpcAccess::Unauthenticated),
+    ("getaddresstxids", RpcAccess::Unauthenticated),
+    ("getaddressutxos", RpcAccess::Unauthenticated),
+    ("stop", RpcAccess::Test),
+    ("getblockcount", RpcAccess::Unauthenticated),
+    ("getblockhash", RpcAccess::Unauthenticated),
+    ("getblocktemplate", RpcAccess::Unauthenticated),
+    ("submitblock", RpcAccess::Unauthenticated),
+    ("getmininginfo", RpcAccess::Unauthenticated),
+    ("getnetworksolps", RpcAccess::Unauthenticated),
+    ("getnetworkhashps", RpcAccess::Unauthenticated),
+    ("getnetworkinfo", RpcAccess::Unauthenticated),
+    ("getpeerinfo", RpcAccess::Unauthenticated),
+    ("ping", RpcAccess::Unauthenticated),
+    ("validateaddress", RpcAccess::Unauthenticated),
+    ("z_validateaddress", RpcAccess::Unauthenticated),
+    ("getblocksubsidy", RpcAccess::Unauthenticated),
+    ("getdifficulty", RpcAccess::Unauthenticated),
+    ("z_listunifiedreceivers", RpcAccess::Unauthenticated),
+    ("invalidateblock", RpcAccess::Admin),
+    ("reconsiderblock", RpcAccess::Admin),
+    ("generate", RpcAccess::Test),
+    ("addnode", RpcAccess::Test),
+    ("rpc.discover", RpcAccess::Unauthenticated),
+    ("gettxout", RpcAccess::Unauthenticated),
+];
+
+/// Returns the reviewed access class for `method_name`.
+pub(crate) fn rpc_method_access(method_name: &str) -> Option<RpcAccess> {
+    RPC_METHOD_ACCESS
+        .iter()
+        .find_map(|(name, access)| (*name == method_name).then_some(*access))
+}
 
 // TODO: Review the parameter descriptions below, and update them as needed:
 // https://github.com/ZcashFoundation/zebra/issues/10320
@@ -374,6 +470,38 @@ pub trait Rpc {
     /// tags: blockchain
     #[method(name = "getbestblockheightandhash")]
     fn get_best_block_height_and_hash(&self) -> Result<GetBlockHeightAndHashResponse>;
+
+    /// Returns information about every tip in the block tree that this node still
+    /// tracks, including the best chain and orphaned branches.
+    ///
+    /// zcashd reference: [`getchaintips`](https://zcash.github.io/rpc/getchaintips.html)
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Notes
+    ///
+    /// zcashd answers this call by scanning its entire block index under `cs_main`,
+    /// which costs seconds once the index holds millions of entries and blocks every
+    /// other RPC for that whole time. Zakura reads only the chains it holds in
+    /// memory, so the cost is bounded by the number of tracked forks rather than by
+    /// the height of the chain.
+    ///
+    /// The two nodes therefore report different tips. zcashd's block index is never
+    /// pruned, so it lists every stale tip it has ever seen. Zakura drops a fork once
+    /// it falls below the finalized tip, so it lists the tips that are still live:
+    /// the best chain, the non-finalized forks, recently invalidated branches, and
+    /// the selected header chain when some block bodies are unavailable.
+    ///
+    /// Zakura never returns zcashd's `valid-headers` or `unknown` statuses. Every
+    /// block in its non-finalized state is contextually verified, so a tip is either
+    /// fully valid, invalidated, or known only by its header.
+    ///
+    /// `branchlen` can be short for an `invalid` tip. Zakura tracks a limited number
+    /// of forks, and it can drop the chain that an invalidated branch forked from.
+    /// The branch is still reported, but its length is then measured from the deepest
+    /// block the node still tracks.
+    #[method(name = "getchaintips")]
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse>;
 
     /// Returns details on the active state of the TX memory pool.
     ///
@@ -855,6 +983,9 @@ where
     /// no matter what the estimated height or local clock is.
     debug_force_finished_sync: bool,
 
+    /// The RPC methods and OpenRPC schema exposed by this instance.
+    rpc_surface: RpcSurface,
+
     /// The estimated last height this release supports, if enforced.
     end_of_support_height: Option<Height>,
 
@@ -972,6 +1103,7 @@ where
             user_agent,
             network: network.clone(),
             debug_force_finished_sync,
+            rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
             mempool: mempool.clone(),
             state: state.clone(),
@@ -1003,6 +1135,12 @@ where
     /// When unset, or set to `None`, the RPC omits `end_of_service`.
     pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
         self.end_of_support_height = end_of_support_height;
+        self
+    }
+
+    /// Selects the method set and OpenRPC schema exposed by this instance.
+    pub(crate) fn with_rpc_surface(mut self, rpc_surface: RpcSurface) -> Self {
+        self.rpc_surface = rpc_surface;
         self
     }
 }
@@ -1741,6 +1879,20 @@ where
             .best_tip_height_and_hash()
             .map(|(height, hash)| GetBlockHeightAndHashResponse { height, hash })
             .ok_or_misc_error("No blocks in state")
+    }
+
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse> {
+        let response: zakura_state::ReadResponse = call_service(
+            self.read_state.clone(),
+            zakura_state::ReadRequest::ChainTips,
+        )
+        .await?;
+
+        let zakura_state::ReadResponse::ChainTips(tips) = response else {
+            unreachable!("unmatched response to a ChainTips request")
+        };
+
+        Ok(tips.into_iter().map(chain_tips::ChainTip::from).collect())
     }
 
     async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse> {
@@ -3193,6 +3345,7 @@ where
 
         let methods = METHODS
             .into_iter()
+            .filter(|(name, _)| self.rpc_surface.exposes(name))
             .map(|(name, method)| method.generate(&mut generator, name))
             .collect();
 

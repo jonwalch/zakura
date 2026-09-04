@@ -16,6 +16,11 @@ use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 
 use super::{ZakuraPeerId, ZakuraRejectReason};
 
+mod first_block_source;
+
+pub(crate) use first_block_source::BlockBodySource;
+use first_block_source::FirstBlockSourceTracker;
+
 /// A Zakura JSONL trace table.
 pub type ZakuraTraceTable = zakura_jsonl_trace::JsonlTraceTable;
 
@@ -87,6 +92,15 @@ pub(crate) mod header_sync_trace {
     pub(crate) const REPAIR_GENERATION: &str = "repair_generation";
     pub(crate) const PHASE: &str = "phase";
     pub(crate) const SUPPLIER_COUNT: &str = "supplier_count";
+    pub(crate) const PREDECESSOR_HEIGHT: &str = "predecessor_height";
+    pub(crate) const PEERS_CONSIDERED: &str = "peers_considered";
+    pub(crate) const REJECTED_HEIGHT: &str = "rejected_height";
+    pub(crate) const REJECTED_CAPACITY: &str = "rejected_capacity";
+    pub(crate) const REJECTED_SCHEMA: &str = "rejected_schema";
+    pub(crate) const REJECTED_BUSY: &str = "rejected_busy";
+    pub(crate) const REJECTED_TRIED: &str = "rejected_tried";
+    pub(crate) const BEST_PEER_HEIGHT: &str = "best_peer_height";
+    pub(crate) const BEST_PEER_HASH: &str = "best_peer_hash";
 
     pub(crate) const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
     pub(crate) const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
@@ -466,10 +480,11 @@ pub mod commit_state_trace {
     pub const REACTOR_EVENT_SENT: &str = "reactor_event_sent";
 }
 
-/// Cloneable Zakura trace emitter.
+/// Cloneable Zakura observability handle.
 #[derive(Clone, Debug)]
 pub struct ZakuraTrace {
     emitter: JsonlEventEmitter,
+    first_block_source: FirstBlockSourceTracker,
 }
 
 impl ZakuraTrace {
@@ -482,7 +497,31 @@ impl ZakuraTrace {
     pub fn new(tracer: JsonlTracer, node: impl Into<Arc<str>>) -> Self {
         Self {
             emitter: JsonlEventEmitter::new(tracer, node),
+            first_block_source: FirstBlockSourceTracker::default(),
         }
+    }
+
+    /// Record a complete block body received from a transport.
+    pub(crate) fn record_block_body_received(
+        &self,
+        hash: zakura_chain::block::Hash,
+        source: BlockBodySource,
+    ) {
+        if self.first_block_source.record(hash, source) {
+            metrics::counter!(
+                "sync.block.first_received.count",
+                "source" => source.as_str()
+            )
+            .increment(1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_block_body_source(
+        &self,
+        hash: zakura_chain::block::Hash,
+    ) -> Option<BlockBodySource> {
+        self.first_block_source.source(hash)
     }
 
     /// Return the underlying JSONL tracer.

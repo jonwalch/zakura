@@ -188,8 +188,19 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+/// A reconciled store over a genesis and `path_len` descendant headers.
+///
+/// The genesis and the first three path headers are finalized and indexed in the canonical
+/// finalized columns. Remaining headers sit in the retained graph above the finalized frontier.
+/// Returns the runtime, its open database, the genesis header, and the requested path.
+fn reconciled_store_with_finalized_prefix(
+    path_len: u8,
+) -> (
+    HeaderChainRuntime,
+    DiskDb,
+    VerifiedHeaderRef,
+    Vec<VerifiedHeaderRef>,
+) {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let db = open(&db_config, engine_config.network());
@@ -205,7 +216,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     };
     let mut path = Vec::new();
     let mut parent = genesis.clone();
-    for marker in 1..=3 {
+    for marker in 1..=path_len {
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
@@ -214,7 +225,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         let height = parent
             .height
             .next()
-            .expect("the three-header fixture stays in range");
+            .expect("the four-header fixture stays in range");
         let hash = header.hash();
         let child = VerifiedHeaderRef {
             height,
@@ -235,7 +246,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         .cf_handle("block_header_by_height")
         .expect("the finalized header column exists");
     let mut batch = DiskWriteBatch::new();
-    for header in std::iter::once(&genesis).chain(path[..2].iter()) {
+    for header in std::iter::once(&genesis).chain(path[..3].iter()) {
         batch.zs_insert(&hash_by_height, header.height, header.hash);
         batch.zs_insert(&height_by_hash, header.hash, header.height);
         batch.zs_insert(
@@ -247,17 +258,275 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     db.write(batch)
         .expect("the canonical finalized header fixture commits");
 
-    let finalized = Frontier::new(path[1].height, path[1].hash);
+    let finalized = Frontier::new(path[2].height, path[2].hash);
     let (runtime, _) = store
         .startup_reconciled(
             &engine_config,
             finalized,
-            path[..2].to_vec(),
-            path[2..].to_vec(),
+            path[..3].to_vec(),
+            path[3..].to_vec(),
         )
         .expect("the finalized prefix and retained suffix reconcile");
+    (runtime, db, genesis, path)
+}
+
+#[test]
+fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).expect("eight is nonzero"));
+    let before = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the initial repair context is coherent")
+        .expect("the retained selected target needs a repair context");
+    let input = zakura_header_chain::TreeAuxRecordV1 {
+        height: target.height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 1,
+        orchard_tx_count: 2,
+        ironwood_tx_count: 3,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([4; 32]),
+    };
+    let rejected = AuxDelivery::new(
+        EvidenceId::from_digest([0x91; 32]),
+        target.hash,
+        SourceId::from_digest([0x92; 32]),
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(input),
+    )
+    .test_only_with_outcome(2, [Some([0x93; 32]), None], Some(path[4].hash))
+    .expect("the rejected auxiliary outcome is coherent");
+    let mut target_node = runtime
+        .store
+        .header_node(target.hash)
+        .expect("the selected target row decodes")
+        .expect("the selected target remains retained");
+    target_node.aux_delivery_ids.push(rejected.delivery_id);
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_NODE_BY_HASH,
+            target.hash.0,
+            &HeaderNodeDisk::from_domain(&target_node),
+        )
+        .expect("the selected target with rejection evidence encodes");
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_AUX_DELIVERY,
+            HeaderAuxDeliveryKey {
+                header: target.hash,
+                delivery: rejected.delivery_id,
+            }
+            .as_bytes(),
+            &rejected,
+        )
+        .expect("the rejected auxiliary outcome encodes");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the durable rejection fixture commits");
+
+    let engine_config = runtime.config.clone();
+    drop(runtime);
+    let (runtime, _) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("startup reconstructs the durable delivery base and rejection constraints");
+    let recovered = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the recovered repair context is coherent")
+        .expect("the recovered selected target still needs repair");
+
+    assert_ne!(recovered.episode, before.episode);
+    assert!(recovered.excludes(input));
+    assert!(recovered.retains_payload(input));
+    assert!(recovered.retains_source(rejected.source));
+
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the repair parent produces validation rules");
+    let headers = [path[3].header.clone()];
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the replacement header passes deterministic preparation");
+    let mut replacement_input = input;
+    replacement_input.sapling_tx_count = replacement_input.sapling_tx_count.saturating_add(1);
+    let source = SourceId::from_digest([0x94; 32]);
+    let replacement = AuxDelivery::new(
+        EvidenceId::from_digest([0x95; 32]),
+        target.hash,
+        source,
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(replacement_input),
+    );
+    let repair_request = |episode, delivery: AuxDelivery| TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source: delivery.source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode,
+            },
+            batch: batch.clone(),
+            aux: vec![delivery],
+        })),
+    };
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+
+    let normal_headers = [path[3].header.clone(), path[4].header.clone()];
+    let normal_batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&normal_headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the duplicate normal path passes deterministic preparation");
+    let normal_owner = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        path[4].hash,
+    )
+    .bind(9, NonZeroU64::new(10).expect("ten is nonzero"));
+    let repeated = AuxDelivery::new(
+        EvidenceId::from_digest([0x96; 32]),
+        target.hash,
+        source,
+        normal_owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(input),
+    );
+    let successor = AuxDelivery::new(
+        EvidenceId::from_digest([0x97; 32]),
+        path[4].hash,
+        source,
+        normal_owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        None,
+    );
+    assert!(matches!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: StateVersion::default(),
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: normal_owner.into(),
+                        source,
+                        parent_hash: parent.hash,
+                        target_tip_hash: path[4].hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: parent,
+                        },
+                        batch: normal_batch,
+                        aux: vec![repeated, successor],
+                    })),
+                },
+                &context,
+            )
+            .expect("rejected semantic input is a normal stale apply outcome"),
+        ApplyResult::Stale(_)
+    ));
+    assert!(runtime
+        .store
+        .aux_deliveries(target.hash)
+        .expect("the target delivery rows remain readable")
+        .iter()
+        .all(|delivery| delivery.delivery_id != repeated.delivery_id));
+
+    assert!(matches!(
+        runtime
+            .apply(repair_request(before.episode, replacement), &context)
+            .expect("a stale repair episode is a normal apply outcome"),
+        ApplyResult::Stale(_)
+    ));
+    assert!(runtime
+        .store
+        .aux_deliveries(target.hash)
+        .expect("the target delivery rows remain readable")
+        .iter()
+        .all(|delivery| delivery.delivery_id != replacement.delivery_id));
+
+    let same_source_replacement = AuxDelivery::new(
+        EvidenceId::from_digest([0x98; 32]),
+        target.hash,
+        rejected.source,
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(replacement_input),
+    );
+    assert!(matches!(
+        runtime
+            .apply(
+                repair_request(recovered.episode, same_source_replacement),
+                &context,
+            )
+            .expect("a retained supplier cannot consume another rooted slot"),
+        ApplyResult::Stale(_)
+    ));
+    assert!(runtime
+        .store
+        .aux_deliveries(target.hash)
+        .expect("the target delivery rows remain readable")
+        .iter()
+        .all(|delivery| delivery.delivery_id != same_source_replacement.delivery_id));
+    let duplicate_input = AuxDelivery::new(
+        EvidenceId::from_digest([0x99; 32]),
+        target.hash,
+        source,
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(input),
+    );
+    assert!(matches!(
+        runtime
+            .apply(repair_request(recovered.episode, duplicate_input), &context)
+            .expect("a retained semantic input cannot complete the repair again"),
+        ApplyResult::Stale(_)
+    ));
+    assert!(matches!(
+        runtime
+            .apply(repair_request(recovered.episode, replacement), &context)
+            .expect("the current repair episode can apply replacement input"),
+        ApplyResult::Committed
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(4);
+    let hash_by_height = db
+        .cf_handle("hash_by_height")
+        .expect("the finalized hash index exists");
     let reader = runtime.reader();
-    let target = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
         &runtime.publisher().snapshot(),
         target.hash,
@@ -281,7 +550,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
 
     let owner = SourceId::from_digest([0x71; 32]);
     let mut after = genesis.hash;
-    for (expected, complete) in path.iter().zip([false, false, true]) {
+    for (expected, complete) in path.iter().zip([false, false, false, true]) {
         let RetainedPathReadOutcome::Page(page) = reader
             .read_retained_path(owner, 9, lease.lease_id, scope, after, 1)
             .expect("the historical path page is coherent")
@@ -817,7 +1086,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     assert!(reader
         .release_retained_path(owner, 7, lease.lease_id, lease_scope)
         .expect("the exact owner can release its lease"));
-    for marker in 1..=MAX_RETAINED_PATH_LEASES {
+    for marker in 1..MAX_RETAINED_PATH_LEASES {
         let marker = u8::try_from(marker).expect("the lease cap fits in one byte");
         assert!(matches!(
             reader
@@ -922,5 +1191,106 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         Err(HeaderChainStoreError::Store(StoreError::Incoherent(
             "retained node and auxiliary delivery index disagree"
         )))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontier() {
+    let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix(4);
+    let finalized = Frontier::new(path[2].height, path[2].hash);
+    let reader = runtime.reader();
+
+    // A VCT repair asks for the exact header at one stalled height. The header graph holds only
+    // the retained suffix, so a supplier that has finalized past that height serves it from the
+    // finalized indexes.
+    let target = Frontier::new(path[1].height, path[1].hash);
+    assert!(target.height < finalized.height);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        target.hash,
+    );
+    // Long retained paths may occupy every general slot. The registry preserves one slot for the
+    // bounded finalized fallback that supplies an exact VCT repair header.
+    let retained_target = Frontier::new(path[3].height, path[3].hash);
+    let retained_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        retained_target.hash,
+    );
+    for marker in 1..MAX_RETAINED_PATH_LEASES {
+        let marker = u8::try_from(marker).expect("the lease cap fits in one byte");
+        assert!(matches!(
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([marker; 32]),
+                    10,
+                    retained_target.hash,
+                    &[genesis.hash],
+                    retained_scope,
+                )
+                .expect("the general path acquisition is coherent"),
+            RetainedPathLeaseOutcome::Acquired(_)
+        ));
+    }
+
+    let owner = SourceId::from_digest([0x81; 32]);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(owner, 11, target.hash, &[path[0].hash], scope)
+        .expect("the finalized target resolves through the finalized indexes")
+    else {
+        panic!("the finalized target should acquire a lease");
+    };
+    assert_eq!(
+        lease.common_ancestor,
+        Frontier::new(path[0].height, path[0].hash)
+    );
+    assert_eq!(lease.target, target);
+
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(owner, 11, lease.lease_id, scope, path[0].hash, 4)
+        .expect("the finalized target page is coherent")
+    else {
+        panic!("the finalized target lease should remain available");
+    };
+    assert_eq!(
+        page.headers.as_slice(),
+        std::slice::from_ref(&path[1].header)
+    );
+    assert_eq!(page.target, target);
+    assert!(page.complete);
+    assert!(reader
+        .release_retained_path(owner, 11, lease.lease_id, scope)
+        .expect("the finalized target cursor releases"));
+
+    // The finalized fallback serves only the one-header VCT repair path. A lower locator cannot
+    // create a renewable multi-page lease.
+    let long_path_owner = SourceId::from_digest([0x84; 32]);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(long_path_owner, 11, target.hash, &[genesis.hash], scope)
+            .expect("the long finalized path lookup is coherent"),
+        RetainedPathLeaseOutcome::NoLocatorIntersection
+    ));
+
+    // A locator at or above the target leaves no ancestor to continue from.
+    let above_owner = SourceId::from_digest([0x82; 32]);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(above_owner, 11, target.hash, &[path[2].hash], scope)
+            .expect("the locator lookup is coherent"),
+        RetainedPathLeaseOutcome::NoLocatorIntersection
+    ));
+
+    // An unknown target stays unservable.
+    let unknown_owner = SourceId::from_digest([0x83; 32]);
+    let unknown = zakura_chain::block::Hash([0x9c; 32]);
+    let unknown_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        unknown,
+    );
+    assert!(matches!(
+        reader
+            .acquire_retained_path(unknown_owner, 11, unknown, &[genesis.hash], unknown_scope)
+            .expect("the unknown target lookup is coherent"),
+        RetainedPathLeaseOutcome::TargetNotRetained
     ));
 }
